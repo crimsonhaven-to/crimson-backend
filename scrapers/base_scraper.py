@@ -18,7 +18,7 @@ class BaseAnimeScraper(abc.ABC):
         )
 
     @abc.abstractmethod
-    async def search_anime(self, anime_title: str) -> str | None:
+    async def search_anime(self, media_ctx: dict) -> str | None:
         """
         Step 1: Search the target streaming site using the anime title.
         Returns the unique slug/ID used by that specific website.

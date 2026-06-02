@@ -161,19 +161,23 @@ async def get_anime_info(tmdb_id: int, season: int = 1):
 
     return merged_response
 
-async def run_single_scraper(scraper_class, title: str, episode_num: int) -> list[str]:
-    """Helper function to manage the lifecycle of a single scraper execution."""
-    # 1. Instantiate the scraper class
+async def run_single_scraper(scraper_class, media_ctx: dict, episode_num: int) -> list[str]:
+    """Manages the lifecycle of a single scraper execution using a context dictionary."""
     scraper = scraper_class()
     try:
-        print(f"🔍 [{scraper_class.__name__}] Searching for: '{title}'")
-        slug = await scraper.search_anime(title)
+        # We pass the entire dictionary context here so scrapers can pull whatever they need (title, tmdb_id, etc)
+        # Scrapers that need a title can use media_ctx.get("title")
+        # Scrapers that need an ID can use media_ctx.get("tmdb_id")
+        title_for_log = media_ctx.get("title", "Unknown Title")
+        print(f"[{scraper_class.__name__}] Processing: '{title_for_log}'")
+        
+        slug = await scraper.search_anime(media_ctx)
         
         if not slug:
-            print(f"[{scraper_class.__name__}] Anime not found on this source.")
+            print(f"[{scraper_class.__name__}] Anime matching data not found on this source.")
             return []
             
-        print(f"🔗 [{scraper_class.__name__}] Found slug: '{slug}'. Fetching episode {episode_num}...")
+        print(f"[{scraper_class.__name__}] Resolved target identifier: '{slug}'. Fetching episode {episode_num}...")
         embeds = await scraper.get_episode_embeds(slug, episode_num)
         return embeds
         
@@ -181,7 +185,6 @@ async def run_single_scraper(scraper_class, title: str, episode_num: int) -> lis
         print(f"[{scraper_class.__name__}] Error during scraping: {e}")
         return []
     finally:
-        # Crucial: Always close the httpx.AsyncClient connection to prevent memory leaks
         await scraper.close()
 
 
