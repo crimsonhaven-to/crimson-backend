@@ -25,7 +25,7 @@ app.add_middleware(
 load_dotenv()  # Load environment variables from .env file
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")  
-DB_NAME = "anime_mappings.db"
+DB_NAME = "./metadata_engine/anime_mappings.db"
 
 def get_anilist_id(tmdb_id: int, season: int = 1) -> int | None:
     """Queries the local SQLite database for the mapped AniList ID."""
@@ -191,10 +191,10 @@ async def run_single_scraper(scraper_class, media_ctx: dict, episode_num: int) -
 @app.get("/watch/{anilist_id}/{episode_number}")
 async def get_streaming_links(anilist_id: int, episode_number: int):
     """
-    The orchestrator route. It resolves the anime title via AniList,
-    fires off all scrapers concurrently, and resolves video stream URLs.
+    The orchestrator route. It resolves the anime metadata via AniList and SQLite,
+    fires off all scrapers concurrently using a full context dictionary, and resolves video stream URLs.
     """
-    # 1. We need the romaji/english title so the scrapers know what text to search for
+    # 1. Fetch the AniList metadata to get the text title
     async with httpx.AsyncClient() as client:
         anilist_data = await fetch_anilist_metadata(client, anilist_id)
     
@@ -202,7 +202,25 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     if not anime_title:
         raise HTTPException(status_code=404, detail="Could not resolve anime title from AniList ID.")
 
-    # 2. If we have no scrapers implemented yet, return an empty list early
+    # --- NEW FIX: Reverse lookup your TMDB ID from your SQLite database ---
+    # Since your local DB maps tmdb_id -> anilist_id, we can safely query it backwards.
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT tmdb_id FROM mappings WHERE anilist_id = ?", (anilist_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    tmdb_id = row[0] if row else None
+
+    # 2. Build the complete context dictionary object!
+    media_ctx = {
+        "title": anime_title,
+        "anilist_id": anilist_id,
+        "tmdb_id": tmdb_id,  # Will be a string/int or None if unmapped
+        **anilist_data       # Unpacks status, banner, episodes_list etc.
+    }
+
+    # 3. If we have no scrapers implemented yet, return empty early
     if not ALL_SCRAPERS:
         return {
             "anime_id": anilist_id,
@@ -211,36 +229,31 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
             "streams": []
         }
 
-    # 3. Create a list of asynchronous tasks, one for each registered provider
+    # 4. FIX: Pass the media_ctx DICTIONARY instead of the raw string title!
     tasks = [
-        run_single_scraper(scraper_class, anime_title, episode_number)
+        run_single_scraper(scraper_class, media_ctx, episode_number)
         for scraper_class in ALL_SCRAPERS
     ]
     
-    # 4. Fire them ALL off simultaneously using asyncio.gather
+    # 5. Fire them ALL off simultaneously
     results = await asyncio.gather(*tasks)
     
-    # 5. Flatten the list of lists into a single flat list of unique embed links
+    # 6. Flatten the list of lists into a single flat list of unique embed links
     flattened_embeds = list(set([embed for sublist in results for embed in sublist]))
 
-    # --- NEW: THE RESOLVER INTERCEPTION LAYER ---
+    # --- THE RESOLVER INTERCEPTION LAYER (Unchanged) ---
     final_streams = []
-
-        # Instantiate our resolvers once before entering the loop
     resolver_instances = [resolver_class() for resolver_class in ALL_RESOLVERS]
 
     for embed_url in flattened_embeds:
         matched_resolver = None
-        
-        # Check if any registered resolver owns this link
         for resolver in resolver_instances:
             if resolver.domain_keyword in embed_url.lower():
                 matched_resolver = resolver
                 break
             
-        # If a resolver was found, use it dynamically!
         if matched_resolver:
-            print(f"🎯 Dynamically routing to {matched_resolver.source_name}: {embed_url}")
+            print(f"Dynamically routing to {matched_resolver.source_name}: {embed_url}")
             direct_video_url = await matched_resolver.resolve(embed_url)
             
             if direct_video_url:
@@ -256,7 +269,6 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
                     "url": embed_url
                 })
         else:
-            # Fallback for platforms without a resolver yet
             final_streams.append({
                 "source": "External Provider",
                 "type": "iframe",
