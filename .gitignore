@@ -1,0 +1,6 @@
+# local development stuff
+*pycache*
+*.db
+
+# secrets
+.env
