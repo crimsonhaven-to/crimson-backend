@@ -34,21 +34,37 @@ def get_anilist_id(tmdb_id: int, season: int = 1) -> int | None:
     return row[0] if row else None
 
 async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int) -> dict:
-    """Fetches posters, descriptions, and backdrops from TMDB."""
-    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={TMDB_API_KEY}&language=en-US"
-    response = await client.get(url)
-    if response.status_code != 200:
-        return {}
-    data = response.json()
-    return {
-        "summary": data.get("overview"),
-        "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}",
-        "backdrop": f"https://image.tmdb.org/t/p/original{data.get('backdrop_path')}"
+    """Fetches posters, descriptions, and backdrops from TMDB using a v4 Read Access Token."""
+    # Notice we removed ?api_key= from the URL entirely
+    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?language=en-US"
+    
+    # Let's pass the massive token securely inside the HTTP Headers
+    headers = {
+        "Authorization": f"Bearer {TMDB_API_KEY}",
+        "accept": "application/json"
     }
+    
+    try:
+        response = await client.get(url, headers=headers)
+        if response.status_code != 200:
+            print(f"TMDB Error: Status {response.status_code}") # Temporary debug line
+            return {}
+            
+        data = response.json()
+        return {
+            "summary": data.get("overview"),
+            "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
+            "backdrop": f"https://image.tmdb.org/t/p/original{data.get('backdrop_path')}" if data.get('backdrop_path') else None
+        }
+    except Exception as e:
+        print(f"TMDB Exception: {e}")
+        return {}
 
 async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> dict:
-    """Fetches anime-specific data like episodes, status, and streaming banners."""
+    """Fetches anime-specific data, including a detailed episode list and titles."""
     url = "https://graphql.anilist.co"
+    
+    # Added 'streamingEpisodes' to pull titles, thumbnails, and official site URLs.
     query = """
     query ($id: Int) {
       Media (id: $id, type: ANIME) {
@@ -59,19 +75,58 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
           romaji
           english
         }
+        streamingEpisodes {
+          title
+          thumbnail
+          url
+        }
       }
     }
     """
-    response = await client.post(url, json={"query": query, "variables": {"id": anilist_id}})
-    if response.status_code != 200:
+    
+    try:
+        response = await client.post(url, json={"query": query, "variables": {"id": anilist_id}})
+        if response.status_code != 200:
+            return {}
+        
+        media = response.json().get("data", {}).get("Media", {})
+        
+        # Parse the streaming episodes into a cleaner format for our frontend
+        raw_episodes = media.get("streamingEpisodes", [])
+        formatted_episodes = []
+        
+        for index, ep in enumerate(raw_episodes, start=1):
+            # Clean up titles (e.g., "Episode 1 - A Dog and a Chainsaw" -> "A Dog and a Chainsaw")
+            # AniList often includes the episode number in the title string
+            ep_title = ep.get("title", f"Episode {index}")
+            
+            formatted_episodes.append({
+                "episode_number": index,
+                "title": ep_title,
+                "thumbnail": ep.get("thumbnail")
+            })
+
+        # Fallback: If AniList has no streaming episode data (common for brand-new or obscure shows),
+        # we generate a dummy list based on total episodes so the frontend still has buttons to click.
+        if not formatted_episodes and media.get("episodes"):
+            for i in range(1, media.get("episodes") + 1):
+                formatted_episodes.append({
+                    "episode_number": i,
+                    "title": f"Episode {i}",
+                    "thumbnail": None
+                })
+
+        return {
+            "title": media.get("title", {}).get("english") or media.get("title", {}).get("romaji"),
+            "total_episodes": media.get("episodes"),
+            "status": media.get("status"),
+            "banner": media.get("bannerImage"),
+            "episodes_list": formatted_episodes  # <-- Beautiful clean array for the UI
+        }
+        
+    except Exception as e:
+        print(f"Error fetching from AniList: {e}")
         return {}
-    media = response.json().get("data", {}).get("Media", {})
-    return {
-        "title": media.get("title", {}).get("english") or media.get("title", {}).get("romaji"),
-        "total_episodes": media.get("episodes"),
-        "status": media.get("status"),
-        "banner": media.get("bannerImage")
-    }
 
 @app.get("/info/{tmdb_id}")
 async def get_anime_info(tmdb_id: int, season: int = 1):
