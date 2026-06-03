@@ -1,18 +1,24 @@
 import sqlite3
 import asyncio
 import os
+import sys
 import httpx
 from dotenv import load_dotenv
+from typing import Dict, Optional, List
 from fastapi import Query
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 # Import the base classes and the list of scrapers
 from scrapers import ALL_SCRAPERS
 from scrapers.base_scraper import BaseAnimeScraper
+from scrapers.vidking_scraper import VidkingScraper
 # import the resolvers
 from resolvers import ALL_RESOLVERS
+from resolvers.base_resolver import BaseResolver
 
 app = FastAPI()
+
+CRIMSON_RED = "990000" # me likey colour
 
 # Enable CORS so the frontend framework can talk to this backend
 app.add_middleware(
@@ -187,14 +193,63 @@ async def run_single_scraper(scraper_class, media_ctx: dict, episode_num: int) -
     finally:
         await scraper.close()
 
+async def run_vidking_scraper_branded(
+    scraper: 'VidkingScraper', 
+    media_ctx: dict, 
+    episode_num: int
+) -> list[str]:
+    """
+    Specialized task executor for VidKing. It performs the search and then generates 
+    the embed URL using predefined branded parameters (Crimson Red).
+
+    Args:
+        scraper: The instantiated VidkingScraper object.
+        media_ctx: The full metadata context dictionary.
+        episode_num: The target episode number.
+
+    Returns:
+        A list of generated embedded URLs, or an empty list on failure.
+    """
+    try:
+        # 1. Search Phase (Standard)
+        title_for_log = media_ctx.get("title", "Unknown Title")
+        print(f"[VidKingScraper] Processing: '{title_for_log}' (Branded Mode)")
+
+        slug = await scraper.search_anime(media_ctx)
+        
+        if not slug:
+            print("[VidKingScraper] Anime matching data not found on this source.")
+            return []
+            
+        # 2. Embed Generation Phase (Specialized/Branded)
+        print(f"[VidKingScraper] Resolved target identifier: '{slug}'. Generating branded embeds for episode {episode_num}...")
+
+        # Use the dedicated method to build the URL with branding parameters
+        embeds = await scraper.get_branded_embeds(
+            anime_slug=slug, 
+            season_num=1, # Must hardcode or pass season from context if needed
+            episode_num=episode_num,
+            color_code=CRIMSON_RED,  # nice colour :3
+            auto_play=True        # Always autoplay for the branded experience
+        )
+
+        return embeds
+        
+    except Exception as e:
+        print(f"[VidKingScraper] CRITICAL ERROR during specialized scraping: {type(e).__name__}: {e}")
+        return []
+    finally:
+        await scraper.close()
+
 
 @app.get("/watch/{anilist_id}/{episode_number}")
 async def get_streaming_links(anilist_id: int, episode_number: int):
     """
     The orchestrator route. It resolves the anime metadata via AniList and SQLite,
-    fires off all scrapers concurrently using a full context dictionary, and resolves video stream URLs.
+    fires off all scrapers concurrently using a full context dictionary, 
+    and then attempts to resolve video stream URLs using the best available links.
     """
-    # 1. Fetch the AniList metadata to get the text title
+    # Metadata Fetching
     async with httpx.AsyncClient() as client:
         anilist_data = await fetch_anilist_metadata(client, anilist_id)
     
@@ -202,8 +257,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     if not anime_title:
         raise HTTPException(status_code=404, detail="Could not resolve anime title from AniList ID.")
 
-    # --- NEW FIX: Reverse lookup your TMDB ID from your SQLite database ---
-    # Since your local DB maps tmdb_id -> anilist_id, we can safely query it backwards.
+    # Database lookup
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT tmdb_id FROM mappings WHERE anilist_id = ?", (anilist_id,))
@@ -212,15 +266,17 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     
     tmdb_id = row[0] if row else None
 
+
     # 2. Build the complete context dictionary object!
     media_ctx = {
         "title": anime_title,
         "anilist_id": anilist_id,
-        "tmdb_id": tmdb_id,  # Will be a string/int or None if unmapped
-        **anilist_data       # Unpacks status, banner, episodes_list etc.
+        "tmdb_id": tmdb_id, 
+        **anilist_data
     }
 
-    # 3. If we have no scrapers implemented yet, return empty early
+
+    # 3. Check for available scrapers
     if not ALL_SCRAPERS:
         return {
             "anime_id": anilist_id,
@@ -229,51 +285,73 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
             "streams": []
         }
 
-    # 4. FIX: Pass the media_ctx DICTIONARY instead of the raw string title!
-    tasks = [
-        run_single_scraper(scraper_class, media_ctx, episode_number)
-        for scraper_class in ALL_SCRAPERS
-    ]
-    
+
+    # 4. Fire off all scraping tasks concurrently (now actually uses the helper)
+    tasks = [] 
+
+    for scraper in ALL_SCRAPERS:
+        source_name = scraper.__class__.__name__
+        
+        if "VidKing" in source_name:
+            print(f"\n[Orchestrator] *** Specialized Path Detected: {source_name} ***", file=sys.stderr)
+            # 1. Run the specialized branded task function (The fix!)
+            task = run_vidking_scraper_branded(scraper, media_ctx, episode_number)
+        else:
+            print(f"\n[Orchestrator] --- Standard Path Detected: {source_name} ---", file=sys.stderr)
+            # 2. Use the generic worker for all other sources (VoE, Gogo, etc.)
+            task = run_single_scraper(scraper, media_ctx, episode_number)
+
     # 5. Fire them ALL off simultaneously
     results = await asyncio.gather(*tasks)
+
+    tasks.append(task)
     
-    # 6. Flatten the list of lists into a single flat list of unique embed links
+    results = await asyncio.gather(*tasks)
+    
+    # 5. Flatten the list of lists into a single flat list of unique embed links
     flattened_embeds = list(set([embed for sublist in results for embed in sublist]))
 
-    # --- THE RESOLVER INTERCEPTION LAYER (Unchanged) ---
+
+    # THE RESOLVER INTERCEPTION LAYER (more robust logging)
     final_streams = []
     resolver_instances = [resolver_class() for resolver_class in ALL_RESOLVERS]
 
     for embed_url in flattened_embeds:
         matched_resolver = None
+        # Use the URL itself to determine which resolver to use.
         for resolver in resolver_instances:
             if resolver.domain_keyword in embed_url.lower():
                 matched_resolver = resolver
                 break
-            
+        
         if matched_resolver:
-            print(f"Dynamically routing to {matched_resolver.source_name}: {embed_url}")
+            print(f"\n[Orchestrator] -> Routing resolution request for {embed_url} to {matched_resolver.source_name}.")
             direct_video_url = await matched_resolver.resolve(embed_url)
             
+            # Determine the final 'type' and 'status' based on result:
             if direct_video_url:
+                stream_type = "hls" if "m3u8" in direct_video_url else "mp4"
                 final_streams.append({
                     "source": matched_resolver.source_name,
-                    "type": "hls" if "m3u8" in direct_video_url else "mp4",
-                    "url": direct_video_url
+                    "type": stream_type,
+                    "url": direct_video_url # This is the final manifest/stream URL
                 })
             else:
+                # If resolution failed, we fall back to using the embed link as an iFrame source 
+                # for display purposes.
                 final_streams.append({
                     "source": f"{matched_resolver.source_name} (Raw Embed)",
-                    "type": "iframe",
-                    "url": embed_url
+                    "type": "iframe", # Indicates it should be rendered in an iframe
+                    "url": embed_url 
                 })
         else:
+            # This path is a safety net for unknown domains
             final_streams.append({
-                "source": "External Provider",
+                "source": "Unknown Source (Fallback)",
                 "type": "iframe",
                 "url": embed_url
             })
+
 
     return {
         "anime_id": anilist_id,
