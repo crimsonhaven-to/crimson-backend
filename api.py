@@ -8,21 +8,25 @@ from typing import Dict, Optional, List
 from fastapi import Query
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-# Import the base classes and the list of scrapers
-from scrapers import ALL_SCRAPERS # Assuming 'scrapers' module exists
+# Assuming the scraper and resolver imports are handled by their respective module structure
+from scrapers import ALL_SCRAPERS 
 from scrapers.base_scraper import BaseAnimeScraper
-from scrapers.vidking_scraper import VidkingScraper # Must be available
-# import the resolvers
-from resolvers import ALL_RESOLVERS # Assuming 'resolvers' module exists
+from scrapers.vidking_scraper import VidkingScraper
+from resolvers import ALL_RESOLVERS
 from resolvers.base_resolver import BaseResolver
 
 app = FastAPI()
-
+#TODO: Implement search and lookup logic from frontend since it crashes as of right now
+'''
+INFO:     127.0.0.1:54043 - "GET /info/Shadow HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:54043 - "GET /search/anime?query_name=Shadow HTTP/1.1" 500 Internal Server Error
+ERROR:    Exception in ASGI application
+'''
 
 CRIMSON_RED = "990000" 
 
 
-# Enable CORS so the frontend framework can talk to this backend
+#TODO: In production, I shoud probably lock this down to just my onw URL
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -35,7 +39,12 @@ load_dotenv()
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY") 
 DB_NAME = "./metadata_engine/anime_mappings.db"
+TMDB_HEADERS = {
+    "Authorization": f"Bearer {TMDB_API_KEY}",
+    "accept": "application/json"
+}
 
+# --- HELPER FUNCTIONS (Unchanged but included for completeness) ---
 
 def get_anilist_id(tmdb_id: int, season: int = 1) -> int | None:
     """Queries the local SQLite database for the mapped AniList ID."""
@@ -111,7 +120,6 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
         formatted_episodes = []
         
         for index, ep in enumerate(raw_episodes, start=1):
-            # Clean up titles (e.g., "Episode 1 - A Dog and a Chainsaw" -> "A Dog and a Chainsaw")
             ep_title = ep.get("title", f"Episode {index}")
             
             formatted_episodes.append({
@@ -119,7 +127,6 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
                 "title": ep_title,
                 "thumbnail": ep.get("thumbnail")
             })
-
 
         # Fallback: If AniList has no streaming episode data, generate a dummy list based on total episodes.
         if not formatted_episodes and media.get("episodes"):
@@ -143,10 +150,122 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
         print(f"Error fetching from AniList: {e}")
         return {}
 
+# --- NEW HELPER FUNCTIONS FOR SEARCH & TRENDING ---
+
+async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str) -> list[dict]:
+    """Searches TMDB by name using v4 Auth and returns a filtered list of matches."""
+    print(f"[TMDB Search] Querying for anime titles containing '{query}'...")
+    
+    # URL clean of API keys in query parameters
+    url = f"https://api.themoviedb.org/3/search/tv?query={httpx.utils.quote(query)}"
+    
+    try:
+        # Headers parameter passes the Bearer token securely
+        response = await client.get(url, headers=TMDB_HEADERS)
+        if response.status_code != 200:
+            print(f"[TMDB Search] Error: Status {response.status_code} - {response.text}")
+            return []
+
+        data = response.json().get("results", [])
+        
+        # Filter and enrich results by checking local database mapping
+        filtered_results = []
+        for item in data[:10]: # Limit to top 10 suggestions for performance
+            tmdb_id = item.get("id")
+            if tmdb_id:
+                anilist_id = get_anilist_id(tmdb_id, season=1)
+                
+                # Only keep results that we can actually track episode data for
+                if anilist_id:
+                    filtered_results.append({
+                        "title": item.get("name") or item.get("original_name"),
+                        "tmdb_id": tmdb_id,
+                        "anilist_id": anilist_id,
+                        "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None
+                    })
+
+        return filtered_results
+
+    except Exception as e:
+        print(f"[TMDB Search] An error occurred during search: {e}")
+        return []
+
+
+async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]:
+    """Fetches the top 10 trending anime using v4 Auth and maps them to AniList IDs."""
+    print("[Orchestrator] Fetching globally trending anime data from TMDB...")
+    
+    # URL clean of API keys in query parameters
+    url = "https://api.themoviedb.org/3/tv/popular?page=1&include_adult=false&language=en-US"
+    
+    try:
+        # Headers parameter passes the Bearer token securely
+        response = await client.get(url, headers=TMDB_HEADERS)
+        if response.status_code != 200:
+            print(f"[Trending] Error: Status {response.status_code} - {response.text}")
+            return []
+
+        data = response.json().get("results", [])
+        trending_list = []
+
+        for item in data[:10]: # Limit to the top 10 as requested
+            tmdb_id = item.get("id")
+            if tmdb_id:
+                anilist_id = get_anilist_id(tmdb_id, season=1)
+                
+                # Only include if we have a traceable AniList ID
+                if anilist_id:
+                    trending_list.append({
+                        "title": item.get("name") or item.get("original_name"),
+                        "tmdb_id": tmdb_id,
+                        "anilist_id": anilist_id,
+                        "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None
+                    })
+
+        return trending_list
+
+    except Exception as e:
+        print(f"[Trending] An error occurred during fetching: {e}")
+        return []
+
+
+# New endpoints
+
+@app.get("/search/anime")
+async def search_anime_by_name(query_name: str):
+    """
+    Endpoint to search for anime by name, using TMDB and mapping results 
+    to local AniList IDs.
+    """
+    if not query_name or not httpx.AsyncClient.__self__.headers["Authorization"]:
+        raise HTTPException(status_code=400, detail="Missing API Key or Query Name.")
+
+    async with httpx.AsyncClient() as client:
+        results = await fetch_tmdb_search_results(client, query_name)
+    
+    return {
+        "query": query_name,
+        "suggestions": results if results else [{"message": "No tracked anime found matching that title."}]
+    }
+
+@app.get("/trending")
+async def get_trending_anime():
+    """Returns a list of the top 10 trending, trackable anime."""
+    async with httpx.AsyncClient() as client:
+        results = await fetch_trending_anime(client)
+    
+    return {
+        "success": True,
+        "count": len(results),
+        "animes": results
+    }
+
+# old endpoints, just  (Modified and included for continuity) ---
+
 
 @app.get("/info/{tmdb_id}")
 async def get_anime_info(tmdb_id: int, season: int = 1):
-    # (Function body remains unchanged - it is clean and correct)
+    # ... (Existing code remains unchanged) ...
     """Queries the local SQLite database for the mapped AniList ID."""
     anilist_id = get_anilist_id(tmdb_id, season)
     if not anilist_id:
@@ -169,8 +288,7 @@ async def get_anime_info(tmdb_id: int, season: int = 1):
 
 
 async def run_single_scraper(scraper_class, media_ctx: dict, episode_num: int) -> list[str]:
-    """Manages the lifecycle of a single scraper execution using a context dictionary."""
-    # (Function body remains unchanged - it is clean and correct)
+    # ... (Function body remains unchanged) ...
     scraper = scraper_class()
     try:
         title_for_log = media_ctx.get("title", "Unknown Title")
@@ -198,10 +316,7 @@ async def run_vidking_scraper_branded(
     media_ctx: dict, 
     episode_num: int
 ) -> list[str]:
-    """
-    Specialized task executor for VidKing. Generates the embed URL using predefined branded parameters.
-    This function is now explicitly trusted to produce an iFrame source type link.
-    """
+    # ... (Function body remains unchanged) ...
     try:
         title_for_log = media_ctx.get("title", "Unknown Title")
         print(f"[VidKingScraper] Processing: '{title_for_log}' (Branded Mode)")
@@ -214,13 +329,12 @@ async def run_vidking_scraper_branded(
             
         print(f"[VidKingScraper] Resolved target identifier: '{slug}'. Generating branded embeds for episode {episode_num}...")
 
-        # Use the dedicated method to build the URL with branding parameters
         embeds = await scraper.get_branded_embeds(
             anime_slug=slug, 
             season_num=1, 
             episode_num=episode_num,
-            color_code=CRIMSON_RED,  # nice colour :3
-            auto_play=True        # Always autoplay for the branded experience
+            color_code=CRIMSON_RED,
+            auto_play=True
         )
 
         return embeds
@@ -234,6 +348,7 @@ async def run_vidking_scraper_branded(
 
 @app.get("/watch/{anilist_id}/{episode_number}")
 async def get_streaming_links(anilist_id: int, episode_number: int):
+    # ... (Function body remains unchanged) ...
     """
     The orchestrator route. Resolves metadata and runs scrapers, 
     applying source-aware logic to determine the final stream type (HLS/MP4 vs iFrame).
@@ -247,7 +362,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
         raise HTTPException(status_code=404, detail="Could not resolve anime title from AniList ID.")
 
 
-    # Database lookup (Remains unchanged and correct)
+    # Database lookup 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT tmdb_id FROM mappings WHERE anilist_id = ?", (anilist_id,))
@@ -266,7 +381,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     }
 
 
-    # 3. Check for available scrapers (Remains unchanged)
+    # 3. Check for available scrapers
     if not ALL_SCRAPERS:
         return {
             "anime_id": anilist_id,
@@ -276,7 +391,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
         }
 
 
-    # 4. Fire off all scraping tasks concurrently (CORRECTION APPLIED HERE)
+    # 4. Fire off all scraping tasks concurrently (FIX APPLIED HERE)
     tasks = [] 
 
     for scraper in ALL_SCRAPERS:
@@ -284,11 +399,9 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
         
         if "VidKing" in source_name:
             print(f"\n[Orchestrator] *** Specialized Path Detected: {source_name} ***", file=sys.stderr)
-            # FIX 1: The task is now properly prepared as an awaitable call.
             tasks.append(run_vidking_scraper_branded(scraper, media_ctx, episode_number))
         else:
             print(f"\n[Orchestrator] --- Standard Path Detected: {source_name} ---", file=sys.stderr)
-            # FIX 2: The task is now properly prepared as an awaitable call.
             tasks.append(run_single_scraper(scraper, media_ctx, episode_number))
 
 
@@ -300,7 +413,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     flattened_embeds = list(set([embed for sublist in results for embed in sublist]))
 
 
-    # THE RESOLVER INTERCEPTION LAYER (This logic block remains correct and is kept.)
+    # THE RESOLVER INTERCEPTION LAYER (Logic block remains unchanged)
     final_streams = []
     resolver_instances = [resolver_class() for resolver_class in ALL_RESOLVERS]
 
@@ -319,7 +432,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
             # Determine stream type based on source name priority:
             if direct_video_url:
                 
-                # Source-Specific Stream Typing Logic (The VidKing Fix)
+                # Source-Specific Stream Typing Logic (VidKing Fix)
                 if matched_resolver.source_name == "VidKing":
                     stream_type = "iframe" 
                     final_streams.append({
@@ -337,14 +450,13 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
                     })
 
             else:
-                # If resolution failed, we fall back to using the raw embed link as an iFrame source.
+                # Fallback to iframe on resolution failure.
                 final_streams.append({
                     "source": f"{matched_resolver.source_name} (Raw Embed)",
-                    "type": "iframe", # Always default to iframe for fallback display
+                    "type": "iframe", 
                     "url": embed_url 
                 })
         else:
-            # Safety net for unknown domains
             final_streams.append({
                 "source": "Unknown Source (Fallback)",
                 "type": "iframe",
