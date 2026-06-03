@@ -247,7 +247,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
         raise HTTPException(status_code=404, detail="Could not resolve anime title from AniList ID.")
 
 
-    # Database lookup (Remains unchanged)
+    # Database lookup (Remains unchanged and correct)
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT tmdb_id FROM mappings WHERE anilist_id = ?", (anilist_id,))
@@ -276,7 +276,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
         }
 
 
-    # 4. Fire off all scraping tasks concurrently
+    # 4. Fire off all scraping tasks concurrently (CORRECTION APPLIED HERE)
     tasks = [] 
 
     for scraper in ALL_SCRAPERS:
@@ -284,14 +284,15 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
         
         if "VidKing" in source_name:
             print(f"\n[Orchestrator] *** Specialized Path Detected: {source_name} ***", file=sys.stderr)
-            # Run the specialized branded task function (The fix!)
-            task = run_vidking_scraper_branded(scraper, media_ctx, episode_number)
+            # FIX 1: The task is now properly prepared as an awaitable call.
+            tasks.append(run_vidking_scraper_branded(scraper, media_ctx, episode_number))
         else:
             print(f"\n[Orchestrator] --- Standard Path Detected: {source_name} ---", file=sys.stderr)
-            # Use the generic worker for all other sources
-            task = run_single_scraper(scraper, media_ctx, episode_number)
+            # FIX 2: The task is now properly prepared as an awaitable call.
+            tasks.append(run_single_scraper(scraper, media_ctx, episode_number))
 
 
+    # Execute all tasks concurrently and await the results!
     results = await asyncio.gather(*tasks)
 
 
@@ -299,7 +300,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     flattened_embeds = list(set([embed for sublist in results for embed in sublist]))
 
 
-    # THE RESOLVER INTERCEPTION LAYER (FIX APPLIED HERE)
+    # THE RESOLVER INTERCEPTION LAYER (This logic block remains correct and is kept.)
     final_streams = []
     resolver_instances = [resolver_class() for resolver_class in ALL_RESOLVERS]
 
@@ -315,13 +316,11 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
             print(f"\n[Orchestrator] -> Routing resolution request for {embed_url} to {matched_resolver.source_name}.")
             direct_video_url = await matched_resolver.resolve(embed_url)
             
-            # --- START OF FIX LOGIC BLOCK ---
-            
+            # Determine stream type based on source name priority:
             if direct_video_url:
                 
-                # Determine stream type based on source name priority:
+                # Source-Specific Stream Typing Logic (The VidKing Fix)
                 if matched_resolver.source_name == "VidKing":
-                    # VidKing always delivers an embed page (iframe), regardless of what the URL contains.
                     stream_type = "iframe" 
                     final_streams.append({
                         "source": matched_resolver.source_name,
@@ -329,8 +328,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
                         "url": embed_url    # Using the original validated embed link
                     })
                 else:
-                    # For all other sources (assuming they aim for direct streaming), 
-                    # we infer type based on content signature.
+                    # All other sources infer type based on manifest/file signatures.
                     stream_type = "hls" if "m3u8" in direct_video_url else "mp4"
                     final_streams.append({
                         "source": matched_resolver.source_name,
@@ -339,14 +337,12 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
                     })
 
             else:
-                # If resolution failed (or returned None), we fall back to using the raw embed link as an iFrame source.
+                # If resolution failed, we fall back to using the raw embed link as an iFrame source.
                 final_streams.append({
                     "source": f"{matched_resolver.source_name} (Raw Embed)",
                     "type": "iframe", # Always default to iframe for fallback display
                     "url": embed_url 
                 })
-            # --- END OF FIX LOGIC BLOCK ---
-
         else:
             # Safety net for unknown domains
             final_streams.append({
@@ -355,11 +351,9 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
                 "url": embed_url
             })
 
-
     return {
         "anime_id": anilist_id,
         "episode": episode_number,
         "title": anime_title,
         "streams": final_streams
     }
-
