@@ -461,7 +461,7 @@ async def run_single_scraper(scraper_class, media_ctx: dict, episode_num: int, s
     try:
         slug = await scraper.search_anime(media_ctx)
         if not slug: return []
-        return await scraper.get_episode_embeds(slug, episode_num)
+        return await scraper.get_episode_embeds(slug, season_num=season_num, episode_num=episode_num)
     except Exception: return []
     finally: await scraper.close()
 
@@ -469,6 +469,6 @@ async def run_vidking_scraper_branded(scraper, media_ctx: dict, episode_num: int
     try:
         slug = await scraper.search_anime(media_ctx)
         if not slug: return []
-        return await scraper.get_branded_embeds(anime_slug=slug, season_num=season_num, episode_num=episode_num, color_code=CRIMSON_RED, auto_play=True)
+        return await scraper.get_branded_embeds(anime_slug=slug, season_num=season_num, episode_num=episode_num)
     except Exception: return []
     finally: await scraper.close()
