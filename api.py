@@ -177,7 +177,7 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str) -> li
         return []
 
 
-async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]:
+async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]: 
     """Fetches the top 10 trending anime using v4 Auth and maps them to AniList IDs."""
     print("[Orchestrator] Fetching globally trending anime data from TMDB...")
     
@@ -189,7 +189,7 @@ async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]:
             print(f"[Trending] Error: Status {response.status_code} - {response.text}")
             return []
 
-        data = response.json().get("results", [])
+        data = response.json().get("results", []) #TODO: Fix this as it returns an empty list when called
         trending_list = []
 
         for item in data[:10]: 
