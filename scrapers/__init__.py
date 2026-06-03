@@ -1,9 +1,10 @@
 # scrapers/__init__.py
 from .gogo_scraper import GogoScraper
 from .voe_scraper import VoeScraper
-# Future scrapers get imported here:
+from .vidking_scraper import VidkingScraper
 
 ALL_SCRAPERS = [
     GogoScraper,
-    VoeScraper
+    VoeScraper,
+    VidkingScraper
 ]
