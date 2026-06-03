@@ -19,11 +19,20 @@ app = FastAPI()
 
 CRIMSON_RED = "990000" 
 
+origins = [
+    "http://localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1"
+    # Add other trusted domains here for production
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=origins,       # Allow specific origins
+    allow_credentials=True,      # Allows cookies/auth headers to be sent with requests
+    allow_methods=["*"],         # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"],         # Allow all headers
 )
 
 load_dotenv() 
