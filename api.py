@@ -178,10 +178,20 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str) -> li
 
 
 async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]: 
-    """Fetches the top 10 trending anime using v4 Auth and maps them to AniList IDs."""
+    """Fetches the top 12 trending anime using v4 Auth and maps them to AniList IDs."""
     print("[Orchestrator] Fetching globally trending anime data from TMDB...")
     
-    url = "https://api.themoviedb.org/3/tv/popular?page=1&include_adult=false&language=en-US"
+    # Network 214 is standard for Tokyo MX / Anime, or you can use original_language=ja
+    # Fixed now!
+    url = (
+        "https://api.themoviedb.org/3/discover/tv"
+        "?page=1"
+        "&include_adult=false"
+        "&language=en-US"
+        "&with_genres=16"          # 16 is the genre ID for Animation
+        "&with_original_language=ja" # Filters for Japanese productions
+        "&sort_by=popularity.desc"  # Keeps it sorted by trending/popular
+    )
     
     try:
         response = await client.get(url, headers=TMDB_HEADERS)
@@ -189,10 +199,10 @@ async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]:
             print(f"[Trending] Error: Status {response.status_code} - {response.text}")
             return []
 
-        data = response.json().get("results", []) #TODO: Fix this as it returns an empty list when called
+        data = response.json().get("results", []) 
         trending_list = []
 
-        for item in data[:10]: 
+        for item in data[:12]: 
             tmdb_id = item.get("id")
             if tmdb_id:
                 anilist_id = get_anilist_id(tmdb_id, season=1)
