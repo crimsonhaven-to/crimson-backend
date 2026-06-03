@@ -40,9 +40,6 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(db_engine.run_sync, 'interval', hours=24)  # Schedule sync every 24 hours
 scheduler.start()
 
-
-CRIMSON_RED = "990000" # not sure whether or not I still need this since it doesn't work anyway lmao
-
 origins = [
     "http://localhost",
     "http://localhost:5173",
@@ -154,7 +151,7 @@ async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: i
         print(f"TMDB Exception: {e}")
         return {}
 
-
+# anilist metadata fetcher
 async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> dict:
     """Fetches anime-specific data, including a detailed episode list and titles."""
     url = "https://graphql.anilist.co"
@@ -217,16 +214,15 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
 
 
 async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str) -> list[dict]:
-    """Searches TMDB by name using v4 Auth and returns a filtered list of matches."""
+    """Searches TMDB by name using v4 Auth and returns filtered matches with accurate season posters."""
     print(f"[TMDB Search] Querying for anime titles containing '{query}'...")
     
     url = "https://api.themoviedb.org/3/search/tv"
     
     try:
-        # FIX: Combined query parameters AND headers into a single, secure request
         response = await client.get(url, headers=TMDB_HEADERS, params={"query": query, "include_adult": "false"})
         if response.status_code != 200:
-            print(f"[TMDB Search] Error: Status {response.status_code} - {response.text}")
+            print(f"[TMDB Search] Error: Status {response.status_code}")
             return []
 
         data = response.json().get("results", [])
@@ -235,14 +231,23 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str) -> li
         for item in data[:10]: 
             tmdb_id = item.get("id")
             if tmdb_id:
+                # 1. Use Season 1 as the entry point for your UI suggestions list
                 anilist_id = get_anilist_id(tmdb_id, season=1)
                 
                 if anilist_id:
+                    # 2.FIX: Call the metadata function to get the actual, cached season poster
+                    season_meta = await fetch_tmdb_metadata(client, tmdb_id, season=1)
+                    poster_url = season_meta.get("poster")
+                    
+                    # Fallback to show-level poster if season meta came back empty
+                    if not poster_url and item.get('poster_path'):
+                        poster_url = f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}"
+
                     filtered_results.append({
                         "title": item.get("name") or item.get("original_name"),
                         "tmdb_id": tmdb_id,
                         "anilist_id": anilist_id,
-                        "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None
+                        "poster": poster_url # Guaranteed to populate if TMDB has data
                     })
 
         return filtered_results
