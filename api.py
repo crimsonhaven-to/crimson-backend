@@ -3,30 +3,55 @@ import asyncio
 import os
 import sys
 import httpx
+import json
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
 from fastapi import Query
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
 # Assuming the scraper and resolver imports are handled by their respective module structure
 from scrapers import ALL_SCRAPERS 
 from scrapers.base_scraper import BaseAnimeScraper
 from scrapers.vidking_scraper import VidkingScraper
 from resolvers import ALL_RESOLVERS
 from resolvers.base_resolver import BaseResolver
+from metadata_engine.db_handler import MappingDatabaseEngine 
 
 app = FastAPI()
 
-CRIMSON_RED = "990000" 
+# import .env variables
+load_dotenv()
+
+# global vars
+TMDB_API_KEY = os.getenv("TMDB_API_KEY") 
+DB_NAME = "anime_mappings.db"
+TMDB_HEADERS = {
+    "Authorization": f"Bearer {TMDB_API_KEY}",
+    "accept": "application/json"
+}
+ 
+
+# Database logic
+db_engine = MappingDatabaseEngine(db_name="anime_mappings.db") # Set DB Engine with our desired database name
+db_engine.init_db()  # Ensure DB is initialized on startup
+scheduler = BackgroundScheduler()
+scheduler.add_job(db_engine.run_sync, 'interval', hours=24)  # Schedule sync every 24 hours
+scheduler.start()
+
+
+CRIMSON_RED = "990000" # not sure whether or not I still need this since it doesn't work anyway lmao
 
 origins = [
     "http://localhost",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://127.0.0.1"
-    # Add other trusted domains here for production
+    #TODO: Add trusted domains here for production
 ]
 
+# CORS stuff
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,       # Allow specific origins
@@ -35,14 +60,6 @@ app.add_middleware(
     allow_headers=["*"],         # Allow all headers
 )
 
-load_dotenv() 
-
-TMDB_API_KEY = os.getenv("TMDB_API_KEY") 
-DB_NAME = "anime_mappings.db"
-TMDB_HEADERS = {
-    "Authorization": f"Bearer {TMDB_API_KEY}",
-    "accept": "application/json"
-}
 
 # --- HELPER FUNCTIONS ---
 
@@ -58,23 +75,81 @@ def get_anilist_id(tmdb_id: int, season: int = 1) -> int | None:
     conn.close()
     return row[0] if row else None
 
+# Cache helper functions (we don't want to risk getting rate-limited on the TMDB API)
+async def get_cached_response(cache_key: str) -> Optional[dict]:
+    """Retrieves a non-expired cached JSON payload."""
+    loop = asyncio.get_event_loop()
+    def _query():
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT response_json FROM api_cache WHERE cache_key = ? AND expires_at > ?",
+            (cache_key, datetime.utcnow().isoformat())
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return json.loads(row[0]) if row else None
+        
+    return await loop.run_in_executor(None, _query)
 
-async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int) -> dict:
-    """Fetches posters, descriptions, and backdrops from TMDB using a v4 Read Access Token."""
-    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?language=en-US"
+
+async def set_cached_response(cache_key: str, data: dict, ttl_seconds: int = 86400):
+    """Saves a JSON payload to the cache with an expiration timestamp (Default: 24h)."""
+    if not data:  # Avoid caching empty failed responses
+        return
+    
+    expires_at = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat()
+    payload = json.dumps(data)
+    
+    loop = asyncio.get_event_loop()
+    def _insert():
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO api_cache (cache_key, response_json, expires_at)
+            VALUES (?, ?, ?)
+        """, (cache_key, payload, expires_at))
+        conn.commit()
+        conn.close()
+        
+    await loop.run_in_executor(None, _insert)
+
+# we now use cache :D
+async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: int = 1) -> dict:
+    """Fetches posters, descriptions, and backdrops for a SPECIFIC season from TMDB."""
+    # Unique cache key per season so they don't overwrite each other
+    cache_key = f"tmdb:meta:{tmdb_id}:s{season}"
+    
+    # 1. Check SQLite Cache
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        return cached_data
+
+    # 2. Cache Miss -> Query TMDB Season Endpoint
+    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}?language=en-US"
     
     try:
         response = await client.get(url, headers=TMDB_HEADERS)
         if response.status_code != 200:
-            print(f"TMDB Error: Status {response.status_code}")
+            print(f"TMDB Error: Status {response.status_code} for Season {season}")
+            # Fallback: If a specific season fails, try to fetch generic show metadata
+            if season != 1:
+                return await fetch_tmdb_metadata(client, tmdb_id, season=1)
             return {}
             
         data = response.json()
-        return {
-            "summary": data.get("overview"),
+        result = {
+            # Season endpoints return 'overview' for that specific season
+            "summary": data.get("overview"), 
             "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
+            # Note: TMDB seasons don't always have distinct backdrops; fallback to show-level can be done in frontend
             "backdrop": f"https://image.tmdb.org/t/p/original{data.get('backdrop_path')}" if data.get('backdrop_path') else None
         }
+        
+        # 3. Save to Cache (TTL: 24 Hours)
+        await set_cached_response(cache_key, result, ttl_seconds=86400)
+        return result
+        
     except Exception as e:
         print(f"TMDB Exception: {e}")
         return {}
@@ -178,25 +253,28 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str) -> li
 
 
 async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]: 
-    """Fetches the top 12 trending anime using v4 Auth and maps them to AniList IDs."""
-    print("[Orchestrator] Fetching globally trending anime data from TMDB...")
+    """Fetches trending anime from TMDB, using a 6-hour cache layer."""
+    cache_key = "tmdb:trending"
     
-    # Network 214 is standard for Tokyo MX / Anime, or you can use original_language=ja
-    # Fixed now!
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        # Wrap it back into the list structure your original code expects
+        return cached_data.get("results", [])
+
     url = (
         "https://api.themoviedb.org/3/discover/tv"
         "?page=1"
         "&include_adult=false"
         "&language=en-US"
-        "&with_genres=16"          # 16 is the genre ID for Animation
-        "&with_original_language=ja" # Filters for Japanese productions
-        "&sort_by=popularity.desc"  # Keeps it sorted by trending/popular
+        "&with_genres=16"          
+        "&with_original_language=ja" 
+        "&sort_by=popularity.desc"  
     )
     
     try:
         response = await client.get(url, headers=TMDB_HEADERS)
         if response.status_code != 200:
-            print(f"[Trending] Error: Status {response.status_code} - {response.text}")
+            print(f"[Trending] Error: Status {response.status_code}")
             return []
 
         data = response.json().get("results", []) 
@@ -206,7 +284,6 @@ async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]:
             tmdb_id = item.get("id")
             if tmdb_id:
                 anilist_id = get_anilist_id(tmdb_id, season=1)
-                
                 if anilist_id:
                     trending_list.append({
                         "title": item.get("name") or item.get("original_name"),
@@ -215,6 +292,8 @@ async def fetch_trending_anime(client: httpx.AsyncClient) -> list[dict]:
                         "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None
                     })
 
+        # Cache the payload (TTL: 6 hours / 21600 seconds)
+        await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=21600)
         return trending_list
 
     except Exception as e:
@@ -255,12 +334,14 @@ async def get_trending_anime():
 
 @app.get("/info/{tmdb_id}")
 async def get_anime_info(tmdb_id: int, season: int = 1):
+    # 1. Correctly maps the (TMDB ID + Season) to the distinct AniList ID
     anilist_id = get_anilist_id(tmdb_id, season)
     if not anilist_id:
         raise HTTPException(status_code=404, detail="Anime mapping not found in local database.")
 
     async with httpx.AsyncClient() as client:
-        tmdb_task = fetch_tmdb_metadata(client, tmdb_id)
+        # 2. Pass the season context here now! 👇
+        tmdb_task = fetch_tmdb_metadata(client, tmdb_id, season=season)
         anilist_task = fetch_anilist_metadata(client, anilist_id)
         
         tmdb_data, anilist_data = await asyncio.gather(tmdb_task, anilist_task)
@@ -268,6 +349,7 @@ async def get_anime_info(tmdb_id: int, season: int = 1):
     merged_response = {
         "tmdb_id": tmdb_id,
         "anilist_id": anilist_id,
+        "current_season": season,
         **tmdb_data,
         **anilist_data
     }
@@ -276,7 +358,7 @@ async def get_anime_info(tmdb_id: int, season: int = 1):
 
 
 @app.get("/watch/{anilist_id}/{episode_number}")
-async def get_streaming_links(anilist_id: int, episode_number: int):
+async def get_streaming_links(anilist_id: int, episode_number: int, season: int = 1):
     async with httpx.AsyncClient() as client:
         anilist_data = await fetch_anilist_metadata(client, anilist_id)
     
@@ -284,18 +366,22 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     if not anime_title:
         raise HTTPException(status_code=404, detail="Could not resolve anime title from AniList ID.")
 
+# --- CONNECT TO DB WITH BOTH PIECES OF CONTEXT ---
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT tmdb_id FROM mappings WHERE anilist_id = ?", (anilist_id,))
+    # Pull both tmdb_id AND the mapped tmdb_season
+    cursor.execute("SELECT tmdb_id, tmdb_season FROM mappings WHERE anilist_id = ?", (anilist_id,))
     row = cursor.fetchone()
     conn.close()
     
     tmdb_id = row[0] if row else None
+    mapped_tmdb_season = row[1] if row else 1 # Fallback to 1 if not found
 
     media_ctx = {
         "title": anime_title,
         "anilist_id": anilist_id,
         "tmdb_id": tmdb_id, 
+        "tmdb_season": mapped_tmdb_season, # Now your scrapers have access to the real TMDB season!
         **anilist_data
     }
 
@@ -311,9 +397,9 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     for scraper in ALL_SCRAPERS:
         source_name = scraper.__class__.__name__
         if "VidKing" in source_name:
-            tasks.append(run_vidking_scraper_branded(scraper, media_ctx, episode_number))
+            tasks.append(run_vidking_scraper_branded(scraper, media_ctx, episode_number, season))
         else:
-            tasks.append(run_single_scraper(scraper, media_ctx, episode_number))
+            tasks.append(run_single_scraper(scraper, media_ctx, episode_number, season))
 
     results = await asyncio.gather(*tasks)
     flattened_embeds = list(set([embed for sublist in results for embed in sublist]))
@@ -365,7 +451,7 @@ async def get_streaming_links(anilist_id: int, episode_number: int):
     }
 
 # --- UNCHANGED SCRAPER RUNNERS ---
-async def run_single_scraper(scraper_class, media_ctx: dict, episode_num: int) -> list[str]:
+async def run_single_scraper(scraper_class, media_ctx: dict, episode_num: int, season_num: int) -> list[str]:
     scraper = scraper_class()
     try:
         slug = await scraper.search_anime(media_ctx)
@@ -374,10 +460,10 @@ async def run_single_scraper(scraper_class, media_ctx: dict, episode_num: int) -
     except Exception: return []
     finally: await scraper.close()
 
-async def run_vidking_scraper_branded(scraper, media_ctx: dict, episode_num: int) -> list[str]:
+async def run_vidking_scraper_branded(scraper, media_ctx: dict, episode_num: int, season_num: int) -> list[str]:
     try:
         slug = await scraper.search_anime(media_ctx)
         if not slug: return []
-        return await scraper.get_branded_embeds(anime_slug=slug, season_num=1, episode_num=episode_num, color_code=CRIMSON_RED, auto_play=True)
+        return await scraper.get_branded_embeds(anime_slug=slug, season_num=season_num, episode_num=episode_num, color_code=CRIMSON_RED, auto_play=True)
     except Exception: return []
     finally: await scraper.close()

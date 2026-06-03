@@ -26,7 +26,7 @@ class BaseAnimeScraper(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def get_episode_embeds(self, anime_slug: str, episode_num: int) -> list[str]:
+    async def get_episode_embeds(self, anime_slug: str, episode_num: int, season_num: int) -> list[str]:
         """
         Step 2: Go to the episode page on that website and locate the 
         third-party embed video player URLs (like MegaF, Mp4Upload, etc).
