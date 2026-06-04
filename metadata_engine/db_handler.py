@@ -1,11 +1,14 @@
 import asyncio
 import sqlite3
 import httpx
+import re
+import time
 from typing import Optional, List, Dict, Any, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
 
 class MappingDatabaseEngine:
     MAPPING_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
+    ANILIST_API_URL = "https://graphql.anilist.co"
 
     def __init__(self, db_name: str = "anime_mappings.db"):
         self.db_name = db_name
@@ -36,7 +39,6 @@ class MappingDatabaseEngine:
         ''')
         
         # Schema 2: Core mappings table
-        # Composite PK allows same AniList ID to map to multiple TMDB seasons
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS mappings (
                 tmdb_id INTEGER,
@@ -50,7 +52,7 @@ class MappingDatabaseEngine:
             )
         ''')
         
-        # Schema 3: Season groups (links multiple AniList entries together)
+        # Schema 3: Season groups
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS season_groups (
                 group_id INTEGER,
@@ -62,32 +64,43 @@ class MappingDatabaseEngine:
             )
         ''')
         
-        # Migration: check if old schema (single-column PK) exists and recreate
+        # Migration logic
         cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='mappings'")
         existing = cursor.fetchone()
-        if existing and 'PRIMARY KEY (anilist_id)' in existing[0] and 'PRIMARY KEY (anilist_id, tmdb_season)' not in existing[0]:
-            cursor.execute("DROP TABLE IF EXISTS mappings")
-            cursor.execute("DROP TABLE IF EXISTS season_groups")
-            cursor.execute('''CREATE TABLE IF NOT EXISTS mappings (
-                tmdb_id INTEGER,
-                tmdb_season INTEGER,
-                anilist_id INTEGER,
-                mal_id INTEGER,
-                title_romaji TEXT,
-                title_english TEXT,
-                anime_type TEXT,
-                PRIMARY KEY (anilist_id, tmdb_season)
-            )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS season_groups (
-                group_id INTEGER,
-                anilist_id INTEGER,
-                season_number INTEGER,
-                tmdb_season INTEGER,
-                title TEXT,
-                PRIMARY KEY (group_id, season_number)
-            )''')
-            # Clear cached ETag to force a full re-sync after schema migration
-            cursor.execute("DELETE FROM sync_meta WHERE key = 'etag'")
+        if existing:
+            needs_recreate = False
+            if 'PRIMARY KEY (anilist_id)' in existing[0] and 'PRIMARY KEY (anilist_id, tmdb_season)' not in existing[0]:
+                needs_recreate = True
+            if 'title_english' not in existing[0]:
+                needs_recreate = True
+                
+            if needs_recreate:
+                print("[DB Engine] Schema out of date. Recreating tables...")
+                cursor.execute("DROP TABLE IF EXISTS mappings")
+                cursor.execute("DROP TABLE IF EXISTS season_groups")
+                # Re-run create table statements
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS mappings (
+                        tmdb_id INTEGER,
+                        tmdb_season INTEGER,
+                        anilist_id INTEGER,
+                        mal_id INTEGER,
+                        title_romaji TEXT,
+                        title_english TEXT,
+                        anime_type TEXT,
+                        PRIMARY KEY (anilist_id, tmdb_season)
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS season_groups (
+                        group_id INTEGER,
+                        anilist_id INTEGER,
+                        season_number INTEGER,
+                        tmdb_season INTEGER,
+                        title TEXT,
+                        PRIMARY KEY (group_id, season_number)
+                    )
+                ''')
         
         # Schema 4: API Cache
         cursor.execute('''
@@ -119,22 +132,57 @@ class MappingDatabaseEngine:
         finally:
             conn.close()
 
-        response = await client.head(self.MAPPING_URL, follow_redirects=True)
-        new_etag = response.headers.get("ETag")
+        try:
+            response = await client.head(self.MAPPING_URL, follow_redirects=True)
+            new_etag = response.headers.get("ETag")
+        except Exception as e:
+            print(f"[DB Engine] Error checking for updates: {e}")
+            return None
 
         if current_etag == new_etag and current_etag is not None:
             return None 
 
-        if current_etag != new_etag:
-            print(f"[DB Engine] ETag change detected (Old: {current_etag} -> New: {new_etag}).")
-            return new_etag
+        return new_etag
 
-        return None
+    async def _fetch_anilist_metadata_bulk(self, anilist_ids: List[int]) -> Dict[int, Dict]:
+        """Fetches metadata from AniList in chunks to avoid rate limits."""
+        results = {}
+        chunk_size = 50
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for i in range(0, len(anilist_ids), chunk_size):
+                chunk = anilist_ids[i:i + chunk_size]
+                
+                # Construct a single query with multiple aliases
+                query_parts = []
+                for idx, aid in enumerate(chunk):
+                    query_parts.append(f'anime_{idx}: Media(id: {aid}, type: ANIME) {{ id title {{ romaji english }} startDate {{ year month day }} }}')
+                
+                query = "query { " + " ".join(query_parts) + " }"
+                
+                try:
+                    response = await client.post(self.ANILIST_API_URL, json={'query': query})
+                    if response.status_code == 200:
+                        data = response.json().get('data', {})
+                        for key, media in data.items():
+                            if media:
+                                results[media['id']] = media
+                    elif response.status_code == 429:
+                        print("[AniList] Rate limited. Waiting...")
+                        await asyncio.sleep(60)
+                        # Retry this chunk
+                        i -= chunk_size
+                        continue
+                except Exception as e:
+                    print(f"[AniList] Error fetching chunk: {e}")
+                
+                # Small delay to be nice to AniList
+                await asyncio.sleep(0.5)
+                
+        return results
 
     def _extract_base_title(self, title: str) -> str:
         """Extract base title by removing season indicators"""
-        import re
-        # Remove common season indicators
         patterns = [
             r'\s*[-\–]\s*Season\s+\d+',
             r'\s*[-\–]\s+Saison\s+\d+',
@@ -154,7 +202,7 @@ class MappingDatabaseEngine:
         return base_title.strip()
 
     async def sync_database_async(self):
-        """Asynchronous execution routine to fetch remote adjustments and update tables."""
+        """Main sync routine."""
         self.init_db() 
         
         async with httpx.AsyncClient(timeout=45.0) as client:
@@ -162,197 +210,177 @@ class MappingDatabaseEngine:
             new_etag = await self._check_needs_update(client)
             
             if not new_etag:
-                print("[DB Engine] Local database mappings are already up-to-date. Skipping download.")
+                print("[DB Engine] Local database mappings are up-to-date.")
                 return
 
-            print("[DB Engine] Downloading fresh layout configurations mapping data...")
+            print("[DB Engine] Downloading mapping data...")
             try:
                 response = await client.get(self.MAPPING_URL, follow_redirects=True)
                 response.raise_for_status() 
                 anime_data: List[Dict[str, Any]] = response.json() 
-                print(f"[DB Engine] Downloaded {len(anime_data)} total entries from Fribb's list")
+                print(f"[DB Engine] Downloaded {len(anime_data)} entries")
             except Exception as e:
                 print(f"[DB Engine] Error fetching data: {e}")
                 return
 
-        # --- DB Processing ---
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        insert_buffer: List[Tuple] = []
+        # --- Graph Building & Grouping ---
+        adj = defaultdict(set)
+        anilist_to_info = {}
         
-        # First, collect all TV entries with TMDB data
-        tv_entries = []
+        print("[DB Engine] Processing entries and building relationship graph...")
         
         for item in anime_data:
-            # Only process TV entries (ignore movies/ONAs for main mappings)
-            anime_type = item.get("type", "")
-            if anime_type != "TV":
+            anilist_id = self._safe_int(item.get("anilist_id"))
+            if not anilist_id:
                 continue
             
-            # Extract TMDB ID
+            # IDs that identify a "Show" (can be shared across seasons)
             tmdb_id_raw = item.get("themoviedb_id")
-            tmdb_id = None
+            tmdb_id = self._safe_int(tmdb_id_raw.get("tv")) if isinstance(tmdb_id_raw, dict) else self._safe_int(tmdb_id_raw)
             
-            if isinstance(tmdb_id_raw, dict):
-                tmdb_id = self._safe_int(tmdb_id_raw.get("tv"))
-            elif isinstance(tmdb_id_raw, (str, int)):
-                tmdb_id = self._safe_int(tmdb_id_raw)
+            tvdb_id = self._safe_int(item.get("tvdb_id"))
             
-            if not tmdb_id:
-                continue
-            
-            # Extract season
+            # Record basic info
             tmdb_season = 1
             season_raw = item.get("season")
             if isinstance(season_raw, dict):
                 tmdb_season = self._safe_int(season_raw.get("tmdb")) or 1
-            
-            # Extract IDs
-            anilist_id = self._safe_int(item.get("anilist_id"))
+                
             mal_id = self._safe_int(item.get("mal_id"))
             
-            if not anilist_id:
-                continue
-            
-            # Get title
-            title = item.get("title", "Unknown Anime")
-            
-            tv_entries.append({
+            # Store info
+            anilist_to_info[anilist_id] = {
                 "anilist_id": anilist_id,
                 "tmdb_id": tmdb_id,
                 "tmdb_season": tmdb_season,
                 "mal_id": mal_id,
-                "title": title,
-                "type": anime_type
-            })
+                "tvdb_id": tvdb_id,
+                "type": item.get("type", "TV")
+            }
+            
+            # Build edges for grouping
+            if tmdb_id:
+                tmdb_node = f"tmdb_{tmdb_id}"
+                adj[anilist_id].add(tmdb_node)
+                adj[tmdb_node].add(anilist_id)
+            
+            if tvdb_id:
+                tvdb_node = f"tvdb_{tvdb_id}"
+                adj[anilist_id].add(tvdb_node)
+                adj[tvdb_node].add(anilist_id)
+
+        # --- Connected Components ---
+        visited = set()
+        groups = []
         
-        print(f"[DB Engine] Found {len(tv_entries)} TV entries with TMDB data")
-        
-        # Group by TMDB ID and detect multi-season
-        tmdb_groups = defaultdict(list)
-        for entry in tv_entries:
-            tmdb_groups[entry["tmdb_id"]].append(entry)
-        
-        # Create season groups
-        season_groups = []
-        group_id = 1
-        
-        for tmdb_id, entries in tmdb_groups.items():
-            if len(entries) > 1:
-                # Sort by season number
-                entries.sort(key=lambda x: x["tmdb_season"])
+        for node in list(adj.keys()):
+            if node not in visited and isinstance(node, int): # Start from an AniList ID
+                component = []
+                queue = deque([node])
+                visited.add(node)
                 
-                # Find the base title (remove season indicators)
-                base_title = self._extract_base_title(entries[0]["title"])
+                while queue:
+                    curr = queue.popleft()
+                    if isinstance(curr, int):
+                        component.append(curr)
+                    
+                    for neighbor in adj[curr]:
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            queue.append(neighbor)
                 
-                print(f"\n[GROUP] TMDB ID {tmdb_id}: Found {len(entries)} seasons")
-                for entry in entries:
-                    print(f"  - Season {entry['tmdb_season']}: AniList {entry['anilist_id']} - '{entry['title']}'")
-                
-                for idx, entry in enumerate(entries, start=1):
-                    season_groups.append({
-                        "group_id": group_id,
-                        "anilist_id": entry["anilist_id"],
-                        "season_number": idx,
-                        "tmdb_season": entry["tmdb_season"],
-                        "title": base_title,
-                        "original_title": entry["title"]
-                    })
-                group_id += 1
+                if len(component) > 1:
+                    groups.append(component)
+
+        print(f"[DB Engine] Identified {len(groups)} multi-season groups.")
+
+        # --- Fetch Metadata ---
+        target_ids = list(anilist_to_info.keys())
+        print(f"[DB Engine] Fetching metadata for {len(target_ids)} AniList IDs from AniList API...")
+        al_metadata = await self._fetch_anilist_metadata_bulk(target_ids)
         
-        # Also handle special case: Eminence in Shadow (different TMDB IDs but same series)
-        # This is a manual mapping for series that have different TMDB IDs per season
-        manual_groups = [
-            {
-                "name": "The Eminence in Shadow",
-                "entries": [
-                    {"anilist_id": 130298, "season": 1, "tmdb_id": 119495, "tmdb_season": 1},
-                    {"anilist_id": 161964, "season": 2, "tmdb_id": 119495, "tmdb_season": 2},
-                ]
-            },
-            # Add more manual groupings here as needed
-        ]
-        
-        for manual_group in manual_groups:
-            print(f"\n[MANUAL GROUP] {manual_group['name']}")
-            for entry in manual_group["entries"]:
-                season_groups.append({
-                    "group_id": group_id,
-                    "anilist_id": entry["anilist_id"],
-                    "season_number": entry["season"],
-                    "tmdb_season": entry["tmdb_season"],
-                    "title": manual_group["name"],
-                    "original_title": manual_group["name"]
-                })
-            group_id += 1
-        
-        # Insert mappings
-        print(f"\n[DB Engine] Inserting {len(tv_entries)} mappings...")
+        # --- Prepare Data for Insertion ---
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
         
         try:
-            # Clear existing data
             cursor.execute("DELETE FROM mappings")
             cursor.execute("DELETE FROM season_groups")
             
-            # Insert mappings
-            for entry in tv_entries:
+            # 1. Insert Core Mappings
+            print("[DB Engine] Inserting core mappings...")
+            for aid, info in anilist_to_info.items():
+                meta = al_metadata.get(aid, {})
+                title_romaji = meta.get("title", {}).get("romaji", "Unknown Anime")
+                title_english = meta.get("title", {}).get("english") or title_romaji
+                
                 cursor.execute('''
-                    INSERT OR REPLACE INTO mappings 
+                    INSERT INTO mappings 
                     (tmdb_id, tmdb_season, anilist_id, mal_id, title_romaji, title_english, anime_type)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    entry["tmdb_id"], 
-                    entry["tmdb_season"], 
-                    entry["anilist_id"], 
-                    entry["mal_id"], 
-                    entry["title"],
-                    entry["title"],
-                    entry["type"]
+                    info["tmdb_id"], 
+                    info["tmdb_season"], 
+                    aid, 
+                    info["mal_id"], 
+                    title_romaji,
+                    title_english,
+                    info["type"]
                 ))
             
-            # Insert season groups
-            for group in season_groups:
-                cursor.execute('''
-                    INSERT INTO season_groups (group_id, anilist_id, season_number, tmdb_season, title)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (
-                    group["group_id"],
-                    group["anilist_id"],
-                    group["season_number"],
-                    group["tmdb_season"],
-                    group["title"]
-                ))
+            # 2. Insert Season Groups
+            print("[DB Engine] Creating season groups...")
+            group_id_counter = 1
+            for group in groups:
+                group_info = []
+                for aid in group:
+                    meta = al_metadata.get(aid, {})
+                    sd = meta.get("startDate", {})
+                    # Create a sortable date
+                    year = sd.get("year") or 9999
+                    month = sd.get("month") or 12
+                    day = sd.get("day") or 31
+                    date_val = year * 10000 + month * 100 + day
+                    
+                    group_info.append({
+                        "anilist_id": aid,
+                        "date": date_val,
+                        "title": meta.get("title", {}).get("romaji", "Unknown Anime"),
+                        "tmdb_season": anilist_to_info[aid]["tmdb_season"]
+                    })
+                
+                # Sort by start date
+                group_info.sort(key=lambda x: x["date"])
+                
+                # Base title from the first season found
+                base_title = self._extract_base_title(group_info[0]["title"])
+                
+                for idx, entry in enumerate(group_info, start=1):
+                    cursor.execute('''
+                        INSERT INTO season_groups (group_id, anilist_id, season_number, tmdb_season, title)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (
+                        group_id_counter,
+                        entry["anilist_id"],
+                        idx,
+                        entry["tmdb_season"],
+                        base_title
+                    ))
+                group_id_counter += 1
             
             cursor.execute("INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('etag', ?)", (new_etag,))
             conn.commit()
-            
-            print(f"🎉 [DB Engine] Sync complete!")
-            print(f"  - Mappings inserted: {len(tv_entries)}")
-            print(f"  - Season groups created: {group_id - 1}")
-            
-            # Verification
-            cursor.execute("SELECT anilist_id, tmdb_season FROM mappings WHERE anilist_id IN (130298, 161964)")
-            eminence = cursor.fetchall()
-            print(f"\n[VERIFICATION] Eminence in Shadow entries:")
-            for anilist_id, season in eminence:
-                print(f"  - AniList {anilist_id} -> TMDB Season {season}")
-            
-            cursor.execute("SELECT * FROM season_groups WHERE title LIKE '%Eminence%'")
-            groups = cursor.fetchall()
-            if groups:
-                print(f"\n[VERIFICATION] Season group created for Eminence in Shadow:")
-                for group in groups:
-                    print(f"  - Group {group[0]}: AniList {group[1]} = Season {group[2]} (TMDB Season {group[3]})")
+            print(f"🎉 [DB Engine] Sync complete! Mappings: {len(anilist_to_info)}, Groups: {group_id_counter - 1}")
             
         except Exception as e:
-            print(f"[DB Engine] Error during insert: {e}")
+            print(f"[DB Engine] Error during database update: {e}")
             conn.rollback()
             raise
         finally:
             conn.close()
 
     def run_sync(self):
-        """Synchronous wrapper function for background schedulers."""
+        """Wrapper for running sync."""
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
