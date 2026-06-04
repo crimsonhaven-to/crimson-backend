@@ -36,6 +36,7 @@ class MappingDatabaseEngine:
         ''')
         
         # Schema 2: Core mappings table
+        # Composite PK allows same AniList ID to map to multiple TMDB seasons
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS mappings (
                 tmdb_id INTEGER,
@@ -45,7 +46,7 @@ class MappingDatabaseEngine:
                 title_romaji TEXT,
                 title_english TEXT,
                 anime_type TEXT,
-                PRIMARY KEY (anilist_id)
+                PRIMARY KEY (anilist_id, tmdb_season)
             )
         ''')
         
@@ -61,6 +62,33 @@ class MappingDatabaseEngine:
             )
         ''')
         
+        # Migration: check if old schema (single-column PK) exists and recreate
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='mappings'")
+        existing = cursor.fetchone()
+        if existing and 'PRIMARY KEY (anilist_id)' in existing[0] and 'PRIMARY KEY (anilist_id, tmdb_season)' not in existing[0]:
+            cursor.execute("DROP TABLE IF EXISTS mappings")
+            cursor.execute("DROP TABLE IF EXISTS season_groups")
+            cursor.execute('''CREATE TABLE IF NOT EXISTS mappings (
+                tmdb_id INTEGER,
+                tmdb_season INTEGER,
+                anilist_id INTEGER,
+                mal_id INTEGER,
+                title_romaji TEXT,
+                title_english TEXT,
+                anime_type TEXT,
+                PRIMARY KEY (anilist_id, tmdb_season)
+            )''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS season_groups (
+                group_id INTEGER,
+                anilist_id INTEGER,
+                season_number INTEGER,
+                tmdb_season INTEGER,
+                title TEXT,
+                PRIMARY KEY (group_id, season_number)
+            )''')
+            # Clear cached ETag to force a full re-sync after schema migration
+            cursor.execute("DELETE FROM sync_meta WHERE key = 'etag'")
+        
         # Schema 4: API Cache
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS api_cache (
@@ -73,6 +101,7 @@ class MappingDatabaseEngine:
         # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_anilist_id ON mappings(anilist_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tmdb_id ON mappings(tmdb_id, tmdb_season)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tmdb_lookup ON mappings(tmdb_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_anilist ON season_groups(anilist_id)')
         
         conn.commit()
