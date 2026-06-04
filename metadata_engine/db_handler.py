@@ -242,9 +242,22 @@ class MappingDatabaseEngine:
             
             # Record basic info
             tmdb_season = 1
+            tvdb_season = 1
             season_raw = item.get("season")
             if isinstance(season_raw, dict):
-                tmdb_season = self._safe_int(season_raw.get("tmdb")) or 1
+                t_val = self._safe_int(season_raw.get("tmdb"))
+                if t_val is not None:
+                    tmdb_season = t_val
+                
+                v_val = self._safe_int(season_raw.get("tvdb"))
+                if v_val is not None:
+                    tvdb_season = v_val
+            
+            # Heuristic: If TMDB season is stuck at 1 but TVDB season is higher,
+            # it's likely a mapping error in the source list for TMDB.
+            # This is common in the Fribb list for shows like Re:Zero.
+            if tmdb_season == 1 and tvdb_season > 1:
+                tmdb_season = tvdb_season
                 
             mal_id = self._safe_int(item.get("mal_id"))
             
