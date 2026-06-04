@@ -2,13 +2,13 @@ version: '3.8'
 
 services:
   anime-api:
-    image: reallordraymond/crimson-backend:0.1
+    image: reallordraymond/crimson-backend:1.0
     ports:
       - "8000:8000"
     environment:
-      - TMDB_API_KEY=${TMDB_API_KEY}
+      - TMDB_API_KEY=eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI2ZTRlMWRmMDQzMTQ5NjcxMmZiOGZjMDQ0YzQ4NmM1YiIsIm5iZiI6MTc1Mzk2NzI0MS43OTMsInN1YiI6IjY4OGI2YTg5ZTIxMWI1MmJjNjUxZDUyZCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.99gdXMQZC2allG4aGkXMgrWSZbBZCsn6eGXoGm9EGuE
 
     restart: unless-stopped
 
     volumes:
-      - ./data/anime_mappings.db:/app/anime_mappings.db # persist database across redeployments
+      - ./anime_mappings.db:/app/anime_mappings.db # persist database across redeployments
