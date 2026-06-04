@@ -204,6 +204,20 @@ def get_tmdb_mappings(anilist_id: int) -> List[Dict[str, Any]]:
         logger.error(f"Database error in get_tmdb_mappings: {e}")
         return []
 
+def get_anilist_ids_for_tmdb(tmdb_id: int) -> List[int]:
+    """Get all distinct AniList IDs mapped to a TMDB show across all seasons"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT anilist_id FROM mappings WHERE tmdb_id = ? ORDER BY anilist_id",
+                (tmdb_id,)
+            )
+            return [row["anilist_id"] for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Database error in get_anilist_ids_for_tmdb: {e}")
+        return []
+
 def get_all_season_mappings(anilist_id: int) -> List[int]:
     """Get all season numbers mapped to an AniList ID"""
     try:
@@ -469,8 +483,9 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit
     for item in data.get("results", [])[:limit]:
         tmdb_id = item.get("id")
         if tmdb_id:
-            anilist_id = get_anilist_id(tmdb_id, season=1)
-            if anilist_id:
+            anilist_ids = get_anilist_ids_for_tmdb(tmdb_id)
+            if anilist_ids:
+                anilist_id = anilist_ids[0]
                 # Get season metadata for proper poster
                 season_meta = await fetch_tmdb_metadata(client, tmdb_id, season=1)
                 poster_url = season_meta.get("poster")
@@ -482,6 +497,7 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit
                     "title": item.get("name") or item.get("original_name"),
                     "tmdb_id": tmdb_id,
                     "anilist_id": anilist_id,
+                    "anilist_ids_available": anilist_ids,
                     "poster": poster_url,
                     "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
                     "vote_average": item.get("vote_average")
@@ -520,12 +536,14 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
     for item in data.get("results", [])[:limit]:
         tmdb_id = item.get("id")
         if tmdb_id:
-            anilist_id = get_anilist_id(tmdb_id, season=1)
-            if anilist_id:
+            anilist_ids = get_anilist_ids_for_tmdb(tmdb_id)
+            if anilist_ids:
+                anilist_id = anilist_ids[0]
                 trending_list.append({
                     "title": item.get("name") or item.get("original_name"),
                     "tmdb_id": tmdb_id,
                     "anilist_id": anilist_id,
+                    "anilist_ids_available": anilist_ids,
                     "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
                     "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
                     "vote_average": item.get("vote_average")
@@ -858,6 +876,9 @@ async def get_anime_info(
             
             tmdb_data, anilist_data = await asyncio.gather(tmdb_task, anilist_task)
         
+        # Get all AniList IDs for this TMDB show (multi-season support)
+        all_anilist_ids = get_anilist_ids_for_tmdb(tmdb_id)
+        
         # Get available seasons for this anime
         available_seasons = get_all_season_mappings(anilist_id)
         
@@ -865,6 +886,7 @@ async def get_anime_info(
             "success": True,
             "tmdb_id": tmdb_id,
             "anilist_id": anilist_id,
+            "all_anilist_ids": all_anilist_ids,
             "current_season": season,
             "available_seasons": available_seasons,
             **tmdb_data,
