@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  anime-api:
+    image: reallordraymond/crimson-backend:0.1
+    ports:
+      - "8000:8000"
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY}
+
+    restart: unless-stopped
+
+    volumes:
+      - ./data/anime_mappings.db:/app/anime_mappings.db # persist database across redeployments
