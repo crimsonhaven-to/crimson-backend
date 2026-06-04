@@ -56,6 +56,8 @@ class Config:
         "https://dev.crimsonhaven.to",
         "https://crimsonhaven.to",
         "https://www.crimsonhaven.to"
+        "https://dev.crimsonhaven.to:", # for dev channel
+        "https://dev-backend.crimsonhaven.to", # for dev backend, dunno if I need this
     ]
     
     @classmethod
