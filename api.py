@@ -56,6 +56,8 @@ class Config:
         "https://dev.crimsonhaven.to",
         "https://crimsonhaven.to",
         "https://www.crimsonhaven.to"
+        "https://dev.crimsonhaven.to:", # for dev channel
+        "https://dev-backend.crimsonhaven.to", # for dev backend, dunno if I need this
     ]
     
     @classmethod
@@ -724,7 +726,7 @@ async def get_anime_seasons(anilist_id: int):
         if group_row:
             # This anime is part of a multi-season group
             group_id = group_row["group_id"]
-            group_title = group_row["title"]
+            group_title = group_row["title"]  # Might be None or "Unknown Anime"
             
             # Get all seasons in this group
             with get_db_connection() as conn:
@@ -737,10 +739,17 @@ async def get_anime_seasons(anilist_id: int):
                 """, (group_id,))
                 all_seasons = cursor.fetchall()
             
+            # Fetch base anime info from AniList using the first season's anilist_id
+            async with httpx.AsyncClient() as client:
+                first_anilist = all_seasons[0]["anilist_id"] if all_seasons else anilist_id
+                anime_info = await fetch_anilist_metadata(client, first_anilist)
+                # Use the fetched title if group_title is missing or generic
+                if not group_title or group_title == "Unknown Anime":
+                    group_title = anime_info.get("title", "Unknown Anime")
+            
             # Fetch metadata for each season
             async with httpx.AsyncClient() as client:
                 for season_row in all_seasons:
-                    # Get the tmdb_id from mappings table using the season's anilist_id
                     with get_db_connection() as conn:
                         cursor2 = conn.cursor()
                         cursor2.execute(
@@ -754,7 +763,6 @@ async def get_anime_seasons(anilist_id: int):
                         tmdb_season = season_row["tmdb_season"]
                         season_number = season_row["season_number"]
                         
-                        # Fetch season metadata from TMDB
                         metadata = await fetch_tmdb_metadata(client, tmdb_id, tmdb_season)
                         
                         seasons_data.append({
@@ -768,20 +776,17 @@ async def get_anime_seasons(anilist_id: int):
                             "air_date": metadata.get("air_date")
                         })
             
-            # Get base anime info from AniList (using the first season's anilist_id or group title)
-            async with httpx.AsyncClient() as client:
-                anime_info = await fetch_anilist_metadata(client, all_seasons[0]["anilist_id"])
-            
             return {
                 "success": True,
                 "anilist_id": anilist_id,
-                "title": group_title or anime_info.get("title"),
+                "title": group_title,  # Now guaranteed to be a real title
                 "total_seasons": len(seasons_data),
                 "seasons": seasons_data
             }
         
         else:
             # Fallback: No season group found, use existing logic (single season)
+            # ... (keep your existing single-season logic here, but also ensure title)
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -812,14 +817,14 @@ async def get_anime_seasons(anilist_id: int):
                         "summary": metadata.get("summary"),
                         "air_date": metadata.get("air_date")
                     })
-            
-            async with httpx.AsyncClient() as client:
+                
+                # Get title from AniList
                 anime_info = await fetch_anilist_metadata(client, anilist_id)
             
             return {
                 "success": True,
                 "anilist_id": anilist_id,
-                "title": anime_info.get("title"),
+                "title": anime_info.get("title", "Unknown Anime"),
                 "total_seasons": len(seasons_data),
                 "seasons": seasons_data
             }
