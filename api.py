@@ -596,9 +596,36 @@ async def root():
             "/trending",
             "/info/{tmdb_id}",
             "/watch/{anilist_id}/{episode_number}",
-            "/seasons/{anilist_id}"
+            "/seasons/{anilist_id}",
+            "/debug/check_seasons/{anilist_id}"
         ]
     }
+
+@app.get("/debug/check_seasons/{anilist_id}")
+async def check_available_seasons(anilist_id: int):
+    """Check what seasons are actually in your database for an anime"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT tmdb_id, tmdb_season, mal_id, title_romaji FROM mappings WHERE anilist_id = ? ORDER BY tmdb_season",
+                (anilist_id,)
+            )
+            mappings = [dict(row) for row in cursor.fetchall()]
+        
+        # Also count total entries for this anilist_id
+        cursor.execute("SELECT COUNT(*) FROM mappings WHERE anilist_id = ?", (anilist_id,))
+        total_count = cursor.fetchone()[0]
+        
+        return {
+            "anilist_id": anilist_id,
+            "total_entries_in_db": total_count,
+            "seasons_found": [m["tmdb_season"] for m in mappings],
+            "full_mappings": mappings,
+            "note": "Each entry represents a separate TMDB season for this anime"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search/anime")
 async def search_anime_by_name(query_name: str = Query(..., min_length=1, description="Anime name to search")):
@@ -638,25 +665,35 @@ async def get_trending_anime(limit: int = Query(12, ge=1, le=50, description="Nu
 
 @app.get("/seasons/{anilist_id}")
 async def get_anime_seasons(anilist_id: int):
-    """Get all available seasons for an anime"""
+    """Get all available seasons for an anime from your database"""
     try:
         # Get all TMDB mappings for this AniList ID
-        mappings = get_tmdb_mappings(anilist_id)
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT tmdb_id, tmdb_season, title_romaji 
+                   FROM mappings 
+                   WHERE anilist_id = ? 
+                   ORDER BY tmdb_season""",
+                (anilist_id,)
+            )
+            mappings = [dict(row) for row in cursor.fetchall()]
         
         if not mappings:
             raise HTTPException(status_code=404, detail="Anime not found in database")
         
-        # Fetch metadata for each season
+        # Fetch metadata for each season from TMDB
         async with httpx.AsyncClient() as client:
             seasons_data = []
             for idx, mapping in enumerate(mappings, start=1):
                 tmdb_id = mapping["tmdb_id"]
                 tmdb_season = mapping["tmdb_season"]
                 
+                # Fetch season-specific metadata
                 metadata = await fetch_tmdb_metadata(client, tmdb_id, tmdb_season)
                 
                 seasons_data.append({
-                    "season_number": idx,  # User-facing season number
+                    "season_number": idx,  # User-facing: 1, 2, 3...
                     "tmdb_season": tmdb_season,  # Actual TMDB season number
                     "tmdb_id": tmdb_id,
                     "name": metadata.get("season_name", f"Season {idx}"),
@@ -665,7 +702,7 @@ async def get_anime_seasons(anilist_id: int):
                     "air_date": metadata.get("air_date")
                 })
         
-        # Also get base anime info
+        # Get base anime info
         async with httpx.AsyncClient() as client:
             anime_info = await fetch_anilist_metadata(client, anilist_id)
         
@@ -681,7 +718,125 @@ async def get_anime_seasons(anilist_id: int):
         raise
     except Exception as e:
         logger.error(f"Seasons error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch season information")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/watch/{anilist_id}/{episode_number}")
+async def get_streaming_links(
+    anilist_id: int,
+    episode_number: int,
+    season_part: int = Query(1, ge=1, description="Season number (1, 2, 3, etc.)")
+):
+    """Get streaming links with proper multi-season support"""
+    try:
+        # Get ALL mappings for this AniList ID from your database
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT tmdb_id, tmdb_season, title_romaji 
+                   FROM mappings 
+                   WHERE anilist_id = ? 
+                   ORDER BY tmdb_season""",
+                (anilist_id,)
+            )
+            all_mappings = [dict(row) for row in cursor.fetchall()]
+        
+        if not all_mappings:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No TMDB mapping found for AniList ID {anilist_id}"
+            )
+        
+        # Map user's season_part to the correct database entry
+        # season_part=1 -> first mapping, season_part=2 -> second mapping, etc.
+        if season_part > len(all_mappings):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Season {season_part} not found. This anime has {len(all_mappings)} season(s) in the database."
+            )
+        
+        # Get the correct mapping for this season
+        selected_mapping = all_mappings[season_part - 1]
+        tmdb_id = selected_mapping["tmdb_id"]
+        tmdb_season = selected_mapping["tmdb_season"]
+        
+        logger.info(f"Using mapping: Anilist {anilist_id} -> TMDB {tmdb_id} Season {tmdb_season} (User requested season {season_part})")
+        
+        # Fetch AniList metadata for title and episode info
+        async with httpx.AsyncClient() as client:
+            anilist_data = await fetch_anilist_metadata(client, anilist_id)
+        
+        anime_title = anilist_data.get("title")
+        if not anime_title:
+            raise HTTPException(status_code=404, detail="Could not resolve anime title")
+        
+        # Note: AniList's total_episodes might be for the ENTIRE series,
+        # not per season. You might need to adjust this logic.
+        total_episodes = anilist_data.get("total_episodes")
+        
+        # Prepare media context for scrapers
+        media_ctx = {
+            "title": anime_title,
+            "anilist_id": anilist_id,
+            "tmdb_id": tmdb_id,
+            "tmdb_season": tmdb_season,  # This is the key!
+            "season_part": season_part,
+            **anilist_data
+        }
+        
+        # Run scrapers in parallel
+        tasks = []
+        for scraper_class in ALL_SCRAPERS:
+            scraper_name = scraper_class.__name__
+            if "VidKing" in scraper_name or "Vidking" in scraper_name:
+                tasks.append(run_vidking_scraper_branded(
+                    scraper_class(), media_ctx, episode_number, tmdb_season
+                ))
+            else:
+                tasks.append(run_single_scraper(
+                    scraper_class, media_ctx, episode_number, tmdb_season
+                ))
+        
+        results = await asyncio.gather(*tasks)
+        
+        # Flatten and deduplicate embed URLs
+        all_embeds = []
+        for embed_list in results:
+            all_embeds.extend(embed_list)
+        unique_embeds = list(dict.fromkeys(all_embeds))
+        
+        # Resolve streams
+        streams = await resolve_streams(unique_embeds)
+        
+        # Get season info for response
+        season_info = None
+        async with httpx.AsyncClient() as client:
+            season_meta = await fetch_tmdb_metadata(client, tmdb_id, tmdb_season)
+            season_info = {
+                "name": season_meta.get("season_name"),
+                "poster": season_meta.get("poster"),
+                "summary": season_meta.get("summary")
+            }
+        
+        return {
+            "success": True,
+            "anime_id": anilist_id,
+            "tmdb_id": tmdb_id,
+            "season": season_part,
+            "tmdb_season": tmdb_season,
+            "season_info": season_info,
+            "episode": episode_number,
+            "title": anime_title,
+            "total_episodes_anilist": total_episodes,
+            "streams": streams,
+            "streams_available": len(streams) > 0,
+            "available_seasons": [i+1 for i in range(len(all_mappings))]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Watch error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get streaming links: {str(e)}")
 
 @app.get("/info/{tmdb_id}")
 async def get_anime_info(
