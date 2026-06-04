@@ -1,0 +1,39 @@
+name: Build and Tag Docker Image
+
+on:
+  push:
+    branches:
+      - dev
+    tags:
+      - 'v*.*' # Triggers on v1.0, v1.1, v2.0, etc.
+
+jobs:
+  build:
+    runs-on: [self-hosted]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. Determine the tags dynamically based on the Git ref
+      - name: Set Docker Tags
+        id: vars
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Extract version from tag (e.g., refs/tags/v1.0 -> v1.0)
+            VERSION=${GITHUB_REF#refs/tags/}
+            echo "IMAGE_TAGS=-t crimson-backend:${VERSION} -t crimson-backend:latest" >> $GITHUB_OUTPUT
+          else
+            # It's a push to the dev branch
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            echo "IMAGE_TAGS=-t crimson-backend:dev -t crimson-backend:dev-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          fi
+
+      # 2. Build the Docker image using the dynamically generated tags
+      - name: Build Docker Image
+        run: |
+          docker build ${{ steps.vars.outputs.IMAGE_TAGS }} .
+
+      # 3. Clean up dangling images to save disk space
+      - name: Prune old images
+        run: docker image prune -f
