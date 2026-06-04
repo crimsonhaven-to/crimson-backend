@@ -684,7 +684,7 @@ async def search_anime_by_name(query_name: str = Query(..., min_length=1, descri
         raise HTTPException(status_code=500, detail="Search failed")
 
 @app.get("/trending")
-async def get_trending_anime(limit: int = Query(12, ge=1, le=50, description="Number of results to return")):
+async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Number of results to return")):
     """Get trending anime"""
     try:
         async with httpx.AsyncClient() as client:
@@ -700,74 +700,126 @@ async def get_trending_anime(limit: int = Query(12, ge=1, le=50, description="Nu
         raise HTTPException(status_code=500, detail="Failed to fetch trending anime")
 
 
-@app.get("/seasons/{anilist_id}") # improved seasons endpoint?
+@app.get("/seasons/{anilist_id}")
 async def get_anime_seasons(anilist_id: int):
-    """Get all available seasons for an anime"""
+    """Get all available seasons for an anime, using season_groups table if available"""
     try:
-        # Check if this anime is part of a season group
-        group_info = get_season_group(anilist_id)
+        # First, check if this anilist_id belongs to a season group
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT group_id, season_number, tmdb_season, title
+                FROM season_groups 
+                WHERE anilist_id = ?
+            """, (anilist_id,))
+            group_row = cursor.fetchone()
         
-        if group_info:
-            # Get all seasons in the group
-            seasons_data = []
+        seasons_data = []
+        group_title = None
+        
+        if group_row:
+            # This anime is part of a multi-season group
+            group_id = group_row["group_id"]
+            group_title = group_row["title"]
+            
+            # Get all seasons in this group
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT anilist_id, season_number, tmdb_season
+                    FROM season_groups 
+                    WHERE group_id = ?
+                    ORDER BY season_number
+                """, (group_id,))
+                all_seasons = cursor.fetchall()
+            
+            # Fetch metadata for each season
             async with httpx.AsyncClient() as client:
-                for season in group_info["all_seasons"]:
-                    # Get mapping for this season's anilist_id
+                for season_row in all_seasons:
+                    # Get the tmdb_id from mappings table using the season's anilist_id
                     with get_db_connection() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute(
+                        cursor2 = conn.cursor()
+                        cursor2.execute(
                             "SELECT tmdb_id FROM mappings WHERE anilist_id = ?",
-                            (season["anilist_id"],)
+                            (season_row["anilist_id"],)
                         )
-                        mapping = cursor.fetchone()
+                        mapping = cursor2.fetchone()
                     
                     if mapping:
-                        metadata = await fetch_tmdb_metadata(client, mapping["tmdb_id"], season["tmdb_season"])
+                        tmdb_id = mapping["tmdb_id"]
+                        tmdb_season = season_row["tmdb_season"]
+                        season_number = season_row["season_number"]
+                        
+                        # Fetch season metadata from TMDB
+                        metadata = await fetch_tmdb_metadata(client, tmdb_id, tmdb_season)
+                        
                         seasons_data.append({
-                            "season_number": season["season_number"],
-                            "anilist_id": season["anilist_id"],
-                            "tmdb_season": season["tmdb_season"],
-                            "name": metadata.get("season_name", f"Season {season['season_number']}"),
+                            "season_number": season_number,
+                            "anilist_id": season_row["anilist_id"],
+                            "tmdb_id": tmdb_id,
+                            "tmdb_season": tmdb_season,
+                            "name": metadata.get("season_name", f"Season {season_number}"),
                             "poster": metadata.get("poster"),
-                            "summary": metadata.get("summary")
+                            "summary": metadata.get("summary"),
+                            "air_date": metadata.get("air_date")
                         })
+            
+            # Get base anime info from AniList (using the first season's anilist_id or group title)
+            async with httpx.AsyncClient() as client:
+                anime_info = await fetch_anilist_metadata(client, all_seasons[0]["anilist_id"])
             
             return {
                 "success": True,
-                "title": group_info["title"],
-                "total_seasons": group_info["total_seasons"],
+                "anilist_id": anilist_id,
+                "title": group_title or anime_info.get("title"),
+                "total_seasons": len(seasons_data),
                 "seasons": seasons_data
             }
+        
         else:
-            # Fallback to single season
+            # Fallback: No season group found, use existing logic (single season)
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT tmdb_id, tmdb_season FROM mappings WHERE anilist_id = ?",
+                    """SELECT tmdb_id, tmdb_season, title_romaji 
+                       FROM mappings 
+                       WHERE anilist_id = ? 
+                       ORDER BY tmdb_season""",
                     (anilist_id,)
                 )
-                mapping = cursor.fetchone()
+                mappings = [dict(row) for row in cursor.fetchall()]
             
-            if not mapping:
-                raise HTTPException(status_code=404, detail="Anime not found")
+            if not mappings:
+                raise HTTPException(status_code=404, detail="Anime not found in database")
             
             async with httpx.AsyncClient() as client:
-                metadata = await fetch_tmdb_metadata(client, mapping["tmdb_id"], mapping["tmdb_season"])
+                for idx, mapping in enumerate(mappings, start=1):
+                    tmdb_id = mapping["tmdb_id"]
+                    tmdb_season = mapping["tmdb_season"]
+                    metadata = await fetch_tmdb_metadata(client, tmdb_id, tmdb_season)
+                    
+                    seasons_data.append({
+                        "season_number": idx,
+                        "anilist_id": anilist_id,
+                        "tmdb_id": tmdb_id,
+                        "tmdb_season": tmdb_season,
+                        "name": metadata.get("season_name", f"Season {idx}"),
+                        "poster": metadata.get("poster"),
+                        "summary": metadata.get("summary"),
+                        "air_date": metadata.get("air_date")
+                    })
+            
+            async with httpx.AsyncClient() as client:
+                anime_info = await fetch_anilist_metadata(client, anilist_id)
             
             return {
                 "success": True,
-                "title": metadata.get("season_name", "Single Season"),
-                "total_seasons": 1,
-                "seasons": [{
-                    "season_number": 1,
-                    "anilist_id": anilist_id,
-                    "tmdb_season": mapping["tmdb_season"],
-                    "name": metadata.get("season_name", "Season 1"),
-                    "poster": metadata.get("poster"),
-                    "summary": metadata.get("summary")
-                }]
+                "anilist_id": anilist_id,
+                "title": anime_info.get("title"),
+                "total_seasons": len(seasons_data),
+                "seasons": seasons_data
             }
-            
+        
     except HTTPException:
         raise
     except Exception as e:
