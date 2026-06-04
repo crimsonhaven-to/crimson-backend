@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-# Assuming these imports work with your project structure
+# Import all scrapers & resolvers + metadata engine
 from scrapers import ALL_SCRAPERS 
 from scrapers.base_scraper import BaseAnimeScraper
 from scrapers.vidking_scraper import VidkingScraper
@@ -51,7 +51,7 @@ class Config:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://127.0.0.1",
-        # Add production domains here
+        #TODO: Add my production domains here
     ]
     
     @classmethod
@@ -770,7 +770,8 @@ async def get_streaming_links(
             raise HTTPException(status_code=404, detail="Could not resolve anime title")
         
         # Note: AniList's total_episodes might be for the ENTIRE series,
-        # not per season. You might need to adjust this logic.
+        # not per season. I might need to adjust this logic.
+        #TODO: Reminder to check this logic
         total_episodes = anilist_data.get("total_episodes")
         
         # Prepare media context for scrapers
