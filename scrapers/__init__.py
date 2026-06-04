@@ -2,9 +2,11 @@
 from .gogo_scraper import GogoScraper
 from .voe_scraper import VoeScraper
 from .vidking_scraper import VidkingScraper
+from .animekai_scraper import AnimekaiScraper
 
 ALL_SCRAPERS = [
     GogoScraper,
-    VoeScraper,
-    VidkingScraper
+    #VoeScraper,
+    VidkingScraper,
+    AnimekaiScraper,
 ]
