@@ -53,7 +53,9 @@ class Config:
         "http://127.0.0.1",
         "http://127.0.0.1:8080",
         "http://localhost:8080",
-        #TODO: Add my production domains here
+        "dev.crimsonhaven.to",
+        "crimsonhaven.to",
+        "www.crimsonhaven.to"
     ]
     
     @classmethod
