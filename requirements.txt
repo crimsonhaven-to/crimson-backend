@@ -1,7 +1,8 @@
-selectolax
-cssselect
+fastapi
+uvicorn
 httpx
 python-dotenv
-fastapi
-typing
 apscheduler
+beautifulsoup4
+lxml
+selectolax
