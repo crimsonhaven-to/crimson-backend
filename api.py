@@ -3,12 +3,12 @@ import asyncio
 import os
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Tuple
 from contextlib import asynccontextmanager
 
 import httpx
 import json
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.requests import Request
@@ -17,11 +17,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 # Import all scrapers & resolvers + metadata engine
-from scrapers import ALL_SCRAPERS 
-from scrapers.base_scraper import BaseAnimeScraper
-from scrapers.vidking_scraper import VidkingScraper
+from scrapers import ALL_SCRAPERS
 from resolvers import ALL_RESOLVERS
-from resolvers.base_resolver import BaseResolver
 from metadata_engine.db_handler import MappingDatabaseEngine
 
 # Configure logging
@@ -92,10 +89,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Initial database sync failed: {e}")
     
-    # Start scheduler for periodic sync
+    # Start scheduler for periodic sync. BackgroundScheduler runs jobs in a worker
+    # thread with no running event loop, so the job spins up its own loop.
+    def _scheduled_sync():
+        try:
+            asyncio.run(db_engine.sync_database_async())
+        except Exception as e:
+            logger.error(f"Scheduled sync failed: {e}")
+
     scheduler = BackgroundScheduler()
     scheduler.add_job(
-        lambda: asyncio.create_task(db_engine.sync_database_async()),
+        _scheduled_sync,
         trigger=IntervalTrigger(hours=24),
         id="db_sync_job",
         replace_existing=True
@@ -153,8 +157,13 @@ def get_anilist_id(tmdb_id: int, season_number: int) -> Optional[int]:
         logger.error(f"Database error in get_anilist_id: {e}")
         return None
 
-def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, int]]:
-    """Returns (tmdb_id, season_number) for a given anilist_id"""
+def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, Optional[int]]]:
+    """
+    Reverse lookup: returns (tmdb_id, season_number) for an anilist_id.
+
+    Falls back to tmdb_extras (specials/OVAs/movies), in which case
+    season_number is None.
+    """
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -163,7 +172,16 @@ def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, int]]:
                 (anilist_id,)
             )
             row = cursor.fetchone()
-            return (row["tmdb_id"], row["season_number"]) if row else None
+            if row:
+                return (row["tmdb_id"], row["season_number"])
+
+            # Not a numbered season — maybe a special/OVA/movie.
+            cursor.execute(
+                "SELECT tmdb_id FROM tmdb_extras WHERE anilist_id = ? LIMIT 1",
+                (anilist_id,)
+            )
+            row = cursor.fetchone()
+            return (row["tmdb_id"], None) if row else None
     except Exception as e:
         logger.error(f"Database error in get_tmdb_season: {e}")
         return None
@@ -185,6 +203,23 @@ def get_show_seasons(tmdb_id: int) -> List[Dict]:
         logger.error(f"Database error in get_show_seasons: {e}")
         return []
 
+def get_show_extras(tmdb_id: int) -> List[Dict]:
+    """Returns specials/OVAs/movies tied to a show (from tmdb_extras)."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT x.anilist_id, x.anime_type, e.title_romaji, e.title_english, e.start_year
+                FROM tmdb_extras x
+                LEFT JOIN anime_entries e ON x.anilist_id = e.anilist_id
+                WHERE x.tmdb_id = ?
+                ORDER BY e.start_year, x.anilist_id
+            """, (tmdb_id,))
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Database error in get_show_extras: {e}")
+        return []
+
 def get_show_info(tmdb_id: int) -> Dict:
     """Gets show info from tmdb_shows table."""
     try:
@@ -196,6 +231,30 @@ def get_show_info(tmdb_id: int) -> Dict:
     except Exception as e:
         logger.error(f"Database error in get_show_info: {e}")
         return {}
+
+def upsert_show_info(show: Dict) -> None:
+    """Persist TMDB show details fetched on demand (lazy population of tmdb_shows)."""
+    if not show.get("tmdb_id"):
+        return
+    try:
+        def _write():
+            with get_db_connection() as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO tmdb_shows
+                        (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    show.get("tmdb_id"),
+                    show.get("title"),
+                    show.get("overview"),
+                    show.get("poster_path"),
+                    show.get("backdrop_path"),
+                    show.get("first_air_date"),
+                ))
+                conn.commit()
+        _write()
+    except Exception as e:
+        logger.error(f"Database error in upsert_show_info: {e}")
 
 # --- CACHE HELPER FUNCTIONS ---
 async def get_cached_response(cache_key: str) -> Optional[Dict]:
@@ -514,14 +573,9 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
 
 # --- SCRAPER HELPER FUNCTIONS ---
 async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int, anilist_data: Dict) -> List[str]:
-    """Run a scraper, handling Vidking differently."""
+    """Run one scraper through the unified search -> embeds pipeline."""
     scraper = scraper_class()
     try:
-        if scraper_class == VidkingScraper:
-            # New signature: tmdb_id, season_num, episode_num
-            return await scraper.get_episode_embeds(tmdb_id, season_num, episode_num)
-        
-        # Standard pipeline for others
         media_ctx = {
             "tmdb_id": tmdb_id,
             "tmdb_season": season_num,
@@ -530,7 +584,6 @@ async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episo
         slug = await scraper.search_anime(media_ctx)
         if not slug:
             return []
-        # Standard signature: slug, episode_num, season_num
         return await scraper.get_episode_embeds(slug, episode_num, season_num)
     except Exception as e:
         logger.error(f"Scraper error for {scraper_class.__name__}: {e}")
@@ -653,7 +706,7 @@ async def get_show_details(tmdb_id: int):
     """Returns show info + list of all seasons"""
     show_info = get_show_info(tmdb_id)
     if not show_info:
-        # Try fetching from TMDB if not in DB
+        # Not cached yet — fetch from TMDB and persist (lazy population of tmdb_shows).
         async with httpx.AsyncClient() as client:
             url = f"https://api.themoviedb.org/3/tv/{tmdb_id}"
             show_data = await fetch_with_retry(client, url)
@@ -667,9 +720,10 @@ async def get_show_details(tmdb_id: int):
                 "backdrop_path": show_data.get("backdrop_path"),
                 "first_air_date": show_data.get("first_air_date")
             }
-    
+            upsert_show_info(show_info)
+
     seasons = get_show_seasons(tmdb_id)
-    
+
     # Enrich seasons with TMDB metadata (poster, air_date)
     async with httpx.AsyncClient() as client:
         enriched_seasons = []
@@ -685,7 +739,8 @@ async def get_show_details(tmdb_id: int):
     return {
         "success": True,
         "show": show_info,
-        "seasons": enriched_seasons
+        "seasons": enriched_seasons,
+        "extras": get_show_extras(tmdb_id)
     }
 
 @app.get("/season/{tmdb_id}/{season_number}")
@@ -708,33 +763,27 @@ async def get_season_details(tmdb_id: int, season_number: int):
         "anilist_metadata": anilist_meta
     }
 
-@app.get("/watch/{tmdb_id}/{season_number}/{episode_number}")
-async def get_watch_links(tmdb_id: int, season_number: int, episode_number: int):
-    """Get streaming links using the new schema lookup."""
-    anilist_id = get_anilist_id(tmdb_id, season_number)
-    if not anilist_id:
-        raise HTTPException(status_code=404, detail=f"Mapping not found for TMDB {tmdb_id} Season {season_number}")
-    
+async def build_watch_response(tmdb_id: int, season_number: int, episode_number: int, anilist_id: int) -> Dict:
+    """Run every scraper for an episode, resolve the embeds, and shape the response."""
     async with httpx.AsyncClient() as client:
         anilist_data = await fetch_anilist_metadata(client, anilist_id)
-    
+
     if not anilist_data:
         raise HTTPException(status_code=404, detail="AniList metadata not found")
 
-    # Prepare tasks for scrapers
-    tasks = []
-    for scraper_class in ALL_SCRAPERS:
-        tasks.append(run_single_scraper(scraper_class, tmdb_id, season_number, episode_number, anilist_data))
-    
+    tasks = [
+        run_single_scraper(scraper_class, tmdb_id, season_number, episode_number, anilist_data)
+        for scraper_class in ALL_SCRAPERS
+    ]
     results = await asyncio.gather(*tasks)
-    
+
     all_embeds = []
     for embed_list in results:
         all_embeds.extend(embed_list)
     unique_embeds = list(dict.fromkeys(all_embeds))
-    
+
     streams = await resolve_streams(unique_embeds)
-    
+
     return {
         "success": True,
         "tmdb_id": tmdb_id,
@@ -744,6 +793,15 @@ async def get_watch_links(tmdb_id: int, season_number: int, episode_number: int)
         "title": anilist_data.get("title"),
         "streams": streams
     }
+
+@app.get("/watch/{tmdb_id}/{season_number}/{episode_number}")
+async def get_watch_links(tmdb_id: int, season_number: int, episode_number: int):
+    """Get streaming links using the new schema lookup."""
+    anilist_id = get_anilist_id(tmdb_id, season_number)
+    if not anilist_id:
+        raise HTTPException(status_code=404, detail=f"Mapping not found for TMDB {tmdb_id} Season {season_number}")
+
+    return await build_watch_response(tmdb_id, season_number, episode_number, anilist_id)
 
 
 @app.get("/anilist/{anilist_id}")
@@ -768,14 +826,21 @@ async def deprecated_info(tmdb_id: int, season: int = Query(1)):
 
 @app.get("/watch/{anilist_id}/{episode_number}")
 async def deprecated_watch(anilist_id: int, episode_number: int, season_part: int = Query(1)):
-    """Redirect to new /watch endpoint after resolving tmdb_id and season."""
+    """
+    Watch by anilist_id. TV seasons redirect to the canonical /watch route;
+    extras (specials/OVAs/movies) have no TMDB season number, so they are served
+    directly here.
+    """
     mapping = get_tmdb_season(anilist_id)
     if not mapping:
         raise HTTPException(status_code=404, detail="AniList ID not mapped")
-    # Note: season_part was relative in old logic, but here we use the absolute mapping.
-    # If the user specifically asks for season_part > 1, it might need more logic,
-    # but the new schema maps 1:1 anilist_id to (tmdb_id, season_number).
-    return RedirectResponse(url=f"/watch/{mapping[0]}/{mapping[1]}/{episode_number}", status_code=301)
+
+    tmdb_id, season_number = mapping
+    if season_number is not None:
+        return RedirectResponse(url=f"/watch/{tmdb_id}/{season_number}/{episode_number}", status_code=301)
+
+    # Extra (special/OVA/movie): no numbered season — serve directly (season 1 for URL builders).
+    return await build_watch_response(tmdb_id, 1, episode_number, anilist_id)
 
 @app.get("/seasons/{anilist_id}")
 async def get_seasons_compat(anilist_id: int):
