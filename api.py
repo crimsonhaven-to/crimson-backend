@@ -818,11 +818,31 @@ async def get_anilist_mapping(anilist_id: int):
         "season_number": mapping[1]
     }
 
-# --- DEPRECATED ENDPOINTS (REDIRECTS) ---
+# --- COMPATIBILITY ENDPOINTS (legacy frontend contract) ---
 @app.get("/info/{tmdb_id}")
-async def deprecated_info(tmdb_id: int, season: int = Query(1)):
-    """Redirect to new /season endpoint."""
-    return RedirectResponse(url=f"/season/{tmdb_id}/{season}", status_code=301)
+async def get_anime_info(tmdb_id: int, season: int = Query(1, ge=1, description="TMDB season number")):
+    """Merged TMDB + AniList metadata for a (tmdb_id, season). Flat legacy shape."""
+    anilist_id = get_anilist_id(tmdb_id, season)
+    if not anilist_id:
+        raise HTTPException(status_code=404, detail=f"No mapping for TMDB ID {tmdb_id} season {season}")
+
+    async with httpx.AsyncClient() as client:
+        tmdb_data, anilist_data = await asyncio.gather(
+            fetch_tmdb_metadata(client, tmdb_id, season),
+            fetch_anilist_metadata(client, anilist_id),
+        )
+
+    available_seasons = [s["season_number"] for s in get_show_seasons(tmdb_id)]
+
+    return {
+        "success": True,
+        "tmdb_id": tmdb_id,
+        "anilist_id": anilist_id,
+        "current_season": season,
+        "available_seasons": available_seasons,
+        **tmdb_data,
+        **anilist_data,
+    }
 
 @app.get("/watch/{anilist_id}/{episode_number}")
 async def deprecated_watch(anilist_id: int, episode_number: int, season_part: int = Query(1)):
@@ -843,14 +863,50 @@ async def deprecated_watch(anilist_id: int, episode_number: int, season_part: in
     return await build_watch_response(tmdb_id, 1, episode_number, anilist_id)
 
 @app.get("/seasons/{anilist_id}")
-async def get_seasons_compat(anilist_id: int):
-    """Update to use the new schema."""
+async def get_anime_seasons(anilist_id: int):
+    """All seasons of the show this anilist_id belongs to (legacy shape).
+
+    Each season carries its own tmdb_id + tmdb_season so the frontend can drill
+    into /info/{tmdb_id}?season={tmdb_season} and /watch/{anilist_id}/{episode}.
+    """
     mapping = get_tmdb_season(anilist_id)
     if not mapping:
         raise HTTPException(status_code=404, detail="AniList ID not mapped")
-    
+
     tmdb_id = mapping[0]
-    return await get_show_details(tmdb_id)
+    seasons = get_show_seasons(tmdb_id)
+
+    async with httpx.AsyncClient() as client:
+        seasons_data = []
+        for s in seasons:
+            season_number = s["season_number"]
+            meta = await fetch_tmdb_metadata(client, tmdb_id, season_number)
+            seasons_data.append({
+                "season_number": season_number,
+                "anilist_id": s["anilist_id"],
+                "tmdb_id": tmdb_id,
+                "tmdb_season": season_number,
+                "name": meta.get("season_name") or f"Season {season_number}",
+                "poster": meta.get("poster"),
+                "summary": meta.get("summary"),
+                "air_date": meta.get("air_date"),
+                "title_romaji": s.get("title_romaji"),
+                "title_english": s.get("title_english"),
+            })
+        anime_info = await fetch_anilist_metadata(client, anilist_id)
+
+    title = (anime_info or {}).get("title")
+    if not title and seasons_data:
+        title = seasons_data[0].get("title_english") or seasons_data[0].get("title_romaji")
+
+    return {
+        "success": True,
+        "anilist_id": anilist_id,
+        "title": title or "Unknown Anime",
+        "total_seasons": len(seasons_data),
+        "seasons": seasons_data,
+        "extras": get_show_extras(tmdb_id),
+    }
 
 # --- HEALTH CHECK ENDPOINT ---
 @app.get("/health")
