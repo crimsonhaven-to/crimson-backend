@@ -10,7 +10,7 @@ import httpx
 import json
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.requests import Request
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -20,6 +20,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from scrapers import ALL_SCRAPERS
 from resolvers import ALL_RESOLVERS
 from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
+from resolvers.movish import proxy_fetch as movish_proxy_fetch
 from metadata_engine.db_handler import MappingDatabaseEngine
 
 # Configure logging
@@ -695,10 +696,10 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dic
                             "type": "iframe",
                             "url": embed_url
                         })
-                    elif matched_resolver.source_name == "VidKing Test":
+                    elif matched_resolver.source_name in ("VidKing Test", "Movish"):
                         # resolve() returns a relative proxy path; make it an
                         # absolute backend URL so the frontend iframe loads it
-                        # from us (ad-stripped) instead of vidking.net directly.
+                        # from us (ad-stripped) instead of the upstream directly.
                         proxy_url = direct_video_url
                         if base_url and proxy_url.startswith("/"):
                             proxy_url = base_url.rstrip("/") + proxy_url
@@ -1024,6 +1025,42 @@ async def vidking_proxy(request: Request, host: str, path: str):
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     return Response(content=content, status_code=status, media_type=content_type)
+
+
+# --- MOVISH AD-FREE PROXY ("movish" source) ---
+@app.api_route("/movish_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
+async def movish_proxy(request: Request, host: str, path: str):
+    """Same-origin reverse proxy for the Movish player. Downloads the page/asset,
+    sandboxes any embed-provider iframe + neutralises pop-ups, rewrites
+    sub-resource URLs back through this proxy, and serves it.
+
+    Text resources (HTML/JS/CSS, and the CORS-less /embed/api JSON) are buffered,
+    cleaned and rewritten; /v1/play media is streamed straight through with Range
+    passthrough so seeking works and large files aren't held in memory. Scoped to
+    the api.movish.net host allow-list in resolvers.movish (rejects anything else
+    to avoid an open proxy)."""
+    body = await request.body() if request.method == "POST" else None
+    try:
+        status, content_type, headers, payload = await movish_proxy_fetch(
+            host=host,
+            path=path,
+            query_string=request.url.query,
+            method=request.method,
+            body=body,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"Movish proxy upstream error for {host}/{path}: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    # Streaming media (video/binary) — forward Range/length headers.
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
 
 
 @app.get("/seasons/{anilist_id}")
