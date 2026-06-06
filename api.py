@@ -22,6 +22,7 @@ from resolvers import ALL_RESOLVERS
 from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
 from resolvers.movish import proxy_fetch as movish_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
+from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 
 # Configure logging
@@ -723,18 +724,13 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dic
                     if is_proxy_path and base_url:
                         abs_url = base_url.rstrip("/") + direct_video_url
 
-                    if "_proxy/h/" in direct_video_url:
-                        # Player-page proxy (VidKing ad-free / Movish): iframe it.
+                    if "_proxy/h/" in direct_video_url or direct_video_url.startswith("/player"):
+                        # Backend-hosted player page (VidKing ad-free / Movish
+                        # player-proxy, or our /player wrapping a Jellyfin stream):
+                        # the frontend just iframes it.
                         resolved_streams.append({
                             "source": matched_resolver.source_name,
                             "type": "iframe",
-                            "url": abs_url
-                        })
-                    elif "/jellyfin_proxy/" in direct_video_url:
-                        stream_type = "hls" if "m3u8" in direct_video_url.lower() else "mp4"
-                        resolved_streams.append({
-                            "source": matched_resolver.source_name,
-                            "type": stream_type,
                             "url": abs_url
                         })
                     elif matched_resolver.source_name == "VidKing":
@@ -1127,6 +1123,23 @@ async def jellyfin_proxy(request: Request, path: str):
     return StreamingResponse(
         payload, status_code=status, media_type=content_type, headers=headers
     )
+
+
+# --- BACKEND-HOSTED PLAYER (Crimson-themed hls.js/mp4 player) ---
+@app.get("/player")
+async def player(
+    src: str = Query(..., description="Same-origin stream path to play"),
+    stream_type: str = Query("", alias="type", description="hls or mp4 (inferred if omitted)"),
+    title: str = Query("", description="Optional title"),
+):
+    """Serve a Crimson-themed player for a same-origin proxied stream. Resolvers
+    that return a raw hls/mp4 stream (e.g. Jellyfin) wrap it in this page so the
+    frontend can iframe it like any other source. ``src`` is restricted to
+    same-origin relative paths to prevent embedding arbitrary external content."""
+    if not is_safe_src(src):
+        raise HTTPException(status_code=400, detail="Invalid src (must be a same-origin path)")
+    html = render_player(src=src, stream_type=stream_type, title=title)
+    return Response(content=html, media_type="text/html; charset=utf-8")
 
 
 @app.get("/seasons/{anilist_id}")

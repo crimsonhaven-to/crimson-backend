@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY api.py .
+COPY player.py .
 COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY metadata_engine ./metadata_engine
