@@ -1,0 +1,9 @@
+{
+  "description": "Manual TMDB(tv) -> AniList season corrections. Applied after the automatic mapping and ALWAYS win. Keys under 'seasons' are TMDB tv ids; each maps season_number -> anilist_id. Use this for the long tail where Fribb's season.tmdb is wrong or missing. Example below is illustrative (delete or replace it).",
+  "seasons": {
+    "_example_tmdb_id": {
+      "1": 0,
+      "2": 0
+    }
+  }
+}
