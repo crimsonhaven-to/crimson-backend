@@ -1,3 +1,4 @@
+import difflib
 import os
 import re
 from typing import Optional
@@ -50,25 +51,60 @@ async def _tmdb_episode_identity(tmdb_id, season_num: int, episode_num: int) -> 
     return None
 
 
-def _match_by_tmdb_identity(episodes: list, ident: Optional[dict]) -> Optional[dict]:
-    """Find the Jellyfin episode matching a TMDB identity (id, then air date)."""
-    if not ident:
-        return None
+def _norm(s: str) -> str:
+    """Normalise an episode title for comparison (lowercase, alnum only)."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _is_generic_name(name: str) -> bool:
+    """True for placeholder titles like 'Episode 1' that can't disambiguate."""
+    return bool(re.fullmatch(r"(episode|ep\.?|e)\s*\d+", (name or "").strip(), re.I))
+
+
+def _match_episode(episodes: list, ident: Optional[dict], target_names: list):
+    """Find the Jellyfin episode for a target, returning ``(episode, how)``.
+
+    Priority: exact TMDB episode id -> exact episode title -> air date ->
+    fuzzy episode title. Title matching is the key signal here — index/season
+    numbers are unreliable across per-season-split, identically named folders,
+    but the episode *name* (from TMDB, same source Jellyfin uses) is not.
+    """
+    norm_targets = [_norm(n) for n in target_names if _norm(n)]
+
     # a) Exact TMDB episode id (when Jellyfin stored episode-level provider ids).
-    ep_id = ident.get("tmdb_ep_id")
+    ep_id = (ident or {}).get("tmdb_ep_id")
     if ep_id:
         for e in episodes:
             if _tmdb_of(e) == ep_id:
-                return e
-    # b) Air date — globally unique per episode and always present in good TMDB
-    #    metadata, so it resolves the right episode even across identically named
-    #    per-season series.
-    air = (ident.get("air_date") or "")[:10]
+                return e, "tmdb-id"
+
+    # b) Exact episode title.
+    if norm_targets:
+        for e in episodes:
+            if _norm(e.get("Name")) in norm_targets:
+                return e, "title"
+
+    # c) Air date — globally unique per episode in good TMDB metadata.
+    air = ((ident or {}).get("air_date") or "")[:10]
     if air:
         for e in episodes:
             if (e.get("PremiereDate") or "")[:10] == air:
-                return e
-    return None
+                return e, "air-date"
+
+    # d) Fuzzy episode title (handles minor punctuation / romanisation drift).
+    if norm_targets:
+        best, best_ratio = None, 0.0
+        for e in episodes:
+            ne = _norm(e.get("Name"))
+            if not ne:
+                continue
+            ratio = max(difflib.SequenceMatcher(None, nt, ne).ratio() for nt in norm_targets)
+            if ratio > best_ratio:
+                best, best_ratio = e, ratio
+        if best is not None and best_ratio >= 0.85:
+            return best, f"title-fuzzy({best_ratio:.2f})"
+
+    return None, None
 
 
 _ROMAN = {"ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8}
@@ -145,6 +181,9 @@ class JellyfinScraper(BaseAnimeScraper):
         self._ep_cache: dict = {}
         self._uid: Optional[str] = None
         self._tmdb_id = media_ctx.get("tmdb_id")
+        # Backup episode-title source (AniList) for name matching, in case TMDB
+        # is unavailable: episodes_list = [{episode_number, title, ...}, ...].
+        self._episodes_list = media_ctx.get("episodes_list") or []
         if not is_configured():
             return None
 
@@ -248,20 +287,36 @@ class JellyfinScraper(BaseAnimeScraper):
         candidates = getattr(self, "_candidates", None) or [{"Id": anime_slug, "Name": ""}]
 
         try:
-            # Strategy 0 (primary) — TMDB identity. Pool every candidate series'
-            # episodes and match the one whose TMDB episode id / air date equals
-            # the target episode's. This is reliable regardless of folder layout
-            # or naming (the failure mode where identically named S1/S2 folders
-            # both matched episode index 1).
+            # Strategy 0 (primary) — match by episode IDENTITY, not by index.
+            # Pool every candidate series' episodes, then match on the episode's
+            # TMDB id / TITLE / air date. Title matching is the workhorse: it
+            # resolves the right episode even across identically named, per-season
+            # split folders where season/index numbers are useless.
             all_eps: list = []
             for c in candidates:
                 all_eps.extend(await self._episodes(c["Id"]))
+
             ident = await _tmdb_episode_identity(getattr(self, "_tmdb_id", None), season_num, episode_num)
-            match = _match_by_tmdb_identity(all_eps, ident)
+
+            # Target episode titles: TMDB name first (same source Jellyfin uses),
+            # then the AniList title as a backup.
+            target_names = []
+            if ident and ident.get("name"):
+                target_names.append(ident["name"])
+            for e in getattr(self, "_episodes_list", []) or []:
+                if e.get("episode_number") == episode_num and e.get("title"):
+                    target_names.append(e["title"])
+            target_names = [n for n in target_names if not _is_generic_name(n)]
+
+            match, how = _match_episode(all_eps, ident, target_names)
             if match:
-                print(f"[JellyfinScraper] TMDB-matched S{season_num}E{episode_num} "
-                      f"(tmdb_ep={ident.get('tmdb_ep_id')}, air={ident.get('air_date')})")
+                print(f"[JellyfinScraper] S{season_num}E{episode_num} matched via {how} "
+                      f"(target={target_names!r}, jellyfin={match.get('Name')!r})")
                 return self._embed(match)
+
+            print(f"[JellyfinScraper] No identity match for S{season_num}E{episode_num} "
+                  f"(target_names={target_names!r}, pooled {len(all_eps)} eps from "
+                  f"{len(candidates)} series); falling back to index matching.")
 
             # Strategy 1 — a genuine multi-season Series that really has this
             # season (ParentIndexNumber == season_num). Trustworthy for season
