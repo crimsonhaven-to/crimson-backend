@@ -99,6 +99,14 @@ We maintain these for our older scrolls and frontend versions.
 - GET /watch/{anilist_id}/{episode_number}: Watch using AniList ID (redirects to canonical watch).
 - GET /seasons/{anilist_id}: Get all seasons for an AniList ID.
 
+### Experimental
+- GET/POST /vidking_proxy/h/{host}/{path}: Same-origin reverse proxy behind the
+  experimental "vidking_test" source. Downloads the VidKing player page, strips
+  the ad/pop-under injector, and rewrites its assets back through this proxy so
+  the frontend can iframe an ad-free player from our own origin. Scoped to the
+  VidKing/Videasy host allow-list (not a general-purpose proxy). The /watch
+  response exposes it as the "VidKing Test" stream alongside the original.
+
 ### Health & Status
 - GET /health: Returns system health, database status, and active scraper count.
 
