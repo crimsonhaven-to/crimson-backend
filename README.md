@@ -61,6 +61,76 @@ The API will be available at `http://localhost:8000`. You can explore the intera
 
 ---
 
+## ⚙️ Configuration
+
+All configuration is via environment variables (see [`.env.example`](.env.example)).
+
+| Variable | Required | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `TMDB_API_KEY` | **yes** | – | TMDB Read Access Token (v4) or legacy key. |
+| `PROXY_SECRET` | prod | random | HMAC secret for the signed stream proxies. **Must be stable and shared across replicas** or proxied playback 403s. `openssl rand -hex 32`. |
+| `MAPPING_DB` | no | `anime_mappings.db` | Path to the TMDB↔AniList mapping + cache DB. |
+| `ACCOUNTS_DB` | no | `accounts.db` | Path to the accounts/favorites/progress DB (kept separate so user data survives mapping resyncs). |
+| `RUN_DB_SYNC` | no | `true` | Whether this instance runs the periodic Fribb resync. Set `false` on all but one replica. |
+| `SQLITE_BUSY_TIMEOUT` | no | `30` | Seconds a sqlite call waits on a locked DB before erroring. |
+| `ALLOWED_ORIGINS` | no | built-in list | Comma-separated CORS origins. |
+| `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
+| `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional Jellyfin source. |
+
+The two SQLite databases run in **WAL mode** with a busy timeout so the async
+workers can read and write concurrently without `database is locked` errors.
+
+---
+
+## 🐳 Deployment
+
+### Docker (single host)
+
+```bash
+docker build -t crimson-backend:1.0 .
+# Provide secrets via an env file or the shell environment:
+TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) docker compose up -d
+```
+
+The container runs as a non-root user, ships a `HEALTHCHECK` that polls
+`/health`, and persists both SQLite DBs to the `crimson-data` named volume.
+
+### Deploying to Docker Swarm
+
+The provided [`docker-compose.yml`](docker-compose.yml) is Swarm-ready
+(`deploy:` block with restart policy, resource limits and `stop-first` updates):
+
+```bash
+docker stack deploy -c docker-compose.yml crimson
+```
+
+> [!IMPORTANT]
+> **State lives in SQLite, which is single-writer and cannot be shared across
+> hosts.** The stack therefore runs as a **single replica pinned to one node**
+> (the `placement.constraints` entry) with a local named volume. This gives you
+> Swarm's self-healing (auto-restart/reschedule on that node) and rolling
+> updates without risking DB corruption.
+>
+> **To run more than one replica:**
+> 1. Keep them on the **same node**, sharing the same local volume (WAL allows
+>    concurrent same-host access).
+> 2. Set `RUN_DB_SYNC=true` on **exactly one** replica, `false` on the rest, so
+>    the wholesale mapping rebuild runs once.
+> 3. Set the **same `PROXY_SECRET`** on every replica so signed proxy URLs
+>    verify regardless of which replica serves the follow-up request.
+>
+> **True multi-node horizontal scaling** requires replacing SQLite with a
+> networked database (e.g. Postgres) for `accounts.db` + the mapping/cache
+> tables — the access layer is small and isolated in `account_engine/db.py`,
+> `metadata_engine/db_handler.py` and the helpers in `api.py`.
+
+The stack must be reachable behind a TLS-terminating reverse proxy that sets
+`X-Forwarded-Proto`/`X-Forwarded-Host` (uvicorn runs with `--proxy-headers`),
+otherwise proxied iframe URLs are emitted as `http://` and blocked as mixed
+content on the HTTPS frontend.
+
+---
+
 ## 📜 API Reference
 
 ### Core Endpoints

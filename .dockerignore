@@ -1,0 +1,29 @@
+# Keep the build context small and avoid baking secrets / local state into the image.
+.git
+.github
+.gitignore
+.vscode
+.claude
+.env
+*.env
+!.env.example
+
+# Local SQLite state (the image starts clean; data lives on a volume).
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python caches / artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Docs / misc not needed at runtime
+README.md
+metadata_engine/README.md
