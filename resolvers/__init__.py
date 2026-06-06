@@ -8,16 +8,16 @@ from .animekai import AnimekaiResolver
 from .animesuge import DirectM3U8Resolver, AsbGamesResolver
 
 # The unified list of all our resolvers.
-# NOTE: VidkingTestResolver MUST precede VidkingResolver — both match vidking.net
-# URLs, but only the test resolver matches the "crimson_proxy=1" marker, and
-# resolve_streams() picks the first matching resolver.
-# MovishResolver matches on the distinct "api.movish.net" host, so its order
-# relative to the VidKing pair doesn't matter.
+# NOTE: The plain VidkingResolver is DEPRECATED — the ad-free VidKing variant
+# (VidkingTestResolver, the "crimson_proxy=1" proxy) is thoroughly tested and now
+# the only active VidKing source. The import is kept so resolvers/vidking.py stays
+# wired and can be re-enabled, but it's intentionally out of ALL_RESOLVERS.
+# MovishResolver matches on the distinct "api.movish.net" host.
 ALL_RESOLVERS = [
     VidmolyResolver,
     VoeResolver,
     VidkingTestResolver,
-    VidkingResolver,
+    # VidkingResolver,   # deprecated — superseded by VidkingTestResolver (ad-free)
     MovishResolver,
     JellyfinResolver,
     AnimekaiResolver,

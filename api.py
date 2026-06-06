@@ -274,6 +274,74 @@ def upsert_show_info(show: Dict) -> None:
     except Exception as e:
         logger.error(f"Database error in upsert_show_info: {e}")
 
+def get_catalogue_items() -> List[Dict]:
+    """Build the full anime catalogue from the local DB only (no external calls).
+
+    One row per AniList entry (every season / movie / OVA we have mapped), with
+    its category (anime_type) and the ids the frontend needs to navigate
+    (anilist_id for /seasons, tmdb_id + season_number for /info & /watch).
+    Posters come from tmdb_shows where present (lazily populated, so often null)
+    — we never hit TMDB here. Sorted by title.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            # anilist_id -> (tmdb_id, season_number) for real TV seasons.
+            cursor.execute("SELECT anilist_id, tmdb_id, season_number FROM tmdb_seasons")
+            season_map: Dict[int, Tuple[int, int]] = {}
+            for r in cursor.fetchall():
+                season_map.setdefault(r["anilist_id"], (r["tmdb_id"], r["season_number"]))
+
+            # anilist_id -> tmdb_id for extras (specials/OVAs/movies).
+            cursor.execute("SELECT anilist_id, tmdb_id FROM tmdb_extras")
+            extra_map: Dict[int, int] = {}
+            for r in cursor.fetchall():
+                extra_map.setdefault(r["anilist_id"], r["tmdb_id"])
+
+            # tmdb_id -> poster_path (sparse; only shows that were opened once).
+            cursor.execute("SELECT tmdb_id, poster_path FROM tmdb_shows")
+            posters: Dict[int, Optional[str]] = {r["tmdb_id"]: r["poster_path"] for r in cursor.fetchall()}
+
+            cursor.execute(
+                """SELECT anilist_id, title_romaji, title_english, title_native,
+                          anime_type, start_year
+                   FROM anime_entries"""
+            )
+            entries = cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Database error in get_catalogue_items: {e}")
+        return []
+
+    items: List[Dict] = []
+    for e in entries:
+        title = e["title_english"] or e["title_romaji"] or e["title_native"]
+        if not title:
+            continue  # entry whose AniList titles never resolved — useless in a list
+        aid = e["anilist_id"]
+        tmdb_id: Optional[int] = None
+        season_number: Optional[int] = None
+        if aid in season_map:
+            tmdb_id, season_number = season_map[aid]
+        elif aid in extra_map:
+            tmdb_id = extra_map[aid]
+        poster_path = posters.get(tmdb_id) if tmdb_id is not None else None
+        items.append({
+            "anilist_id": aid,
+            "title": title,
+            "title_romaji": e["title_romaji"],
+            "title_english": e["title_english"],
+            "category": e["anime_type"] or "UNKNOWN",
+            "year": e["start_year"],
+            "tmdb_id": tmdb_id,
+            "season_number": season_number,
+            "poster": _tmdb_img(poster_path) if poster_path else None,
+        })
+
+    items.sort(key=lambda x: (x["title"] or "").lower())
+    return items
+
+
 # --- CACHE HELPER FUNCTIONS ---
 async def get_cached_response(cache_key: str) -> Optional[Dict]:
     """Retrieve cached response from database"""
@@ -822,6 +890,44 @@ async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Nu
     except Exception as e:
         logger.error(f"Trending error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch trending anime")
+
+@app.get("/catalogue")
+async def get_catalogue(category: Optional[str] = Query(None, description="Optional category filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL")):
+    """Full anime catalogue for a 'browse by category' page.
+
+    Lists every anime in our local DB (name + category + navigation ids) with no
+    external API calls. ``categories`` always reflects the whole catalogue (so
+    the frontend can render all category tabs); ``animes`` is filtered when a
+    ``category`` query param is given.
+    """
+    cache_key = "catalogue:v1"
+    cached = await get_cached_response(cache_key)
+    if cached and "items" in cached:
+        items = cached["items"]
+    else:
+        loop = asyncio.get_event_loop()
+        items = await loop.run_in_executor(None, get_catalogue_items)
+        if items:
+            await set_cached_response(cache_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+
+    # Category breakdown over the FULL catalogue (before any filtering).
+    counts: Dict[str, int] = {}
+    for it in items:
+        counts[it["category"]] = counts.get(it["category"], 0) + 1
+    categories = [{"category": k, "count": v} for k, v in sorted(counts.items())]
+
+    animes = items
+    if category:
+        wanted = category.strip().upper()
+        animes = [it for it in items if (it["category"] or "").upper() == wanted]
+
+    return {
+        "success": True,
+        "count": len(animes),
+        "total": len(items),
+        "categories": categories,
+        "animes": animes,
+    }
 
 def _build_season_list(tmdb_id: int, show: Dict) -> List[Dict]:
     """Build the per-season list from TMDB's real seasons, attaching AniList mapping."""

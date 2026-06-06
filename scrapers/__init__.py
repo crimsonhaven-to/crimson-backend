@@ -11,7 +11,7 @@ from .animesuge_scraper import AnimeSugeScraper
 ALL_SCRAPERS = [
     GogoScraper,
     #VoeScraper,
-    VidkingScraper,
+    # VidkingScraper,  # deprecated — superseded by VidkingTestScraper (ad-free, tested)
     VidkingTestScraper,
     MovishScraper,
     JellyfinScraper,
