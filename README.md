@@ -1,50 +1,51 @@
 # Crimson Backend
 
-Greetings from the throne room of Crimson Haven! I am Luminas Crimsonveil—your vampire queen and curator of all things anime. You may call me Lumi ( ^ . ^ ) 
+Greetings from the heart of Crimson Haven! I am Luminas Crimsonveil—your curator of all things anime. You may call me Lumi ( ^ . ^ )
 
-This is the robust, high-performance heart of our streaming sanctuary. We built this engine to handle the complexities of multi-season anime by mapping TMDB show data to AniList entries. It features our custom automated metadata engine, multi-source scraping, and elegant stream resolution.
+This is the robust, high-performance engine powering our streaming sanctuary. It handles multi-season anime mapping, automated metadata aggregation, and multi-source stream resolution with elegance and speed.
 
-## Features
+## 🩸 Core Features
 
-- Multi-Season Intelligence: We automatically map TMDB TV shows and seasons to their corresponding AniList IDs so you never lose your way in the archives.
-- Unified Search: Search across TMDB with automatic suggestions provided by our loyal familiars.
-- Smart Metadata: We aggregate data from TMDB and AniList for the most complete information possible.
-- Advanced Scraping: Multi-threaded scraping from various anime sources (AnimeKai, AnimeSuge, GogoAnime, etc.).
-- Stream Resolution: We resolve embed URLs to direct HLS/MP4 streams where possible for a seamless viewing experience.
-- Automatic Sync: A built-in scheduler to keep our mapping database up-to-date with upstream sources.
-- Performant Caching: SQLite-based caching to ensure the castle remains responsive.
+- **Multi-Season Intelligence**: Automatically maps TMDB TV shows and seasons to their corresponding AniList IDs using the Fribb dataset.
+- **Unified Search**: Search across TMDB with automatic suggestions and metadata enrichment.
+- **Smart Metadata**: Aggregates data from TMDB and AniList for complete info (titles, posters, episode summaries).
+- **Advanced Scraping**: Multi-threaded, async scraping from various sources (AnimeKai, AnimeSuge, GogoAnime, etc.).
+- **Stream Resolution**: Resolves third-party embed URLs to direct HLS/MP4 streams or ad-free proxied players.
+- **Automatic Sync**: Built-in scheduler keeps the local mapping database up-to-date with upstream sources.
+- **Internal Proxies**: Custom reverse proxies for providers like VidKing, Movish, and Jellyfin to bypass ads and CORS.
+- **Crimson Player**: A minimal, ad-free HLS/MP4 player served directly from the backend for a seamless experience.
 
-## Tech Stack
+## 🛠 Tech Stack
 
-- Framework: FastAPI (Python)
-- Database: SQLite (Metadata & Cache)
-- Networking: HTTPX (Async requests)
-- Parsing: BeautifulSoup4, Selectolax
-- Scheduling: APScheduler
-- Containerization: Docker
+- **Framework**: FastAPI (Python 3.10+)
+- **Database**: SQLite (Metadata Mapping & API Cache)
+- **Networking**: HTTPX (Async)
+- **Parsing**: BeautifulSoup4, Selectolax, lxml
+- **Scheduling**: APScheduler
+- **Containerization**: Docker & Docker Compose
 
-## Getting Started
+## 🚀 Getting Started
 
 ### Prerequisites
 
-- Python 3.10+
-- TMDB API Key (Necessary for my magic to work)
+- **Python 3.10+**
+- **TMDB API Key**: Required for metadata and search (Legacy API Key / Read Access Token).
 
 ### Installation
 
-1. Clone the repository:
+1. **Clone the repository**:
    ```bash
    git clone https://github.com/ramon/crimson-backend.git
    cd crimson-backend
    ```
 
-2. Install dependencies:
+2. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. Configure environment variables:
-   Create a .env file in the root directory:
+3. **Configure environment**:
+   Create a `.env` file in the root:
    ```env
    TMDB_API_KEY=your_tmdb_api_key_here
    DEBUG=False
@@ -56,70 +57,46 @@ This is the robust, high-performance heart of our streaming sanctuary. We built 
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-### Using Docker
-
-```bash
-docker-compose up -d
-```
+The API will be available at `http://localhost:8000`. You can explore the interactive docs at `/docs`.
 
 ---
 
-## API Documentation
-
-Our API runs on port 8000 by default. You can view the full grimoire of endpoints via Swagger UI at /docs ( > ◡ < )
+## 📜 API Reference
 
 ### Core Endpoints
 
-#### GET /search/anime
-Search for anime by name.
-- Query Params: query_name (string, required)
-- Returns: List of suggestions with TMDB and AniList IDs.
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/search/anime` | Search for anime by name (TMDB-based). |
+| `GET` | `/trending` | Fetch popular shows. |
+| `GET` | `/catalogue` | List all mapped anime in the local DB. |
+| `GET` | `/show/{tmdb_id}` | Get full show details and season list. |
+| `GET` | `/season/{tmdb_id}/{num}` | Get metadata for a specific season. |
+| `GET` | `/watch/{tmdb_id}/{s}/{e}` | **Primary**: Retrieve streaming links for an episode. |
+| `GET` | `/anilist/{id}` | Reverse lookup (AniList ID -> TMDB ID). |
 
-#### GET /trending
-Fetch what is currently popular among my subjects.
-- Query Params: limit (int, default: 10)
+### Internal Proxies & Utilities
 
-#### GET /show/{tmdb_id}
-Get comprehensive show details, including all seasons and "extras" (OVAs/Movies).
-
-#### GET /season/{tmdb_id}/{season_number}
-Get metadata for a specific season, merging TMDB and AniList data.
-
-#### GET /watch/{tmdb_id}/{season_number}/{episode_number}
-Retrieve streaming links for a specific episode.
-- Returns: List of streams (HLS, MP4, or Iframe) from various sources.
-
-#### GET /anilist/{anilist_id}
-Reverse lookup to find the corresponding TMDB ID and season number.
-
-### Legacy/Compatibility Endpoints
-We maintain these for our older scrolls and frontend versions.
-
-- GET /info/{tmdb_id}: Merged TMDB + AniList metadata (flat structure).
-- GET /watch/{anilist_id}/{episode_number}: Watch using AniList ID (redirects to canonical watch).
-- GET /seasons/{anilist_id}: Get all seasons for an AniList ID.
-
-### Experimental
-- GET/POST /vidking_proxy/h/{host}/{path}: Same-origin reverse proxy behind the
-  experimental "vidking_test" source. Downloads the VidKing player page, strips
-  the ad/pop-under injector, and rewrites its assets back through this proxy so
-  the frontend can iframe an ad-free player from our own origin. Scoped to the
-  VidKing/Videasy host allow-list (not a general-purpose proxy). The /watch
-  response exposes it as the "VidKing Test" stream alongside the original.
-
-### Health & Status
-- GET /health: Returns system health, database status, and active scraper count.
+- **`/player`**: Renders the Crimson Player for direct HLS/MP4 streams.
+- **`/vidking_proxy`**: Removes ads and pop-unders from VidKing/Videasy embeds.
+- **`/movish_proxy`**: Proxies Movish streams to handle headers/CORS.
+- **`/jellyfin_proxy`**: Proxies Jellyfin HLS segments for same-origin playback.
+- **`/health`**: Check system status and database health.
 
 ---
 
-## Architecture
+## 🏗 Architecture
 
-- api.py: The central entry point and API routing logic.
-- metadata_engine/: Handles the complex mapping between TMDB (show-centric) and AniList (release-centric) using the Fribb dataset.
-- scrapers/: Modular scrapers that search and extract video page URLs from anime sites.
-- resolvers/: Resolvers that take video host URLs (e.g., VidKing, VidMoly) and extract the final playable stream.
+- **`api.py`**: Main entry point, routing, and lifecycle management.
+- **`metadata_engine/`**: Handles the complex mapping between TMDB and AniList. See its [README](metadata_engine/README.md) for details.
+- **`scrapers/`**: Modular providers that find video embeds on streaming sites.
+- **`resolvers/`**: Tools that extract raw video links from those embeds.
+- **`player.py`**: The logic for our built-in HTML5 video player.
+
+### Extending the Engine
+To add a new source, implement a new scraper in `scrapers/` (inheriting from `BaseAnimeScraper`) and, if needed, a resolver in `resolvers/` (inheriting from `BaseResolver`).
 
 ---
 
-## TL;DR:
-This is Lumi's FastAPI-based backend for Crimson Haven. It uses TMDB for IDs but maps everything to AniList for accuracy. We scrape multiple sites, resolve direct links, and cache everything in SQLite. Set your TMDB_API_KEY, run it, and enjoy your stay in my kingdom! ( ^ ▿ ^ )
+## 🌹 TL;DR
+Lumi's FastAPI backend for Crimson Haven. It maps TMDB to AniList, scrapes multiple sources, resolves direct links, and proxies streams to keep your viewing experience pure and ad-free. Set your key, run it, and enjoy! ( ^ ▿ ^ )
