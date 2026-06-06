@@ -801,12 +801,18 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dic
                             "type": "iframe",
                             "url": abs_url
                         })
-                    elif matched_resolver.source_name == "VidKing":
-                        # Plain VidKing: hand the raw embed to the frontend iframe.
+                    elif matched_resolver.domain_keyword == "vidking.net":
+                        # Plain (legacy) VidKing: the resolver validates and hands
+                        # back the raw vidking.net /embed page, which is an iframe
+                        # target, NOT a video file. Match on domain_keyword (the
+                        # resolver's stable identity) rather than source_name, which
+                        # is a display label — e.g. "VidKing (Legacy)" — and would
+                        # otherwise fall through to the mp4/hls branch below and be
+                        # mislabelled as a direct MP4 the player can't play.
                         resolved_streams.append({
                             "source": matched_resolver.source_name,
                             "type": "iframe",
-                            "url": embed_url
+                            "url": direct_video_url
                         })
                     else:
                         stream_type = "hls" if "m3u8" in direct_video_url.lower() else "mp4"
