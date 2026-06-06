@@ -22,6 +22,7 @@ from resolvers import ALL_RESOLVERS
 from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
 from resolvers.movish import proxy_fetch as movish_proxy_fetch
 from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
+from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
@@ -1238,6 +1239,40 @@ async def playimdb_proxy(request: Request):
         raise HTTPException(status_code=403, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"PlayIMDb proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- ANIMESUGE AD-FREE STREAM PROXY ("animesuge" source) ---
+@app.get("/animesuge_proxy")
+async def animesuge_proxy(request: Request):
+    """Signed, same-origin proxy for the AnimeSuge source. Fetches a signed
+    upstream direct file (mp4/m3u8) server-side, rewrites HLS playlists so
+    sub-resources flow back through this proxy, and streams media through with
+    Range passthrough.
+
+    The direct-file CDN host can rotate, so instead of a host allow-list this
+    proxy verifies an HMAC on the ``u`` URL (see resolvers.animesuge) and refuses
+    anything unsigned — closing the open-proxy / SSRF hole. No AnimeSuge or
+    third-party player/ad code is ever involved; the scraper extracts the raw
+    direct file and the resolver wraps it in /player."""
+    url = request.query_params.get("u")
+    sig = request.query_params.get("s")
+    try:
+        status, content_type, headers, payload = await animesuge_proxy_fetch(
+            url=url,
+            sig=sig,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"AnimeSuge proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     if isinstance(payload, (bytes, bytearray)):

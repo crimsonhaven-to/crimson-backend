@@ -6,7 +6,7 @@ from .movish import MovishResolver
 from .playimdb import PlayimdbResolver
 from .jellyfin import JellyfinResolver
 from .animekai import AnimekaiResolver
-from .animesuge import DirectM3U8Resolver, AsbGamesResolver
+from .animesuge import AnimeSugeResolver, DirectM3U8Resolver, AsbGamesResolver
 
 # The unified list of all our resolvers.
 # NOTE: The plain VidkingResolver is DEPRECATED — the ad-free VidKing variant
@@ -23,6 +23,7 @@ ALL_RESOLVERS = [
     PlayimdbResolver,
     JellyfinResolver,
     AnimekaiResolver,
+    AnimeSugeResolver,  # ad-free: extracts direct mp4/m3u8, proxies + /player
     DirectM3U8Resolver,
     AsbGamesResolver,
 ]
