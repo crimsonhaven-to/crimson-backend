@@ -203,6 +203,20 @@ def get_show_seasons(tmdb_id: int) -> List[Dict]:
         logger.error(f"Database error in get_show_seasons: {e}")
         return []
 
+def get_anime_entry(anilist_id: Optional[int]) -> Dict:
+    """Returns the anime_entries row (titles, type, year) for an anilist_id."""
+    if not anilist_id:
+        return {}
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM anime_entries WHERE anilist_id = ?", (anilist_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else {}
+    except Exception as e:
+        logger.error(f"Database error in get_anime_entry: {e}")
+        return {}
+
 def get_show_extras(tmdb_id: int) -> List[Dict]:
     """Returns specials/OVAs/movies tied to a show (from tmdb_extras)."""
     try:
@@ -330,48 +344,105 @@ async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional
     
     return None
 
-async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: int = 1) -> Dict:
-    """Fetch metadata for a specific TMDB season"""
-    cache_key = f"tmdb:meta:{tmdb_id}:s{season}"
-    
-    # Check cache
+# Bump when the cached TMDB payload shape changes, so stale entries in the
+# volume-persisted api_cache are ignored after a deploy instead of served.
+TMDB_CACHE_VERSION = "v2"
+
+def _tmdb_img(path: Optional[str], size: str = "w500") -> Optional[str]:
+    return f"https://image.tmdb.org/t/p/{size}{path}" if path else None
+
+async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
+    """
+    Fetch a TMDB show with its real season list (the authority for what VidKing
+    can play). Cached, and persists core fields into tmdb_shows on first fetch.
+    """
+    cache_key = f"tmdb:show:{TMDB_CACHE_VERSION}:{tmdb_id}"
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         return cached_data
-    
-    # Fetch from TMDB
-    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}"
-    data = await fetch_with_retry(client, url)
-    
+
+    data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}")
     if not data:
-        # Fallback to show-level metadata if season doesn't exist
+        return {}
+
+    seasons = []
+    for s in data.get("seasons", []):
+        num = s.get("season_number")
+        # Skip specials (season 0) and empty placeholder seasons.
+        if num is None or num < 1 or (s.get("episode_count") or 0) < 1:
+            continue
+        seasons.append({
+            "season_number": num,
+            "name": s.get("name") or f"Season {num}",
+            "episode_count": s.get("episode_count"),
+            "air_date": s.get("air_date"),
+            "poster": _tmdb_img(s.get("poster_path")),
+            "overview": s.get("overview"),
+        })
+
+    result = {
+        "tmdb_id": tmdb_id,
+        "title": data.get("name") or data.get("original_name"),
+        "overview": data.get("overview"),
+        "poster_path": data.get("poster_path"),
+        "backdrop_path": data.get("backdrop_path"),
+        "poster": _tmdb_img(data.get("poster_path")),
+        "backdrop": _tmdb_img(data.get("backdrop_path"), "original"),
+        "first_air_date": data.get("first_air_date"),
+        "seasons": seasons,
+    }
+
+    upsert_show_info({k: result.get(k) for k in
+                      ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "first_air_date")})
+    await set_cached_response(cache_key, result)
+    return result
+
+async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: int = 1) -> Dict:
+    """Fetch metadata + episode list for a specific TMDB season.
+
+    Falls back to show-level overview when the season overview is empty (common
+    for anime) so a description is always available.
+    """
+    cache_key = f"tmdb:meta:{TMDB_CACHE_VERSION}:{tmdb_id}:s{season}"
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        return cached_data
+
+    data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}")
+    show = await fetch_tmdb_show(client, tmdb_id)  # cached
+
+    if not data:
         logger.info(f"Season {season} not found for TMDB ID {tmdb_id}, falling back to show metadata")
-        show_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}"
-        show_data = await fetch_with_retry(client, show_url)
-        
-        if show_data:
-            result = {
-                "summary": show_data.get("overview"),
-                "poster": f"https://image.tmdb.org/t/p/w500{show_data.get('poster_path')}" if show_data.get('poster_path') else None,
-                "backdrop": f"https://image.tmdb.org/t/p/original{show_data.get('backdrop_path')}" if show_data.get('backdrop_path') else None,
-                "season_name": f"Season {season}",
-                "air_date": None
-            }
-        else:
-            result = {}
-    else:
         result = {
-            "summary": data.get("overview"),
-            "poster": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get('poster_path') else None,
-            "backdrop": f"https://image.tmdb.org/t/p/original{data.get('backdrop_path')}" if data.get('backdrop_path') else None,
-            "season_name": data.get("name", f"Season {season}"),
-            "air_date": data.get("air_date")
+            "summary": show.get("overview"),
+            "poster": show.get("poster"),
+            "backdrop": show.get("backdrop"),
+            "season_name": f"Season {season}",
+            "air_date": None,
+            "episodes": [],
         }
-    
-    # Cache the result
+    else:
+        episodes = [{
+            "episode_number": ep.get("episode_number"),
+            "title": ep.get("name") or f"Episode {ep.get('episode_number')}",
+            "thumbnail": _tmdb_img(ep.get("still_path")),
+            "overview": ep.get("overview"),
+            "air_date": ep.get("air_date"),
+            "url": None,
+        } for ep in data.get("episodes", [])]
+
+        result = {
+            "summary": data.get("overview") or show.get("overview"),
+            "poster": _tmdb_img(data.get("poster_path")) or show.get("poster"),
+            "backdrop": show.get("backdrop"),
+            "season_name": data.get("name") or f"Season {season}",
+            "air_date": data.get("air_date"),
+            "episodes": episodes,
+        }
+
     if result:
         await set_cached_response(cache_key, result)
-    
+
     return result
 
 async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> Dict:
@@ -701,59 +772,65 @@ async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Nu
         logger.error(f"Trending error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch trending anime")
 
+def _build_season_list(tmdb_id: int, show: Dict) -> List[Dict]:
+    """Build the per-season list from TMDB's real seasons, attaching AniList mapping."""
+    seasons = []
+    for s in show.get("seasons", []):
+        num = s["season_number"]
+        anilist_id = get_anilist_id(tmdb_id, num)
+        entry = get_anime_entry(anilist_id)
+        seasons.append({
+            "season_number": num,
+            "anilist_id": anilist_id,
+            "tmdb_id": tmdb_id,
+            "tmdb_season": num,
+            "name": s["name"],
+            "poster": s["poster"] or show.get("poster"),
+            "summary": s.get("overview") or show.get("overview"),
+            "air_date": s["air_date"],
+            "episode_count": s["episode_count"],
+            "title_romaji": entry.get("title_romaji"),
+            "title_english": entry.get("title_english"),
+            "anime_type": entry.get("anime_type"),
+        })
+    return seasons
+
 @app.get("/show/{tmdb_id}")
 async def get_show_details(tmdb_id: int):
-    """Returns show info + list of all seasons"""
-    show_info = get_show_info(tmdb_id)
-    if not show_info:
-        # Not cached yet — fetch from TMDB and persist (lazy population of tmdb_shows).
-        async with httpx.AsyncClient() as client:
-            url = f"https://api.themoviedb.org/3/tv/{tmdb_id}"
-            show_data = await fetch_with_retry(client, url)
-            if not show_data:
-                raise HTTPException(status_code=404, detail="Show not found")
-            show_info = {
-                "tmdb_id": tmdb_id,
-                "title": show_data.get("name"),
-                "overview": show_data.get("overview"),
-                "poster_path": show_data.get("poster_path"),
-                "backdrop_path": show_data.get("backdrop_path"),
-                "first_air_date": show_data.get("first_air_date")
-            }
-            upsert_show_info(show_info)
-
-    seasons = get_show_seasons(tmdb_id)
-
-    # Enrich seasons with TMDB metadata (poster, air_date)
+    """Returns show info + every TMDB season (playable via VidKing), AniList-mapped where known."""
     async with httpx.AsyncClient() as client:
-        enriched_seasons = []
-        for s in seasons:
-            meta = await fetch_tmdb_metadata(client, tmdb_id, s["season_number"])
-            enriched_seasons.append({
-                **s,
-                "name": meta.get("season_name"),
-                "poster": meta.get("poster"),
-                "air_date": meta.get("air_date")
-            })
+        show = await fetch_tmdb_show(client, tmdb_id)
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found")
+
+    show_info = get_show_info(tmdb_id) or {
+        "tmdb_id": tmdb_id,
+        "title": show.get("title"),
+        "overview": show.get("overview"),
+        "poster_path": show.get("poster_path"),
+        "backdrop_path": show.get("backdrop_path"),
+        "first_air_date": show.get("first_air_date"),
+    }
 
     return {
         "success": True,
         "show": show_info,
-        "seasons": enriched_seasons,
+        "seasons": _build_season_list(tmdb_id, show),
         "extras": get_show_extras(tmdb_id)
     }
 
 @app.get("/season/{tmdb_id}/{season_number}")
 async def get_season_details(tmdb_id: int, season_number: int):
-    """Returns combined TMDB season metadata + AniList metadata for that season."""
+    """Combined TMDB season metadata + AniList metadata (AniList optional)."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
-    if not anilist_id:
-        raise HTTPException(status_code=404, detail=f"No mapping for TMDB ID {tmdb_id} season {season_number}")
-    
+
     async with httpx.AsyncClient() as client:
         tmdb_meta = await fetch_tmdb_metadata(client, tmdb_id, season_number)
-        anilist_meta = await fetch_anilist_metadata(client, anilist_id)
-    
+        anilist_meta = await fetch_anilist_metadata(client, anilist_id) if anilist_id else {}
+
+    if not tmdb_meta and not anilist_meta:
+        raise HTTPException(status_code=404, detail=f"No data for TMDB ID {tmdb_id} season {season_number}")
+
     return {
         "success": True,
         "tmdb_id": tmdb_id,
@@ -763,16 +840,23 @@ async def get_season_details(tmdb_id: int, season_number: int):
         "anilist_metadata": anilist_meta
     }
 
-async def build_watch_response(tmdb_id: int, season_number: int, episode_number: int, anilist_id: int) -> Dict:
-    """Run every scraper for an episode, resolve the embeds, and shape the response."""
-    async with httpx.AsyncClient() as client:
-        anilist_data = await fetch_anilist_metadata(client, anilist_id)
+async def build_watch_response(tmdb_id: int, season_number: int, episode_number: int,
+                               anilist_id: Optional[int], fallback_title: Optional[str] = None) -> Dict:
+    """Run every scraper for an episode, resolve the embeds, and shape the response.
 
-    if not anilist_data:
-        raise HTTPException(status_code=404, detail="AniList metadata not found")
+    Works without an AniList mapping (e.g. TMDB-only seasons of long shows): VidKing
+    plays off the TMDB id, and title-based scrapers fall back to the TMDB show title.
+    """
+    anilist_data = {}
+    if anilist_id:
+        async with httpx.AsyncClient() as client:
+            anilist_data = await fetch_anilist_metadata(client, anilist_id) or {}
+
+    title = anilist_data.get("title") or fallback_title
+    media_ctx = {**anilist_data, "title": title}
 
     tasks = [
-        run_single_scraper(scraper_class, tmdb_id, season_number, episode_number, anilist_data)
+        run_single_scraper(scraper_class, tmdb_id, season_number, episode_number, media_ctx)
         for scraper_class in ALL_SCRAPERS
     ]
     results = await asyncio.gather(*tasks)
@@ -790,18 +874,26 @@ async def build_watch_response(tmdb_id: int, season_number: int, episode_number:
         "season_number": season_number,
         "episode_number": episode_number,
         "anilist_id": anilist_id,
-        "title": anilist_data.get("title"),
+        "title": title,
         "streams": streams
     }
 
 @app.get("/watch/{tmdb_id}/{season_number}/{episode_number}")
 async def get_watch_links(tmdb_id: int, season_number: int, episode_number: int):
-    """Get streaming links using the new schema lookup."""
+    """Get streaming links. Works even for TMDB seasons with no AniList mapping
+    (long shows like Naruto) — VidKing plays off the TMDB id."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
-    if not anilist_id:
-        raise HTTPException(status_code=404, detail=f"Mapping not found for TMDB {tmdb_id} Season {season_number}")
 
-    return await build_watch_response(tmdb_id, season_number, episode_number, anilist_id)
+    fallback_title = None
+    if not anilist_id:
+        info = get_show_info(tmdb_id)
+        fallback_title = info.get("title") if info else None
+        if not fallback_title:
+            async with httpx.AsyncClient() as client:
+                show = await fetch_tmdb_show(client, tmdb_id)
+            fallback_title = show.get("title")
+
+    return await build_watch_response(tmdb_id, season_number, episode_number, anilist_id, fallback_title)
 
 
 @app.get("/anilist/{anilist_id}")
@@ -821,27 +913,48 @@ async def get_anilist_mapping(anilist_id: int):
 # --- COMPATIBILITY ENDPOINTS (legacy frontend contract) ---
 @app.get("/info/{tmdb_id}")
 async def get_anime_info(tmdb_id: int, season: int = Query(1, ge=1, description="TMDB season number")):
-    """Merged TMDB + AniList metadata for a (tmdb_id, season). Flat legacy shape."""
+    """Merged TMDB + AniList metadata for a (tmdb_id, season). Flat legacy shape.
+
+    AniList is optional: seasons of long shows with no AniList entry still return
+    TMDB metadata + a TMDB-derived episode list, and the description always falls
+    back (AniList -> TMDB season -> TMDB show overview).
+    """
     anilist_id = get_anilist_id(tmdb_id, season)
-    if not anilist_id:
-        raise HTTPException(status_code=404, detail=f"No mapping for TMDB ID {tmdb_id} season {season}")
 
     async with httpx.AsyncClient() as client:
-        tmdb_data, anilist_data = await asyncio.gather(
-            fetch_tmdb_metadata(client, tmdb_id, season),
-            fetch_anilist_metadata(client, anilist_id),
-        )
+        show = await fetch_tmdb_show(client, tmdb_id)
+        tmdb_data = await fetch_tmdb_metadata(client, tmdb_id, season)
+        anilist_data = await fetch_anilist_metadata(client, anilist_id) if anilist_id else {}
 
-    available_seasons = [s["season_number"] for s in get_show_seasons(tmdb_id)]
+    if not show and not tmdb_data and not anilist_data:
+        raise HTTPException(status_code=404, detail=f"No data for TMDB ID {tmdb_id} season {season}")
+
+    available_seasons = [s["season_number"] for s in show.get("seasons", [])]
+    if not available_seasons:
+        available_seasons = [s["season_number"] for s in get_show_seasons(tmdb_id)]
+
+    # Never return an empty description / episode list.
+    description = anilist_data.get("description") or tmdb_data.get("summary") or show.get("overview")
+
+    # Prefer the more complete episode list. VidKing plays by TMDB episode number,
+    # so when TMDB has more episodes than AniList (e.g. TMDB lumps cours together,
+    # or splits a long run into seasons) use TMDB's so every episode is reachable.
+    anilist_eps = anilist_data.get("episodes_list") or []
+    tmdb_eps = tmdb_data.get("episodes") or []
+    episodes_list = anilist_eps if len(anilist_eps) >= len(tmdb_eps) else tmdb_eps
 
     return {
+        **tmdb_data,
+        **anilist_data,
         "success": True,
         "tmdb_id": tmdb_id,
         "anilist_id": anilist_id,
         "current_season": season,
         "available_seasons": available_seasons,
-        **tmdb_data,
-        **anilist_data,
+        "description": description,
+        "summary": tmdb_data.get("summary") or show.get("overview"),
+        "episodes_list": episodes_list,
+        "title": anilist_data.get("title") or show.get("title"),
     }
 
 @app.get("/watch/{anilist_id}/{episode_number}")
@@ -874,35 +987,21 @@ async def get_anime_seasons(anilist_id: int):
         raise HTTPException(status_code=404, detail="AniList ID not mapped")
 
     tmdb_id = mapping[0]
-    seasons = get_show_seasons(tmdb_id)
 
     async with httpx.AsyncClient() as client:
-        seasons_data = []
-        for s in seasons:
-            season_number = s["season_number"]
-            meta = await fetch_tmdb_metadata(client, tmdb_id, season_number)
-            seasons_data.append({
-                "season_number": season_number,
-                "anilist_id": s["anilist_id"],
-                "tmdb_id": tmdb_id,
-                "tmdb_season": season_number,
-                "name": meta.get("season_name") or f"Season {season_number}",
-                "poster": meta.get("poster"),
-                "summary": meta.get("summary"),
-                "air_date": meta.get("air_date"),
-                "title_romaji": s.get("title_romaji"),
-                "title_english": s.get("title_english"),
-            })
+        show = await fetch_tmdb_show(client, tmdb_id)
+        if not show:
+            raise HTTPException(status_code=404, detail="Show not found on TMDB")
         anime_info = await fetch_anilist_metadata(client, anilist_id)
 
-    title = (anime_info or {}).get("title")
-    if not title and seasons_data:
-        title = seasons_data[0].get("title_english") or seasons_data[0].get("title_romaji")
+    seasons_data = _build_season_list(tmdb_id, show)
+
+    title = (anime_info or {}).get("title") or show.get("title") or "Unknown Anime"
 
     return {
         "success": True,
         "anilist_id": anilist_id,
-        "title": title or "Unknown Anime",
+        "title": title,
         "total_seasons": len(seasons_data),
         "seasons": seasons_data,
         "extras": get_show_extras(tmdb_id),
