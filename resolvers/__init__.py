@@ -3,6 +3,7 @@ from .voe import VoeResolver
 from .vidking import VidkingResolver
 from .vidking_test import VidkingTestResolver
 from .movish import MovishResolver
+from .jellyfin import JellyfinResolver
 from .animekai import AnimekaiResolver
 from .animesuge import DirectM3U8Resolver, AsbGamesResolver
 
@@ -18,6 +19,7 @@ ALL_RESOLVERS = [
     VidkingTestResolver,
     VidkingResolver,
     MovishResolver,
+    JellyfinResolver,
     AnimekaiResolver,
     DirectM3U8Resolver,
     AsbGamesResolver,
