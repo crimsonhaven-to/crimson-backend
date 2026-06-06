@@ -178,13 +178,20 @@ async def auth_challenge(body: ChallengeRequest):
 async def auth_register(body: RegisterRequest):
     """Create the account for a public key (proving key possession via the
     signed challenge) and return a session. 409 if the key is already
-    registered — use /auth/login instead."""
-    _verify_signed_challenge(body.public_key, body.challenge, body.signature)
-    pk = body.public_key.lower()
+    registered — use /auth/login instead.
+
+    The account-exists check runs BEFORE the (one-time) challenge is consumed,
+    so a 409 leaves the challenge intact for a /auth/login retry with the same
+    challenge — supporting a frontend that tries register then falls back to
+    login (and vice-versa) on a single challenge."""
+    pk = (body.public_key or "").lower()
+    if not _HEX64.match(pk):
+        raise HTTPException(status_code=400, detail="public_key must be 64 hex chars")
 
     if store.get_account_by_public_key(pk):
         raise HTTPException(status_code=409, detail="Account already exists; use /auth/login")
 
+    _verify_signed_challenge(pk, body.challenge, body.signature)
     account = store.create_account(pk, body.label)
     token, expires_at = store.create_session(account["user_id"])
     store.touch_login(account["user_id"])
@@ -197,14 +204,21 @@ async def auth_register(body: RegisterRequest):
 @router.post("/auth/login", response_model=AuthResponse)
 async def auth_login(body: LoginRequest):
     """Log in to an existing account by signing the challenge. 404 if the public
-    key isn't registered yet — use /auth/register."""
-    _verify_signed_challenge(body.public_key, body.challenge, body.signature)
-    pk = body.public_key.lower()
+    key isn't registered yet — use /auth/register.
+
+    The account-exists check runs BEFORE the (one-time) challenge is consumed,
+    so a 404 leaves the challenge intact for a /auth/register fallback with the
+    same challenge (the common 'link identity' frontend flow: try login, then
+    register the new key)."""
+    pk = (body.public_key or "").lower()
+    if not _HEX64.match(pk):
+        raise HTTPException(status_code=400, detail="public_key must be 64 hex chars")
 
     account = store.get_account_by_public_key(pk)
     if not account:
         raise HTTPException(status_code=404, detail="No account for this key; use /auth/register")
 
+    _verify_signed_challenge(pk, body.challenge, body.signature)
     token, expires_at = store.create_session(account["user_id"])
     store.touch_login(account["user_id"])
     return AuthResponse(
