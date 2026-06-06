@@ -10,7 +10,7 @@ import httpx
 import json
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.requests import Request
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -20,6 +20,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 from scrapers import ALL_SCRAPERS
 from resolvers import ALL_RESOLVERS
 from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
+from resolvers.movish import proxy_fetch as movish_proxy_fetch
+from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
+from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 
 # Configure logging
@@ -663,6 +666,24 @@ async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episo
     finally:
         await scraper.close()
 
+def _public_base_url(request: Request) -> str:
+    """Public base URL of this backend, honoring reverse-proxy forwarded headers.
+
+    Behind a TLS-terminating reverse proxy (our Docker deploy), uvicorn sees a
+    plain HTTP request, so ``request.base_url`` reports ``http://`` — which makes
+    the absolute iframe URLs we emit for the ad-free proxy sources (VidKing Test,
+    Movish) get blocked as mixed content on the HTTPS frontend. Trust
+    ``X-Forwarded-Proto``/``X-Forwarded-Host`` (set by the proxy) so the URL is
+    HTTPS, regardless of uvicorn's --proxy-headers/--forwarded-allow-ips config.
+    """
+    proto = request.headers.get("x-forwarded-proto")
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if proto and host:
+        # X-Forwarded-Proto can be a comma-separated list ("https,http").
+        proto = proto.split(",")[0].strip()
+        return f"{proto}://{host}/"
+    return str(request.base_url)
+
 async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dict]:
     """Resolve embed URLs to direct stream URLs.
 
@@ -688,24 +709,36 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dic
             try:
                 direct_video_url = await matched_resolver.resolve(embed_url)
                 if direct_video_url:
-                    # Determine stream type
-                    if matched_resolver.source_name == "VidKing":
+                    # Decide the stream's shape by the URL the resolver returned,
+                    # NOT by source_name (which is a mutable display label):
+                    #   * /{x}_proxy/h/...  -> ad-stripped player-page proxy
+                    #     (VidKing ad-free, Movish) -> iframe the backend page.
+                    #   * /jellyfin_proxy/... -> a proxied raw stream -> hls/mp4.
+                    #   * anything relative ("/..") is made absolute against the
+                    #     backend base so the frontend (a different origin) loads
+                    #     it from us.
+                    # Resolvers that hand back an absolute third-party URL fall
+                    # through to the generic hls/mp4 (or plain-VidKing iframe).
+                    is_proxy_path = direct_video_url.startswith("/")
+                    abs_url = direct_video_url
+                    if is_proxy_path and base_url:
+                        abs_url = base_url.rstrip("/") + direct_video_url
+
+                    if "_proxy/h/" in direct_video_url or direct_video_url.startswith("/player"):
+                        # Backend-hosted player page (VidKing ad-free / Movish
+                        # player-proxy, or our /player wrapping a Jellyfin stream):
+                        # the frontend just iframes it.
+                        resolved_streams.append({
+                            "source": matched_resolver.source_name,
+                            "type": "iframe",
+                            "url": abs_url
+                        })
+                    elif matched_resolver.source_name == "VidKing":
+                        # Plain VidKing: hand the raw embed to the frontend iframe.
                         resolved_streams.append({
                             "source": matched_resolver.source_name,
                             "type": "iframe",
                             "url": embed_url
-                        })
-                    elif matched_resolver.source_name == "VidKing Test":
-                        # resolve() returns a relative proxy path; make it an
-                        # absolute backend URL so the frontend iframe loads it
-                        # from us (ad-stripped) instead of vidking.net directly.
-                        proxy_url = direct_video_url
-                        if base_url and proxy_url.startswith("/"):
-                            proxy_url = base_url.rstrip("/") + proxy_url
-                        resolved_streams.append({
-                            "source": matched_resolver.source_name,
-                            "type": "iframe",
-                            "url": proxy_url
                         })
                     else:
                         stream_type = "hls" if "m3u8" in direct_video_url.lower() else "mp4"
@@ -916,7 +949,7 @@ async def get_watch_links(request: Request, tmdb_id: int, season_number: int, ep
             fallback_title = show.get("title")
 
     return await build_watch_response(tmdb_id, season_number, episode_number, anilist_id,
-                                      fallback_title, base_url=str(request.base_url))
+                                      fallback_title, base_url=_public_base_url(request))
 
 
 @app.get("/anilist/{anilist_id}")
@@ -997,7 +1030,7 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
 
     # Extra (special/OVA/movie): no numbered season — serve directly (season 1 for URL builders).
     return await build_watch_response(tmdb_id, 1, episode_number, anilist_id,
-                                      base_url=str(request.base_url))
+                                      base_url=_public_base_url(request))
 
 # --- VIDKING AD-FREE PROXY (experimental "vidking_test" source) ---
 @app.api_route("/vidking_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
@@ -1024,6 +1057,89 @@ async def vidking_proxy(request: Request, host: str, path: str):
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     return Response(content=content, status_code=status, media_type=content_type)
+
+
+# --- MOVISH AD-FREE PROXY ("movish" source) ---
+@app.api_route("/movish_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
+async def movish_proxy(request: Request, host: str, path: str):
+    """Same-origin reverse proxy for the Movish player. Downloads the page/asset,
+    sandboxes any embed-provider iframe + neutralises pop-ups, rewrites
+    sub-resource URLs back through this proxy, and serves it.
+
+    Text resources (HTML/JS/CSS, and the CORS-less /embed/api JSON) are buffered,
+    cleaned and rewritten; /v1/play media is streamed straight through with Range
+    passthrough so seeking works and large files aren't held in memory. Scoped to
+    the api.movish.net host allow-list in resolvers.movish (rejects anything else
+    to avoid an open proxy)."""
+    body = await request.body() if request.method == "POST" else None
+    try:
+        status, content_type, headers, payload = await movish_proxy_fetch(
+            host=host,
+            path=path,
+            query_string=request.url.query,
+            method=request.method,
+            body=body,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"Movish proxy upstream error for {host}/{path}: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    # Streaming media (video/binary) — forward Range/length headers.
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- JELLYFIN PROXY ("jellyfin" source) ---
+@app.api_route("/jellyfin_proxy/{path:path}", methods=["GET", "POST"])
+async def jellyfin_proxy(request: Request, path: str):
+    """Authenticated reverse proxy to the user's Jellyfin server. Injects the
+    access token server-side (so it never reaches the browser) and rewrites HLS
+    playlists to flow back through this proxy; media segments / direct files are
+    streamed straight through with Range passthrough. Configured via the
+    JELLYFIN_* env vars (see resolvers.jellyfin)."""
+    body = await request.body() if request.method == "POST" else None
+    try:
+        status, content_type, headers, payload = await jellyfin_proxy_fetch(
+            path=path,
+            query_string=request.url.query,
+            method=request.method,
+            body=body,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"Jellyfin proxy upstream error for {path}: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type, headers=headers)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- BACKEND-HOSTED PLAYER (Crimson-themed hls.js/mp4 player) ---
+@app.get("/player")
+async def player(
+    src: str = Query(..., description="Same-origin stream path to play"),
+    stream_type: str = Query("", alias="type", description="hls or mp4 (inferred if omitted)"),
+    title: str = Query("", description="Optional title"),
+):
+    """Serve a Crimson-themed player for a same-origin proxied stream. Resolvers
+    that return a raw hls/mp4 stream (e.g. Jellyfin) wrap it in this page so the
+    frontend can iframe it like any other source. ``src`` is restricted to
+    same-origin relative paths to prevent embedding arbitrary external content."""
+    if not is_safe_src(src):
+        raise HTTPException(status_code=400, detail="Invalid src (must be a same-origin path)")
+    html = render_player(src=src, stream_type=stream_type, title=title)
+    return Response(content=html, media_type="text/html; charset=utf-8")
 
 
 @app.get("/seasons/{anilist_id}")
@@ -1073,7 +1189,8 @@ async def health_check():
             "database": "connected",
             "entries_count": count,
             "scrapers_available": len(ALL_SCRAPERS),
-            "resolvers_available": len(ALL_RESOLVERS)
+            "resolvers_available": len(ALL_RESOLVERS),
+            "jellyfin_configured": jellyfin_is_configured()
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")

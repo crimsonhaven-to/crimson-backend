@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY api.py .
+COPY player.py .
 COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY metadata_engine ./metadata_engine
@@ -22,5 +23,9 @@ COPY metadata_engine ./metadata_engine
 # Expose FastAPI default port
 EXPOSE 8000
 
-# Run the application with uvicorn
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the application with uvicorn.
+# --proxy-headers + --forwarded-allow-ips=* make uvicorn trust the
+# X-Forwarded-Proto/Host set by our TLS-terminating reverse proxy, so the app
+# sees the real https scheme (otherwise proxied iframe URLs are emitted as http
+# and blocked as mixed content on the https frontend).
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]

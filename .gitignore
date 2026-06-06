@@ -1,5 +1,6 @@
 # local development stuff
 *pycache*
+/.claude
 
 # secrets
 .env
