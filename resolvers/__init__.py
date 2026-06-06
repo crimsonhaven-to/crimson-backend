@@ -17,7 +17,7 @@ ALL_RESOLVERS = [
     VidmolyResolver,
     VoeResolver,
     VidkingTestResolver,
-    # VidkingResolver,   # deprecated — superseded by VidkingTestResolver (ad-free)
+    VidkingResolver,   # deprecated — superseded by VidkingTestResolver (ad-free) but for now I'll re enable it
     MovishResolver,
     JellyfinResolver,
     AnimekaiResolver,
