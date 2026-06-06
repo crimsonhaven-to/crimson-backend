@@ -19,6 +19,7 @@ COPY player.py .
 COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY metadata_engine ./metadata_engine
+COPY account_engine ./account_engine
 
 # Expose FastAPI default port
 EXPOSE 8000

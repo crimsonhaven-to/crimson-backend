@@ -7,8 +7,14 @@ services:
       - "8000:8000"
     environment:
       - TMDB_API_KEY=eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI2ZTRlMWRmMDQzMTQ5NjcxMmZiOGZjMDQ0YzQ4NmM1YiIsIm5iZiI6MTc1Mzk2NzI0MS43OTMsInN1YiI6IjY4OGI2YTg5ZTIxMWI1MmJjNjUxZDUyZCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.99gdXMQZC2allG4aGkXMgrWSZbBZCsn6eGXoGm9EGuE
+      # Accounts DB lives under /app/data (a persisted dir, see volumes below) so
+      # user accounts/favorites/progress survive redeploys and mapping resyncs.
+      - ACCOUNTS_DB=/app/data/accounts.db
+      # Optional: pin a stable secret if you ever sign anything cross-restart.
+      # - PLAYIMDB_PROXY_SECRET=change-me
 
     restart: unless-stopped
 
     volumes:
-      - ./anime_mappings.db:/app/anime_mappings.db # persist database across redeployments
+      - ./anime_mappings.db:/app/anime_mappings.db # persist mapping DB across redeployments
+      - ./data:/app/data                           # persist accounts DB (user data)

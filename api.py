@@ -25,6 +25,7 @@ from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
+from account_engine import router as account_router, store as account_store
 
 # Configure logging
 logging.basicConfig(
@@ -84,8 +85,9 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up FastAPI application...")
     
-    # Initialize database
+    # Initialize databases
     db_engine.init_db()
+    account_store.init_db()  # separate accounts.db (survives mapping resyncs)
     
     # Run initial sync
     try:
@@ -139,6 +141,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Account system (mnemonic/Ed25519 sign-in, favorites, watch progress).
+app.include_router(account_router)
 
 # --- DATABASE HELPER FUNCTIONS ---
 def get_db_connection():
