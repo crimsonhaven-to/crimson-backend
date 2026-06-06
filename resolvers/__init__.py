@@ -3,6 +3,7 @@ from .voe import VoeResolver
 from .vidking import VidkingResolver
 from .vidking_test import VidkingTestResolver
 from .movish import MovishResolver
+from .playimdb import PlayimdbResolver
 from .jellyfin import JellyfinResolver
 from .animekai import AnimekaiResolver
 from .animesuge import DirectM3U8Resolver, AsbGamesResolver
@@ -19,6 +20,7 @@ ALL_RESOLVERS = [
     VidkingTestResolver,
     VidkingResolver,   # deprecated — superseded by VidkingTestResolver (ad-free) but for now I'll re enable it
     MovishResolver,
+    PlayimdbResolver,
     JellyfinResolver,
     AnimekaiResolver,
     DirectM3U8Resolver,

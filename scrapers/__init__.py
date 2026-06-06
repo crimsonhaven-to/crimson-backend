@@ -4,6 +4,7 @@ from .voe_scraper import VoeScraper
 from .vidking_scraper import VidkingScraper
 from .vidking_test_scraper import VidkingTestScraper
 from .movish_scraper import MovishScraper
+from .playimdb_scraper import PlayimdbScraper
 from .jellyfin_scraper import JellyfinScraper
 from .animekai_scraper import AnimekaiScraper
 from .animesuge_scraper import AnimeSugeScraper
@@ -14,6 +15,7 @@ ALL_SCRAPERS = [
     VidkingScraper,  # deprecated — superseded by VidkingTestScraper (ad-free, tested) but for now I'll re enable it
     VidkingTestScraper,
     MovishScraper,
+    PlayimdbScraper,
     JellyfinScraper,
     AnimekaiScraper,
     AnimeSugeScraper,
