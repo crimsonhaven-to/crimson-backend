@@ -664,6 +664,24 @@ async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episo
     finally:
         await scraper.close()
 
+def _public_base_url(request: Request) -> str:
+    """Public base URL of this backend, honoring reverse-proxy forwarded headers.
+
+    Behind a TLS-terminating reverse proxy (our Docker deploy), uvicorn sees a
+    plain HTTP request, so ``request.base_url`` reports ``http://`` — which makes
+    the absolute iframe URLs we emit for the ad-free proxy sources (VidKing Test,
+    Movish) get blocked as mixed content on the HTTPS frontend. Trust
+    ``X-Forwarded-Proto``/``X-Forwarded-Host`` (set by the proxy) so the URL is
+    HTTPS, regardless of uvicorn's --proxy-headers/--forwarded-allow-ips config.
+    """
+    proto = request.headers.get("x-forwarded-proto")
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if proto and host:
+        # X-Forwarded-Proto can be a comma-separated list ("https,http").
+        proto = proto.split(",")[0].strip()
+        return f"{proto}://{host}/"
+    return str(request.base_url)
+
 async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dict]:
     """Resolve embed URLs to direct stream URLs.
 
@@ -917,7 +935,7 @@ async def get_watch_links(request: Request, tmdb_id: int, season_number: int, ep
             fallback_title = show.get("title")
 
     return await build_watch_response(tmdb_id, season_number, episode_number, anilist_id,
-                                      fallback_title, base_url=str(request.base_url))
+                                      fallback_title, base_url=_public_base_url(request))
 
 
 @app.get("/anilist/{anilist_id}")
@@ -998,7 +1016,7 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
 
     # Extra (special/OVA/movie): no numbered season — serve directly (season 1 for URL builders).
     return await build_watch_response(tmdb_id, 1, episode_number, anilist_id,
-                                      base_url=str(request.base_url))
+                                      base_url=_public_base_url(request))
 
 # --- VIDKING AD-FREE PROXY (experimental "vidking_test" source) ---
 @app.api_route("/vidking_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
