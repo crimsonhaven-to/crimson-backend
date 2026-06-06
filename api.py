@@ -10,7 +10,7 @@ import httpx
 import json
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.requests import Request
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -19,6 +19,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 # Import all scrapers & resolvers + metadata engine
 from scrapers import ALL_SCRAPERS
 from resolvers import ALL_RESOLVERS
+from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
 from metadata_engine.db_handler import MappingDatabaseEngine
 
 # Configure logging
@@ -662,8 +663,13 @@ async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episo
     finally:
         await scraper.close()
 
-async def resolve_streams(embed_urls: List[str]) -> List[Dict]:
-    """Resolve embed URLs to direct stream URLs"""
+async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dict]:
+    """Resolve embed URLs to direct stream URLs.
+
+    ``base_url`` is the public base of this backend (e.g. https://host/). It is
+    used to turn the VidKing Test resolver's relative proxy path into an
+    absolute iframe src the frontend can load.
+    """
     if not embed_urls:
         return []
     
@@ -688,6 +694,18 @@ async def resolve_streams(embed_urls: List[str]) -> List[Dict]:
                             "source": matched_resolver.source_name,
                             "type": "iframe",
                             "url": embed_url
+                        })
+                    elif matched_resolver.source_name == "VidKing Test":
+                        # resolve() returns a relative proxy path; make it an
+                        # absolute backend URL so the frontend iframe loads it
+                        # from us (ad-stripped) instead of vidking.net directly.
+                        proxy_url = direct_video_url
+                        if base_url and proxy_url.startswith("/"):
+                            proxy_url = base_url.rstrip("/") + proxy_url
+                        resolved_streams.append({
+                            "source": matched_resolver.source_name,
+                            "type": "iframe",
+                            "url": proxy_url
                         })
                     else:
                         stream_type = "hls" if "m3u8" in direct_video_url.lower() else "mp4"
@@ -841,11 +859,15 @@ async def get_season_details(tmdb_id: int, season_number: int):
     }
 
 async def build_watch_response(tmdb_id: int, season_number: int, episode_number: int,
-                               anilist_id: Optional[int], fallback_title: Optional[str] = None) -> Dict:
+                               anilist_id: Optional[int], fallback_title: Optional[str] = None,
+                               base_url: str = "") -> Dict:
     """Run every scraper for an episode, resolve the embeds, and shape the response.
 
     Works without an AniList mapping (e.g. TMDB-only seasons of long shows): VidKing
     plays off the TMDB id, and title-based scrapers fall back to the TMDB show title.
+
+    ``base_url`` (the backend's public base) is threaded into stream resolution so
+    the VidKing Test ad-free proxy can emit an absolute iframe URL.
     """
     anilist_data = {}
     if anilist_id:
@@ -866,7 +888,7 @@ async def build_watch_response(tmdb_id: int, season_number: int, episode_number:
         all_embeds.extend(embed_list)
     unique_embeds = list(dict.fromkeys(all_embeds))
 
-    streams = await resolve_streams(unique_embeds)
+    streams = await resolve_streams(unique_embeds, base_url=base_url)
 
     return {
         "success": True,
@@ -879,7 +901,7 @@ async def build_watch_response(tmdb_id: int, season_number: int, episode_number:
     }
 
 @app.get("/watch/{tmdb_id}/{season_number}/{episode_number}")
-async def get_watch_links(tmdb_id: int, season_number: int, episode_number: int):
+async def get_watch_links(request: Request, tmdb_id: int, season_number: int, episode_number: int):
     """Get streaming links. Works even for TMDB seasons with no AniList mapping
     (long shows like Naruto) — VidKing plays off the TMDB id."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
@@ -893,7 +915,8 @@ async def get_watch_links(tmdb_id: int, season_number: int, episode_number: int)
                 show = await fetch_tmdb_show(client, tmdb_id)
             fallback_title = show.get("title")
 
-    return await build_watch_response(tmdb_id, season_number, episode_number, anilist_id, fallback_title)
+    return await build_watch_response(tmdb_id, season_number, episode_number, anilist_id,
+                                      fallback_title, base_url=str(request.base_url))
 
 
 @app.get("/anilist/{anilist_id}")
@@ -958,7 +981,7 @@ async def get_anime_info(tmdb_id: int, season: int = Query(1, ge=1, description=
     }
 
 @app.get("/watch/{anilist_id}/{episode_number}")
-async def deprecated_watch(anilist_id: int, episode_number: int, season_part: int = Query(1)):
+async def deprecated_watch(request: Request, anilist_id: int, episode_number: int, season_part: int = Query(1)):
     """
     Watch by anilist_id. TV seasons redirect to the canonical /watch route;
     extras (specials/OVAs/movies) have no TMDB season number, so they are served
@@ -973,7 +996,35 @@ async def deprecated_watch(anilist_id: int, episode_number: int, season_part: in
         return RedirectResponse(url=f"/watch/{tmdb_id}/{season_number}/{episode_number}", status_code=301)
 
     # Extra (special/OVA/movie): no numbered season — serve directly (season 1 for URL builders).
-    return await build_watch_response(tmdb_id, 1, episode_number, anilist_id)
+    return await build_watch_response(tmdb_id, 1, episode_number, anilist_id,
+                                      base_url=str(request.base_url))
+
+# --- VIDKING AD-FREE PROXY (experimental "vidking_test" source) ---
+@app.api_route("/vidking_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
+async def vidking_proxy(request: Request, host: str, path: str):
+    """Same-origin reverse proxy that downloads a VidKing page/asset, strips its
+    ads, rewrites its sub-resource URLs back through this proxy, and serves it.
+
+    This is what lets the frontend iframe the VidKing player from our own origin
+    without the ad/pop-under layer. Scoped to the VidKing/Videasy host allow-list
+    in resolvers.vidking_test (rejects anything else to avoid an open proxy)."""
+    body = await request.body() if request.method == "POST" else None
+    try:
+        status, content, content_type = await vidking_proxy_fetch(
+            host=host,
+            path=path,
+            query_string=request.url.query,
+            method=request.method,
+            body=body,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"VidKing proxy upstream error for {host}/{path}: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    return Response(content=content, status_code=status, media_type=content_type)
+
 
 @app.get("/seasons/{anilist_id}")
 async def get_anime_seasons(anilist_id: int):
