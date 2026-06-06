@@ -1,6 +1,9 @@
 # local development stuff
 *pycache*
-*.db
 
 # secrets
 .env
+
+# temporary until DB generation is done
+*.db
+*.db-journal
