@@ -109,6 +109,56 @@ def _match_episode(episodes: list, ident: Optional[dict], target_names: list):
 
 _ROMAN = {"ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8}
 
+# Trailing season indicators stripped from a search title so a per-season AniList
+# title ("Show Season 2", "Show 2nd Season", "Show II", "Show Part 2") still finds
+# a base-named Jellyfin Series ("Show"). Mirrors _season_from_name's vocabulary.
+_SEASON_SUFFIX_PATTERNS = [
+    r"\s*[:\-]?\s*season\s*\d{1,2}\s*$",
+    r"\s*\d{1,2}(?:st|nd|rd|th)\s+season\s*$",
+    r"\s*[:\-]?\s*(?:part|cour)\s*\d{1,2}\s*$",
+    r"\s+(?:ii|iii|iv|v|vi|vii|viii)\s*$",
+]
+
+
+def _strip_season_suffix(title: str) -> Optional[str]:
+    """Return ``title`` with a trailing season indicator removed, or None if it
+    carries none (so callers can skip a redundant duplicate search). Bare
+    trailing numbers are intentionally NOT stripped — too many titles legitimately
+    end in one (e.g. "86")."""
+    if not title:
+        return None
+    t = title.strip()
+    for pat in _SEASON_SUFFIX_PATTERNS:
+        stripped = re.sub(pat, "", t, flags=re.I).strip()
+        if stripped and stripped != t:
+            return stripped
+    return None
+
+
+def _search_titles(media_ctx: dict) -> list[str]:
+    """Ordered, deduped list of titles to search Jellyfin by.
+
+    Includes the primary/english/romaji titles AND their season-suffix-stripped
+    forms, so a season-specific title ("... Season 2") still discovers the base
+    Jellyfin series in a multi-season library. Capped to keep request count sane.
+    """
+    titles: list[str] = []
+    for key in ("title", "title_english", "title_romaji"):
+        v = media_ctx.get(key)
+        if v:
+            titles.append(v)
+            base = _strip_season_suffix(v)
+            if base:
+                titles.append(base)
+    # Dedupe (case-insensitively) while preserving order.
+    seen, ordered = set(), []
+    for t in titles:
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
+            ordered.append(t)
+    return ordered[:4]
+
 
 def _season_from_name(name: str) -> Optional[int]:
     """Best-effort season number parsed from a Jellyfin series name.
@@ -188,7 +238,7 @@ class JellyfinScraper(BaseAnimeScraper):
             return None
 
         tmdb_id = media_ctx.get("tmdb_id")
-        title = media_ctx.get("title")
+        search_titles = _search_titles(media_ctx)
 
         try:
             _token, uid = await _ensure_auth()
@@ -221,15 +271,17 @@ class JellyfinScraper(BaseAnimeScraper):
                     pass
 
             # 2) By title — catches per-season Series Jellyfin didn't tag with
-            #    the show's TMDB id (e.g. matched via TVDB).
-            if title:
+            #    the show's TMDB id (e.g. matched via TVDB). Searches several
+            #    title variants (incl. season-suffix-stripped) so a per-season
+            #    title like "... Season 2" still finds the base-named series.
+            for term in search_titles:
                 data = await api_get(
                     "/Items",
                     {
                         "userId": uid,
                         "recursive": "true",
                         "includeItemTypes": "Series",
-                        "searchTerm": title,
+                        "searchTerm": term,
                         "fields": "ProviderIds",
                         "limit": 30,
                     },
@@ -238,7 +290,7 @@ class JellyfinScraper(BaseAnimeScraper):
                     candidates.setdefault(it.get("Id"), it)
 
             if not candidates:
-                print(f"[JellyfinScraper] No series found (tmdb={tmdb_id}, title={title!r}).")
+                print(f"[JellyfinScraper] No series found (tmdb={tmdb_id}, titles={search_titles!r}).")
                 return None
 
             self._candidates = [c for c in candidates.values() if c.get("Id")]
