@@ -57,8 +57,14 @@ class AccountStore:
 
     # -- connection / schema --------------------------------------------
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        # WAL + busy timeout so concurrent API workers (and multiple replicas
+        # sharing the accounts volume) can read/write without "database is
+        # locked"; foreign keys on for the ON DELETE CASCADE relationships.
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 

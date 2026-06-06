@@ -2,7 +2,7 @@ import sqlite3
 import asyncio
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Tuple
 from contextlib import asynccontextmanager
 
@@ -22,6 +22,7 @@ from resolvers import ALL_RESOLVERS
 from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
 from resolvers.movish import proxy_fetch as movish_proxy_fetch
 from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
+from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
@@ -34,22 +35,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _utcnow_iso() -> str:
+    """Current UTC time as a naive ISO-8601 string.
+
+    ``datetime.utcnow()`` is deprecated (and slated for removal), so we derive
+    UTC from a tz-aware ``now`` but drop the offset to keep the exact same
+    ``YYYY-MM-DDTHH:MM:SS.ffffff`` shape the api_cache rows were written with —
+    so lexicographic ``expires_at`` comparisons stay correct across an upgrade.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
 # Load environment variables
 load_dotenv()
 
 # Configuration
 class Config:
     TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-    DB_NAME = "anime_mappings.db"
+    # Path to the TMDB<->AniList mapping + api_cache DB. Override (e.g. to point
+    # at a persisted volume) with MAPPING_DB; defaults to the repo-local file.
+    DB_NAME = os.getenv("MAPPING_DB", "anime_mappings.db")
     CACHE_TTL_SECONDS = 86400  # 24 hours
     TRENDING_CACHE_TTL_SECONDS = 21600  # 6 hours
     MAX_CONCURRENT_REQUESTS = 10
     REQUEST_TIMEOUT = 30.0
     MAX_RETRIES = 3
     RETRY_BACKOFF_FACTOR = 1.0
-    
-    # CORS Origins
-    ALLOWED_ORIGINS = [
+    # How long a sqlite call waits for a competing writer before giving up.
+    SQLITE_BUSY_TIMEOUT = float(os.getenv("SQLITE_BUSY_TIMEOUT", "30"))
+
+    # Only the replica with this set to true runs the periodic Fribb resync.
+    # The sync rebuilds the mapping tables wholesale, so running it on every
+    # replica in a Docker Swarm is wasteful and causes write contention — keep
+    # it enabled on exactly one replica (see README "Deploying to Docker Swarm").
+    RUN_DB_SYNC = os.getenv("RUN_DB_SYNC", "true").lower() not in ("0", "false", "no")
+
+    # CORS Origins. Overridable via the ALLOWED_ORIGINS env var (comma-separated)
+    # so the deploy can lock these down without a code change; falls back to the
+    # built-in dev + crimsonhaven.to list.
+    _DEFAULT_ORIGINS = [
         "http://localhost",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
@@ -61,7 +85,10 @@ class Config:
         "https://www.crimsonhaven.to",
         "https://dev-backend.crimsonhaven.to",
     ]
-    
+    ALLOWED_ORIGINS = [
+        o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()
+    ] or _DEFAULT_ORIGINS
+
     @classmethod
     def validate(cls):
         if not cls.TMDB_API_KEY:
@@ -85,43 +112,50 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up FastAPI application...")
     
-    # Initialize databases
+    # Initialize databases (idempotent — safe on every replica).
     db_engine.init_db()
     account_store.init_db()  # separate accounts.db (survives mapping resyncs)
-    
-    # Run initial sync
-    try:
-        await db_engine.sync_database_async()
-        logger.info("Initial database sync completed")
-    except Exception as e:
-        logger.error(f"Initial database sync failed: {e}")
-    
-    # Start scheduler for periodic sync. BackgroundScheduler runs jobs in a worker
-    # thread with no running event loop, so the job spins up its own loop.
-    def _scheduled_sync():
-        try:
-            asyncio.run(db_engine.sync_database_async())
-        except Exception as e:
-            logger.error(f"Scheduled sync failed: {e}")
 
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        _scheduled_sync,
-        trigger=IntervalTrigger(hours=24),
-        id="db_sync_job",
-        replace_existing=True
-    )
-    scheduler.start()
-    logger.info("Background scheduler started")
-    
-    # Store scheduler in app state for cleanup
-    app.state.scheduler = scheduler
-    
+    app.state.scheduler = None
+
+    # The Fribb resync rebuilds the mapping tables wholesale. In a multi-replica
+    # Swarm deploy only ONE replica should own it (RUN_DB_SYNC), otherwise every
+    # replica downloads + rebuilds in lockstep, wasting bandwidth and contending
+    # on the shared DB file. Other replicas just serve from the synced DB.
+    if not Config.RUN_DB_SYNC:
+        logger.info("RUN_DB_SYNC is disabled — this replica will not run the mapping resync")
+    else:
+        # Run initial sync
+        try:
+            await db_engine.sync_database_async()
+            logger.info("Initial database sync completed")
+        except Exception as e:
+            logger.error(f"Initial database sync failed: {e}")
+
+        # Start scheduler for periodic sync. BackgroundScheduler runs jobs in a
+        # worker thread with no running event loop, so the job spins up its own.
+        def _scheduled_sync():
+            try:
+                asyncio.run(db_engine.sync_database_async())
+            except Exception as e:
+                logger.error(f"Scheduled sync failed: {e}")
+
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(
+            _scheduled_sync,
+            trigger=IntervalTrigger(hours=24),
+            id="db_sync_job",
+            replace_existing=True
+        )
+        scheduler.start()
+        logger.info("Background scheduler started")
+        app.state.scheduler = scheduler
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down...")
-    if hasattr(app.state, 'scheduler'):
+    if getattr(app.state, 'scheduler', None) is not None:
         app.state.scheduler.shutdown()
     logger.info("Shutdown complete")
 
@@ -147,9 +181,19 @@ app.include_router(account_router)
 
 # --- DATABASE HELPER FUNCTIONS ---
 def get_db_connection():
-    """Get database connection with row factory"""
-    conn = sqlite3.connect(Config.DB_NAME)
+    """Get database connection with row factory.
+
+    WAL mode + a busy timeout let many concurrent readers coexist with the
+    occasional writer (the on-demand tmdb_shows/api_cache upserts, and the
+    periodic mapping resync) without raising "database is locked" — important
+    because FastAPI serves these sqlite calls from a thread pool and, in a
+    multi-replica deploy, several workers hit the same DB file at once.
+    """
+    conn = sqlite3.connect(Config.DB_NAME, timeout=Config.SQLITE_BUSY_TIMEOUT)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=%d" % int(Config.SQLITE_BUSY_TIMEOUT * 1000))
     return conn
 
 def get_anilist_id(tmdb_id: int, season_number: int) -> Optional[int]:
@@ -357,7 +401,7 @@ async def get_cached_response(cache_key: str) -> Optional[Dict]:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT response_json FROM api_cache WHERE cache_key = ? AND expires_at > ?",
-                    (cache_key, datetime.utcnow().isoformat())
+                    (cache_key, _utcnow_iso())
                 )
                 row = cursor.fetchone()
                 return json.loads(row["response_json"]) if row else None
@@ -374,7 +418,7 @@ async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Con
         return
     
     try:
-        expires_at = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat()
+        expires_at = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl_seconds)).isoformat()
         payload = json.dumps(data)
         
         def _insert():
@@ -1238,6 +1282,40 @@ async def playimdb_proxy(request: Request):
         raise HTTPException(status_code=403, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"PlayIMDb proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- ANIMESUGE AD-FREE STREAM PROXY ("animesuge" source) ---
+@app.get("/animesuge_proxy")
+async def animesuge_proxy(request: Request):
+    """Signed, same-origin proxy for the AnimeSuge source. Fetches a signed
+    upstream direct file (mp4/m3u8) server-side, rewrites HLS playlists so
+    sub-resources flow back through this proxy, and streams media through with
+    Range passthrough.
+
+    The direct-file CDN host can rotate, so instead of a host allow-list this
+    proxy verifies an HMAC on the ``u`` URL (see resolvers.animesuge) and refuses
+    anything unsigned — closing the open-proxy / SSRF hole. No AnimeSuge or
+    third-party player/ad code is ever involved; the scraper extracts the raw
+    direct file and the resolver wraps it in /player."""
+    url = request.query_params.get("u")
+    sig = request.query_params.get("s")
+    try:
+        status, content_type, headers, payload = await animesuge_proxy_fetch(
+            url=url,
+            sig=sig,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"AnimeSuge proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     if isinstance(payload, (bytes, bytearray)):

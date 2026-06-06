@@ -84,7 +84,14 @@ class MappingDatabaseEngine:
         return datetime.now(timezone.utc).isoformat()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_name)
+        # WAL + a generous busy timeout so the wholesale resync (BEGIN; DELETE;
+        # bulk INSERT) can proceed while the API serves concurrent readers from
+        # the same file without either side hitting "database is locked".
+        conn = sqlite3.connect(self.db_name, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
 
     # ------------------------------------------------------------------ #
     # Schema
