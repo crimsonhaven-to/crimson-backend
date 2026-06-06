@@ -92,6 +92,31 @@ Retrieve streaming links for a specific episode.
 #### GET /anilist/{anilist_id}
 Reverse lookup to find the corresponding TMDB ID and season number.
 
+#### GET /catalogue
+lists every anime in the local DB by category, with zero external API calls (pure DB reads, so no rate-limit risk). Verified: 6,809 items.
+
+Response shape:
+{
+  "success": true,
+  "count": 6809,          // animes returned (after optional filter)
+  "total": 6809,          // full catalogue size
+  "categories": [ {"category":"TV","count":4007}, {"category":"OVA","count":1011}, ... ],
+  "animes": [
+    {
+      "anilist_id": 158287,
+      "title": "...",            // english → romaji → native
+      "title_romaji": "...",
+      "title_english": "...",
+      "category": "TV",          // anime_type: TV / OVA / MOVIE / TV_SHORT / ONA / SPECIAL / MUSIC / UNKNOWN
+      "year": 2025,
+      "tmdb_id": 215615,         // for /info & /watch
+      "season_number": 1,        // null for movies/OVAs/specials
+      "poster": null             // from tmdb_shows when available (sparse, since lazily populated)
+    }
+  ]
+}
+
+
 ### Legacy/Compatibility Endpoints
 We maintain these for our older scrolls and frontend versions.
 
