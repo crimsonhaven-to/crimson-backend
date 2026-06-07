@@ -26,6 +26,7 @@ from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configure
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
+from supporters_engine import router as supporters_router, store as supporters_store
 from db_pool import get_pool, close_pool
 
 # Configure logging
@@ -112,6 +113,7 @@ async def lifespan(app: FastAPI):
     # Initialize databases (idempotent — safe on every replica).
     db_engine.init_db()
     account_store.init_db()  # account tables (untouched by mapping resyncs)
+    supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
 
     app.state.scheduler = None
 
@@ -176,6 +178,9 @@ app.add_middleware(
 
 # Account system (mnemonic/Ed25519 sign-in, favorites, watch progress).
 app.include_router(account_router)
+
+# Ko-fi supporters (webhook ingest + public "Lumi's Loved Mortals" list).
+app.include_router(supporters_router)
 
 # --- DATABASE HELPER FUNCTIONS ---
 def get_db_connection():

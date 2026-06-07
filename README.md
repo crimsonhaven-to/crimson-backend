@@ -268,6 +268,70 @@ poster?, position_seconds?, duration_seconds?, status? }`.
 
 ---
 
+## ☕ Ko-fi Supporters ("Lumi's Loved Mortals")
+
+A public list of Ko-fi supporters, fed automatically by Ko-fi's webhook — **no
+email scanning, no polling**. Ko-fi has no "list my supporters" API; it only
+*pushes* a webhook to us when a payment happens (tip / membership / commission /
+shop order) and never on cancellation. So the backend keeps an append-only ledger
+of every payment event and derives the public list by aggregating it.
+
+### Setup (one-time)
+
+1. Generate a token and set it: `KOFI_VERIFICATION_TOKEN=<your token>` (see
+   `.env.example`). The token comes from Ko-fi itself.
+2. In Ko-fi → **Settings → Advanced → Webhooks / API**, copy the *Verification
+   Token* into that env var and set the **Webhook URL** to
+   `https://<your-backend>/kofi/webhook`.
+3. That's it. Every future payment POSTs to that URL and appears on `/supporters`.
+   (Past payments aren't back-filled — Ko-fi only sends new events.)
+
+### Endpoints
+
+| Method | Endpoint | Auth | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/kofi/webhook` | Ko-fi token | **Ko-fi only** — receives payment events. Verifies `verification_token`; idempotent. Do not call from the frontend. |
+| `GET`  | `/supporters` | – | Public list for the page. `?include_lapsed=true` to show lapsed subscribers; `?limit=N` to cap. |
+| `GET`  | `/supporters/stats` | – | `{ supporter_count, total_raised, currency }` for a page header. |
+
+`GET /supporters` returns (most-recent payment first, **never any email**):
+
+```jsonc
+{
+  "success": true,
+  "count": 2,
+  "supporters": [
+    {
+      "name": "Jo Example",          // from_name, or "Anonymous"
+      "message": "Good luck Lumi!",  // the supporter's public message (may be null)
+      "total_amount": 9.0,           // summed across this supporter's payments
+      "currency": "USD",
+      "is_subscription": true,       // monthly member vs. one-time tipper
+      "tier_name": "Bronze",         // membership tier (null for one-off tips)
+      "type": "Subscription",        // latest event type
+      "contribution_count": 3,
+      "first_seen_at": "2026-03-01T10:00:00Z",
+      "last_payment_at": "2026-06-01T10:00:00Z"
+    }
+  ]
+}
+```
+
+### Expand / shrink behaviour
+
+- **Expand** — automatic: each new payment upserts the supporter (a subscription
+  renewal just advances their `last_payment_at`).
+- **Shrink** — Ko-fi gives no cancellation event, so a *subscriber* is listed only
+  while their last payment is within `KOFI_ACTIVE_WINDOW_DAYS` (default **35** =
+  one cycle + grace). One-time tippers are kept forever. Pass `?include_lapsed=true`
+  to override. Identity is grouped by email (server-side only), falling back to
+  display name, so a member's monthly payments collapse into one entry.
+
+> Supporters who chose to keep a donation private (`is_public = false` on Ko-fi)
+> are recorded but excluded from the public list.
+
+---
+
 ## 🏗 Architecture
 
 - **`api.py`**: Main entry point, routing, and lifecycle management.
@@ -276,6 +340,7 @@ poster?, position_seconds?, duration_seconds?, status? }`.
 - **`scrapers/`**: Modular providers that find video embeds on streaming sites.
 - **`resolvers/`**: Tools that extract raw video links from those embeds.
 - **`account_engine/`**: Mnemonic (Ed25519) sign-in, favorites and watch progress. Self-contained crypto (`ed25519.py`, no native deps), PostgreSQL store (`db.py`, via the shared `db_pool`), and the API router (`routes.py`).
+- **`supporters_engine/`**: Ko-fi supporters ("Lumi's Loved Mortals"). Webhook ingest into an append-only ledger plus the derived public list, as a PostgreSQL store (`db.py`) + API router (`routes.py`) — same shape as the account engine.
 - **`player.py`**: The logic for our built-in HTML5 video player.
 
 ### Extending the Engine
