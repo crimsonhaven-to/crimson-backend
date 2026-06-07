@@ -25,6 +25,7 @@ COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY metadata_engine ./metadata_engine
 COPY account_engine ./account_engine
+COPY supporters_engine ./supporters_engine
 
 # Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
 # container is stateless and needs no writable data volume.
