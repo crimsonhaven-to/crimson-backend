@@ -249,7 +249,8 @@ Save `session_token` securely; send it as `Authorization: Bearer <session_token>
   ```
   `status` is optional — the server marks `completed` automatically when `position/duration ≥ 0.9`, else `in_progress`. Call this periodically during playback and on pause/exit. → `{ success, progress }`
 - `GET /account/progress?status=in_progress|completed` → `{ success, count, progress:[...] }`
-- `GET /account/continue-watching` → `{ success, count, items:[...] }` — in-progress episodes, most-recent first (build a “Continue Watching” row).
+- `GET /account/continue-watching` → `{ success, count, items:[...] }` — in-progress episodes only, most-recent first (build a “Continue Watching” row).
+- `GET /account/recent?limit=20` → `{ success, count, items:[...] }` — recently-watched episodes of **any** status (in-progress **and** completed), most-recent first (build a “Recent” / watch-history row that survives finishing an episode).
 - `DELETE /account/progress?item_key=&tmdb_id=&anilist_id=&season_number=&episode_number=` → remove one. 404 if not found.
 
 ---
@@ -280,4 +281,4 @@ Save `session_token` securely; send it as `Authorization: Bearer <session_token>
 | Get challenge | `POST /auth/challenge` |
 | Register / Login | `POST /auth/register` · `POST /auth/login` |
 | Favorites | `GET/POST/DELETE /account/favorites` |
-| Progress / Continue | `GET/POST/DELETE /account/progress` · `GET /account/continue-watching` |
+| Progress / Continue / Recent | `GET/POST/DELETE /account/progress` · `GET /account/continue-watching` · `GET /account/recent` |
