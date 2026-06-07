@@ -20,16 +20,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application code.
 COPY api.py .
 COPY player.py .
+COPY db_pool.py .
 COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY metadata_engine ./metadata_engine
 COPY account_engine ./account_engine
 
-# Run as a non-root user. /app (mapping DB + its -wal/-shm) and /app/data
-# (accounts DB) must be writable; chowning them in the image means a freshly
-# created named volume mounted there inherits this ownership.
+# Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
+# container is stateless and needs no writable data volume.
 RUN useradd --create-home --uid 10001 appuser \
-    && mkdir -p /app/data \
     && chown -R appuser:appuser /app
 USER appuser
 

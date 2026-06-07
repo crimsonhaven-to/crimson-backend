@@ -1,9 +1,9 @@
 """
 Metadata mapping engine.
 
-Builds the local SQLite mapping between TMDB tv ids and AniList ids using the
+Builds the PostgreSQL mapping between TMDB tv ids and AniList ids using the
 Fribb anime-lists dataset (https://github.com/Fribb/anime-lists) enriched with
-AniList titles.
+AniList titles. Storage is the shared connection pool (see db_pool).
 
 Design
 ------
@@ -24,13 +24,14 @@ applied last and always wins -- the single maintenance lever for the long tail.
 import asyncio
 import json
 import os
-import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+from db_pool import get_connection
 
 _THIS_DIR = Path(__file__).resolve().parent
 
@@ -45,6 +46,8 @@ class MappingDatabaseEngine:
     ANILIST_CHUNK_DELAY = 0.7  # seconds between chunks (rate-limit friendly)
 
     def __init__(self, db_name: str = "anime_mappings.db", tmdb_api_key: Optional[str] = None):
+        # db_name is retained for call-site compatibility but ignored: storage is
+        # now the shared PostgreSQL pool, configured via DATABASE_URL (see db_pool).
         self.db_name = db_name
         self.tmdb_api_key = tmdb_api_key or os.getenv("TMDB_API_KEY")
 
@@ -83,120 +86,113 @@ class MappingDatabaseEngine:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def _connect(self) -> sqlite3.Connection:
-        # WAL + a generous busy timeout so the wholesale resync (BEGIN; DELETE;
-        # bulk INSERT) can proceed while the API serves concurrent readers from
-        # the same file without either side hitting "database is locked".
-        conn = sqlite3.connect(self.db_name, timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        return conn
+    def _connect(self):
+        # Borrow a pooled PostgreSQL connection (dict rows; the transaction is
+        # committed on a clean `with` exit and rolled back on exception). MVCC
+        # means the wholesale resync's readers see the pre-DELETE snapshot until
+        # the rebuild transaction commits — no "database is locked" contention.
+        return get_connection()
 
     # ------------------------------------------------------------------ #
     # Schema
     # ------------------------------------------------------------------ #
     def init_db(self):
         """Create the schema (idempotent) and drop obsolete tables."""
-        conn = self._connect()
-        cursor = conn.cursor()
+        with self._connect() as conn:
+            cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sync_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sync_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
             )
-            """
-        )
 
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS anime_entries (
-                anilist_id    INTEGER PRIMARY KEY,
-                mal_id        INTEGER,
-                title_romaji  TEXT,
-                title_english TEXT,
-                title_native  TEXT,
-                anime_type    TEXT,
-                start_year    INTEGER,
-                last_synced   TIMESTAMP
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS anime_entries (
+                    anilist_id    INTEGER PRIMARY KEY,
+                    mal_id        INTEGER,
+                    title_romaji  TEXT,
+                    title_english TEXT,
+                    title_native  TEXT,
+                    anime_type    TEXT,
+                    start_year    INTEGER,
+                    last_synced   TEXT
+                )
+                """
             )
-            """
-        )
 
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tmdb_shows (
-                tmdb_id        INTEGER PRIMARY KEY,
-                title          TEXT,
-                overview       TEXT,
-                poster_path    TEXT,
-                backdrop_path  TEXT,
-                first_air_date TEXT
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tmdb_shows (
+                    tmdb_id        INTEGER PRIMARY KEY,
+                    title          TEXT,
+                    overview       TEXT,
+                    poster_path    TEXT,
+                    backdrop_path  TEXT,
+                    first_air_date TEXT
+                )
+                """
             )
-            """
-        )
 
-        # One AniList id per real TMDB season (season_number >= 1).
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tmdb_seasons (
-                tmdb_id       INTEGER,
-                season_number INTEGER,
-                anilist_id    INTEGER NOT NULL,
-                PRIMARY KEY (tmdb_id, season_number),
-                FOREIGN KEY (anilist_id) REFERENCES anime_entries(anilist_id)
+            # One AniList id per real TMDB season (season_number >= 1).
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tmdb_seasons (
+                    tmdb_id       INTEGER,
+                    season_number INTEGER,
+                    anilist_id    INTEGER NOT NULL,
+                    PRIMARY KEY (tmdb_id, season_number),
+                    FOREIGN KEY (anilist_id) REFERENCES anime_entries(anilist_id)
+                )
+                """
             )
-            """
-        )
 
-        # Specials / OVAs / movies (and season-collision losers) tied to a show.
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tmdb_extras (
-                tmdb_id    INTEGER,
-                anilist_id INTEGER NOT NULL,
-                anime_type TEXT,
-                PRIMARY KEY (tmdb_id, anilist_id),
-                FOREIGN KEY (anilist_id) REFERENCES anime_entries(anilist_id)
+            # Specials / OVAs / movies (and season-collision losers) tied to a show.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tmdb_extras (
+                    tmdb_id    INTEGER,
+                    anilist_id INTEGER NOT NULL,
+                    anime_type TEXT,
+                    PRIMARY KEY (tmdb_id, anilist_id),
+                    FOREIGN KEY (anilist_id) REFERENCES anime_entries(anilist_id)
+                )
+                """
             )
-            """
-        )
 
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS api_cache (
-                cache_key     TEXT PRIMARY KEY,
-                response_json TEXT,
-                expires_at    TIMESTAMP
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_cache (
+                    cache_key     TEXT PRIMARY KEY,
+                    response_json TEXT,
+                    expires_at    TEXT
+                )
+                """
             )
-            """
-        )
 
-        # Indexes for the reverse (anilist -> tmdb) lookups.
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_seasons_anilist ON tmdb_seasons(anilist_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_extras_anilist ON tmdb_extras(anilist_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_extras_show ON tmdb_extras(tmdb_id)")
+            # Indexes for the reverse (anilist -> tmdb) lookups.
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_seasons_anilist ON tmdb_seasons(anilist_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_extras_anilist ON tmdb_extras(anilist_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_extras_show ON tmdb_extras(tmdb_id)")
 
-        # Drop tables from earlier schema iterations if a persisted DB still has them.
-        for legacy in ("show_groups", "group_members", "mappings", "season_groups"):
-            cursor.execute(f"DROP TABLE IF EXISTS {legacy}")
+            # Drop tables from earlier schema iterations if a persisted DB still has them.
+            for legacy in ("show_groups", "group_members", "mappings", "season_groups"):
+                cursor.execute(f"DROP TABLE IF EXISTS {legacy}")
 
-        conn.commit()
-        conn.close()
-        print(f"[DB Engine] Schema ready at '{self.db_name}'.")
+        print("[DB Engine] Schema ready (PostgreSQL).")
 
     def _entry_count(self) -> int:
-        conn = self._connect()
         try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM anime_entries")
-            return cursor.fetchone()[0]
-        except sqlite3.Error:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) AS n FROM anime_entries")
+                return cursor.fetchone()["n"]
+        except Exception:
             return 0
-        finally:
-            conn.close()
 
     # ------------------------------------------------------------------ #
     # Update detection
@@ -208,14 +204,11 @@ class MappingDatabaseEngine:
         If the local DB is empty we always resync (self-heals a wiped DB even
         when the upstream ETag has not changed).
         """
-        conn = self._connect()
-        try:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT value FROM sync_meta WHERE key = 'etag'")
             row = cursor.fetchone()
-            current_etag = row[0] if row else None
-        finally:
-            conn.close()
+            current_etag = row["value"] if row else None
 
         try:
             response = await client.head(self.MAPPING_URL, follow_redirects=True)
@@ -437,43 +430,46 @@ class MappingDatabaseEngine:
             season_rows = [(t, s, a) for (t, s), a in season_map.items()]
             print(f"[DB Engine] Applied overrides for {len(overrides)} show(s).")
 
-        # 6. Commit atomically; never wipe to nothing.
-        conn = self._connect()
+        # 6. Commit atomically; never wipe to nothing. The whole rebuild runs in
+        # one transaction (the `with` block commits on success, rolls back on
+        # error). Children are deleted before parents to satisfy the FKs, then
+        # parents are inserted before children for the same reason.
         committed = False
         try:
-            cursor = conn.cursor()
-            cursor.execute("BEGIN")
-            cursor.execute("DELETE FROM anime_entries")
-            cursor.execute("DELETE FROM tmdb_seasons")
-            cursor.execute("DELETE FROM tmdb_extras")
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM tmdb_seasons")
+                cursor.execute("DELETE FROM tmdb_extras")
+                cursor.execute("DELETE FROM anime_entries")
 
-            cursor.executemany(
-                """
-                INSERT OR REPLACE INTO anime_entries
-                    (anilist_id, mal_id, title_romaji, title_english, title_native,
-                     anime_type, start_year, last_synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                entry_rows,
-            )
-            cursor.executemany(
-                "INSERT OR REPLACE INTO tmdb_seasons (tmdb_id, season_number, anilist_id) VALUES (?, ?, ?)",
-                season_rows,
-            )
-            cursor.executemany(
-                "INSERT OR REPLACE INTO tmdb_extras (tmdb_id, anilist_id, anime_type) VALUES (?, ?, ?)",
-                extra_rows,
-            )
-            cursor.execute(
-                "INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('etag', ?)", (new_etag,)
-            )
-            conn.commit()
+                cursor.executemany(
+                    """
+                    INSERT INTO anime_entries
+                        (anilist_id, mal_id, title_romaji, title_english, title_native,
+                         anime_type, start_year, last_synced)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (anilist_id) DO NOTHING
+                    """,
+                    entry_rows,
+                )
+                cursor.executemany(
+                    "INSERT INTO tmdb_seasons (tmdb_id, season_number, anilist_id) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (tmdb_id, season_number) DO NOTHING",
+                    season_rows,
+                )
+                cursor.executemany(
+                    "INSERT INTO tmdb_extras (tmdb_id, anilist_id, anime_type) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (tmdb_id, anilist_id) DO NOTHING",
+                    extra_rows,
+                )
+                cursor.execute(
+                    "INSERT INTO sync_meta (key, value) VALUES ('etag', %s) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    (new_etag,),
+                )
             committed = True
         except Exception as e:
-            conn.rollback()
             print(f"[DB Engine] Sync failed, rolled back: {e}")
-        finally:
-            conn.close()
 
         if committed:
             # Keep this print ASCII-only: some consoles (Windows cp1252) raise on emoji.
