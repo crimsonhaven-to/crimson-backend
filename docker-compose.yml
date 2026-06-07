@@ -20,6 +20,10 @@ services:
       # the synced mapping survive redeploys.
       - MAPPING_DB=/app/data/anime_mappings.db
       - ACCOUNTS_DB=/app/data/accounts.db
+      #IMPORTANT: The db must be owned by 1001:1001.
+      # sudo mkdir -p /db/data
+      # sudo chown -R 10001:10001 /db/data
+      # sudo chown 10001:10001 /db/anime_mappings.db
       # Stable, shared secret for the signed stream proxies (PlayIMDb/AnimeSuge).
       # MUST be set (and identical on every replica) or proxied playback 403s
       # across restarts/replicas. Generate one: `openssl rand -hex 32`.
