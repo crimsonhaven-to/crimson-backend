@@ -10,3 +10,7 @@ lxml==6.1.1
 selectolax==0.4.10
 # Direct dependency of account_engine.routes (also pulled in by fastapi); pin it.
 pydantic==2.13.4
+# PostgreSQL driver + connection pool (replaces SQLite). [binary] ships a
+# prebuilt cp314 manylinux/musllinux wheel (no compiler / Rust needed on
+# python:3.14-slim); [pool] is pure-Python. Verified wheels exist for 3.3.4.
+psycopg[binary,pool]==3.3.4

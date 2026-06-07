@@ -1,7 +1,8 @@
 # Metadata Engine
 
-Builds the local SQLite mapping between **TMDB tv ids** (the public key used by
-the API and frontend) and **AniList ids** (one per cour/season/OVA/movie).
+Builds the PostgreSQL mapping between **TMDB tv ids** (the public key used by
+the API and frontend) and **AniList ids** (one per cour/season/OVA/movie). The
+tables are stored in the shared database and accessed through `db_pool`.
 
 ## Why this exists
 

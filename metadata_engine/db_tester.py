@@ -1,21 +1,22 @@
 """Quick sanity check for the mapping database.
 
 Run after a sync to confirm the schema is populated and multi-season shows
-resolve to distinct AniList ids per season.
+resolve to distinct AniList ids per season. Reads through the shared PostgreSQL
+pool, so DATABASE_URL / POSTGRES_* must point at the same database the API uses.
 
     python -m metadata_engine.db_tester
 """
 
-import sqlite3
+from dotenv import load_dotenv
 
-DB_NAME = "anime_mappings.db"
+from db_pool import get_connection
+
+load_dotenv()
 
 
 def main():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    try:
+    with get_connection() as conn:
+        cursor = conn.cursor()
         for table in ("anime_entries", "tmdb_seasons", "tmdb_extras", "tmdb_shows"):
             cursor.execute(f"SELECT COUNT(*) AS n FROM {table}")
             print(f"{table:>14}: {cursor.fetchone()['n']} rows")
@@ -26,7 +27,7 @@ def main():
             SELECT tmdb_id, COUNT(*) AS season_count
             FROM tmdb_seasons
             GROUP BY tmdb_id
-            HAVING season_count >= 3
+            HAVING COUNT(*) >= 3
             ORDER BY season_count DESC
             LIMIT 5
         """)
@@ -37,7 +38,7 @@ def main():
                 SELECT s.season_number, s.anilist_id, e.title_romaji
                 FROM tmdb_seasons s
                 LEFT JOIN anime_entries e ON s.anilist_id = e.anilist_id
-                WHERE s.tmdb_id = ?
+                WHERE s.tmdb_id = %s
                 ORDER BY s.season_number
                 """,
                 (tmdb_id,),
@@ -46,8 +47,6 @@ def main():
             print(f"  TMDB {tmdb_id} ({row['season_count']} seasons):")
             for s in seasons:
                 print(f"    S{s['season_number']:<2} anilist={s['anilist_id']} {s['title_romaji']}")
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

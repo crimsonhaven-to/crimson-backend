@@ -1,4 +1,3 @@
-import sqlite3
 import asyncio
 import os
 import logging
@@ -27,6 +26,7 @@ from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configure
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
+from db_pool import get_pool, close_pool
 
 # Configure logging
 logging.basicConfig(
@@ -52,22 +52,19 @@ load_dotenv()
 # Configuration
 class Config:
     TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-    # Path to the TMDB<->AniList mapping + api_cache DB. Override (e.g. to point
-    # at a persisted volume) with MAPPING_DB; defaults to the repo-local file.
-    DB_NAME = os.getenv("MAPPING_DB", "anime_mappings.db")
+    # Mapping + accounts now live in PostgreSQL; the connection is configured via
+    # DATABASE_URL / POSTGRES_* and pooled in db_pool (no per-process DB path).
     CACHE_TTL_SECONDS = 86400  # 24 hours
     TRENDING_CACHE_TTL_SECONDS = 21600  # 6 hours
     MAX_CONCURRENT_REQUESTS = 10
     REQUEST_TIMEOUT = 30.0
     MAX_RETRIES = 3
     RETRY_BACKOFF_FACTOR = 1.0
-    # How long a sqlite call waits for a competing writer before giving up.
-    SQLITE_BUSY_TIMEOUT = float(os.getenv("SQLITE_BUSY_TIMEOUT", "30"))
 
     # Only the replica with this set to true runs the periodic Fribb resync.
     # The sync rebuilds the mapping tables wholesale, so running it on every
-    # replica in a Docker Swarm is wasteful and causes write contention — keep
-    # it enabled on exactly one replica (see README "Deploying to Docker Swarm").
+    # replica is wasteful — keep it enabled on exactly one replica (see README
+    # "Deploying to Docker Swarm").
     RUN_DB_SYNC = os.getenv("RUN_DB_SYNC", "true").lower() not in ("0", "false", "no")
 
     # CORS Origins. Overridable via the ALLOWED_ORIGINS env var (comma-separated)
@@ -102,8 +99,8 @@ TMDB_HEADERS = {
     "accept": "application/json"
 }
 
-# Initialize database engine
-db_engine = MappingDatabaseEngine(db_name=Config.DB_NAME, tmdb_api_key=Config.TMDB_API_KEY)
+# Initialize database engine (storage is the shared PostgreSQL pool; see db_pool)
+db_engine = MappingDatabaseEngine(tmdb_api_key=Config.TMDB_API_KEY)
 
 # --- LIFESPAN MANAGEMENT ---
 @asynccontextmanager
@@ -114,7 +111,7 @@ async def lifespan(app: FastAPI):
     
     # Initialize databases (idempotent — safe on every replica).
     db_engine.init_db()
-    account_store.init_db()  # separate accounts.db (survives mapping resyncs)
+    account_store.init_db()  # account tables (untouched by mapping resyncs)
 
     app.state.scheduler = None
 
@@ -157,6 +154,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down...")
     if getattr(app.state, 'scheduler', None) is not None:
         app.state.scheduler.shutdown()
+    close_pool()  # drain the PostgreSQL connection pool
     logger.info("Shutdown complete")
 
 # Create FastAPI app with lifespan
@@ -181,20 +179,16 @@ app.include_router(account_router)
 
 # --- DATABASE HELPER FUNCTIONS ---
 def get_db_connection():
-    """Get database connection with row factory.
+    """Borrow a pooled PostgreSQL connection as a context manager.
 
-    WAL mode + a busy timeout let many concurrent readers coexist with the
-    occasional writer (the on-demand tmdb_shows/api_cache upserts, and the
-    periodic mapping resync) without raising "database is locked" — important
-    because FastAPI serves these sqlite calls from a thread pool and, in a
-    multi-replica deploy, several workers hit the same DB file at once.
+    Returns the pool's connection context manager, so the existing
+    ``with get_db_connection() as conn:`` call sites keep working unchanged: the
+    transaction commits on a clean exit (rolls back on error) and the connection
+    returns to the pool. FastAPI serves these synchronous DB calls from its
+    thread pool, and the pool is thread-safe, so many workers (and replicas) can
+    share the same external database concurrently.
     """
-    conn = sqlite3.connect(Config.DB_NAME, timeout=Config.SQLITE_BUSY_TIMEOUT)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=%d" % int(Config.SQLITE_BUSY_TIMEOUT * 1000))
-    return conn
+    return get_pool().connection()
 
 def get_anilist_id(tmdb_id: int, season_number: int) -> Optional[int]:
     """Query mapped AniList ID from TMDB ID and season"""
@@ -202,7 +196,7 @@ def get_anilist_id(tmdb_id: int, season_number: int) -> Optional[int]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT anilist_id FROM tmdb_seasons WHERE tmdb_id = ? AND season_number = ?",
+                "SELECT anilist_id FROM tmdb_seasons WHERE tmdb_id = %s AND season_number = %s",
                 (tmdb_id, season_number)
             )
             row = cursor.fetchone()
@@ -222,7 +216,7 @@ def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, Optional[int]]]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT tmdb_id, season_number FROM tmdb_seasons WHERE anilist_id = ?",
+                "SELECT tmdb_id, season_number FROM tmdb_seasons WHERE anilist_id = %s",
                 (anilist_id,)
             )
             row = cursor.fetchone()
@@ -231,7 +225,7 @@ def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, Optional[int]]]:
 
             # Not a numbered season — maybe a special/OVA/movie.
             cursor.execute(
-                "SELECT tmdb_id FROM tmdb_extras WHERE anilist_id = ? LIMIT 1",
+                "SELECT tmdb_id FROM tmdb_extras WHERE anilist_id = %s LIMIT 1",
                 (anilist_id,)
             )
             row = cursor.fetchone()
@@ -249,7 +243,7 @@ def get_show_seasons(tmdb_id: int) -> List[Dict]:
                 SELECT s.season_number, s.anilist_id, e.title_romaji, e.title_english, e.anime_type
                 FROM tmdb_seasons s
                 JOIN anime_entries e ON s.anilist_id = e.anilist_id
-                WHERE s.tmdb_id = ?
+                WHERE s.tmdb_id = %s
                 ORDER BY s.season_number
             """, (tmdb_id,))
             return [dict(row) for row in cursor.fetchall()]
@@ -264,7 +258,7 @@ def get_anime_entry(anilist_id: Optional[int]) -> Dict:
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM anime_entries WHERE anilist_id = ?", (anilist_id,))
+            cursor.execute("SELECT * FROM anime_entries WHERE anilist_id = %s", (anilist_id,))
             row = cursor.fetchone()
             return dict(row) if row else {}
     except Exception as e:
@@ -280,7 +274,7 @@ def get_show_extras(tmdb_id: int) -> List[Dict]:
                 SELECT x.anilist_id, x.anime_type, e.title_romaji, e.title_english, e.start_year
                 FROM tmdb_extras x
                 LEFT JOIN anime_entries e ON x.anilist_id = e.anilist_id
-                WHERE x.tmdb_id = ?
+                WHERE x.tmdb_id = %s
                 ORDER BY e.start_year, x.anilist_id
             """, (tmdb_id,))
             return [dict(row) for row in cursor.fetchall()]
@@ -293,7 +287,7 @@ def get_show_info(tmdb_id: int) -> Dict:
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM tmdb_shows WHERE tmdb_id = ?", (tmdb_id,))
+            cursor.execute("SELECT * FROM tmdb_shows WHERE tmdb_id = %s", (tmdb_id,))
             row = cursor.fetchone()
             return dict(row) if row else {}
     except Exception as e:
@@ -308,9 +302,13 @@ def upsert_show_info(show: Dict) -> None:
         def _write():
             with get_db_connection() as conn:
                 conn.execute("""
-                    INSERT OR REPLACE INTO tmdb_shows
+                    INSERT INTO tmdb_shows
                         (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (tmdb_id) DO UPDATE SET
+                        title=EXCLUDED.title, overview=EXCLUDED.overview,
+                        poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
+                        first_air_date=EXCLUDED.first_air_date
                 """, (
                     show.get("tmdb_id"),
                     show.get("title"),
@@ -319,7 +317,6 @@ def upsert_show_info(show: Dict) -> None:
                     show.get("backdrop_path"),
                     show.get("first_air_date"),
                 ))
-                conn.commit()
         _write()
     except Exception as e:
         logger.error(f"Database error in upsert_show_info: {e}")
@@ -400,7 +397,7 @@ async def get_cached_response(cache_key: str) -> Optional[Dict]:
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT response_json FROM api_cache WHERE cache_key = ? AND expires_at > ?",
+                    "SELECT response_json FROM api_cache WHERE cache_key = %s AND expires_at > %s",
                     (cache_key, _utcnow_iso())
                 )
                 row = cursor.fetchone()
@@ -425,10 +422,11 @@ async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Con
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT OR REPLACE INTO api_cache (cache_key, response_json, expires_at)
-                    VALUES (?, ?, ?)
+                    INSERT INTO api_cache (cache_key, response_json, expires_at)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (cache_key) DO UPDATE SET
+                        response_json=EXCLUDED.response_json, expires_at=EXCLUDED.expires_at
                 """, (cache_key, payload, expires_at))
-                conn.commit()
         
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _insert)
@@ -1484,8 +1482,8 @@ async def health_check():
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM anime_entries")
-            count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) AS n FROM anime_entries")
+            count = cursor.fetchone()["n"]
         
         return {
             "status": "healthy",

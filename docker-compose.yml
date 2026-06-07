@@ -1,29 +1,48 @@
-# Works with both `docker compose up` (local) and `docker stack deploy` (Swarm).
+# Works with `docker compose up` (local / dev). For a real Swarm production
+# deploy you'll likely point DATABASE_URL at a managed/external PostgreSQL
+# instead of the bundled `postgres` service below — but for dev-testing a second
+# container is the simplest thing that works.
 #
-# IMPORTANT (scaling): this backend stores all state in SQLite files on a volume.
-# SQLite is single-writer and cannot be safely shared across hosts, so the
-# service runs as a SINGLE replica pinned (via the placement constraint) to one
-# node, where WAL mode lets the async workers read/write concurrently. To run
-# more than one replica you must (a) keep them on the same node sharing a local
-# volume, and (b) set RUN_DB_SYNC=true on exactly one of them + a shared
-# PROXY_SECRET on all. True horizontal (multi-node) scaling needs a networked
-# DB instead of SQLite — see the README "Deploying to Docker Swarm" section.
+# State now lives in PostgreSQL (mapping tables + account/user data, one DB), so
+# the API is stateless and can be scaled to multiple replicas pointing at the
+# same database — the SQLite single-writer/shared-volume limitation is gone.
+# Keep RUN_DB_SYNC=true on exactly ONE replica (the Fribb resync rebuilds the
+# mapping tables wholesale; running it everywhere just wastes bandwidth) and a
+# shared PROXY_SECRET on all.
 
 services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-crimson}
+      - POSTGRES_USER=${POSTGRES_USER:-crimson}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crimson}
+    volumes:
+      - crimson-pgdata:/var/lib/postgresql/data
+    # Not published to the host by default; only the api service needs it on the
+    # internal network. Uncomment to inspect with psql from the host.
+    # ports:
+    #   - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crimson} -d ${POSTGRES_DB:-crimson}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
   anime-api:
     image: crimson-backend:1.0
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY in the environment or an .env file}
-      # Mapping DB + accounts DB live on the persisted volume so user data and
-      # the synced mapping survive redeploys.
-      - MAPPING_DB=/app/data/anime_mappings.db
-      - ACCOUNTS_DB=/app/data/accounts.db
-      #IMPORTANT: The db must be owned by 1001:1001.
-      # sudo mkdir -p /db/data
-      # sudo chown -R 10001:10001 /db/data
-      # sudo chown 10001:10001 /db/anime_mappings.db
+      # Point the pool at the bundled postgres service (or override with a full
+      # DATABASE_URL to use a managed/external database in production).
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson}
       # Stable, shared secret for the signed stream proxies (PlayIMDb/AnimeSuge).
       # MUST be set (and identical on every replica) or proxied playback 403s
       # across restarts/replicas. Generate one: `openssl rand -hex 32`.
@@ -36,9 +55,6 @@ services:
       # - JELLYFIN_URL=
       # - JELLYFIN_USERNAME=
       # - JELLYFIN_PASSWORD=
-
-    volumes:
-      - crimson-data:/app/data   # mapping DB + accounts DB (named volume)
 
     # Container-level health is also defined in the Dockerfile; declared here too
     # so `docker compose` reports it without relying on the image default.
@@ -54,18 +70,12 @@ services:
 
     deploy:
       replicas: 1
-      placement:
-        # Pin to one node so the SQLite volume is never split across hosts.
-        # Replace with a real constraint, e.g. `- node.labels.crimson == true`.
-        constraints:
-          - node.role == manager
       restart_policy:
         condition: on-failure
         delay: 5s
         max_attempts: 3
         window: 60s
       update_config:
-        order: stop-first   # single-writer DB: never run old+new together
         parallelism: 1
       resources:
         limits:
@@ -76,4 +86,4 @@ services:
           memory: 256M
 
 volumes:
-  crimson-data:
+  crimson-pgdata:   # PostgreSQL data directory (named volume)

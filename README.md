@@ -19,7 +19,7 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
 ## 🛠 Tech Stack
 
 - **Framework**: FastAPI (Python 3.10+)
-- **Database**: SQLite (Metadata Mapping & API Cache)
+- **Database**: PostgreSQL (Metadata Mapping, API Cache & Accounts), pooled via psycopg 3
 - **Networking**: HTTPX (Async)
 - **Parsing**: BeautifulSoup4, Selectolax, lxml
 - **Scheduling**: APScheduler
@@ -30,6 +30,7 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
 ### Prerequisites
 
 - **Python 3.10+**
+- **PostgreSQL**: A reachable database (run one locally, or use the bundled `postgres` service via `docker compose`).
 - **TMDB API Key**: Required for metadata and search (Legacy API Key / Read Access Token).
 
 ### Installation
@@ -49,8 +50,11 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
    Create a `.env` file in the root:
    ```env
    TMDB_API_KEY=your_tmdb_api_key_here
+   DATABASE_URL=postgresql://crimson:crimson@localhost:5432/crimson
    DEBUG=False
    ```
+   The database schema is created automatically on startup (idempotent); you
+   only need an empty database and a user that can create tables.
 
 ### Running the API
 
@@ -70,16 +74,22 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | :--- | :--- | :--- | :--- |
 | `TMDB_API_KEY` | **yes** | – | TMDB Read Access Token (v4) or legacy key. |
 | `PROXY_SECRET` | prod | random | HMAC secret for the signed stream proxies. **Must be stable and shared across replicas** or proxied playback 403s. `openssl rand -hex 32`. |
-| `MAPPING_DB` | no | `anime_mappings.db` | Path to the TMDB↔AniList mapping + cache DB. |
-| `ACCOUNTS_DB` | no | `accounts.db` | Path to the accounts/favorites/progress DB (kept separate so user data survives mapping resyncs). |
+| `DATABASE_URL` | prod | – | Full PostgreSQL connection URL, e.g. `postgresql://crimson:crimson@postgres:5432/crimson`. Takes precedence over the discrete `POSTGRES_*` parts below. |
+| `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | no | `localhost` / `5432` / `crimson` / `crimson` / `crimson` | Used to assemble the connection when `DATABASE_URL` is unset. |
+| `DB_POOL_MIN` / `DB_POOL_MAX` | no | `1` / `10` | Connection-pool sizing. |
+| `DB_CONNECT_TIMEOUT` | no | `30` | Seconds to wait at startup for the database to accept connections. |
 | `RUN_DB_SYNC` | no | `true` | Whether this instance runs the periodic Fribb resync. Set `false` on all but one replica. |
-| `SQLITE_BUSY_TIMEOUT` | no | `30` | Seconds a sqlite call waits on a locked DB before erroring. |
 | `ALLOWED_ORIGINS` | no | built-in list | Comma-separated CORS origins. |
 | `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
 | `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional Jellyfin source. |
 
-The two SQLite databases run in **WAL mode** with a busy timeout so the async
-workers can read and write concurrently without `database is locked` errors.
+All state (the TMDB↔AniList mapping, the API cache, and accounts/favorites/
+progress) lives in **one PostgreSQL database**, reached through a process-wide
+psycopg connection pool (`db_pool.py`). A Fribb resync only rebuilds the three
+mapping tables inside a transaction, so it never touches user data — which is
+why mapping and accounts can safely share one database. Because the API holds no
+local state, replicas are interchangeable and can all point at the same
+database.
 
 ---
 
@@ -93,23 +103,17 @@ docker build -t crimson-backend:1.0 .
 TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) docker compose up -d
 ```
 
-The container runs as a non-root user, ships a `HEALTHCHECK` that polls
-`/health`, and persists both SQLite DBs to the `crimson-data` named volume.
+The Compose file brings up a bundled **`postgres:17-alpine`** service (data on
+the `crimson-pgdata` named volume) and the stateless API container, which runs
+as a non-root user and ships a `HEALTHCHECK` that polls `/health`. The API waits
+for Postgres to report healthy (`depends_on`) before starting.
 
-> [!IMPORTANT]
-> **Bind mounts must be writable by the container's non-root user (uid `10001`).**
-> The image runs as `appuser` (uid `10001`) and the Dockerfile chowns `/app` and
-> `/app/data` — but that ownership only applies to **named volumes**. If you bind-mount
-> host paths instead (e.g. `/db/data:/app/data` for `ACCOUNTS_DB`), Docker creates
-> any missing host dir as `root`, so uid 10001 can't write and startup dies with
-> `sqlite3.OperationalError: attempt to write a readonly database` (WAL needs to
-> create the DB + its `-wal`/`-shm` sidecars). Fix by chowning the host paths to the
-> container uid before starting:
-> ```bash
-> sudo mkdir -p /db/data
-> sudo chown -R 10001:10001 /db/data /db/anime_mappings.db
-> ```
-> Or just use named volumes, which inherit the image's ownership automatically.
+> [!NOTE]
+> The bundled `postgres` service is meant for **dev / single-host** use. In
+> production, point `DATABASE_URL` at a managed or externally-operated PostgreSQL
+> instance and drop the bundled service — the API needs no writable volume of its
+> own. Override the database credentials via `POSTGRES_USER` / `POSTGRES_PASSWORD`
+> / `POSTGRES_DB` (or set a full `DATABASE_URL`).
 
 ### Deploying to Docker Swarm
 
@@ -121,24 +125,18 @@ docker stack deploy -c docker-compose.yml crimson
 ```
 
 > [!IMPORTANT]
-> **State lives in SQLite, which is single-writer and cannot be shared across
-> hosts.** The stack therefore runs as a **single replica pinned to one node**
-> (the `placement.constraints` entry) with a local named volume. This gives you
-> Swarm's self-healing (auto-restart/reschedule on that node) and rolling
-> updates without risking DB corruption.
->
-> **To run more than one replica:**
-> 1. Keep them on the **same node**, sharing the same local volume (WAL allows
->    concurrent same-host access).
-> 2. Set `RUN_DB_SYNC=true` on **exactly one** replica, `false` on the rest, so
+> **State now lives in PostgreSQL, so the API is stateless and scales across
+> nodes.** Point every replica at the same database (a managed/external Postgres
+> in production; the bundled `postgres` service is fine for a single host) and
+> scale `anime-api` freely. When running more than one replica:
+> 1. Set `RUN_DB_SYNC=true` on **exactly one** replica, `false` on the rest, so
 >    the wholesale mapping rebuild runs once.
-> 3. Set the **same `PROXY_SECRET`** on every replica so signed proxy URLs
+> 2. Set the **same `PROXY_SECRET`** on every replica so signed proxy URLs
 >    verify regardless of which replica serves the follow-up request.
 >
-> **True multi-node horizontal scaling** requires replacing SQLite with a
-> networked database (e.g. Postgres) for `accounts.db` + the mapping/cache
-> tables — the access layer is small and isolated in `account_engine/db.py`,
-> `metadata_engine/db_handler.py` and the helpers in `api.py`.
+> The database access layer is small and isolated in `db_pool.py` (the shared
+> pool), `account_engine/db.py`, `metadata_engine/db_handler.py` and the helpers
+> in `api.py`.
 
 The stack must be reachable behind a TLS-terminating reverse proxy that sets
 `X-Forwarded-Proto`/`X-Forwarded-Host` (uvicorn runs with `--proxy-headers`),
@@ -211,8 +209,8 @@ No usernames, no passwords. An account **is** an Ed25519 public key derived from
 12-word BIP39 mnemonic that lives entirely on the client (like P-Stream). The
 server stores only the public key and *verifies* signatures over one-time
 challenges — the mnemonic / private key never reach the backend, so a DB leak
-exposes no credential. User data (favorites + watch progress) lives in a separate
-`accounts.db` that survives mapping resyncs.
+exposes no credential. User data (favorites + watch progress) lives in its own
+PostgreSQL tables, untouched by mapping resyncs.
 
 ### Endpoints
 
@@ -272,10 +270,11 @@ poster?, position_seconds?, duration_seconds?, status? }`.
 ## 🏗 Architecture
 
 - **`api.py`**: Main entry point, routing, and lifecycle management.
+- **`db_pool.py`**: Shared psycopg 3 PostgreSQL connection pool used by every DB caller.
 - **`metadata_engine/`**: Handles the complex mapping between TMDB and AniList. See its [README](metadata_engine/README.md) for details.
 - **`scrapers/`**: Modular providers that find video embeds on streaming sites.
 - **`resolvers/`**: Tools that extract raw video links from those embeds.
-- **`account_engine/`**: Mnemonic (Ed25519) sign-in, favorites and watch progress. Self-contained crypto (`ed25519.py`, no native deps), SQLite store (`db.py`), and the API router (`routes.py`).
+- **`account_engine/`**: Mnemonic (Ed25519) sign-in, favorites and watch progress. Self-contained crypto (`ed25519.py`, no native deps), PostgreSQL store (`db.py`, via the shared `db_pool`), and the API router (`routes.py`).
 - **`player.py`**: The logic for our built-in HTML5 video player.
 
 ### Extending the Engine

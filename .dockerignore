@@ -8,7 +8,8 @@
 *.env
 !.env.example
 
-# Local SQLite state (the image starts clean; data lives on a volume).
+# Leftover local SQLite files from before the PostgreSQL migration — never bake
+# them into the image (state now lives in PostgreSQL, not in the build context).
 *.db
 *.db-journal
 *.db-wal
