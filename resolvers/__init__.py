@@ -18,7 +18,9 @@ ALL_RESOLVERS = [
     VidmolyResolver,
     VoeResolver,
     VidkingTestResolver,
-    VidkingResolver,   # deprecated — superseded by VidkingTestResolver (ad-free) but for now I'll re enable it
+    # VidkingResolver,  # ARCHIVED — legacy VidKing (raw vidking.net embed, ads).
+    #                   # Superseded by VidkingTestResolver. Import kept so it can
+    #                   # be re-enabled by uncommenting this line.
     MovishResolver,
     PlayimdbResolver,
     JellyfinResolver,
