@@ -223,7 +223,8 @@ PostgreSQL tables, untouched by mapping resyncs.
 | `GET`  | `/account/me` | Bearer | Profile + favorite/progress counts. |
 | `GET`/`POST`/`DELETE` | `/account/favorites` | Bearer | List / add / remove a favorited show. |
 | `GET`/`POST`/`DELETE` | `/account/progress` | Bearer | List / upsert / remove per-episode watch progress. |
-| `GET`  | `/account/continue-watching` | Bearer | In-progress episodes, most recent first. |
+| `GET`  | `/account/continue-watching` | Bearer | In-progress episodes only, most recent first. |
+| `GET`  | `/account/recent` | Bearer | Recently-watched episodes of **any** status (incl. completed), most recent first. `?limit=` (default 20). |
 
 Authenticated requests send `Authorization: Bearer <session_token>`.
 

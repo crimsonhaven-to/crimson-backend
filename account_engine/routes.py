@@ -19,7 +19,8 @@ Flow:
     POST /auth/login     {public_key, challenge, signature}          -> session
     # authenticated requests:  Authorization: Bearer <session_token>
     GET/POST/DELETE /account/favorites
-    GET/POST/DELETE /account/progress, GET /account/continue-watching
+    GET/POST/DELETE /account/progress
+    GET /account/continue-watching, GET /account/recent
 
 Favorites are show-level; watch progress is per-episode. Both are stored as
 plain structured rows (so the backend can serve "continue watching" etc.).
@@ -319,6 +320,20 @@ async def continue_watching(user: dict = Depends(require_user)):
     """In-progress episodes, most-recently-watched first — for a
     'Continue Watching' row on the frontend."""
     items = store.list_progress(user["user_id"], status="in_progress")
+    return {"success": True, "count": len(items), "items": items}
+
+
+@router.get("/account/recent")
+async def recent(
+    user: dict = Depends(require_user),
+    limit: int = Query(20, ge=1, le=100, description="Max items to return"),
+):
+    """Recently-watched episodes of *any* status (in_progress + completed),
+    most-recently-watched first — for a 'Recent' / 'History' row on the frontend.
+
+    Unlike /account/continue-watching (which is in_progress only), this keeps
+    finished episodes so a watch-history view stays populated after completion."""
+    items = store.list_progress(user["user_id"])[:limit]
     return {"success": True, "count": len(items), "items": items}
 
 
