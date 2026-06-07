@@ -1053,16 +1053,33 @@ async def get_season_details(tmdb_id: int, season_number: int):
         "anilist_metadata": anilist_meta
     }
 
-async def build_watch_response(tmdb_id: int, season_number: int, episode_number: int,
-                               anilist_id: Optional[int], fallback_title: Optional[str] = None,
-                               base_url: str = "") -> Dict:
-    """Run every scraper for an episode, resolve the embeds, and shape the response.
+def _ndjson(obj: Dict) -> str:
+    """Serialize one NDJSON record: a single JSON object followed by a newline."""
+    return json.dumps(obj, ensure_ascii=False) + "\n"
 
-    Works without an AniList mapping (e.g. TMDB-only seasons of long shows): VidKing
-    plays off the TMDB id, and title-based scrapers fall back to the TMDB show title.
 
-    ``base_url`` (the backend's public base) is threaded into stream resolution so
-    the VidKing Test ad-free proxy can emit an absolute iframe URL.
+# Sent to the proxy + client so progressive lines actually flush through instead
+# of being buffered until the response completes (nginx buffers by default).
+_STREAM_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+
+
+async def stream_watch_response(tmdb_id: int, season_number: int, episode_number: int,
+                                anilist_id: Optional[int], fallback_title: Optional[str] = None,
+                                base_url: str = ""):
+    """Progressively scrape + resolve an episode, yielding NDJSON lines as each
+    source is found — instead of waiting for every scraper to finish.
+
+    Emits, in order:
+      * one ``{"type": "meta", ...}`` line (ids + title), flushed immediately;
+      * one ``{"type": "stream", source, streamType, url}`` line per resolved
+        stream, the instant its scraper + resolver finish — the sources race, so
+        the fastest one reaches the player first;
+      * a final ``{"type": "done", "count": N}`` line once every scraper is done.
+
+    Works without an AniList mapping (e.g. TMDB-only seasons of long shows):
+    VidKing plays off the TMDB id, and title-based scrapers fall back to the TMDB
+    show title. ``base_url`` (the backend's public base) is threaded into stream
+    resolution so the proxy sources can emit an absolute iframe URL.
     """
     anilist_data = {}
     if anilist_id:
@@ -1072,33 +1089,81 @@ async def build_watch_response(tmdb_id: int, season_number: int, episode_number:
     title = anilist_data.get("title") or fallback_title
     media_ctx = {**anilist_data, "title": title}
 
-    tasks = [
-        run_single_scraper(scraper_class, tmdb_id, season_number, episode_number, media_ctx)
-        for scraper_class in ALL_SCRAPERS
-    ]
-    results = await asyncio.gather(*tasks)
-
-    all_embeds = []
-    for embed_list in results:
-        all_embeds.extend(embed_list)
-    unique_embeds = list(dict.fromkeys(all_embeds))
-
-    streams = await resolve_streams(unique_embeds, base_url=base_url)
-
-    return {
+    yield _ndjson({
+        "type": "meta",
         "success": True,
         "tmdb_id": tmdb_id,
         "season_number": season_number,
         "episode_number": episode_number,
         "anilist_id": anilist_id,
         "title": title,
-        "streams": streams
-    }
+    })
+
+    # Each scraper runs as its own task: scrape -> resolve -> push the resolved
+    # streams onto a queue the moment they're ready, so a slow source never holds
+    # back a fast one. A shared seen-set (guarded by a lock) dedupes embeds and
+    # stream URLs across sources, preserving the old global de-dup behaviour while
+    # the work happens concurrently.
+    queue: asyncio.Queue = asyncio.Queue()
+    seen_embeds: set = set()
+    seen_urls: set = set()
+    lock = asyncio.Lock()
+
+    async def _work(scraper_class):
+        try:
+            embeds = await run_single_scraper(
+                scraper_class, tmdb_id, season_number, episode_number, media_ctx
+            )
+            for embed in embeds:
+                async with lock:
+                    if embed in seen_embeds:
+                        continue
+                    seen_embeds.add(embed)
+                for stream in await resolve_streams([embed], base_url=base_url):
+                    async with lock:
+                        if stream["url"] in seen_urls:
+                            continue
+                        seen_urls.add(stream["url"])
+                    await queue.put(stream)
+        except Exception as e:
+            logger.error(f"Streaming scraper error for {scraper_class.__name__}: {e}")
+
+    workers = [asyncio.create_task(_work(sc)) for sc in ALL_SCRAPERS]
+
+    async def _finish():
+        # Wait for every scraper, then push the sentinel that ends the drain loop.
+        await asyncio.gather(*workers, return_exceptions=True)
+        await queue.put(None)
+
+    finisher = asyncio.create_task(_finish())
+
+    count = 0
+    try:
+        while True:
+            stream = await queue.get()
+            if stream is None:  # sentinel: all scrapers finished
+                break
+            count += 1
+            yield _ndjson({
+                "type": "stream",
+                "source": stream["source"],
+                "streamType": stream["type"],
+                "url": stream["url"],
+            })
+        yield _ndjson({"type": "done", "count": count})
+    finally:
+        # If the client disconnects mid-stream the generator is closed here —
+        # cancel the still-running tasks so they don't leak (no-op if done).
+        finisher.cancel()
+        for w in workers:
+            w.cancel()
+
 
 @app.get("/watch/{tmdb_id}/{season_number}/{episode_number}")
 async def get_watch_links(request: Request, tmdb_id: int, season_number: int, episode_number: int):
-    """Get streaming links. Works even for TMDB seasons with no AniList mapping
-    (long shows like Naruto) — VidKing plays off the TMDB id."""
+    """Get streaming links as a progressive NDJSON stream (one line per source,
+    emitted as soon as that source resolves). Works even for TMDB seasons with no
+    AniList mapping (long shows like Naruto) — VidKing plays off the TMDB id."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
 
     fallback_title = None
@@ -1110,8 +1175,12 @@ async def get_watch_links(request: Request, tmdb_id: int, season_number: int, ep
                 show = await fetch_tmdb_show(client, tmdb_id)
             fallback_title = show.get("title")
 
-    return await build_watch_response(tmdb_id, season_number, episode_number, anilist_id,
-                                      fallback_title, base_url=_public_base_url(request))
+    return StreamingResponse(
+        stream_watch_response(tmdb_id, season_number, episode_number, anilist_id,
+                              fallback_title, base_url=_public_base_url(request)),
+        media_type="application/x-ndjson",
+        headers=_STREAM_HEADERS,
+    )
 
 
 @app.get("/anilist/{anilist_id}")
@@ -1191,8 +1260,12 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
         return RedirectResponse(url=f"/watch/{tmdb_id}/{season_number}/{episode_number}", status_code=301)
 
     # Extra (special/OVA/movie): no numbered season — serve directly (season 1 for URL builders).
-    return await build_watch_response(tmdb_id, 1, episode_number, anilist_id,
-                                      base_url=_public_base_url(request))
+    return StreamingResponse(
+        stream_watch_response(tmdb_id, 1, episode_number, anilist_id,
+                              base_url=_public_base_url(request)),
+        media_type="application/x-ndjson",
+        headers=_STREAM_HEADERS,
+    )
 
 # --- VIDKING AD-FREE PROXY (experimental "vidking_test" source) ---
 @app.api_route("/vidking_proxy/h/{host}/{path:path}", methods=["GET", "POST"])

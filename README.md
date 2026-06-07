@@ -11,6 +11,7 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
 - **Smart Metadata**: Aggregates data from TMDB and AniList for complete info (titles, posters, episode summaries).
 - **Advanced Scraping**: Multi-threaded, async scraping from various sources (AnimeKai, AnimeSuge, GogoAnime, etc.).
 - **Stream Resolution**: Resolves third-party embed URLs to direct HLS/MP4 streams or ad-free proxied players.
+- **Progressive Streaming**: `/watch` streams results as **NDJSON** — each source is pushed to the client the instant its scraper + resolver finish, so the fastest source plays first instead of waiting for every source.
 - **Automatic Sync**: Built-in scheduler keeps the local mapping database up-to-date with upstream sources.
 - **Internal Proxies**: Custom reverse proxies for providers like VidKing, Movish, and Jellyfin to bypass ads and CORS.
 - **Crimson Player**: A minimal, ad-free HLS/MP4 player served directly from the backend for a seamless experience.
@@ -95,6 +96,21 @@ TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) docker compose up -d
 The container runs as a non-root user, ships a `HEALTHCHECK` that polls
 `/health`, and persists both SQLite DBs to the `crimson-data` named volume.
 
+> [!IMPORTANT]
+> **Bind mounts must be writable by the container's non-root user (uid `10001`).**
+> The image runs as `appuser` (uid `10001`) and the Dockerfile chowns `/app` and
+> `/app/data` — but that ownership only applies to **named volumes**. If you bind-mount
+> host paths instead (e.g. `/db/data:/app/data` for `ACCOUNTS_DB`), Docker creates
+> any missing host dir as `root`, so uid 10001 can't write and startup dies with
+> `sqlite3.OperationalError: attempt to write a readonly database` (WAL needs to
+> create the DB + its `-wal`/`-shm` sidecars). Fix by chowning the host paths to the
+> container uid before starting:
+> ```bash
+> sudo mkdir -p /db/data
+> sudo chown -R 10001:10001 /db/data /db/anime_mappings.db
+> ```
+> Or just use named volumes, which inherit the image's ownership automatically.
+
 ### Deploying to Docker Swarm
 
 The provided [`docker-compose.yml`](docker-compose.yml) is Swarm-ready
@@ -141,9 +157,42 @@ content on the HTTPS frontend.
 | `GET` | `/trending` | Fetch popular shows. |
 | `GET` | `/catalogue` | List all mapped anime in the local DB. |
 | `GET` | `/show/{tmdb_id}` | Get full show details and season list. |
+| `GET` | `/info/{tmdb_id}?season=` | Flat merged TMDB + AniList metadata + `episodes_list` for a season. |
+| `GET` | `/seasons/{anilist_id}` | All seasons of the show an AniList id belongs to. |
 | `GET` | `/season/{tmdb_id}/{num}` | Get metadata for a specific season. |
-| `GET` | `/watch/{tmdb_id}/{s}/{e}` | **Primary**: Retrieve streaming links for an episode. |
+| `GET` | `/watch/{tmdb_id}/{s}/{e}` | **Primary**: stream episode links progressively as **NDJSON** (see below). |
 | `GET` | `/anilist/{id}` | Reverse lookup (AniList ID -> TMDB ID). |
+
+### Progressive `/watch` (NDJSON streaming)
+
+`GET /watch/{tmdb_id}/{season}/{episode}` does **not** return a single JSON body.
+It responds with `Content-Type: application/x-ndjson` and emits **one JSON object
+per line, flushed as each source resolves** — the client should read the body
+incrementally (line by line) and surface each source the moment it arrives.
+
+Lines, in order:
+
+```jsonc
+{"type":"meta","success":true,"tmdb_id":1234,"season_number":1,"episode_number":1,"anilist_id":567,"title":"..."}
+{"type":"stream","source":"AnimeSuge","streamType":"hls","url":"https://.../playlist.m3u8"}
+{"type":"stream","source":"Movish","streamType":"iframe","url":"https://<backend>/movish_proxy/h/.../..."}
+{"type":"done","count":2}
+```
+
+- `meta` — always first (ids + resolved title).
+- `stream` — zero or more; `streamType` is `hls` | `mp4` | `iframe`. Append each to the player's source list as it arrives.
+- `done` — terminal; `count` = number of `stream` lines emitted (`0` → nothing found).
+
+Each scraper runs as its own task (scrape → resolve → emit); a shared seen-set
+de-dupes embeds/URLs across sources. If the client disconnects mid-stream the
+backend cancels its in-flight scraper tasks. The response carries
+`X-Accel-Buffering: no` so an nginx/reverse proxy flushes lines through instead
+of buffering the whole response. The legacy `GET /watch/{anilist_id}/{episode}`
+301-redirects to the canonical 3-part route for TV seasons, or streams directly
+for extras (specials/OVAs/movies).
+
+> The full client-side integration spec (including an Android NDJSON consumer and
+> how to play each `streamType`) lives in [`Mobile.md`](Mobile.md).
 
 ### Internal Proxies & Utilities
 
