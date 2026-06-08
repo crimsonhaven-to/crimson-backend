@@ -8,9 +8,11 @@ from .playimdb_scraper import PlayimdbScraper
 from .jellyfin_scraper import JellyfinScraper
 from .animekai_scraper import AnimekaiScraper
 from .animesuge_scraper import AnimeSugeScraper
+from .aniworld_scraper import AniworldScraper
 
 ALL_SCRAPERS = [
     GogoScraper,
+    AniworldScraper,  # German s.to-family site; feeds VOE/Vidmoly embeds.
     #VoeScraper,
     # VidkingScraper,  # ARCHIVED — legacy VidKing (raw vidking.net embed, ads).
     #                  # Superseded by the ad-free VidkingTestScraper below. Import
