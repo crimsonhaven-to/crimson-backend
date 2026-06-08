@@ -1,0 +1,99 @@
+# Docker Swarm stack for the Crimsonhaven backend (API).
+#
+# Deploy:
+#   TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) \
+#   DATABASE_URL=postgresql://user:pass@db-host:5432/crimson \
+#   docker stack deploy -c docker-stack.yml crimson-api
+#
+# Unlike docker-compose.yml (which bundles a postgres container for local/dev),
+# this stack expects an EXTERNAL managed PostgreSQL via DATABASE_URL — the IaC
+# doctrine goal: every replica is identical and stateless, pointing at one DB.
+#
+# Production fronting: keep this BEHIND your TLS-terminating reverse proxy. The
+# app emits absolute iframe URLs from X-Forwarded-Proto/Host, so it must only be
+# reachable via that proxy — do NOT expose the published port below straight to
+# the internet (an attacker could spoof X-Forwarded-Host). Either remove the
+# `ports:` block and attach your proxy to `crimson_net`, or bind-publish to
+# loopback and have the host proxy forward to it.
+version: "3.8"
+
+services:
+  api:
+    image: ${CRIMSON_API_IMAGE:-reallordraymond/crimson-backend:latest}
+
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
+      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
+      # Stable + identical across replicas, or signed-proxy playback 403s after a
+      # restart / on another replica. Generate: openssl rand -hex 32
+      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
+      # Lock CORS down to the real frontend origins in production.
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
+      # The Fribb resync rebuilds the mapping tables wholesale, so exactly ONE
+      # replica may own it. With replicas: 1 below it lives here. To scale out,
+      # see the "Scaling past one replica" note at the bottom of this file.
+      - RUN_DB_SYNC=true
+      # Optional Ko-fi supporters webhook + Jellyfin source (see .env.example).
+      # - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN}
+      # - JELLYFIN_URL=${JELLYFIN_URL}
+      # - JELLYFIN_USERNAME=${JELLYFIN_USERNAME}
+      # - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD}
+
+    # Front this with your reverse proxy. Remove if you attach the proxy directly
+    # to crimson_net instead of publishing a host port.
+    ports:
+      - target: 8000
+        published: 8000
+        protocol: tcp
+        mode: ingress
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+    stop_grace_period: 20s
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+        monitor: 30s
+        max_failure_ratio: 0.3
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+        order: start-first
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+    networks:
+      - crimson_net
+
+networks:
+  crimson_net:
+    driver: overlay
+    attachable: true
+
+# --- Scaling past one replica ------------------------------------------------
+# Only one process may run the Fribb resync. To run N serving replicas:
+#   1. Set RUN_DB_SYNC=false above and raise `replicas` to N.
+#   2. Add a second service from the same image with replicas: 1 and
+#      RUN_DB_SYNC=true (it both syncs and serves), or run the sync as a
+#      one-shot `docker service create --restart-condition none` job on a timer.
+# Every replica still runs the cheap expired-session purge on its own schedule.

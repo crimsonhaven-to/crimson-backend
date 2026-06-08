@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY api.py .
 COPY player.py .
 COPY db_pool.py .
+COPY rate_limit.py .
 COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY metadata_engine ./metadata_engine

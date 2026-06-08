@@ -29,11 +29,12 @@ plain structured rows (so the backend can serve "continue watching" etc.).
 import re
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
 from . import ed25519
 from .db import AccountStore
+from rate_limit import limiter
 
 router = APIRouter(tags=["account"])
 store = AccountStore()
@@ -164,7 +165,8 @@ class ProgressIn(BaseModel):
 
 # --- auth endpoints --------------------------------------------------------
 @router.post("/auth/challenge", response_model=ChallengeResponse)
-async def auth_challenge(body: ChallengeRequest):
+@limiter.limit("20/minute")
+async def auth_challenge(request: Request, body: ChallengeRequest):
     """Issue a one-time challenge for a public key. The client signs the
     returned ``challenge`` string with its Ed25519 private key, then calls
     /auth/register or /auth/login."""
@@ -176,7 +178,8 @@ async def auth_challenge(body: ChallengeRequest):
 
 
 @router.post("/auth/register", response_model=AuthResponse)
-async def auth_register(body: RegisterRequest):
+@limiter.limit("10/minute")
+async def auth_register(request: Request, body: RegisterRequest):
     """Create the account for a public key (proving key possession via the
     signed challenge) and return a session. 409 if the key is already
     registered — use /auth/login instead.
@@ -203,7 +206,8 @@ async def auth_register(body: RegisterRequest):
 
 
 @router.post("/auth/login", response_model=AuthResponse)
-async def auth_login(body: LoginRequest):
+@limiter.limit("10/minute")
+async def auth_login(request: Request, body: LoginRequest):
     """Log in to an existing account by signing the challenge. 404 if the public
     key isn't registered yet — use /auth/register.
 

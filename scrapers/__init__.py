@@ -12,7 +12,9 @@ from .animesuge_scraper import AnimeSugeScraper
 ALL_SCRAPERS = [
     GogoScraper,
     #VoeScraper,
-    VidkingScraper,  # deprecated — superseded by VidkingTestScraper (ad-free, tested) but for now I'll re enable it
+    # VidkingScraper,  # ARCHIVED — legacy VidKing (raw vidking.net embed, ads).
+    #                  # Superseded by the ad-free VidkingTestScraper below. Import
+    #                  # kept so it can be re-enabled by uncommenting this line.
     VidkingTestScraper,
     MovishScraper,
     PlayimdbScraper,

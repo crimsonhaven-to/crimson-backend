@@ -28,6 +28,9 @@ from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
 from supporters_engine import router as supporters_router, store as supporters_store
 from db_pool import get_pool, close_pool
+from rate_limit import limiter
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 # Configure logging
 logging.basicConfig(
@@ -115,12 +118,31 @@ async def lifespan(app: FastAPI):
     account_store.init_db()  # account tables (untouched by mapping resyncs)
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
 
-    app.state.scheduler = None
+    # One scheduler per replica. It always owns cheap housekeeping (expired
+    # session/challenge purge); the heavy Fribb mapping resync is added to it on
+    # exactly ONE replica (RUN_DB_SYNC).
+    scheduler = BackgroundScheduler()
+
+    # Housekeeping (every replica): consume_challenge / get_user_by_session already
+    # delete rows on access, but abandoned challenges (requested, never completed)
+    # would otherwise pile up until the next restart — sweep them periodically.
+    def _purge_expired():
+        try:
+            account_store.purge_expired()
+        except Exception as e:
+            logger.error(f"Expired session/challenge purge failed: {e}")
+
+    scheduler.add_job(
+        _purge_expired,
+        trigger=IntervalTrigger(hours=6),
+        id="purge_expired_job",
+        replace_existing=True,
+    )
 
     # The Fribb resync rebuilds the mapping tables wholesale. In a multi-replica
     # Swarm deploy only ONE replica should own it (RUN_DB_SYNC), otherwise every
     # replica downloads + rebuilds in lockstep, wasting bandwidth and contending
-    # on the shared DB file. Other replicas just serve from the synced DB.
+    # on the shared DB. Other replicas just serve from the synced DB.
     if not Config.RUN_DB_SYNC:
         logger.info("RUN_DB_SYNC is disabled — this replica will not run the mapping resync")
     else:
@@ -131,24 +153,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Initial database sync failed: {e}")
 
-        # Start scheduler for periodic sync. BackgroundScheduler runs jobs in a
-        # worker thread with no running event loop, so the job spins up its own.
+        # Periodic sync. BackgroundScheduler runs jobs in a worker thread with no
+        # running event loop, so the job spins up its own.
         def _scheduled_sync():
             try:
                 asyncio.run(db_engine.sync_database_async())
             except Exception as e:
                 logger.error(f"Scheduled sync failed: {e}")
 
-        scheduler = BackgroundScheduler()
         scheduler.add_job(
             _scheduled_sync,
             trigger=IntervalTrigger(hours=24),
             id="db_sync_job",
-            replace_existing=True
+            replace_existing=True,
         )
-        scheduler.start()
-        logger.info("Background scheduler started")
-        app.state.scheduler = scheduler
+
+    scheduler.start()
+    logger.info("Background scheduler started")
+    app.state.scheduler = scheduler
 
     yield
 
@@ -166,6 +188,12 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan
 )
+
+# Rate limiting (slowapi). Registered on app.state so the @limiter.limit
+# decorators on the expensive/abusable endpoints take effect; the 429 handler
+# returns a clean JSON error with Retry-After.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS Middleware
 app.add_middleware(
@@ -1163,6 +1191,7 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
 
 
 @app.get("/watch/{tmdb_id}/{season_number}/{episode_number}")
+@limiter.limit("30/minute")
 async def get_watch_links(request: Request, tmdb_id: int, season_number: int, episode_number: int):
     """Get streaming links as a progressive NDJSON stream (one line per source,
     emitted as soon as that source resolves). Works even for TMDB seasons with no
@@ -1248,6 +1277,7 @@ async def get_anime_info(tmdb_id: int, season: int = Query(1, ge=1, description=
     }
 
 @app.get("/watch/{anilist_id}/{episode_number}")
+@limiter.limit("30/minute")
 async def deprecated_watch(request: Request, anilist_id: int, episode_number: int, season_part: int = Query(1)):
     """
     Watch by anilist_id. TV seasons redirect to the canonical /watch route;
@@ -1499,10 +1529,15 @@ async def health_check():
             "jellyfin_configured": jellyfin_is_configured()
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        # Log the real cause server-side; don't leak DB/internal detail to an
+        # unauthenticated probe. Surface specifics only when DEBUG is set.
+        logger.error(f"Health check failed: {e}", exc_info=True)
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "error": str(e)}
+            content={
+                "status": "unhealthy",
+                "error": str(e) if os.getenv("DEBUG") else "database unavailable",
+            },
         )
 
 # --- ERROR HANDLERS ---
