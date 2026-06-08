@@ -21,6 +21,7 @@ from resolvers import ALL_RESOLVERS
 from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
 from resolvers.movish import proxy_fetch as movish_proxy_fetch
 from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
+from resolvers.voe import proxy_fetch as voe_proxy_fetch
 from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from player import render_player, is_safe_src
@@ -1390,6 +1391,40 @@ async def playimdb_proxy(request: Request):
         raise HTTPException(status_code=403, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"PlayIMDb proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- VOE STREAM PROXY ("Voe" source) ---
+@app.get("/voe_proxy")
+async def voe_proxy(request: Request):
+    """Signed, same-origin HLS proxy for the VOE source. VOE's delivery CDN binds
+    its stream token to the IP/ASN that resolved the embed (note the ``asn=``
+    query param), so the raw playlist/segment URLs 403 from the viewer's browser
+    even though they play for the backend. This fetches the signed upstream
+    playlist/segment server-side, rewrites playlists so sub-resources flow back
+    through this proxy, and streams segments through with Range passthrough.
+
+    The CDN host rotates, so instead of a host allow-list this proxy verifies an
+    HMAC on the ``u`` URL (see resolvers.voe) and refuses anything unsigned —
+    closing the open-proxy / SSRF hole."""
+    url = request.query_params.get("u")
+    sig = request.query_params.get("s")
+    try:
+        status, content_type, headers, payload = await voe_proxy_fetch(
+            url=url,
+            sig=sig,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"VOE proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     if isinstance(payload, (bytes, bytearray)):
