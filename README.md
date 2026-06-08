@@ -198,7 +198,8 @@ for extras (specials/OVAs/movies).
 - **`/vidking_proxy`**: Removes ads and pop-unders from VidKing/Videasy embeds.
 - **`/movish_proxy`**: Proxies Movish streams to handle headers/CORS.
 - **`/playimdb_proxy`**: Signed HLS proxy for the PlayIMDb source (injects the referer the PlayIMDb CDNs require; the raw stream is extracted server-side so no PlayIMDb player/ad code is ever loaded).
-- **`/voe_proxy`**: Signed HLS proxy for the VOE source (most of aniworld.to is hosted on VOE). VOE's CDN binds the stream token to the IP/ASN **and** User-Agent that resolved the embed, so the raw playlist/segment URLs 403 from the viewer's browser; the backend fetches them server-side (matching UA) and rewrites playlists so segments flow back through the proxy.
+- **`/voe_proxy`**: Signed HLS proxy for the VOE source (most of aniworld.to is hosted on VOE). VOE's CDN binds the stream token to the IP/ASN **and** User-Agent that resolved the embed, so the raw playlist/segment URLs 403 from the viewer's browser; the backend fetches them server-side (matching UA) and rewrites playlists so segments flow back through the proxy. Emitted as a `streamType: hls` source the frontend's in-app player loads directly.
+- **`/vidmoly_proxy`**: Signed HLS proxy for the Vidmoly source (the other common aniworld.to host). Same idea as `/voe_proxy` — the stream is proxied server-side and emitted as a direct `hls` source for the in-app player (also future-proofs against the CDN's `asn=` token binding).
 - **`/jellyfin_proxy`**: Proxies Jellyfin HLS segments for same-origin playback.
 - **`/health`**: Check system status and database health.
 

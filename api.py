@@ -22,6 +22,7 @@ from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
 from resolvers.movish import proxy_fetch as movish_proxy_fetch
 from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
 from resolvers.voe import proxy_fetch as voe_proxy_fetch
+from resolvers.vidmoly import proxy_fetch as vidmoly_proxy_fetch
 from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from player import render_player, is_safe_src
@@ -903,7 +904,7 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dic
                         resolved_streams.append({
                             "source": matched_resolver.source_name,
                             "type": stream_type,
-                            "url": direct_video_url
+                            "url": abs_url
                         })
                 else:
                     resolved_streams.append({
@@ -1425,6 +1426,41 @@ async def voe_proxy(request: Request):
         raise HTTPException(status_code=403, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"VOE proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- VIDMOLY STREAM PROXY ("Vidmoly" source) ---
+@app.get("/vidmoly_proxy")
+async def vidmoly_proxy(request: Request):
+    """Signed, same-origin HLS proxy for the Vidmoly source. Fetches the signed
+    upstream playlist/segment server-side (with the vidmoly Referer), rewrites
+    playlists so sub-resources flow back through this proxy, and streams segments
+    through with Range passthrough.
+
+    This exists so the Vidmoly stream can be played in the same-origin Crimson
+    ``/player`` (which gives a real, fullscreen-capable player) instead of being
+    handed to the frontend as a bare cross-origin URL. The CDN host rotates, so
+    instead of a host allow-list the proxy verifies an HMAC on the ``u`` URL (see
+    resolvers.vidmoly) and refuses anything unsigned — closing the open-proxy /
+    SSRF hole."""
+    url = request.query_params.get("u")
+    sig = request.query_params.get("s")
+    try:
+        status, content_type, headers, payload = await vidmoly_proxy_fetch(
+            url=url,
+            sig=sig,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"Vidmoly proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     if isinstance(payload, (bytes, bytearray)):
