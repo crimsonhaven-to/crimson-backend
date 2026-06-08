@@ -1,0 +1,66 @@
+# Cluster-wide Patroni configuration — IDENTICAL on all three database hosts.
+#
+# Per-host identity (node name), network addresses, etcd endpoints and all
+# passwords are injected via PATRONI_* environment variables in docker-compose.yml
+# and OVERRIDE anything here. This file only holds the things every node shares.
+#
+# The `bootstrap:` section is special: it is read ONLY the very first time the
+# cluster is created and is then stored in etcd. Editing it here afterwards has
+# no effect — change a running cluster with `patronictl edit-config` instead.
+
+bootstrap:
+  # Distributed configuration seeded into etcd on first bootstrap.
+  dcs:
+    ttl: 30                          # leader lease seconds; lose it -> failover
+    loop_wait: 10                    # how often each node re-checks the cluster
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576 # 1 MiB: never promote a too-far-behind standby
+    synchronous_mode: true           # a write is ACKed only once a standby also has it
+    postgresql:
+      use_pg_rewind: true            # cheap re-sync of an old primary after failover
+      use_slots: true                # replication slots so WAL isn't dropped too early
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 256MB
+        password_encryption: scram-sha-256
+        # Continuous WAL archiving to pgBackRest (run `stanza-create` right after
+        # the cluster is up — see the README — or these pushes will queue up).
+        archive_mode: "on"
+        archive_command: 'pgbackrest --stanza=crimson archive-push %p'
+
+  # Used only the first time the data directory is created.
+  initdb:
+    - encoding: UTF8
+    - data-checksums                 # detect silent disk corruption early
+
+  # Runs once, on the leader, right after bootstrap. Creates the application
+  # role + database that the API's DATABASE_URL points at (see init-app-db.sh).
+  post_init: /etc/patroni/init-app-db.sh
+
+  # Seed host-based auth. EDIT THE CIDRs to match your networks (see README §7):
+  #   - the Swarm/app network needs to reach Postgres (the `all` rules)
+  #   - the DB hosts need to reach each other for replication
+  pg_hba:
+    - local   all             all                                  scram-sha-256
+    - host    all             all       127.0.0.1/32               scram-sha-256
+    - host    all             all       ::1/128                    scram-sha-256
+    - host    all             all       10.0.0.0/8                 scram-sha-256
+    - host    replication     replicator 10.0.0.0/8                scram-sha-256
+
+postgresql:
+  bin_dir: /usr/lib/postgresql/17/bin
+  # The data directory lives in a sub-folder of the bind-mounted volume so a
+  # mount-point `lost+found` (common on ext4 RAID arrays) never collides with it.
+  data_dir: /var/lib/postgresql/data/pgroot
+  pgpass: /tmp/pgpass
+  # superuser + replication credentials come from PATRONI_SUPERUSER_* and
+  # PATRONI_REPLICATION_* in docker-compose.yml.
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

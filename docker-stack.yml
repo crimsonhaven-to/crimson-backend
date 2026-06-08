@@ -9,6 +9,11 @@
 # this stack expects an EXTERNAL managed PostgreSQL via DATABASE_URL — the IaC
 # doctrine goal: every replica is identical and stateless, pointing at one DB.
 #
+# For a redundant, self-hosted PostgreSQL (Patroni HA cluster) plus the dev->prod
+# data migration, see deploy/postgres-ha/README.md. With that cluster, point
+# DATABASE_URL at all three DB hosts and let psycopg find the primary itself:
+#   DATABASE_URL=postgresql://crimson:PASS@db-1,db-2,db-3:5432/crimson?target_session_attrs=read-write
+#
 # Production fronting: keep this BEHIND your TLS-terminating reverse proxy. The
 # app emits absolute iframe URLs from X-Forwarded-Proto/Host, so it must only be
 # reachable via that proxy — do NOT expose the published port below straight to

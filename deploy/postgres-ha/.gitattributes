@@ -1,0 +1,5 @@
+# These run on the Linux database hosts — force LF so they aren't checked out
+# with CRLF on Windows and then fail with "bad interpreter" / syntax errors.
+*.sh text eol=lf
+patroni.yml text eol=lf
+docker-compose.yml text eol=lf
