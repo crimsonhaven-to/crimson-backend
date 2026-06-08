@@ -1,0 +1,29 @@
+# Patroni-managed PostgreSQL 17 image for the Crimsonhaven HA cluster.
+#
+# It's the official PostgreSQL image (so we get the real server binaries, tuned
+# defaults and the `postgres` user) with three things layered on top:
+#   * Patroni        — the supervisor that runs Postgres, elects a leader via
+#                      etcd and fails over automatically.
+#   * etcd3 client   — how Patroni talks to the etcd consensus store.
+#   * pgBackRest     — backups + point-in-time recovery (see pgbackrest/).
+#
+# Build once and reuse on every DB host (docker-compose builds it for you):
+#   docker compose build patroni
+FROM postgres:17-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-psycopg2 \
+      pgbackrest curl ca-certificates \
+ && pip3 install --no-cache-dir --break-system-packages 'patroni[etcd3]' \
+ && rm -rf /var/lib/apt/lists/*
+
+# Patroni runs the cluster as the unprivileged `postgres` user (uid 999) that the
+# base image already ships — it must own the data directory you bind-mount in.
+USER postgres
+
+# Override the base image's entrypoint: we don't want its initdb logic, Patroni
+# owns the data directory lifecycle. Patroni reads identity/addresses/secrets
+# from PATRONI_* environment variables (set in docker-compose.yml) and the rest
+# from this file.
+ENTRYPOINT ["patroni", "/etc/patroni/patroni.yml"]
