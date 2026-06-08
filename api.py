@@ -624,6 +624,7 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
           english
           native
         }
+        synonyms
         description
         startDate {
           year
@@ -692,6 +693,7 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
             "title_romaji": media.get("title", {}).get("romaji"),
             "title_english": media.get("title", {}).get("english"),
             "title_native": media.get("title", {}).get("native"),
+            "synonyms": media.get("synonyms") or [],
             "total_episodes": media.get("episodes"),
             "status": media.get("status"),
             "banner": media.get("bannerImage"),
