@@ -45,6 +45,22 @@ from psycopg_pool import ConnectionPool
 _pool: Optional[ConnectionPool] = None
 _lock = threading.Lock()
 
+# Advisory-lock key shared by every init_db() that creates schema. `CREATE TABLE
+# / INDEX IF NOT EXISTS` is NOT safe under catalog contention — several replicas
+# booting at once race and one crashes with "tuple concurrently updated" /
+# "duplicate key ... pg_type_typname_nsp_index". Each init_db takes
+# pg_advisory_xact_lock(SCHEMA_INIT_LOCK) as its first statement so simultaneous
+# boots serialize (the loser waits, then runs the DDL as a harmless no-op). It's
+# transaction-scoped, so it auto-releases when the init_db transaction commits.
+SCHEMA_INIT_LOCK = 0x6372736E  # "crsn"
+
+
+def lock_schema_init(conn) -> None:
+    """Take the cluster-wide schema-init advisory lock on ``conn``'s current
+    transaction. Call this first inside an init_db() ``with get_connection()``
+    block so concurrent replica startups don't race on DDL."""
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_INIT_LOCK,))
+
 
 def _dsn() -> str:
     url = os.getenv("DATABASE_URL")

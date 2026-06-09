@@ -33,7 +33,7 @@ and so never reaches the public page. Only events the supporter marked public
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from db_pool import get_connection
+from db_pool import get_connection, lock_schema_init
 
 
 def _now_iso() -> str:
@@ -60,6 +60,8 @@ class SupporterStore:
     def init_db(self) -> None:
         """Create the schema (idempotent — safe on every replica/boot)."""
         with get_connection() as conn:
+            # Serialize DDL across replicas (see db_pool.lock_schema_init).
+            lock_schema_init(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS kofi_transactions (

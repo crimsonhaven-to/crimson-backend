@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from db_pool import get_connection
+from db_pool import get_connection, lock_schema_init
 
 _THIS_DIR = Path(__file__).resolve().parent
 
@@ -100,6 +100,9 @@ class MappingDatabaseEngine:
         """Create the schema (idempotent) and drop obsolete tables."""
         with self._connect() as conn:
             cursor = conn.cursor()
+
+            # Serialize DDL across replicas (see db_pool.lock_schema_init).
+            lock_schema_init(conn)
 
             cursor.execute(
                 """

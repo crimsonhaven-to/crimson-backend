@@ -14,6 +14,11 @@
 # DATABASE_URL at all three DB hosts and let psycopg find the primary itself:
 #   DATABASE_URL=postgresql://crimson:PASS@db-1,db-2,db-3:5432/crimson?target_session_attrs=read-write
 #
+# Two services, one image (see "Why two services" at the bottom):
+#   api       — N stateless serving replicas (RUN_DB_SYNC=false), publishes :8000
+#   api-sync  — exactly ONE replica that owns the Fribb resync (RUN_DB_SYNC=true),
+#               no published port (it doesn't serve ingress traffic)
+#
 # Production fronting: keep this BEHIND your TLS-terminating reverse proxy. The
 # app emits absolute iframe URLs from X-Forwarded-Proto/Host, so it must only be
 # reachable via that proxy — do NOT expose the published port below straight to
@@ -23,6 +28,11 @@
 version: "3.8"
 
 services:
+  # --- Serving replicas ------------------------------------------------------
+  # Stateless, horizontally scalable. They do NOT run the Fribb resync; they just
+  # read the mapping tables that api-sync keeps fresh in the shared DB. Scale via
+  # `replicas` below. Schema init is concurrency-safe (db_pool.lock_schema_init),
+  # so multiple replicas can boot simultaneously without racing on DDL.
   api:
     image: ${CRIMSON_API_IMAGE:-reallordraymond/crimson-backend:latest}
 
@@ -34,18 +44,19 @@ services:
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
       # Lock CORS down to the real frontend origins in production.
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
-      # The Fribb resync rebuilds the mapping tables wholesale, so exactly ONE
-      # replica may own it. With replicas: 1 below it lives here. To scale out,
-      # see the "Scaling past one replica" note at the bottom of this file.
-      - RUN_DB_SYNC=true
-      # Optional Ko-fi supporters webhook + Jellyfin source (see .env.example).
+      # Serving replicas never run the resync — api-sync owns it.
+      - RUN_DB_SYNC=false
+      # Optional Ko-fi webhook + Jellyfin source. These belong on the serving
+      # service (it handles the ingress POST /kofi/webhook + playback requests),
+      # not on api-sync. Uncomment and supply values via the deploy environment.
       # - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN}
       # - JELLYFIN_URL=${JELLYFIN_URL}
       # - JELLYFIN_USERNAME=${JELLYFIN_USERNAME}
       # - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD}
 
     # Front this with your reverse proxy. Remove if you attach the proxy directly
-    # to crimson_net instead of publishing a host port.
+    # to crimson_net instead of publishing a host port. Only THIS service may
+    # publish :8000 — two services can't share an ingress port.
     ports:
       - target: 8000
         published: 8000
@@ -57,20 +68,14 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      # Uvicorn binds port 8000 only AFTER lifespan startup finishes, and on the
-      # RUN_DB_SYNC replica that includes the first-boot Fribb resync (download +
-      # wholesale mapping rebuild), which can take several minutes. Until it's
-      # done /health is connection-refused, so the grace window must cover it or
-      # Swarm kills the container mid-sync and it loops forever. Serving replicas
-      # (RUN_DB_SYNC=false) bind fast and a passing check marks them healthy
-      # immediately, so the longer window costs them nothing.
-      start_period: 600s
+      # Serving replicas skip the resync, so they bind :8000 within seconds.
+      start_period: 60s
 
     stop_grace_period: 20s
 
     deploy:
       mode: replicated
-      replicas: 1
+      replicas: 3
       restart_policy:
         condition: any
         delay: 5s
@@ -97,15 +102,85 @@ services:
     networks:
       - crimson_net
 
+  # --- Sync owner (exactly one) ----------------------------------------------
+  # Owns the periodic Fribb resync that rebuilds the mapping tables wholesale.
+  # MUST stay at replicas: 1 — two of these would download + rebuild in lockstep,
+  # wasting bandwidth and contending on the shared DB. No published port: it does
+  # not serve ingress traffic, it only keeps the DB fresh for the api replicas.
+  api-sync:
+    image: ${CRIMSON_API_IMAGE:-reallordraymond/crimson-backend:latest}
+
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
+      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
+      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
+      # The one process that runs the Fribb resync.
+      - RUN_DB_SYNC=true
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Uvicorn binds :8000 only AFTER lifespan startup finishes, and here that
+      # includes the first-boot Fribb resync (download + wholesale rebuild), which
+      # can take several minutes. Until it's done /health is connection-refused,
+      # so the grace window must cover it or Swarm kills the container mid-sync
+      # and it loops forever. The resync re-runs on every boot of this service.
+      start_period: 600s
+
+    stop_grace_period: 20s
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        # stop-first: never run two syncers at once (start-first would briefly
+        # overlap the old + new container, both doing the wholesale resync).
+        order: stop-first
+        failure_action: rollback
+        monitor: 30s
+        max_failure_ratio: 0.3
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+        order: stop-first
+      resources:
+        limits:
+          cpus: "1.50"
+          # The resync loads the full Fribb mapping into memory. If this container
+          # gets OOM-killed (task error "non-zero exit (137)") during the rebuild,
+          # raise this limit (e.g. 1024M / 1536M).
+          memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+    networks:
+      - crimson_net
+
 networks:
   crimson_net:
     driver: overlay
     attachable: true
 
-# --- Scaling past one replica ------------------------------------------------
-# Only one process may run the Fribb resync. To run N serving replicas:
-#   1. Set RUN_DB_SYNC=false above and raise `replicas` to N.
-#   2. Add a second service from the same image with replicas: 1 and
-#      RUN_DB_SYNC=true (it both syncs and serves), or run the sync as a
-#      one-shot `docker service create --restart-condition none` job on a timer.
-# Every replica still runs the cheap expired-session purge on its own schedule.
+# --- Why two services --------------------------------------------------------
+# Only ONE process may run the Fribb resync, but the serving tier must scale. A
+# single service can't do both: every replica of a service shares the same env,
+# so you can't have one with RUN_DB_SYNC=true and the rest false. Hence the split
+# — `api` (replicas: N, RUN_DB_SYNC=false) and `api-sync` (replicas: 1,
+# RUN_DB_SYNC=true). Both run from the same image and both run the cheap
+# expired-session purge on their own schedule; only api-sync runs the resync.
+#
+# To scale the serving tier, change `replicas` under `api`. Keep an eye on the
+# DB connection ceiling: each replica opens up to DB_POOL_MAX (default 10)
+# connections to the Patroni leader, plus api-sync's pool, plus replication/
+# Patroni overhead — stay well under Postgres max_connections (default 100), or
+# lower DB_POOL_MAX / put PgBouncer in front of the leader.
