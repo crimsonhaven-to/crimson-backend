@@ -34,7 +34,7 @@ services:
   # `replicas` below. Schema init is concurrency-safe (db_pool.lock_schema_init),
   # so multiple replicas can boot simultaneously without racing on DDL.
   api:
-    image: ${CRIMSON_API_IMAGE:-reallordraymond/crimson-backend:latest}
+    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
 
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
@@ -46,13 +46,14 @@ services:
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
       # Serving replicas never run the resync — api-sync owns it.
       - RUN_DB_SYNC=false
-      # Optional Ko-fi webhook + Jellyfin source. These belong on the serving
-      # service (it handles the ingress POST /kofi/webhook + playback requests),
-      # not on api-sync. Uncomment and supply values via the deploy environment.
-      # - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN}
-      # - JELLYFIN_URL=${JELLYFIN_URL}
-      # - JELLYFIN_USERNAME=${JELLYFIN_USERNAME}
-      # - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD}
+      # Ko-fi webhook + Jellyfin source live on the serving service (it handles
+      # the ingress POST /kofi/webhook + playback requests), not on api-sync.
+      # These are optional (`:-` => empty when unset disables the feature), but
+      # are supplied via crimson.env on the manager to match production.
+      - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN:-}
+      - JELLYFIN_URL=${JELLYFIN_URL:-}
+      - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
+      - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
 
     # Front this with your reverse proxy. Remove if you attach the proxy directly
     # to crimson_net instead of publishing a host port. Only THIS service may
@@ -108,7 +109,7 @@ services:
   # wasting bandwidth and contending on the shared DB. No published port: it does
   # not serve ingress traffic, it only keeps the DB fresh for the api replicas.
   api-sync:
-    image: ${CRIMSON_API_IMAGE:-reallordraymond/crimson-backend:latest}
+    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
 
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
