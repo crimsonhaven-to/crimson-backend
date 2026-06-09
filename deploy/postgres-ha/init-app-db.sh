@@ -18,16 +18,16 @@ APP_DB="${CRIMSON_APP_DB:-crimson}"
 : "${CRIMSON_APP_PASSWORD:?CRIMSON_APP_PASSWORD must be set}"
 
 # Create the login role if it doesn't already exist (idempotent).
-psql "$CONN" -v ON_ERROR_STOP=1 \
-  -v app_user="$APP_USER" -v app_password="$CRIMSON_APP_PASSWORD" <<'SQL'
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'app_user') THEN
-    EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', :'app_user', :'app_password');
-  END IF;
-END
-$$;
+# NOTE: psql does NOT interpolate :'var' references inside a dollar-quoted
+# ($$ ... $$) block, so the existence check is done outside one. The CREATE
+# uses :"app_user" (quoted identifier) and :'app_password' (quoted literal),
+# which psql substitutes safely in a plain -c command.
+if ! psql "$CONN" -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${APP_USER}'" | grep -q 1; then
+  psql "$CONN" -v ON_ERROR_STOP=1 \
+    -v app_user="$APP_USER" -v app_password="$CRIMSON_APP_PASSWORD" <<'SQL'
+CREATE ROLE :"app_user" LOGIN PASSWORD :'app_password';
 SQL
+fi
 
 # CREATE DATABASE can't run inside a transaction/DO block, so guard it separately.
 if ! psql "$CONN" -tAc "SELECT 1 FROM pg_database WHERE datname = '${APP_DB}'" | grep -q 1; then

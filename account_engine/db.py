@@ -20,7 +20,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from db_pool import get_connection
+from db_pool import get_connection, lock_schema_init
 
 # Lifetimes.
 SESSION_TTL = timedelta(days=30)
@@ -62,6 +62,8 @@ class AccountStore:
     def init_db(self) -> None:
         """Create the schema (idempotent)."""
         with self._connect() as conn:
+            # Serialize DDL across replicas (see db_pool.lock_schema_init).
+            lock_schema_init(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS accounts (

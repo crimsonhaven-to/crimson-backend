@@ -7,13 +7,13 @@
 .DESCRIPTION
     Only these tables are moved, in foreign-key-safe order:
         accounts, favorites, watch_progress, kofi_transactions
-    The TMDB<->AniList mapping tables and api_cache are deliberately NOT copied —
+    The TMDB<->AniList mapping tables and api_cache are deliberately NOT copied --
     production rebuilds them from Fribb on first boot. sessions/challenges are
     skipped too (users simply re-login; challenges have a 5-minute TTL).
 
     pg_dump emits the rows as COPY plus the setval() for the accounts identity
     sequence, so production keeps the same user_ids and the next signup won't
-    collide. The production tables must already exist and be EMPTY — i.e. let the
+    collide. The production tables must already exist and be EMPTY -- i.e. let the
     API boot once against the cluster first so its init_db() creates the schema.
 
     Requires the PostgreSQL client tools (pg_dump, psql) on PATH. Install via the
@@ -55,8 +55,11 @@ $before.GetEnumerator() | ForEach-Object { "    {0,-18} {1}" -f $_.Key, $_.Value
 
 Write-Host "==> Dumping precious tables from dev -> $DumpFile" -ForegroundColor Cyan
 $tableArgs = $tables | ForEach-Object { "--table=$_" }
-& pg_dump --data-only --no-owner --no-privileges @tableArgs $DevUrl |
-    Out-File -FilePath $DumpFile -Encoding utf8
+# Let pg_dump write the file itself (--file). Piping through PowerShell's
+# Out-File would re-encode it: Windows PowerShell 5.1's "utf8" adds a BOM, which
+# psql then rejects ("syntax error at or near ï»¿" on line 1). Writing direct
+# keeps it BOM-less UTF-8, and $LASTEXITCODE now reflects pg_dump (not Out-File).
+& pg_dump --data-only --no-owner --no-privileges --file=$DumpFile @tableArgs $DevUrl
 if ($LASTEXITCODE -ne 0) { throw "pg_dump failed (exit $LASTEXITCODE)" }
 
 Write-Host "==> Loading into production" -ForegroundColor Cyan
@@ -64,7 +67,7 @@ Write-Host "    (production tables must already exist and be empty)" -Foreground
 & psql $ProdUrl -v ON_ERROR_STOP=1 -f $DumpFile
 if ($LASTEXITCODE -ne 0) { throw "psql restore failed (exit $LASTEXITCODE)" }
 
-Write-Host "==> Verifying — dev vs prod row counts:" -ForegroundColor Cyan
+Write-Host "==> Verifying -- dev vs prod row counts:" -ForegroundColor Cyan
 $after = Get-RowCounts $ProdUrl
 $ok = $true
 foreach ($t in $tables) {
