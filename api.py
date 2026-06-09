@@ -800,7 +800,7 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
     return trending_list
 
 # --- SCRAPER HELPER FUNCTIONS ---
-async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int, anilist_data: Dict) -> List[str]:
+async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int, anilist_data: Dict) -> List:
     """Run one scraper through the unified search -> embeds pipeline."""
     scraper = scraper_class()
     try:
@@ -837,12 +837,17 @@ def _public_base_url(request: Request) -> str:
         return f"{proto}://{host}/"
     return str(request.base_url)
 
-async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dict]:
+async def resolve_streams(embed_urls: List[str], base_url: str = "", language: Optional[str] = None) -> List[Dict]:
     """Resolve embed URLs to direct stream URLs.
 
     ``base_url`` is the public base of this backend (e.g. https://host/). It is
     used to turn the VidKing Test resolver's relative proxy path into an
     absolute iframe src the frontend can load.
+
+    ``language`` is an optional human-readable audio/subtitle label (e.g.
+    "German Dub") for these embeds, known by some scrapers (aniworld) and not
+    others. When set, it is stamped onto every resolved stream so the frontend
+    can show it; otherwise the streams carry no language and it stays blank.
     """
     if not embed_urls:
         return []
@@ -925,7 +930,13 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "") -> List[Dic
                 "type": "iframe",
                 "url": embed_url
             })
-    
+
+    # Stamp the known language onto every stream from this batch (all embeds in a
+    # single call share one language). Left off entirely when unknown.
+    if language:
+        for stream in resolved_streams:
+            stream["language"] = language
+
     return resolved_streams
 
 # --- API ENDPOINTS ---
@@ -1150,11 +1161,19 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
                 scraper_class, tmdb_id, season_number, episode_number, media_ctx
             )
             for embed in embeds:
+                # Embeds are either a bare URL string or a {"url", "language"}
+                # dict (scrapers that know the dub/sub language, e.g. aniworld).
+                if isinstance(embed, dict):
+                    embed_url, language = embed.get("url"), embed.get("language")
+                else:
+                    embed_url, language = embed, None
+                if not embed_url:
+                    continue
                 async with lock:
-                    if embed in seen_embeds:
+                    if embed_url in seen_embeds:
                         continue
-                    seen_embeds.add(embed)
-                for stream in await resolve_streams([embed], base_url=base_url):
+                    seen_embeds.add(embed_url)
+                for stream in await resolve_streams([embed_url], base_url=base_url, language=language):
                     async with lock:
                         if stream["url"] in seen_urls:
                             continue
@@ -1184,6 +1203,7 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
                 "source": stream["source"],
                 "streamType": stream["type"],
                 "url": stream["url"],
+                "language": stream.get("language"),
             })
         yield _ndjson({"type": "done", "count": count})
     finally:

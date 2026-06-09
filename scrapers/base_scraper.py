@@ -26,10 +26,15 @@ class BaseAnimeScraper(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def get_episode_embeds(self, anime_slug: str, episode_num: int, season_num: int) -> list[str]:
+    async def get_episode_embeds(self, anime_slug: str, episode_num: int, season_num: int) -> list:
         """
-        Step 2: Go to the episode page on that website and locate the 
+        Step 2: Go to the episode page on that website and locate the
         third-party embed video player URLs (like MegaF, Mp4Upload, etc).
+
+        Returns a list of embeds. Each entry is either a bare URL string, or a
+        ``{"url": <str>, "language": <str|None>}`` dict when the scraper knows the
+        audio/subtitle language of that embed (e.g. aniworld's German Dub / Sub).
+        The resolve pipeline accepts both forms.
         """
         pass
 
