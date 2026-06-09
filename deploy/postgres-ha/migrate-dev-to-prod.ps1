@@ -55,8 +55,11 @@ $before.GetEnumerator() | ForEach-Object { "    {0,-18} {1}" -f $_.Key, $_.Value
 
 Write-Host "==> Dumping precious tables from dev -> $DumpFile" -ForegroundColor Cyan
 $tableArgs = $tables | ForEach-Object { "--table=$_" }
-& pg_dump --data-only --no-owner --no-privileges @tableArgs $DevUrl |
-    Out-File -FilePath $DumpFile -Encoding utf8
+# Let pg_dump write the file itself (--file). Piping through PowerShell's
+# Out-File would re-encode it: Windows PowerShell 5.1's "utf8" adds a BOM, which
+# psql then rejects ("syntax error at or near ï»¿" on line 1). Writing direct
+# keeps it BOM-less UTF-8, and $LASTEXITCODE now reflects pg_dump (not Out-File).
+& pg_dump --data-only --no-owner --no-privileges --file=$DumpFile @tableArgs $DevUrl
 if ($LASTEXITCODE -ne 0) { throw "pg_dump failed (exit $LASTEXITCODE)" }
 
 Write-Host "==> Loading into production" -ForegroundColor Cyan
