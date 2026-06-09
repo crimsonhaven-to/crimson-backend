@@ -246,15 +246,6 @@ def is_rewritable(content_type: str) -> bool:
     return "mpegurl" in (content_type or "").lower()
 
 
-def _player_url(stream_path: str, stream_type: str) -> str:
-    """Wrap a same-origin proxied stream path in the backend /player page.
-
-    The frontend iframes the player (which it handles well) rather than getting
-    a bare hls/mp4 URL it only knows how to print as a link.
-    """
-    return "/player?" + urlencode({"type": stream_type, "src": stream_path})
-
-
 # --- The proxy fetch (used by the api.py route) ----------------------------
 async def proxy_fetch(
     path: str,
@@ -400,17 +391,18 @@ class JellyfinResolver(BaseResolver):
         ms_id = ms.get("Id") or item_id
         play_session = info.get("PlaySessionId") or ""
 
-        # Auto: direct-play browser-friendly files; everything else -> HLS.
-        # Both are wrapped in our same-origin /player page (see _player_url) so
-        # the frontend can iframe them like any other source.
+        # Auto: direct-play browser-friendly files; everything else -> HLS. Both
+        # are returned as a bare same-origin proxy path; api.py tags them mp4/hls
+        # so the frontend's CrimsonPlayer plays them like any other source. (The
+        # token-injecting proxy stays — the Jellyfin host is private/auth-gated —
+        # but the backend /player page is no longer in the loop.)
         if _is_web_playable(ms):
             params = {"static": "true", "mediaSourceId": ms_id}
             if play_session:
                 params["playSessionId"] = play_session
             proxy_path = f"{PROXY_PREFIX}/Videos/{item_id}/stream?{urlencode(params)}"
-            player_url = _player_url(proxy_path, "mp4")
-            print(f"[JellyfinResolver] SUCCESS (direct): {player_url}")
-            return player_url
+            print(f"[JellyfinResolver] SUCCESS (direct): {proxy_path}")
+            return proxy_path
 
         # HLS: prefer Jellyfin's ready-made TranscodingUrl (has all the right
         # params); fall back to a hand-built master.m3u8 request.
@@ -431,6 +423,5 @@ class JellyfinResolver(BaseResolver):
                 params["playSessionId"] = play_session
             proxy_path = f"{PROXY_PREFIX}/Videos/{item_id}/master.m3u8?{urlencode(params)}"
 
-        player_url = _player_url(proxy_path, "hls")
-        print(f"[JellyfinResolver] SUCCESS (hls): {player_url}")
-        return player_url
+        print(f"[JellyfinResolver] SUCCESS (hls): {proxy_path}")
+        return proxy_path
