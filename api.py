@@ -1057,12 +1057,12 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                         "url": embed_url
                     })
             except Exception as e:
+                # A resolver that errors out has nothing playable to offer. Drop
+                # it entirely instead of emitting a broken "(Error)" iframe — that
+                # placeholder used to surface as a dead source (e.g. Movish, which
+                # fails fast and so raced to the top of the list). Just log it.
                 logger.error(f"Resolver error for {matched_resolver.source_name}: {e}")
-                resolved_streams.append({
-                    "source": f"{matched_resolver.source_name} (Error)",
-                    "type": "iframe",
-                    "url": embed_url
-                })
+                continue
         else:
             resolved_streams.append({
                 "source": "Direct Embed",
