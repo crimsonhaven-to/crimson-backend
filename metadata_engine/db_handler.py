@@ -41,8 +41,14 @@ class MappingDatabaseEngine:
     ANILIST_API_URL = "https://graphql.anilist.co"
     OVERRIDES_PATH = _THIS_DIR / "overrides.json"
 
-    # AniList bulk-fetch tuning
-    ANILIST_CHUNK_SIZE = 50
+    # AniList bulk-fetch tuning.
+    # AniList caps GraphQL query complexity at 500. Each aliased Media costs ~11
+    # complexity with the fields we request (id/idMal/format/genres/title/
+    # startDate), so the batch size must stay <= floor(500/11) = 45 or the whole
+    # chunk 400s ("Max query complexity should be 500 but got 550"). 50 used to
+    # squeak by at exactly 500 *before* the genres field was added (~10/alias);
+    # genres pushed it to 550. 40 keeps a comfortable margin (~440).
+    ANILIST_CHUNK_SIZE = 40
     ANILIST_CHUNK_DELAY = 0.7  # seconds between chunks (rate-limit friendly)
 
     def __init__(self, db_name: str = "anime_mappings.db", tmdb_api_key: Optional[str] = None):
@@ -270,14 +276,24 @@ class MappingDatabaseEngine:
                     await asyncio.sleep(retry_after)
                     continue  # retry the same chunk
 
-                if response.status_code != 200:
-                    # GraphQL may still return partial data with a non-200; try to use it.
-                    print(f"[AniList] Chunk returned status {response.status_code}; attempting partial parse.")
-
                 try:
-                    data = response.json().get("data") or {}
+                    body = response.json()
                 except Exception:
-                    data = {}
+                    body = {}
+
+                if response.status_code != 200:
+                    # GraphQL may still return partial data with a non-200; we try
+                    # to use it below. Surface AniList's actual error messages
+                    # though — a swallowed 400 (e.g. "Max query complexity should
+                    # be 500 but got 550") otherwise silently drops the whole
+                    # chunk's titles + genres with no clue why.
+                    errs = body.get("errors") if isinstance(body, dict) else None
+                    detail = "; ".join(
+                        str(e.get("message", e)) for e in errs[:3]
+                    ) if errs else "no error detail"
+                    print(f"[AniList] Chunk returned status {response.status_code}: {detail}")
+
+                data = (body.get("data") if isinstance(body, dict) else None) or {}
 
                 for media in data.values():
                     if media and media.get("id"):
