@@ -54,7 +54,7 @@ services:
   api:
     # Pull the same image production runs, but allow a local build so a dev
     # checkout works with `--build` without first pushing to the registry.
-    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+    # image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
     build:
       context: .
       dockerfile: Dockerfile
