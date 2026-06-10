@@ -259,7 +259,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Anime Streaming API",
     description="API for streaming anime with multi-season support",
-    version="2.0.1",
+    version="2.1.0",
     lifespan=lifespan
 )
 
