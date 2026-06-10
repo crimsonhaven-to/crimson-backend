@@ -41,8 +41,14 @@ class MappingDatabaseEngine:
     ANILIST_API_URL = "https://graphql.anilist.co"
     OVERRIDES_PATH = _THIS_DIR / "overrides.json"
 
-    # AniList bulk-fetch tuning
-    ANILIST_CHUNK_SIZE = 50
+    # AniList bulk-fetch tuning.
+    # AniList caps GraphQL query complexity at 500. Each aliased Media costs ~11
+    # complexity with the fields we request (id/idMal/format/genres/title/
+    # startDate), so the batch size must stay <= floor(500/11) = 45 or the whole
+    # chunk 400s ("Max query complexity should be 500 but got 550"). 50 used to
+    # squeak by at exactly 500 *before* the genres field was added (~10/alias);
+    # genres pushed it to 550. 40 keeps a comfortable margin (~440).
+    ANILIST_CHUNK_SIZE = 40
     ANILIST_CHUNK_DELAY = 0.7  # seconds between chunks (rate-limit friendly)
 
     def __init__(self, db_name: str = "anime_mappings.db", tmdb_api_key: Optional[str] = None):
@@ -123,10 +129,16 @@ class MappingDatabaseEngine:
                     title_native  TEXT,
                     anime_type    TEXT,
                     start_year    INTEGER,
+                    genres        TEXT,
                     last_synced   TEXT
                 )
                 """
             )
+
+            # Backfill the genres column on DBs created before it existed
+            # (CREATE TABLE IF NOT EXISTS won't add columns to an existing table).
+            # Stays null until the next sync rebuild repopulates anime_entries.
+            cursor.execute("ALTER TABLE anime_entries ADD COLUMN IF NOT EXISTS genres TEXT")
 
             cursor.execute(
                 """
@@ -245,7 +257,7 @@ class MappingDatabaseEngine:
                 chunk = anilist_ids[i:i + chunk_size]
                 query_parts = [
                     f"a{idx}: Media(id: {aid}, type: ANIME) {{ "
-                    f"id idMal format title {{ romaji english native }} "
+                    f"id idMal format genres title {{ romaji english native }} "
                     f"startDate {{ year }} }}"
                     for idx, aid in enumerate(chunk)
                 ]
@@ -264,14 +276,24 @@ class MappingDatabaseEngine:
                     await asyncio.sleep(retry_after)
                     continue  # retry the same chunk
 
-                if response.status_code != 200:
-                    # GraphQL may still return partial data with a non-200; try to use it.
-                    print(f"[AniList] Chunk returned status {response.status_code}; attempting partial parse.")
-
                 try:
-                    data = response.json().get("data") or {}
+                    body = response.json()
                 except Exception:
-                    data = {}
+                    body = {}
+
+                if response.status_code != 200:
+                    # GraphQL may still return partial data with a non-200; we try
+                    # to use it below. Surface AniList's actual error messages
+                    # though — a swallowed 400 (e.g. "Max query complexity should
+                    # be 500 but got 550") otherwise silently drops the whole
+                    # chunk's titles + genres with no clue why.
+                    errs = body.get("errors") if isinstance(body, dict) else None
+                    detail = "; ".join(
+                        str(e.get("message", e)) for e in errs[:3]
+                    ) if errs else "no error detail"
+                    print(f"[AniList] Chunk returned status {response.status_code}: {detail}")
+
+                data = (body.get("data") if isinstance(body, dict) else None) or {}
 
                 for media in data.values():
                     if media and media.get("id"):
@@ -313,16 +335,31 @@ class MappingDatabaseEngine:
     # ------------------------------------------------------------------ #
     # Sync
     # ------------------------------------------------------------------ #
-    async def sync_database_async(self):
-        """Download the Fribb dataset and rebuild the mapping tables."""
+    async def sync_database_async(self, force: bool = False):
+        """Download the Fribb dataset and rebuild the mapping tables.
+
+        ``force=True`` rebuilds even when the upstream ETag is unchanged — used by
+        the manual `python -m metadata_engine.resync` trigger to backfill after a
+        schema change (e.g. the genres column) without waiting for Fribb to move.
+        """
         self.init_db()
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             print("\n--- Mapping sync starting ---")
             new_etag = await self._check_needs_update(client)
             if not new_etag:
-                print("[DB Engine] Mappings already up-to-date.")
-                return
+                if not force:
+                    print("[DB Engine] Mappings already up-to-date.")
+                    return
+                # Forced rebuild despite a matching ETag. Capture the current ETag
+                # so sync_meta stays in step and the next scheduled check doesn't
+                # see a phantom change and resync again.
+                try:
+                    head = await client.head(self.MAPPING_URL, follow_redirects=True)
+                    new_etag = head.headers.get("ETag") or "forced-resync"
+                except Exception:
+                    new_etag = "forced-resync"
+                print("[DB Engine] Forced resync: rebuilding despite up-to-date ETag.")
 
             print("[DB Engine] Downloading Fribb anime-list...")
             try:
@@ -410,6 +447,7 @@ class MappingDatabaseEngine:
         for aid in all_anilist_ids:
             meta = al_metadata.get(aid, {})
             title = meta.get("title") or {}
+            genres = meta.get("genres") or []
             entry_rows.append(
                 (
                     aid,
@@ -419,6 +457,7 @@ class MappingDatabaseEngine:
                     title.get("native"),
                     meta.get("format") or entry_type.get(aid),
                     (meta.get("startDate") or {}).get("year"),
+                    json.dumps(genres) if genres else None,
                     now,
                 )
             )
@@ -449,8 +488,8 @@ class MappingDatabaseEngine:
                     """
                     INSERT INTO anime_entries
                         (anilist_id, mal_id, title_romaji, title_english, title_native,
-                         anime_type, start_year, last_synced)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                         anime_type, start_year, genres, last_synced)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (anilist_id) DO NOTHING
                     """,
                     entry_rows,

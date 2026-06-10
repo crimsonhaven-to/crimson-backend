@@ -22,7 +22,7 @@ whenever `anime_entries` is empty, so a wiped DB self-heals).
 
 | Table          | Purpose |
 |----------------|---------|
-| `anime_entries`| AniList metadata: titles (romaji/english/native), `mal_id`, `anime_type` (`format`: TV/MOVIE/OVA/…), `start_year`. |
+| `anime_entries`| AniList metadata: titles (romaji/english/native), `mal_id`, `anime_type` (`format`: TV/MOVIE/OVA/…), `start_year`, `genres` (JSON array of AniList genres). |
 | `tmdb_seasons` | One AniList id per real TMDB season. PK `(tmdb_id, season_number)`, `season_number >= 1`. |
 | `tmdb_extras`  | Specials / OVAs / movies (and season-collision losers) tied to a show. PK `(tmdb_id, anilist_id)`. |
 | `tmdb_shows`   | TMDB show details, populated **lazily** by the API on first request. |
