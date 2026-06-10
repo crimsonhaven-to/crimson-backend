@@ -259,7 +259,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Anime Streaming API",
     description="API for streaming anime with multi-season support",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan
 )
 
@@ -486,7 +486,7 @@ def get_catalogue_items() -> List[Dict]:
 
             cursor.execute(
                 """SELECT anilist_id, title_romaji, title_english, title_native,
-                          anime_type, start_year
+                          anime_type, start_year, genres
                    FROM anime_entries"""
             )
             entries = cursor.fetchall()
@@ -507,12 +507,19 @@ def get_catalogue_items() -> List[Dict]:
         elif aid in extra_map:
             tmdb_id = extra_map[aid]
         poster_path = posters.get(tmdb_id) if tmdb_id is not None else None
+        # genres is a JSON-encoded list (null for entries synced before genres
+        # existed, or with no AniList genres); decode defensively to [].
+        try:
+            genres = json.loads(e["genres"]) if e["genres"] else []
+        except (TypeError, ValueError):
+            genres = []
         items.append({
             "anilist_id": aid,
             "title": title,
             "title_romaji": e["title_romaji"],
             "title_english": e["title_english"],
             "category": e["anime_type"] or "UNKNOWN",
+            "genres": genres,
             "year": e["start_year"],
             "tmdb_id": tmdb_id,
             "season_number": season_number,
@@ -1133,17 +1140,23 @@ async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Nu
         raise HTTPException(status_code=500, detail="Failed to fetch trending anime")
 
 @app.get("/catalogue")
-async def get_catalogue(request: Request, category: Optional[str] = Query(None, description="Optional category filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL")):
+async def get_catalogue(
+    request: Request,
+    category: Optional[str] = Query(None, description="Optional format filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL"),
+    genre: Optional[str] = Query(None, description="Optional genre filter, e.g. Action, Romance, Comedy"),
+):
     """Full anime catalogue for a 'browse by category' page.
 
-    Lists every anime in our local DB (name + category + navigation ids) with no
-    external API calls. ``categories`` always reflects the whole catalogue (so
-    the frontend can render all category tabs); ``animes`` is filtered when a
-    ``category`` query param is given.
+    Lists every anime in our local DB (name + format + genres + navigation ids)
+    with no external API calls. ``categories`` and ``genres`` always reflect the
+    whole catalogue (so the frontend can render all tabs/chips); ``animes`` is
+    filtered when a ``category`` (format) and/or ``genre`` query param is given.
 
     The (large) response is gzip-compressed when the client accepts it.
     """
-    cache_key = "catalogue:v1"
+    # v2: item shape gained a `genres` field; bump so pre-genre cached lists
+    # (which lack it) aren't served.
+    cache_key = "catalogue:v2"
     # L1: in-process cache for the whole item list (no DB round-trip on a hit).
     items = _local_get(cache_key)
     if items is None:
@@ -1158,22 +1171,33 @@ async def get_catalogue(request: Request, category: Optional[str] = Query(None, 
         if items:
             _local_set(cache_key, items)
 
-    # Category breakdown over the FULL catalogue (before any filtering).
+    # Format + genre breakdowns over the FULL catalogue (before any filtering).
     counts: Dict[str, int] = {}
+    genre_counts: Dict[str, int] = {}
     for it in items:
         counts[it["category"]] = counts.get(it["category"], 0) + 1
+        for g in it.get("genres") or []:
+            genre_counts[g] = genre_counts.get(g, 0) + 1
     categories = [{"category": k, "count": v} for k, v in sorted(counts.items())]
+    genres = [{"genre": k, "count": v} for k, v in sorted(genre_counts.items())]
 
     animes = items
     if category:
         wanted = category.strip().upper()
-        animes = [it for it in items if (it["category"] or "").upper() == wanted]
+        animes = [it for it in animes if (it["category"] or "").upper() == wanted]
+    if genre:
+        wanted_g = genre.strip().casefold()
+        animes = [
+            it for it in animes
+            if any(g.casefold() == wanted_g for g in (it.get("genres") or []))
+        ]
 
     return _gzip_json(request, {
         "success": True,
         "count": len(animes),
         "total": len(items),
         "categories": categories,
+        "genres": genres,
         "animes": animes,
     })
 

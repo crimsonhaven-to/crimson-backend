@@ -123,10 +123,16 @@ class MappingDatabaseEngine:
                     title_native  TEXT,
                     anime_type    TEXT,
                     start_year    INTEGER,
+                    genres        TEXT,
                     last_synced   TEXT
                 )
                 """
             )
+
+            # Backfill the genres column on DBs created before it existed
+            # (CREATE TABLE IF NOT EXISTS won't add columns to an existing table).
+            # Stays null until the next sync rebuild repopulates anime_entries.
+            cursor.execute("ALTER TABLE anime_entries ADD COLUMN IF NOT EXISTS genres TEXT")
 
             cursor.execute(
                 """
@@ -245,7 +251,7 @@ class MappingDatabaseEngine:
                 chunk = anilist_ids[i:i + chunk_size]
                 query_parts = [
                     f"a{idx}: Media(id: {aid}, type: ANIME) {{ "
-                    f"id idMal format title {{ romaji english native }} "
+                    f"id idMal format genres title {{ romaji english native }} "
                     f"startDate {{ year }} }}"
                     for idx, aid in enumerate(chunk)
                 ]
@@ -410,6 +416,7 @@ class MappingDatabaseEngine:
         for aid in all_anilist_ids:
             meta = al_metadata.get(aid, {})
             title = meta.get("title") or {}
+            genres = meta.get("genres") or []
             entry_rows.append(
                 (
                     aid,
@@ -419,6 +426,7 @@ class MappingDatabaseEngine:
                     title.get("native"),
                     meta.get("format") or entry_type.get(aid),
                     (meta.get("startDate") or {}).get("year"),
+                    json.dumps(genres) if genres else None,
                     now,
                 )
             )
@@ -449,8 +457,8 @@ class MappingDatabaseEngine:
                     """
                     INSERT INTO anime_entries
                         (anilist_id, mal_id, title_romaji, title_english, title_native,
-                         anime_type, start_year, last_synced)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                         anime_type, start_year, genres, last_synced)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (anilist_id) DO NOTHING
                     """,
                     entry_rows,
