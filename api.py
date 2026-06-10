@@ -259,7 +259,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Anime Streaming API",
     description="API for streaming anime with multi-season support",
-    version="2.2.1",
+    version="2.2.2",
     lifespan=lifespan
 )
 
@@ -1058,11 +1058,26 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                             "url": abs_url
                         })
                 else:
-                    resolved_streams.append({
-                        "source": f"{matched_resolver.source_name} (Embed)",
-                        "type": "iframe",
-                        "url": embed_url
-                    })
+                    # resolve() found nothing playable. Only fall back to
+                    # iframing the raw embed_url if it's a genuine http(s) embed
+                    # page (legacy resolvers). For marker-based sources
+                    # (crimson-playimdb:..., crimson-vidking:..., etc.) the
+                    # embed_url is an INTERNAL routing token, not a URL — iframing
+                    # it yields an empty frame src that the frontend's
+                    # `frame-src https:` CSP blocks ("This content is blocked").
+                    # Drop the source instead so it never surfaces as a dead tile.
+                    if embed_url.lower().startswith(("http://", "https://")):
+                        resolved_streams.append({
+                            "source": f"{matched_resolver.source_name} (Embed)",
+                            "type": "iframe",
+                            "url": embed_url
+                        })
+                    else:
+                        logger.info(
+                            f"{matched_resolver.source_name}: no stream for marker "
+                            f"{embed_url!r}; dropping (not a frameable URL)."
+                        )
+                        continue
             except Exception as e:
                 # A resolver that errors out has nothing playable to offer. Drop
                 # it entirely instead of emitting a broken "(Error)" iframe — that
