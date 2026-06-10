@@ -26,6 +26,16 @@ from db_pool import get_connection, lock_schema_init
 SESSION_TTL = timedelta(days=30)
 CHALLENGE_TTL = timedelta(minutes=5)
 
+# Soft per-account row caps. An authenticated account can otherwise insert an
+# unbounded number of distinct item_keys (one row each), bloating the DB. Updates
+# to an existing key are always allowed; only growth past the cap is rejected.
+MAX_FAVORITES_PER_USER = 2000
+MAX_PROGRESS_PER_USER = 5000
+
+
+class QuotaExceeded(Exception):
+    """Raised when a per-account row cap would be exceeded (surfaced as HTTP 409)."""
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -180,7 +190,13 @@ class AccountStore:
             if row is None:
                 return False
             # Always delete (single-use), even if it turns out invalid/expired.
-            conn.execute("DELETE FROM challenges WHERE challenge = %s", (challenge,))
+            # Gate on rowcount: under concurrency two requests can both SELECT the
+            # row, but only the transaction whose DELETE actually removes it (the
+            # other races to 0 rows once the first commits) may consume it — so a
+            # captured (pk, challenge, signature) can't be replayed in parallel.
+            cur = conn.execute("DELETE FROM challenges WHERE challenge = %s", (challenge,))
+            if cur.rowcount == 0:
+                return False
             if row["public_key"] != public_key or row["purpose"] != purpose:
                 return False
             try:
@@ -235,6 +251,19 @@ class AccountStore:
     # -- favorites ------------------------------------------------------
     def upsert_favorite(self, user_id: int, fav: Dict) -> Dict:
         with self._connect() as conn:
+            # Soft cap: reject only NEW keys past the limit; updates always pass.
+            # Done in the same transaction as the insert so it's race-free enough
+            # (a tiny concurrent overshoot is harmless for a storage guard).
+            exists = conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s",
+                (user_id, fav["item_key"]),
+            ).fetchone()
+            if exists is None:
+                count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM favorites WHERE user_id = %s", (user_id,)
+                ).fetchone()["n"]
+                if count >= MAX_FAVORITES_PER_USER:
+                    raise QuotaExceeded(f"favorites limit ({MAX_FAVORITES_PER_USER}) reached")
             conn.execute(
                 """
                 INSERT INTO favorites
@@ -282,6 +311,18 @@ class AccountStore:
     # -- watch progress -------------------------------------------------
     def upsert_progress(self, user_id: int, prog: Dict) -> Dict:
         with self._connect() as conn:
+            # Soft cap: reject only NEW keys past the limit; updates always pass
+            # (same-episode progress saves keep working at the cap).
+            exists = conn.execute(
+                "SELECT 1 FROM watch_progress WHERE user_id = %s AND item_key = %s",
+                (user_id, prog["item_key"]),
+            ).fetchone()
+            if exists is None:
+                count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM watch_progress WHERE user_id = %s", (user_id,)
+                ).fetchone()["n"]
+                if count >= MAX_PROGRESS_PER_USER:
+                    raise QuotaExceeded(f"progress limit ({MAX_PROGRESS_PER_USER}) reached")
             conn.execute(
                 """
                 INSERT INTO watch_progress

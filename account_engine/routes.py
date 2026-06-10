@@ -33,7 +33,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
 from . import ed25519
-from .db import AccountStore
+from .db import AccountStore, QuotaExceeded
 from rate_limit import limiter
 
 router = APIRouter(tags=["account"])
@@ -264,9 +264,13 @@ async def get_favorites(user: dict = Depends(require_user)):
 
 
 @router.post("/account/favorites")
-async def add_favorite(body: FavoriteIn, user: dict = Depends(require_user)):
+@limiter.limit("60/minute")
+async def add_favorite(request: Request, body: FavoriteIn, user: dict = Depends(require_user)):
     item_key = _favorite_item_key(body.tmdb_id, body.anilist_id)
-    fav = store.upsert_favorite(user["user_id"], {"item_key": item_key, **body.model_dump()})
+    try:
+        fav = store.upsert_favorite(user["user_id"], {"item_key": item_key, **body.model_dump()})
+    except QuotaExceeded as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return {"success": True, "favorite": fav}
 
 
@@ -331,13 +335,17 @@ async def get_progress(
 
 
 @router.post("/account/progress")
-async def upsert_progress(body: ProgressIn, user: dict = Depends(require_user)):
+@limiter.limit("60/minute")
+async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depends(require_user)):
     item_key = _progress_item_key(
         body.tmdb_id, body.anilist_id, body.season_number, body.episode_number
     )
     payload = body.model_dump()
     payload["status"] = _resolve_status(body)
-    prog = store.upsert_progress(user["user_id"], {"item_key": item_key, **payload})
+    try:
+        prog = store.upsert_progress(user["user_id"], {"item_key": item_key, **payload})
+    except QuotaExceeded as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return {"success": True, "progress": prog}
 
 

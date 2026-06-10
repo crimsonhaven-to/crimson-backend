@@ -1,0 +1,107 @@
+# Single-node DEV stack for the Crimsonhaven backend.
+#
+# Same SHAPE as production (docker-stack.yml) — same image, same env contract,
+# same signed-proxy / CORS / sync semantics — but collapsed to the smallest thing
+# that runs end-to-end:
+#
+#   * ONE PostgreSQL container (no Patroni HA cluster, no replication, no external
+#     managed DB). Data lives in a local named volume.
+#   * ONE backend container that BOTH serves ingress AND owns the Fribb resync
+#     (RUN_DB_SYNC=true). Production splits these into `api` (replicas: N,
+#     RUN_DB_SYNC=false) + `api-sync` (replicas: 1, RUN_DB_SYNC=true); here a
+#     single replica plays both roles, so there's no two-service split to make.
+#
+# Run it (plain Docker, no Swarm needed):
+#   TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) \
+#   docker compose -f docker-compose-dev.yml up --build
+#
+# vs. docker-stack.yml (production): that expects an EXTERNAL managed/HA Postgres
+# via DATABASE_URL and never bundles a database. This file bundles one so a single
+# `up` gives you a working backend with zero external dependencies.
+#
+# Like production, keep this BEHIND a TLS-terminating reverse proxy if you expose
+# it publicly: the app emits absolute iframe URLs from X-Forwarded-Proto/Host, so
+# a directly-reachable published port lets an attacker spoof X-Forwarded-Host. For
+# local dev on loopback that's a non-issue.
+version: "3.8"
+
+services:
+  # --- Single PostgreSQL node ------------------------------------------------
+  # No HA, no replication. The production doctrine (every replica identical,
+  # pointing at one external DB) is preserved — the backend still talks only to
+  # DATABASE_URL — we've just made that "one DB" a local container.
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-crimson}
+      - POSTGRES_USER=${POSTGRES_USER:-crimson}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crimson}
+    volumes:
+      - crimson-pgdata-dev:/var/lib/postgresql/data
+    # Publish to loopback only so you can inspect with psql from the host without
+    # exposing the DB to the LAN. Comment out if you don't need host access.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crimson} -d ${POSTGRES_DB:-crimson}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --- Single backend container (serves + syncs) -----------------------------
+  api:
+    # Pull the same image production runs, but allow a local build so a dev
+    # checkout works with `--build` without first pushing to the registry.
+    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY in the environment or an .env file}
+      # Point the pool at the bundled single-node postgres above.
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson}
+      # Stable, shared secret for the signed stream proxies. A single dev instance
+      # could omit it (a random per-process secret is then used), but setting it
+      # mirrors production and survives a container restart. openssl rand -hex 32
+      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET (e.g. openssl rand -hex 32)}
+      # This lone replica owns the Fribb resync (in prod that's api-sync's job).
+      - RUN_DB_SYNC=true
+      # Dev CORS: defaults to the built-in dev + crimsonhaven list when unset.
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      # Optional features (parity with production), disabled when unset.
+      - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN:-}
+      - JELLYFIN_URL=${JELLYFIN_URL:-}
+      - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
+      - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # This replica runs the resync (download + wholesale rebuild) before uvicorn
+      # binds :8000, so give the first boot room like api-sync does in production.
+      start_period: 600s
+
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+volumes:
+  crimson-pgdata-dev:   # PostgreSQL data directory (named volume)
