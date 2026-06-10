@@ -289,6 +289,28 @@ async def remove_favorite(
 
 
 # --- watch progress --------------------------------------------------------
+def _dedup_by_show(rows: List[dict], limit: Optional[int] = None) -> List[dict]:
+    """Collapse progress rows to one entry per show, preserving order.
+
+    Rows are expected newest-first, so the first row seen for a show is its most
+    recent episode (carrying that episode's season/episode + progress). Keyed by
+    AniList id when present, else TMDB id — matching _progress_item_key."""
+    seen: set[str] = set()
+    out: List[dict] = []
+    for row in rows:
+        show_key = (
+            f"anilist:{row['anilist_id']}" if row.get("anilist_id") is not None
+            else f"tmdb:{row['tmdb_id']}"
+        )
+        if show_key in seen:
+            continue
+        seen.add(show_key)
+        out.append(row)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
 def _resolve_status(body: ProgressIn) -> str:
     """Explicit status wins; otherwise infer 'completed' near the end."""
     if body.status in ("in_progress", "completed"):
@@ -321,9 +343,12 @@ async def upsert_progress(body: ProgressIn, user: dict = Depends(require_user)):
 
 @router.get("/account/continue-watching")
 async def continue_watching(user: dict = Depends(require_user)):
-    """In-progress episodes, most-recently-watched first — for a
-    'Continue Watching' row on the frontend."""
-    items = store.list_progress(user["user_id"], status="in_progress")
+    """In-progress shows, most-recently-watched first — for a 'Continue Watching'
+    row on the frontend.
+
+    Collapsed to one entry per show (latest in-progress episode), so a series
+    you're partway through several episodes of appears once."""
+    items = _dedup_by_show(store.list_progress(user["user_id"], status="in_progress"))
     return {"success": True, "count": len(items), "items": items}
 
 
@@ -332,12 +357,15 @@ async def recent(
     user: dict = Depends(require_user),
     limit: int = Query(20, ge=1, le=100, description="Max items to return"),
 ):
-    """Recently-watched episodes of *any* status (in_progress + completed),
+    """Recently-watched shows of *any* status (in_progress + completed),
     most-recently-watched first — for a 'Recent' / 'History' row on the frontend.
 
-    Unlike /account/continue-watching (which is in_progress only), this keeps
-    finished episodes so a watch-history view stays populated after completion."""
-    items = store.list_progress(user["user_id"])[:limit]
+    Collapsed to one entry per show: a viewer who watched several episodes of the
+    same series shows up once, carrying that show's most recent episode (and its
+    progress). Rows are newest-first, so the first time we see a show is its
+    latest episode. Unlike /account/continue-watching (which is in_progress only),
+    this keeps finished episodes so the history stays populated after completion."""
+    items = _dedup_by_show(store.list_progress(user["user_id"]), limit=limit)
     return {"success": True, "count": len(items), "items": items}
 
 
