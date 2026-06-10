@@ -477,6 +477,7 @@ class MappingDatabaseEngine:
         # error). Children are deleted before parents to satisfy the FKs, then
         # parents are inserted before children for the same reason.
         committed = False
+        catalogue_cache_purged = 0
         try:
             with self._connect() as conn:
                 cursor = conn.cursor()
@@ -509,6 +510,19 @@ class MappingDatabaseEngine:
                     "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                     (new_etag,),
                 )
+                # Invalidate the cached /catalogue response so this rebuild's
+                # titles/format/genres show up immediately instead of being masked
+                # by the stale cache (api_cache TTL is 6h). Done in the SAME
+                # transaction as the rebuild, so the cache is dropped iff the
+                # rebuild commits. The LIKE matches any cache version
+                # (catalogue:v2 and any future bump). Only the DB-level (L2) cache
+                # is reachable from here; the api replicas' in-process (L1) caches
+                # expire on their own short TTL (minutes) and then refill from DB.
+                cursor.execute(
+                    "DELETE FROM api_cache WHERE cache_key LIKE %s",
+                    ("catalogue:%",),
+                )
+                catalogue_cache_purged = cursor.rowcount or 0
             committed = True
         except Exception as e:
             print(f"[DB Engine] Sync failed, rolled back: {e}")
@@ -517,7 +531,8 @@ class MappingDatabaseEngine:
             # Keep this print ASCII-only: some consoles (Windows cp1252) raise on emoji.
             print(
                 f"[DB Engine] Sync complete. "
-                f"entries={len(entry_rows)} seasons={len(season_rows)} extras={len(extra_rows)}"
+                f"entries={len(entry_rows)} seasons={len(season_rows)} extras={len(extra_rows)} "
+                f"catalogue_cache_purged={catalogue_cache_purged}"
             )
 
 
