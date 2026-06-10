@@ -319,16 +319,31 @@ class MappingDatabaseEngine:
     # ------------------------------------------------------------------ #
     # Sync
     # ------------------------------------------------------------------ #
-    async def sync_database_async(self):
-        """Download the Fribb dataset and rebuild the mapping tables."""
+    async def sync_database_async(self, force: bool = False):
+        """Download the Fribb dataset and rebuild the mapping tables.
+
+        ``force=True`` rebuilds even when the upstream ETag is unchanged — used by
+        the manual `python -m metadata_engine.resync` trigger to backfill after a
+        schema change (e.g. the genres column) without waiting for Fribb to move.
+        """
         self.init_db()
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             print("\n--- Mapping sync starting ---")
             new_etag = await self._check_needs_update(client)
             if not new_etag:
-                print("[DB Engine] Mappings already up-to-date.")
-                return
+                if not force:
+                    print("[DB Engine] Mappings already up-to-date.")
+                    return
+                # Forced rebuild despite a matching ETag. Capture the current ETag
+                # so sync_meta stays in step and the next scheduled check doesn't
+                # see a phantom change and resync again.
+                try:
+                    head = await client.head(self.MAPPING_URL, follow_redirects=True)
+                    new_etag = head.headers.get("ETag") or "forced-resync"
+                except Exception:
+                    new_etag = "forced-resync"
+                print("[DB Engine] Forced resync: rebuilding despite up-to-date ETag.")
 
             print("[DB Engine] Downloading Fribb anime-list...")
             try:
