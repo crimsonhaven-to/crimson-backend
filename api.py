@@ -1,5 +1,7 @@
 import asyncio
 import os
+import gzip
+import time
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Tuple
@@ -108,13 +110,71 @@ TMDB_HEADERS = {
 # Initialize database engine (storage is the shared PostgreSQL pool; see db_pool)
 db_engine = MappingDatabaseEngine(tmdb_api_key=Config.TMDB_API_KEY)
 
+# --- SHARED HTTP CLIENT ---
+# One process-wide AsyncClient (opened in lifespan) instead of a fresh
+# httpx.AsyncClient() per request. Reusing it keeps the TCP+TLS connections to
+# TMDB / AniList warm across requests rather than paying a new handshake every
+# call — the single biggest latency win on the metadata endpoints. Call sites use
+# the ``http_client()`` context manager below, which yields this shared instance
+# and deliberately does NOT close it on block exit.
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Return the shared AsyncClient, creating a transient fallback if the
+    lifespan hasn't run yet (only possible outside the normal request path)."""
+    if _http_client is None:
+        return httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT)
+    return _http_client
+
+
+@asynccontextmanager
+async def http_client():
+    """Yield the shared AsyncClient. Drop-in for ``httpx.AsyncClient()`` at the
+    existing ``async with ... as client:`` call sites — but the shared client is
+    kept open (not closed) when the block exits."""
+    yield get_http_client()
+
+
+# --- IN-PROCESS L1 CACHE (hot global keys) ---
+# A tiny TTL cache in front of the PostgreSQL api_cache for the few hot keys that
+# use a fixed global cache key (trending, catalogue). It removes a DB round-trip
+# on every hit. Stateless-friendly: it only ever serves data up to its short TTL
+# and each replica converges independently (no cross-replica invalidation needed
+# because these payloads are read-mostly and already TTL-bounded upstream).
+_LOCAL_CACHE_TTL = 300  # seconds
+_local_cache: Dict[str, Tuple[float, object]] = {}
+
+
+def _local_get(key: str):
+    hit = _local_cache.get(key)
+    if not hit:
+        return None
+    expiry, value = hit
+    if expiry < time.monotonic():
+        _local_cache.pop(key, None)
+        return None
+    return value
+
+
+def _local_set(key: str, value: object, ttl: int = _LOCAL_CACHE_TTL) -> None:
+    _local_cache[key] = (time.monotonic() + ttl, value)
+
+
 # --- LIFESPAN MANAGEMENT ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle"""
     # Startup
     logger.info("Starting up FastAPI application...")
-    
+
+    # Open the shared HTTP client (kept warm for the whole process lifetime).
+    global _http_client
+    _http_client = httpx.AsyncClient(
+        timeout=Config.REQUEST_TIMEOUT,
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+    )
+
     # Initialize databases (idempotent — safe on every replica).
     db_engine.init_db()
     account_store.init_db()  # account tables (untouched by mapping resyncs)
@@ -133,6 +193,15 @@ async def lifespan(app: FastAPI):
             account_store.purge_expired()
         except Exception as e:
             logger.error(f"Expired session/challenge purge failed: {e}")
+        # Also sweep expired api_cache rows. consume-on-read never deletes them,
+        # and every unique search query writes a row, so the table would grow
+        # unbounded otherwise.
+        try:
+            n = purge_expired_cache()
+            if n:
+                logger.info(f"Purged {n} expired api_cache rows")
+        except Exception as e:
+            logger.error(f"Expired api_cache purge failed: {e}")
 
     scheduler.add_job(
         _purge_expired,
@@ -180,6 +249,9 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down...")
     if getattr(app.state, 'scheduler', None) is not None:
         app.state.scheduler.shutdown()
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
     close_pool()  # drain the PostgreSQL connection pool
     logger.info("Shutdown complete")
 
@@ -187,7 +259,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Anime Streaming API",
     description="API for streaming anime with multi-season support",
-    version="2.0.1",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -285,6 +357,33 @@ def get_show_seasons(tmdb_id: int) -> List[Dict]:
     except Exception as e:
         logger.error(f"Database error in get_show_seasons: {e}")
         return []
+
+def get_first_anilist_ids(tmdb_ids: List[int]) -> Dict[int, int]:
+    """Map each tmdb_id -> its lowest-numbered season's anilist_id, in ONE query.
+
+    Replaces calling ``get_show_seasons`` once per search/trending result (an N+1
+    that borrowed a pooled connection per item). A tmdb_id with no mapped season
+    is simply absent from the result.
+    """
+    if not tmdb_ids:
+        return {}
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT tmdb_id, anilist_id, season_number
+                   FROM tmdb_seasons
+                   WHERE tmdb_id = ANY(%s)
+                   ORDER BY tmdb_id, season_number""",
+                (list(tmdb_ids),),
+            )
+            out: Dict[int, int] = {}
+            for r in cursor.fetchall():
+                out.setdefault(r["tmdb_id"], r["anilist_id"])  # first = lowest season
+            return out
+    except Exception as e:
+        logger.error(f"Database error in get_first_anilist_ids: {e}")
+        return {}
 
 def get_anime_entry(anilist_id: Optional[int]) -> Dict:
     """Returns the anime_entries row (titles, type, year) for an anilist_id."""
@@ -468,6 +567,30 @@ async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Con
     except Exception as e:
         logger.error(f"Cache storage error for key {cache_key}: {e}")
 
+def purge_expired_cache() -> int:
+    """Delete expired api_cache rows. Returns the number removed."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM api_cache WHERE expires_at < %s", (_utcnow_iso(),))
+        return cursor.rowcount or 0
+
+async def _empty() -> Dict:
+    """A coroutine that resolves to ``{}`` — lets us ``asyncio.gather`` an
+    optional fetch (e.g. AniList when there's no mapping) without branching."""
+    return {}
+
+def _gzip_json(request: Request, payload: Dict) -> Response:
+    """Serialize ``payload`` as JSON, gzip-compressing it when the client accepts
+    gzip and the body is worth compressing. Used for the large, non-streaming
+    endpoints (e.g. /catalogue) — applied per-response instead of via global
+    middleware so the progressive NDJSON /watch stream is never buffered."""
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Vary": "Accept-Encoding"}
+    if len(body) >= 1024 and "gzip" in request.headers.get("accept-encoding", "").lower():
+        body = gzip.compress(body, compresslevel=6)
+        headers["Content-Encoding"] = "gzip"
+    return Response(content=body, media_type="application/json", headers=headers)
+
 # --- TMDB API FUNCTIONS ---
 async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
     """Fetch data from API with retry logic"""
@@ -552,11 +675,14 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
     await set_cached_response(cache_key, result)
     return result
 
-async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: int = 1) -> Dict:
+async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: int = 1,
+                              show: Optional[Dict] = None) -> Dict:
     """Fetch metadata + episode list for a specific TMDB season.
 
     Falls back to show-level overview when the season overview is empty (common
-    for anime) so a description is always available.
+    for anime) so a description is always available. ``show`` may be passed in by
+    a caller that already fetched it (e.g. /info), avoiding a redundant cached
+    re-fetch; otherwise it is fetched here.
     """
     cache_key = f"tmdb:meta:{TMDB_CACHE_VERSION}:{tmdb_id}:s{season}"
     cached_data = await get_cached_response(cache_key)
@@ -564,7 +690,8 @@ async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: i
         return cached_data
 
     data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}")
-    show = await fetch_tmdb_show(client, tmdb_id)  # cached
+    if show is None:
+        show = await fetch_tmdb_show(client, tmdb_id)  # cached
 
     if not data:
         logger.info(f"Season {season} not found for TMDB ID {tmdb_id}, falling back to show metadata")
@@ -731,25 +858,26 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit
     
     if not data:
         return []
-    
+
+    items = data.get("results", [])[:limit]
+    # One batched lookup for every candidate's anilist mapping instead of a query
+    # per result.
+    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+
     results = []
-    for item in data.get("results", [])[:limit]:
+    for item in items:
         tmdb_id = item.get("id")
-        if tmdb_id:
-            seasons = get_show_seasons(tmdb_id)
-            if seasons:
-                # Use first season's anilist_id
-                anilist_id = seasons[0]["anilist_id"]
-                
-                results.append({
-                    "title": item.get("name") or item.get("original_name"),
-                    "tmdb_id": tmdb_id,
-                    "anilist_id": anilist_id,
-                    "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
-                    "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
-                    "vote_average": item.get("vote_average")
-                })
-    
+        anilist_id = anilist_by_tmdb.get(tmdb_id) if tmdb_id else None
+        if anilist_id:
+            results.append({
+                "title": item.get("name") or item.get("original_name"),
+                "tmdb_id": tmdb_id,
+                "anilist_id": anilist_id,
+                "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
+                "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
+                "vote_average": item.get("vote_average")
+            })
+
     # Cache search results for 24 hours
     await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
     return results
@@ -757,12 +885,19 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit
 async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> List[Dict]:
     """Fetch trending anime from TMDB"""
     cache_key = "tmdb:trending"
-    
+
+    # L1: in-process cache (no DB round-trip on a hit).
+    local = _local_get(cache_key)
+    if local is not None:
+        return local
+
     # Check cache
     cached_data = await get_cached_response(cache_key)
     if cached_data:
-        return cached_data.get("results", [])
-    
+        results = cached_data.get("results", [])
+        _local_set(cache_key, results)
+        return results
+
     url = "https://api.themoviedb.org/3/discover/tv"
     params = {
         "page": 1,
@@ -778,25 +913,29 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
     
     if not data:
         return []
-    
+
+    items = data.get("results", [])[:limit]
+    # One batched lookup for every candidate's anilist mapping instead of a query
+    # per result.
+    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+
     trending_list = []
-    for item in data.get("results", [])[:limit]:
+    for item in items:
         tmdb_id = item.get("id")
-        if tmdb_id:
-            seasons = get_show_seasons(tmdb_id)
-            if seasons:
-                anilist_id = seasons[0]["anilist_id"]
-                trending_list.append({
-                    "title": item.get("name") or item.get("original_name"),
-                    "tmdb_id": tmdb_id,
-                    "anilist_id": anilist_id,
-                    "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
-                    "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
-                    "vote_average": item.get("vote_average")
-                })
-    
-    # Cache trending results
+        anilist_id = anilist_by_tmdb.get(tmdb_id) if tmdb_id else None
+        if anilist_id:
+            trending_list.append({
+                "title": item.get("name") or item.get("original_name"),
+                "tmdb_id": tmdb_id,
+                "anilist_id": anilist_id,
+                "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
+                "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
+                "vote_average": item.get("vote_average")
+            })
+
+    # Cache trending results (DB for cross-replica reuse + L1 for this process).
     await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+    _local_set(cache_key, trending_list)
     return trending_list
 
 # --- SCRAPER HELPER FUNCTIONS ---
@@ -918,12 +1057,12 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                         "url": embed_url
                     })
             except Exception as e:
+                # A resolver that errors out has nothing playable to offer. Drop
+                # it entirely instead of emitting a broken "(Error)" iframe — that
+                # placeholder used to surface as a dead source (e.g. Movish, which
+                # fails fast and so raced to the top of the list). Just log it.
                 logger.error(f"Resolver error for {matched_resolver.source_name}: {e}")
-                resolved_streams.append({
-                    "source": f"{matched_resolver.source_name} (Error)",
-                    "type": "iframe",
-                    "url": embed_url
-                })
+                continue
         else:
             resolved_streams.append({
                 "source": "Direct Embed",
@@ -964,7 +1103,7 @@ async def search_anime_by_name(query_name: str = Query(..., min_length=1, descri
         raise HTTPException(status_code=500, detail="TMDB API key not configured")
     
     try:
-        async with httpx.AsyncClient() as client:
+        async with http_client() as client:
             results = await fetch_tmdb_search_results(client, query_name)
         
         return {
@@ -981,7 +1120,7 @@ async def search_anime_by_name(query_name: str = Query(..., min_length=1, descri
 async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Number of results to return")):
     """Get trending anime"""
     try:
-        async with httpx.AsyncClient() as client:
+        async with http_client() as client:
             results = await fetch_trending_anime(client, limit)
         
         return {
@@ -994,23 +1133,30 @@ async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Nu
         raise HTTPException(status_code=500, detail="Failed to fetch trending anime")
 
 @app.get("/catalogue")
-async def get_catalogue(category: Optional[str] = Query(None, description="Optional category filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL")):
+async def get_catalogue(request: Request, category: Optional[str] = Query(None, description="Optional category filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL")):
     """Full anime catalogue for a 'browse by category' page.
 
     Lists every anime in our local DB (name + category + navigation ids) with no
     external API calls. ``categories`` always reflects the whole catalogue (so
     the frontend can render all category tabs); ``animes`` is filtered when a
     ``category`` query param is given.
+
+    The (large) response is gzip-compressed when the client accepts it.
     """
     cache_key = "catalogue:v1"
-    cached = await get_cached_response(cache_key)
-    if cached and "items" in cached:
-        items = cached["items"]
-    else:
-        loop = asyncio.get_event_loop()
-        items = await loop.run_in_executor(None, get_catalogue_items)
+    # L1: in-process cache for the whole item list (no DB round-trip on a hit).
+    items = _local_get(cache_key)
+    if items is None:
+        cached = await get_cached_response(cache_key)
+        if cached and "items" in cached:
+            items = cached["items"]
+        else:
+            loop = asyncio.get_event_loop()
+            items = await loop.run_in_executor(None, get_catalogue_items)
+            if items:
+                await set_cached_response(cache_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
         if items:
-            await set_cached_response(cache_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+            _local_set(cache_key, items)
 
     # Category breakdown over the FULL catalogue (before any filtering).
     counts: Dict[str, int] = {}
@@ -1023,24 +1169,28 @@ async def get_catalogue(category: Optional[str] = Query(None, description="Optio
         wanted = category.strip().upper()
         animes = [it for it in items if (it["category"] or "").upper() == wanted]
 
-    return {
+    return _gzip_json(request, {
         "success": True,
         "count": len(animes),
         "total": len(items),
         "categories": categories,
         "animes": animes,
-    }
+    })
 
 def _build_season_list(tmdb_id: int, show: Dict) -> List[Dict]:
-    """Build the per-season list from TMDB's real seasons, attaching AniList mapping."""
+    """Build the per-season list from TMDB's real seasons, attaching AniList mapping.
+
+    The AniList mapping + entry titles for every season come from a single JOIN
+    query (get_show_seasons) instead of two DB queries per season.
+    """
+    db_seasons = {s["season_number"]: s for s in get_show_seasons(tmdb_id)}
     seasons = []
     for s in show.get("seasons", []):
         num = s["season_number"]
-        anilist_id = get_anilist_id(tmdb_id, num)
-        entry = get_anime_entry(anilist_id)
+        mapped = db_seasons.get(num, {})
         seasons.append({
             "season_number": num,
-            "anilist_id": anilist_id,
+            "anilist_id": mapped.get("anilist_id"),
             "tmdb_id": tmdb_id,
             "tmdb_season": num,
             "name": s["name"],
@@ -1048,16 +1198,16 @@ def _build_season_list(tmdb_id: int, show: Dict) -> List[Dict]:
             "summary": s.get("overview") or show.get("overview"),
             "air_date": s["air_date"],
             "episode_count": s["episode_count"],
-            "title_romaji": entry.get("title_romaji"),
-            "title_english": entry.get("title_english"),
-            "anime_type": entry.get("anime_type"),
+            "title_romaji": mapped.get("title_romaji"),
+            "title_english": mapped.get("title_english"),
+            "anime_type": mapped.get("anime_type"),
         })
     return seasons
 
 @app.get("/show/{tmdb_id}")
 async def get_show_details(tmdb_id: int):
     """Returns show info + every TMDB season (playable via VidKing), AniList-mapped where known."""
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         show = await fetch_tmdb_show(client, tmdb_id)
     if not show:
         raise HTTPException(status_code=404, detail="Show not found")
@@ -1083,9 +1233,11 @@ async def get_season_details(tmdb_id: int, season_number: int):
     """Combined TMDB season metadata + AniList metadata (AniList optional)."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
 
-    async with httpx.AsyncClient() as client:
-        tmdb_meta = await fetch_tmdb_metadata(client, tmdb_id, season_number)
-        anilist_meta = await fetch_anilist_metadata(client, anilist_id) if anilist_id else {}
+    async with http_client() as client:
+        tmdb_meta, anilist_meta = await asyncio.gather(
+            fetch_tmdb_metadata(client, tmdb_id, season_number),
+            fetch_anilist_metadata(client, anilist_id) if anilist_id else _empty(),
+        )
 
     if not tmdb_meta and not anilist_meta:
         raise HTTPException(status_code=404, detail=f"No data for TMDB ID {tmdb_id} season {season_number}")
@@ -1129,7 +1281,7 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
     """
     anilist_data = {}
     if anilist_id:
-        async with httpx.AsyncClient() as client:
+        async with http_client() as client:
             anilist_data = await fetch_anilist_metadata(client, anilist_id) or {}
 
     title = anilist_data.get("title") or fallback_title
@@ -1227,7 +1379,7 @@ async def get_watch_links(request: Request, tmdb_id: int, season_number: int, ep
         info = get_show_info(tmdb_id)
         fallback_title = info.get("title") if info else None
         if not fallback_title:
-            async with httpx.AsyncClient() as client:
+            async with http_client() as client:
                 show = await fetch_tmdb_show(client, tmdb_id)
             fallback_title = show.get("title")
 
@@ -1264,10 +1416,14 @@ async def get_anime_info(tmdb_id: int, season: int = Query(1, ge=1, description=
     """
     anilist_id = get_anilist_id(tmdb_id, season)
 
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         show = await fetch_tmdb_show(client, tmdb_id)
-        tmdb_data = await fetch_tmdb_metadata(client, tmdb_id, season)
-        anilist_data = await fetch_anilist_metadata(client, anilist_id) if anilist_id else {}
+        # Season metadata (reusing the show we just fetched) and AniList metadata
+        # are independent — fetch them concurrently instead of in series.
+        tmdb_data, anilist_data = await asyncio.gather(
+            fetch_tmdb_metadata(client, tmdb_id, season, show=show),
+            fetch_anilist_metadata(client, anilist_id) if anilist_id else _empty(),
+        )
 
     if not show and not tmdb_data and not anilist_data:
         raise HTTPException(status_code=404, detail=f"No data for TMDB ID {tmdb_id} season {season}")
@@ -1584,11 +1740,13 @@ async def get_anime_seasons(anilist_id: int):
 
     tmdb_id = mapping[0]
 
-    async with httpx.AsyncClient() as client:
-        show = await fetch_tmdb_show(client, tmdb_id)
-        if not show:
-            raise HTTPException(status_code=404, detail="Show not found on TMDB")
-        anime_info = await fetch_anilist_metadata(client, anilist_id)
+    async with http_client() as client:
+        show, anime_info = await asyncio.gather(
+            fetch_tmdb_show(client, tmdb_id),
+            fetch_anilist_metadata(client, anilist_id),
+        )
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found on TMDB")
 
     seasons_data = _build_season_list(tmdb_id, show)
 
