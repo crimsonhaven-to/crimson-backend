@@ -43,6 +43,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Single source of truth for the API version — fed to both the FastAPI app
+# metadata (OpenAPI/docs) and the "/" root greeting.
+VERSION = "2.2.3"
+
 
 def _utcnow_iso() -> str:
     """Current UTC time as a naive ISO-8601 string.
@@ -259,7 +263,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Anime Streaming API",
     description="API for streaming anime with multi-season support",
-    version="2.2.2",
+    version=VERSION,
     lifespan=lifespan
 )
 
@@ -1105,17 +1109,8 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
 async def root():
     """API root endpoint"""
     return {
-        "name": "Anime Streaming API",
-        "version": "2.0.0",
-        "status": "operational",
-        "endpoints": [
-            "/search/anime",
-            "/trending",
-            "/show/{tmdb_id}",
-            "/season/{tmdb_id}/{season_number}",
-            "/watch/{tmdb_id}/{season_number}/{episode_number}",
-            "/anilist/{anilist_id}"
-        ]
+        "version": VERSION,
+        "message": "Hehe, you found me, Luminas Crimsonveil. Be proud, little mortal. ✨",
     }
 
 @app.get("/search/anime")
