@@ -24,6 +24,7 @@ metadata fetch can take a few minutes) and exits non-zero if it fails.
 import asyncio
 import sys
 
+from db_pool import close_pool
 from metadata_engine.db_handler import MappingDatabaseEngine
 
 
@@ -34,6 +35,10 @@ def main() -> int:
     except Exception as e:  # surface a non-zero exit for `docker exec` callers
         print(f"[resync] Forced resync failed: {e}", file=sys.stderr)
         return 1
+    finally:
+        # Return pooled connections and stop the pool's worker threads so this
+        # short-lived `docker exec` process exits promptly instead of lingering.
+        close_pool()
     print("[resync] Forced resync complete.")
     return 0
 
