@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "2.2.3"
+VERSION = "2.3.0"
 
 
 def _utcnow_iso() -> str:
