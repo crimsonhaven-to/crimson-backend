@@ -1110,7 +1110,7 @@ async def root():
     """API root endpoint"""
     return {
         "version": VERSION,
-        "message": "Hehe, you found me, Luminas Crimsonveil. Be proud, little mortal. ✨",
+        "message": "Hehe, you found me, Luminas Crimsonveil, the eternal empress of this realm. Be proud, little mortal. ✨",
     }
 
 @app.get("/search/anime")
