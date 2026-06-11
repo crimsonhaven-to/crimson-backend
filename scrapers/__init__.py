@@ -7,6 +7,7 @@ from .jellyfin_scraper import JellyfinScraper
 from .animekai_scraper import AnimekaiScraper
 from .animesuge_scraper import AnimeSugeScraper
 from .aniworld_scraper import AniworldScraper
+from .cinemabz_scraper import CinemabzScraper
 
 ALL_SCRAPERS = [
     GogoScraper,
@@ -17,4 +18,5 @@ ALL_SCRAPERS = [
     JellyfinScraper,
     AnimekaiScraper,
     AnimeSugeScraper,
+    CinemabzScraper,  # TMDB-keyed HLS aggregator; 3 providers -> 3 tiles
 ]

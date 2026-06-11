@@ -25,6 +25,7 @@ from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
 from resolvers.voe import proxy_fetch as voe_proxy_fetch
 from resolvers.vidmoly import proxy_fetch as vidmoly_proxy_fetch
 from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
+from resolvers.cinemabz import proxy_fetch as cinemabz_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
@@ -1636,6 +1637,41 @@ async def vidmoly_proxy(request: Request):
         raise HTTPException(status_code=403, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"Vidmoly proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- CINEMA.BZ STREAM PROXY ("Cinema.bz (…)" sources) ---
+@app.get("/cinemabz_proxy")
+async def cinemabz_proxy(request: Request):
+    """Signed, same-origin HLS proxy for the cinema.bz sources. cinema.bz's
+    upstream HLS CDN is Referer-gated (403s without ``Referer: https://cinema.bz/``)
+    and the 1shows CDN serves CORS scoped to cinema.bz's own origin (not ``*``), so
+    the raw playlist/segments can't be fetched by the viewer's browser. This fetches
+    the signed upstream playlist/segment server-side (with the cinema.bz Referer),
+    rewrites playlists so sub-resources flow back through this proxy, and streams
+    segments through with Range passthrough.
+
+    The upstream CDN host rotates, so instead of a host allow-list this proxy
+    verifies an HMAC on the ``u`` URL (see resolvers.cinemabz) and refuses anything
+    unsigned — closing the open-proxy / SSRF hole."""
+    url = request.query_params.get("u")
+    sig = request.query_params.get("s")
+    try:
+        status, content_type, headers, payload = await cinemabz_proxy_fetch(
+            url=url,
+            sig=sig,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"Cinema.bz proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     if isinstance(payload, (bytes, bytearray)):
