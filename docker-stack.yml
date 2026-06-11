@@ -180,8 +180,14 @@ networks:
 # RUN_DB_SYNC=true). Both run from the same image and both run the cheap
 # expired-session purge on their own schedule; only api-sync runs the resync.
 #
-# To scale the serving tier, change `replicas` under `api`. Keep an eye on the
-# DB connection ceiling: each replica opens up to DB_POOL_MAX (default 10)
+# To scale the serving tier, change `replicas` under `api`. Mind the DB
+# connection ceiling: each replica opens up to DB_POOL_MAX (default 10)
 # connections to the Patroni leader, plus api-sync's pool, plus replication/
-# Patroni overhead — stay well under Postgres max_connections (default 100), or
-# lower DB_POOL_MAX / put PgBouncer in front of the leader.
+# Patroni overhead — so direct-to-Postgres you top out at ~8 api replicas before
+# hitting max_connections (default 100).
+#
+# To scale past that, run the co-located PgBouncer pooler (deploy/pgbouncer): it
+# multiplexes the whole API tier onto a small, fixed set of Postgres connections,
+# so replica count stops driving connection count. After standing it up, just
+# point DATABASE_URL at port 6432 instead of 5432 (same host list, same
+# target_session_attrs=read-write). See deploy/pgbouncer/README.md.

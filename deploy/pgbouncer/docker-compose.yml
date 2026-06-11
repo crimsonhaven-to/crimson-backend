@@ -1,0 +1,34 @@
+# Crimsonhaven PgBouncer — run ONE copy of this on EACH of the three database
+# hosts, right next to the Patroni stack (deploy/postgres-ha).
+#
+#   docker compose build      # build the PgBouncer image (first time only)
+#   docker compose up -d       # start the co-located bouncer on this host
+#
+# Host networking (same as Patroni): the bouncer listens on the host's :6432 —
+# reachable from the Swarm app nodes exactly like Postgres' :5432 — and connects
+# to its OWN node's PostgreSQL on 127.0.0.1:5432. There is nothing host-specific
+# here, so this file + pgbouncer.ini + userlist.txt are byte-for-byte identical on
+# all three hosts. See README.md.
+
+services:
+  pgbouncer:
+    build:
+      context: .
+      dockerfile: Dockerfile.pgbouncer
+    image: crimson-pgbouncer:1
+    network_mode: host
+    restart: unless-stopped
+
+    volumes:
+      - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./userlist.txt:/etc/pgbouncer/userlist.txt:ro
+
+    # "Accepting connections" once PgBouncer is listening on :6432. pg_isready
+    # only checks the listener is up (it does not need to authenticate), so this
+    # stays green regardless of whether THIS node is the leader or a standby.
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

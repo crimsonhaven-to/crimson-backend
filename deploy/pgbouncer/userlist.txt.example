@@ -1,0 +1,20 @@
+;; PgBouncer auth file — copy to `userlist.txt` and edit, then place the SAME file
+;; on all three database hosts. (userlist.txt is git-ignored so the secret never
+;; gets committed; this .example is the template.)
+;;
+;; Format:  "username" "secret"
+;;
+;; ── EASIEST (recommended) ──────────────────────────────────────────────────
+;; Paste the crimson application password — the CRIMSON_APP_PASSWORD from your
+;; postgres-ha/.env, i.e. the same password in your app's DATABASE_URL — in plain
+;; text between the quotes below. auth_type is scram-sha-256 (see pgbouncer.ini),
+;; so PgBouncer derives the SCRAM handshake from this to BOTH verify the app
+;; client and log in to PostgreSQL. This password already lives in .env on these
+;; same hosts, so the file adds no new exposure. Then lock it down: chmod 600.
+;;
+;; ── MORE SECURE (optional) ─────────────────────────────────────────────────
+;; Store the one-way SCRAM *verifier* instead of the plaintext password — see
+;; README §5 for the single read-only command that prints the exact line. Replace
+;; the line below with what it prints (it starts with SCRAM-SHA-256$...).
+
+"crimson" "REPLACE_WITH_YOUR_CRIMSON_APP_PASSWORD"

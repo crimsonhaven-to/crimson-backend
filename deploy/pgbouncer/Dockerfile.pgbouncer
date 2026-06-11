@@ -1,0 +1,21 @@
+# Crimsonhaven PgBouncer image.
+#
+# Built from the Alpine package (transparent + fully under your control, the same
+# "build your own, mount the config" approach as Dockerfile.patroni). We disable
+# app-side prepared statements (DB_PREPARE_THRESHOLD in db_pool.py), so any modern
+# PgBouncer works in transaction mode with no version pinning gymnastics.
+FROM alpine:3.20
+
+# pgbouncer = the pooler itself; postgresql-client = pg_isready for the healthcheck.
+RUN apk add --no-cache pgbouncer postgresql-client
+
+# Run unprivileged. The config + auth file are bind-mounted read-only at runtime
+# (see docker-compose.yml), so the image itself carries no secrets.
+RUN addgroup -S pgb && adduser -S -G pgb pgb
+USER pgb
+
+EXPOSE 6432
+
+# Foreground (no -d) so Docker supervises the process and logs go to stdout/stderr.
+ENTRYPOINT ["pgbouncer"]
+CMD ["/etc/pgbouncer/pgbouncer.ini"]

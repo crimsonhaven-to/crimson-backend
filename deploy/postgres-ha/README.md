@@ -251,6 +251,12 @@ Quick sanity check from a Swarm host:
 psql "postgresql://crimson:APP_PASSWORD@10.0.0.11,10.0.0.12,10.0.0.13:5432/crimson?target_session_attrs=read-write" -c "select 1"
 ```
 
+> **Scaling past ~8 API replicas?** Each replica opens its own pool of Postgres
+> connections, so the serving tier eventually hits `max_connections`. The fix is a
+> co-located **PgBouncer** pooler on these same three hosts — then `DATABASE_URL`
+> just points at port `6432` instead of `5432`. It's additive and reversible and
+> touches no data. See [`../pgbouncer/README.md`](../pgbouncer/README.md).
+
 ---
 
 ## 10. Migrate your dev data into prod (keeping the donors)
