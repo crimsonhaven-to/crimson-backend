@@ -27,6 +27,18 @@ otherwise assembled from the discrete parts:
 ``POSTGRES_USER`` (crimson), ``POSTGRES_PASSWORD`` (crimson).
 Pool sizing: ``DB_POOL_MIN`` (1), ``DB_POOL_MAX`` (10). Startup wait for the DB
 to accept connections: ``DB_CONNECT_TIMEOUT`` seconds (30).
+
+``DB_PREPARE_THRESHOLD`` controls psycopg's server-side prepared statements.
+psycopg auto-prepares a statement after it's been used a few times
+(``prepare_threshold``, default 5). Those prepared statements do NOT survive
+PgBouncer's *transaction* pooling — a later EXECUTE can land on a different
+Postgres backend than the one that ran PREPARE — so the documented production
+topology (the app behind a transaction-mode PgBouncer; see deploy/pgbouncer)
+needs them OFF. We therefore default ``prepare_threshold`` to ``None`` (disabled);
+the queries here are short and simple, so the lost plan-caching is negligible,
+and this is correct whether or not a pooler is in front. Set
+``DB_PREPARE_THRESHOLD`` to an integer (e.g. ``5``) to re-enable it when
+connecting straight to Postgres with no pooler.
 """
 
 from __future__ import annotations
@@ -74,6 +86,22 @@ def _dsn() -> str:
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
+def _prepare_threshold() -> Optional[int]:
+    """psycopg ``prepare_threshold`` for pooled connections (see module docstring).
+
+    Defaults to ``None`` (auto-prepare disabled) so the app is safe behind a
+    transaction-mode PgBouncer. ``DB_PREPARE_THRESHOLD`` may set an integer to
+    re-enable it for a direct (pooler-less) Postgres connection.
+    """
+    raw = os.getenv("DB_PREPARE_THRESHOLD")
+    if raw is None or raw.strip().lower() in ("", "none", "disabled", "off"):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def get_pool() -> ConnectionPool:
     """Return the shared pool, opening it on first call.
 
@@ -88,7 +116,12 @@ def get_pool() -> ConnectionPool:
                     conninfo=_dsn(),
                     min_size=int(os.getenv("DB_POOL_MIN", "1")),
                     max_size=int(os.getenv("DB_POOL_MAX", "10")),
-                    kwargs={"row_factory": dict_row},
+                    kwargs={
+                        "row_factory": dict_row,
+                        # OFF by default so transaction-mode PgBouncer is safe;
+                        # see _prepare_threshold / the module docstring.
+                        "prepare_threshold": _prepare_threshold(),
+                    },
                     name="crimson",
                     open=False,
                 )
