@@ -24,10 +24,13 @@ services:
       - ./userlist.txt:/etc/pgbouncer/userlist.txt:ro
 
     # "Accepting connections" once PgBouncer is listening on :6432. pg_isready
-    # only checks the listener is up (it does not need to authenticate), so this
-    # stays green regardless of whether THIS node is the leader or a standby.
+    # only checks the listener is up (it never authenticates), so this stays green
+    # regardless of whether THIS node is the leader or a standby. We pass
+    # -U crimson -d crimson so the probe presents a user that EXISTS in
+    # userlist.txt — otherwise pg_isready defaults to the container's OS user
+    # (pgb) and PgBouncer logs a harmless but noisy "no such user: pgb" each time.
     healthcheck:
-      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432"]
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432", "-U", "crimson", "-d", "crimson"]
       interval: 30s
       timeout: 5s
       retries: 3
