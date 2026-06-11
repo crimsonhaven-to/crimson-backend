@@ -204,12 +204,21 @@ You want exactly this shape:
   read-write routing works and follows the leader.
 - `current_user = crimson` → auth works.
 
-Also peek at the pool itself (the admin console — read-only):
+Also peek at the pool itself. The cleanest way is **on a DB host**, inside the
+bouncer container (it already has `psql` and is on the host network), which avoids
+SSH tunnels and shell-quoting headaches:
 
 ```bash
-psql "postgresql://crimson:YOUR_CRIMSON_PASSWORD@10.0.0.11:6432/pgbouncer?target_session_attrs=any" \
-  -c "SHOW POOLS"
+docker compose exec -e PGPASSWORD='YOUR_CRIMSON_PASSWORD' pgbouncer \
+  psql "host=127.0.0.1 port=6432 user=crimson dbname=pgbouncer" -c "SHOW POOLS"
 ```
+
+> ⚠️ For the admin console (`dbname=pgbouncer`) do **not** add
+> `target_session_attrs=read-write` (or any value but `any`). libpq then sends
+> `SHOW transaction_read_only` on connect, which the admin console rejects
+> (`invalid command`), so the command fails or hangs. The admin console is local
+> to each bouncer and has no leader/standby notion — it needs no routing hint. The
+> real `crimson` database (§8, §9) is the opposite: it *wants* `read-write`.
 
 You'll see a `crimson` pool with a few `sv_idle` server connections. **If §8 looks
 right, you're 95% done and nothing has changed for production yet.**
@@ -256,7 +265,8 @@ docker-stack.yml crimson-api`). A rolling update swaps replicas one at a time.
 - Watch the pool fill in under real traffic (run on the **leader** host):
 
   ```bash
-  psql "postgresql://crimson:PASS@127.0.0.1:6432/pgbouncer?target_session_attrs=any" -c "SHOW POOLS"
+  docker compose exec -e PGPASSWORD='PASS' pgbouncer \
+    psql "host=127.0.0.1 port=6432 user=crimson dbname=pgbouncer" -c "SHOW POOLS"
   ```
   `cl_active` rises with traffic; `sv_active`/`sv_idle` stay small (≤ `default_pool_
   size`). That small, flat server number is the whole win.
@@ -285,13 +295,18 @@ running while you investigate — they cost nothing.
 
 ## 12. Day-2 & troubleshooting
 
-**Useful commands** (connect to the `pgbouncer` admin database, read-only):
+**Useful commands** — run on a DB host, via the bouncer container (read-only admin
+console). Note: `dbname=pgbouncer` and **no** `target_session_attrs` (see the
+warning in §8):
 
 ```bash
-psql "postgresql://crimson:PASS@127.0.0.1:6432/pgbouncer?target_session_attrs=any" -c "SHOW POOLS"
-psql "...:6432/pgbouncer..." -c "SHOW STATS"     # request rates, query times
-psql "...:6432/pgbouncer..." -c "SHOW CLIENTS"   # who's connected
-psql "...:6432/pgbouncer..." -c "SHOW SERVERS"   # the real Postgres backends
+cd /srv/crimson/deploy/pgbouncer
+A() { docker compose exec -e PGPASSWORD='PASS' pgbouncer \
+        psql "host=127.0.0.1 port=6432 user=crimson dbname=pgbouncer" -c "$1"; }
+A "SHOW POOLS"     # per-pool client/server counts (cl_active, sv_idle, cl_waiting)
+A "SHOW STATS"     # request rates, query times
+A "SHOW CLIENTS"   # who's connected
+A "SHOW SERVERS"   # the real Postgres backends
 ```
 
 **Tuning:** the one number you might change is `default_pool_size` in
@@ -304,6 +319,7 @@ under peak load (clients queueing for a backend). After editing, `docker compose
 | §8 `psql` hangs or "could not connect" | firewall: open `6432` from your client (§7). Confirm the bouncer is up: `docker compose ps`. |
 | §8 "password authentication failed" | `userlist.txt` doesn't match the crimson password. Re-do §5 (mind the quotes), `docker compose up -d` to reload, retry. |
 | §8 shows `on_a_standby = t` | a bouncer answered but you somehow reached a standby — make sure `target_session_attrs=read-write` is in the URL (without it, libpq accepts any node). |
+| `SHOW POOLS` / `SHOW *` hangs or `invalid command 'SHOW transaction_read_only'` | you added `target_session_attrs=read-write` (or anything but `any`) to a `dbname=pgbouncer` admin-console URL — drop it (see §8 warning). Easiest is the container form above, which omits it. The `\` line-continuation is a backtick (`` ` ``) in PowerShell, not `\` — a stray `\` becomes a junk arg; just put the command on one line. |
 | App errors after §9 mentioning **prepared statement** | something set `DB_PREPARE_THRESHOLD` to a number. Unset it (default = disabled) and redeploy. |
 | `SHOW POOLS` shows `cl_waiting` climbing | real load exceeded the pool — raise `default_pool_size` (still keep it well under Postgres' 100), restart bouncers. |
 | After a failover, brief connection errors | expected and self-healing: libpq drops, reconnects, and finds the new leader's bouncer within seconds (same as the direct setup). |
