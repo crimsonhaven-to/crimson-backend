@@ -9,12 +9,13 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
 - **Multi-Season Intelligence**: Automatically maps TMDB TV shows and seasons to their corresponding AniList IDs using the Fribb dataset.
 - **Unified Search**: Search across TMDB with automatic suggestions and metadata enrichment.
 - **Smart Metadata**: Aggregates data from TMDB and AniList for complete info (titles, posters, episode summaries).
-- **Advanced Scraping**: Multi-threaded, async scraping from various sources (AnimeKai, AnimeSuge, GogoAnime, etc.).
+- **Advanced Scraping**: Multi-threaded, async scraping from various sources (AniWorld, AnimeKai, AnimeSuge, GogoAnime, etc.). Sources like AniWorld even include **language labels** (English Sub, German Dub, etc.).
 - **Stream Resolution**: Resolves third-party embed URLs to direct HLS/MP4 streams or ad-free proxied players.
 - **Progressive Streaming**: `/watch` streams results as **NDJSON** — each source is pushed to the client the instant its scraper + resolver finish, so the fastest source plays first instead of waiting for every source.
 - **Automatic Sync**: Built-in scheduler keeps the local mapping database up-to-date with upstream sources.
-- **Internal Proxies**: Custom reverse proxies for providers like VidKing, Movish, and Jellyfin to bypass ads and CORS.
+- **Internal Proxies**: Custom reverse proxies for providers like AnimeSuge, Movish, and Jellyfin to bypass ads and CORS.
 - **Crimson Player**: A minimal, ad-free HLS/MP4 player served directly from the backend for a seamless experience.
+- **Rate Limiting**: Built-in protection against scraping abuse and brute-force attempts on sensitive endpoints.
 
 ## 🛠 Tech Stack
 
@@ -23,6 +24,7 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
 - **Networking**: HTTPX (Async)
 - **Parsing**: BeautifulSoup4, Selectolax, lxml
 - **Scheduling**: APScheduler
+- **Rate Limiting**: slowapi (Token Bucket)
 - **Containerization**: Docker & Docker Compose
 
 ## 🚀 Getting Started
@@ -73,13 +75,14 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | Variable | Required | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `TMDB_API_KEY` | **yes** | – | TMDB Read Access Token (v4) or legacy key. |
-| `PROXY_SECRET` | prod | random | HMAC secret for the signed stream proxies. **Must be stable and shared across replicas** or proxied playback 403s. `openssl rand -hex 32`. |
+| `PROXY_SECRET` | prod | random | HMAC secret for the signed stream proxies (AnimeSuge/PlayIMDb/VOE/Vidmoly). **Must be stable and shared across replicas** or proxied playback 403s. `openssl rand -hex 32`. |
 | `DATABASE_URL` | prod | – | Full PostgreSQL connection URL, e.g. `postgresql://crimson:crimson@postgres:5432/crimson`. Takes precedence over the discrete `POSTGRES_*` parts below. |
 | `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | no | `localhost` / `5432` / `crimson` / `crimson` / `crimson` | Used to assemble the connection when `DATABASE_URL` is unset. |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | no | `1` / `10` | Connection-pool sizing. |
 | `DB_CONNECT_TIMEOUT` | no | `30` | Seconds to wait at startup for the database to accept connections. |
 | `RUN_DB_SYNC` | no | `true` | Whether this instance runs the periodic Fribb resync. Set `false` on all but one replica. |
-| `ALLOWED_ORIGINS` | no | built-in list | Comma-separated CORS origins. |
+| `ALLOWED_ORIGINS` | no | built-in list | Comma-separated CORS origins (e.g. `https://crimsonhaven.to`). |
+| `RATE_LIMIT_STORAGE_URI` | no | `memory://` | Storage backend for rate limiting. Set to `redis://redis:6379` for shared limits across replicas. |
 | `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
 | `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional Jellyfin source. |
 
@@ -155,6 +158,7 @@ content on the HTTPS frontend.
 | `GET` | `/trending` | Fetch popular shows. |
 | `GET` | `/catalogue` | List all mapped anime in the local DB. |
 | `GET` | `/show/{tmdb_id}` | Get full show details and season list. |
+| `GET` | `/overview/{anilist_id}` | **New**: Aggregated show metadata + season list in one round-trip. |
 | `GET` | `/info/{tmdb_id}?season=` | Flat merged TMDB + AniList metadata + `episodes_list` for a season. |
 | `GET` | `/seasons/{anilist_id}` | All seasons of the show an AniList id belongs to. |
 | `GET` | `/season/{tmdb_id}/{num}` | Get metadata for a specific season. |
@@ -172,8 +176,8 @@ Lines, in order:
 
 ```jsonc
 {"type":"meta","success":true,"tmdb_id":1234,"season_number":1,"episode_number":1,"anilist_id":567,"title":"..."}
-{"type":"stream","source":"AnimeSuge","streamType":"hls","url":"https://.../playlist.m3u8"}
-{"type":"stream","source":"Movish","streamType":"iframe","url":"https://<backend>/movish_proxy/h/.../..."}
+{"type":"stream","source":"AniWorld","streamType":"hls","url":"https://.../playlist.m3u8","language":"English Sub"}
+{"type":"stream","source":"AnimeSuge","streamType":"hls","url":"https://<backend>/animesuge_proxy?u=...&s=..."}
 {"type":"done","count":2}
 ```
 
@@ -195,7 +199,7 @@ for extras (specials/OVAs/movies).
 ### Internal Proxies & Utilities
 
 - **`/player`**: Renders the Crimson Player for direct HLS/MP4 streams.
-- **`/vidking_proxy`**: Removes ads and pop-unders from VidKing/Videasy embeds.
+- **`/animesuge_proxy`**: Signed, same-origin proxy for AnimeSuge direct streams (handles Referer and HLS rewriting).
 - **`/movish_proxy`**: Proxies Movish streams to handle headers/CORS.
 - **`/playimdb_proxy`**: Signed HLS proxy for the PlayIMDb source (injects the referer the PlayIMDb CDNs require; the raw stream is extracted server-side so no PlayIMDb player/ad code is ever loaded).
 - **`/voe_proxy`**: Signed HLS proxy for the VOE source (most of aniworld.to is hosted on VOE). VOE's CDN binds the stream token to the IP/ASN **and** User-Agent that resolved the embed, so the raw playlist/segment URLs 403 from the viewer's browser; the backend fetches them server-side (matching UA) and rewrites playlists so segments flow back through the proxy. Emitted as a `streamType: hls` source the frontend's in-app player loads directly.
