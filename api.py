@@ -1795,6 +1795,66 @@ async def get_anime_seasons(anilist_id: int):
         "extras": get_show_extras(tmdb_id),
     }
 
+@app.get("/overview/{anilist_id}")
+async def get_anime_overview(anilist_id: int):
+    """Aggregated show overview for the per-anime landing/overview page.
+
+    Returns show-level metadata (title, poster, backdrop, synopsis, status, year)
+    plus the full season list + extras in a single round-trip, so the frontend can
+    paint the season/episode browser shell without a /seasons -> /info waterfall.
+
+    Per-season episode lists (with the stored per-episode titles/thumbnails) are
+    still fetched lazily by the frontend via /info/{tmdb_id}?season=, so /overview
+    never fans out into one TMDB season call per season.
+    """
+    mapping = get_tmdb_season(anilist_id)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="AniList ID not mapped")
+
+    tmdb_id = mapping[0]
+
+    async with http_client() as client:
+        show, anime_info = await asyncio.gather(
+            fetch_tmdb_show(client, tmdb_id),
+            fetch_anilist_metadata(client, anilist_id),
+        )
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found on TMDB")
+
+    anime_info = anime_info or {}
+    seasons_data = _build_season_list(tmdb_id, show)
+    title = anime_info.get("title") or show.get("title") or "Unknown Anime"
+
+    # Year: prefer TMDB's first-air-date, fall back to AniList's start year.
+    year = None
+    first_air = show.get("first_air_date")
+    if first_air:
+        year = first_air[:4]
+    elif (anime_info.get("start_date") or {}).get("year"):
+        year = str(anime_info["start_date"]["year"])
+
+    return {
+        "success": True,
+        "anilist_id": anilist_id,
+        "tmdb_id": tmdb_id,
+        "title": title,
+        "title_romaji": anime_info.get("title_romaji"),
+        "title_english": anime_info.get("title_english"),
+        # AniList cover art is higher quality; fall back to the TMDB poster.
+        "poster": anime_info.get("cover") or show.get("poster"),
+        "backdrop": show.get("backdrop"),
+        "banner": anime_info.get("banner"),
+        # `description` may contain AniList HTML; `summary` is the plain TMDB overview.
+        "description": anime_info.get("description") or show.get("overview"),
+        "summary": show.get("overview"),
+        "status": anime_info.get("status"),
+        "year": year,
+        "total_episodes": anime_info.get("total_episodes"),
+        "total_seasons": len(seasons_data),
+        "seasons": seasons_data,
+        "extras": get_show_extras(tmdb_id),
+    }
+
 # --- HEALTH CHECK ENDPOINT ---
 @app.get("/health")
 async def health_check():
