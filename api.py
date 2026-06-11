@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 
 def _utcnow_iso() -> str:
@@ -1456,12 +1456,17 @@ async def get_anime_info(tmdb_id: int, season: int = Query(1, ge=1, description=
     # Never return an empty description / episode list.
     description = anilist_data.get("description") or tmdb_data.get("summary") or show.get("overview")
 
-    # Prefer the more complete episode list. The proxy sources play by TMDB episode
-    # number, so when TMDB has more episodes than AniList (e.g. TMDB lumps cours together,
-    # or splits a long run into seasons) use TMDB's so every episode is reachable.
-    anilist_eps = anilist_data.get("episodes_list") or []
+    # Prefer TMDB's per-season episode list. It is correctly split by season (with
+    # real per-episode titles, thumbnails, air dates and overviews) and matches the
+    # episode numbering the proxy sources actually play by. AniList's
+    # streamingEpisodes are crowd-sourced and unreliable for sequel seasons — they
+    # frequently echo the *first* season's titles (e.g. the Overlord II/III/IV
+    # entries all return season 1's episode names), which made every season of a
+    # show look identical. So AniList is only a fallback when TMDB has no
+    # per-episode data for the season.
     tmdb_eps = tmdb_data.get("episodes") or []
-    episodes_list = anilist_eps if len(anilist_eps) >= len(tmdb_eps) else tmdb_eps
+    anilist_eps = anilist_data.get("episodes_list") or []
+    episodes_list = tmdb_eps or anilist_eps
 
     return {
         **tmdb_data,
