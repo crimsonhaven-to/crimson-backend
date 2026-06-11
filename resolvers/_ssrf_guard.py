@@ -1,9 +1,8 @@
 """
-SSRF guard for the third-party stream proxies (PlayIMDb / AnimeSuge / VidKing /
-Movish).
+SSRF guard for the third-party stream proxies (PlayIMDb / AnimeSuge / Movish).
 
 Those proxies fetch *untrusted* upstreams: the signed proxies hit rotating CDN
-hosts, and even the host-allow-listed ones (VidKing/Movish) follow redirects.
+hosts, and even the host-allow-listed ones (Movish) follow redirects.
 httpx's signature/allow-list check only validates the *initial* URL — once a 3xx
 arrives, httpx will happily follow it to **any** host. A malicious or compromised
 upstream could therefore redirect the backend at ``http://169.254.169.254/`` (cloud

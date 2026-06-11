@@ -40,8 +40,8 @@ services:
       - crimson-pgdata-dev:/var/lib/postgresql/data
     # Publish to loopback only so you can inspect with psql from the host without
     # exposing the DB to the LAN. Comment out if you don't need host access.
-    ports:
-      - "127.0.0.1:5432:5432"
+    # ports:
+    #   - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crimson} -d ${POSTGRES_DB:-crimson}"]
       interval: 10s
@@ -54,10 +54,10 @@ services:
   api:
     # Pull the same image production runs, but allow a local build so a dev
     # checkout works with `--build` without first pushing to the registry.
-    # image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: crimson-backend:1.0
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy

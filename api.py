@@ -20,7 +20,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 # Import all scrapers & resolvers + metadata engine
 from scrapers import ALL_SCRAPERS
 from resolvers import ALL_RESOLVERS
-from resolvers.vidking_test import proxy_fetch as vidking_proxy_fetch
 from resolvers.movish import proxy_fetch as movish_proxy_fetch
 from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
 from resolvers.voe import proxy_fetch as voe_proxy_fetch
@@ -45,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "2.2.3"
+VERSION = "2.4.0"
 
 
 def _utcnow_iso() -> str:
@@ -642,8 +641,9 @@ def _tmdb_img(path: Optional[str], size: str = "w500") -> Optional[str]:
 
 async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
     """
-    Fetch a TMDB show with its real season list (the authority for what VidKing
-    can play). Cached, and persists core fields into tmdb_shows on first fetch.
+    Fetch a TMDB show with its real season list (the authority for what the
+    TMDB-keyed sources can play). Cached, and persists core fields into tmdb_shows
+    on first fetch.
     """
     cache_key = f"tmdb:show:{TMDB_CACHE_VERSION}:{tmdb_id}"
     cached_data = await get_cached_response(cache_key)
@@ -974,8 +974,8 @@ def _public_base_url(request: Request) -> str:
 
     Behind a TLS-terminating reverse proxy (our Docker deploy), uvicorn sees a
     plain HTTP request, so ``request.base_url`` reports ``http://`` — which makes
-    the absolute iframe URLs we emit for the ad-free proxy sources (VidKing Test,
-    Movish) get blocked as mixed content on the HTTPS frontend. Trust
+    the absolute iframe URLs we emit for the ad-free proxy sources (Movish,
+    PlayIMDb, AnimeSuge) get blocked as mixed content on the HTTPS frontend. Trust
     ``X-Forwarded-Proto``/``X-Forwarded-Host`` (set by the proxy) so the URL is
     HTTPS, regardless of uvicorn's --proxy-headers/--forwarded-allow-ips config.
     """
@@ -991,8 +991,8 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
     """Resolve embed URLs to direct stream URLs.
 
     ``base_url`` is the public base of this backend (e.g. https://host/). It is
-    used to turn the VidKing Test resolver's relative proxy path into an
-    absolute iframe src the frontend can load.
+    used to turn a resolver's relative proxy/player path (Movish, PlayIMDb,
+    AnimeSuge, Jellyfin) into an absolute iframe src the frontend can load.
 
     ``language`` is an optional human-readable audio/subtitle label (e.g.
     "German Dub") for these embeds, known by some scrapers (aniworld) and not
@@ -1020,39 +1020,26 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                     # Decide the stream's shape by the URL the resolver returned,
                     # NOT by source_name (which is a mutable display label):
                     #   * /{x}_proxy/h/...  -> ad-stripped player-page proxy
-                    #     (VidKing ad-free, Movish) -> iframe the backend page.
+                    #     (Movish) -> iframe the backend page.
                     #   * /jellyfin_proxy/... -> a proxied raw stream -> hls/mp4.
                     #   * anything relative ("/..") is made absolute against the
                     #     backend base so the frontend (a different origin) loads
                     #     it from us.
                     # Resolvers that hand back an absolute third-party URL fall
-                    # through to the generic hls/mp4 (or plain-VidKing iframe).
+                    # through to the generic hls/mp4 branch.
                     is_proxy_path = direct_video_url.startswith("/")
                     abs_url = direct_video_url
                     if is_proxy_path and base_url:
                         abs_url = base_url.rstrip("/") + direct_video_url
 
                     if "_proxy/h/" in direct_video_url or direct_video_url.startswith("/player"):
-                        # Backend-hosted player page (VidKing ad-free / Movish
-                        # player-proxy, or our /player wrapping a Jellyfin stream):
+                        # Backend-hosted player page (Movish player-proxy, or our
+                        # /player wrapping a Jellyfin/PlayIMDb/AnimeSuge stream):
                         # the frontend just iframes it.
                         resolved_streams.append({
                             "source": matched_resolver.source_name,
                             "type": "iframe",
                             "url": abs_url
-                        })
-                    elif matched_resolver.domain_keyword == "vidking.net":
-                        # Plain (legacy) VidKing: the resolver validates and hands
-                        # back the raw vidking.net /embed page, which is an iframe
-                        # target, NOT a video file. Match on domain_keyword (the
-                        # resolver's stable identity) rather than source_name, which
-                        # is a display label — e.g. "VidKing (Legacy)" — and would
-                        # otherwise fall through to the mp4/hls branch below and be
-                        # mislabelled as a direct MP4 the player can't play.
-                        resolved_streams.append({
-                            "source": matched_resolver.source_name,
-                            "type": "iframe",
-                            "url": direct_video_url
                         })
                     else:
                         stream_type = "hls" if "m3u8" in direct_video_url.lower() else "mp4"
@@ -1065,7 +1052,7 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                     # resolve() found nothing playable. Only fall back to
                     # iframing the raw embed_url if it's a genuine http(s) embed
                     # page (legacy resolvers). For marker-based sources
-                    # (crimson-playimdb:..., crimson-vidking:..., etc.) the
+                    # (crimson-playimdb:..., crimson-animesuge:..., etc.) the
                     # embed_url is an INTERNAL routing token, not a URL — iframing
                     # it yields an empty frame src that the frontend's
                     # `frame-src https:` CSP blocks ("This content is blocked").
@@ -1110,7 +1097,7 @@ async def root():
     """API root endpoint"""
     return {
         "version": VERSION,
-        "message": "Hehe, you found me, Luminas Crimsonveil. Be proud, little mortal. ✨",
+        "message": "Hehe, you found me, Luminas Crimsonveil, the eternal empress of this realm. Be proud, little mortal. ✨",
     }
 
 @app.get("/search/anime")
@@ -1240,7 +1227,7 @@ def _build_season_list(tmdb_id: int, show: Dict) -> List[Dict]:
 
 @app.get("/show/{tmdb_id}")
 async def get_show_details(tmdb_id: int):
-    """Returns show info + every TMDB season (playable via VidKing), AniList-mapped where known."""
+    """Returns show info + every TMDB season (playable via the TMDB-keyed sources), AniList-mapped where known."""
     async with http_client() as client:
         show = await fetch_tmdb_show(client, tmdb_id)
     if not show:
@@ -1308,9 +1295,9 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
         the fastest one reaches the player first;
       * a final ``{"type": "done", "count": N}`` line once every scraper is done.
 
-    Works without an AniList mapping (e.g. TMDB-only seasons of long shows):
-    VidKing plays off the TMDB id, and title-based scrapers fall back to the TMDB
-    show title. ``base_url`` (the backend's public base) is threaded into stream
+    Works without an AniList mapping (e.g. TMDB-only seasons of long shows): the
+    TMDB-keyed sources play off the TMDB id, and title-based scrapers fall back to
+    the TMDB show title. ``base_url`` (the backend's public base) is threaded into stream
     resolution so the proxy sources can emit an absolute iframe URL.
     """
     anilist_data = {}
@@ -1405,7 +1392,7 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
 async def get_watch_links(request: Request, tmdb_id: int, season_number: int, episode_number: int):
     """Get streaming links as a progressive NDJSON stream (one line per source,
     emitted as soon as that source resolves). Works even for TMDB seasons with no
-    AniList mapping (long shows like Naruto) — VidKing plays off the TMDB id."""
+    AniList mapping (long shows like Naruto) — the proxy sources play off the TMDB id."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
 
     fallback_title = None
@@ -1469,8 +1456,8 @@ async def get_anime_info(tmdb_id: int, season: int = Query(1, ge=1, description=
     # Never return an empty description / episode list.
     description = anilist_data.get("description") or tmdb_data.get("summary") or show.get("overview")
 
-    # Prefer the more complete episode list. VidKing plays by TMDB episode number,
-    # so when TMDB has more episodes than AniList (e.g. TMDB lumps cours together,
+    # Prefer the more complete episode list. The proxy sources play by TMDB episode
+    # number, so when TMDB has more episodes than AniList (e.g. TMDB lumps cours together,
     # or splits a long run into seasons) use TMDB's so every episode is reachable.
     anilist_eps = anilist_data.get("episodes_list") or []
     tmdb_eps = tmdb_data.get("episodes") or []
@@ -1513,33 +1500,6 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
         media_type="application/x-ndjson",
         headers=_STREAM_HEADERS,
     )
-
-# --- VIDKING AD-FREE PROXY (experimental "vidking_test" source) ---
-@app.api_route("/vidking_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
-async def vidking_proxy(request: Request, host: str, path: str):
-    """Same-origin reverse proxy that downloads a VidKing page/asset, strips its
-    ads, rewrites its sub-resource URLs back through this proxy, and serves it.
-
-    This is what lets the frontend iframe the VidKing player from our own origin
-    without the ad/pop-under layer. Scoped to the VidKing/Videasy host allow-list
-    in resolvers.vidking_test (rejects anything else to avoid an open proxy)."""
-    body = await request.body() if request.method == "POST" else None
-    try:
-        status, content, content_type = await vidking_proxy_fetch(
-            host=host,
-            path=path,
-            query_string=request.url.query,
-            method=request.method,
-            body=body,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"VidKing proxy upstream error for {host}/{path}: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    return Response(content=content, status_code=status, media_type=content_type)
-
 
 # --- MOVISH AD-FREE PROXY ("movish" source) ---
 @app.api_route("/movish_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
@@ -1790,6 +1750,66 @@ async def get_anime_seasons(anilist_id: int):
         "success": True,
         "anilist_id": anilist_id,
         "title": title,
+        "total_seasons": len(seasons_data),
+        "seasons": seasons_data,
+        "extras": get_show_extras(tmdb_id),
+    }
+
+@app.get("/overview/{anilist_id}")
+async def get_anime_overview(anilist_id: int):
+    """Aggregated show overview for the per-anime landing/overview page.
+
+    Returns show-level metadata (title, poster, backdrop, synopsis, status, year)
+    plus the full season list + extras in a single round-trip, so the frontend can
+    paint the season/episode browser shell without a /seasons -> /info waterfall.
+
+    Per-season episode lists (with the stored per-episode titles/thumbnails) are
+    still fetched lazily by the frontend via /info/{tmdb_id}?season=, so /overview
+    never fans out into one TMDB season call per season.
+    """
+    mapping = get_tmdb_season(anilist_id)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="AniList ID not mapped")
+
+    tmdb_id = mapping[0]
+
+    async with http_client() as client:
+        show, anime_info = await asyncio.gather(
+            fetch_tmdb_show(client, tmdb_id),
+            fetch_anilist_metadata(client, anilist_id),
+        )
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found on TMDB")
+
+    anime_info = anime_info or {}
+    seasons_data = _build_season_list(tmdb_id, show)
+    title = anime_info.get("title") or show.get("title") or "Unknown Anime"
+
+    # Year: prefer TMDB's first-air-date, fall back to AniList's start year.
+    year = None
+    first_air = show.get("first_air_date")
+    if first_air:
+        year = first_air[:4]
+    elif (anime_info.get("start_date") or {}).get("year"):
+        year = str(anime_info["start_date"]["year"])
+
+    return {
+        "success": True,
+        "anilist_id": anilist_id,
+        "tmdb_id": tmdb_id,
+        "title": title,
+        "title_romaji": anime_info.get("title_romaji"),
+        "title_english": anime_info.get("title_english"),
+        # AniList cover art is higher quality; fall back to the TMDB poster.
+        "poster": anime_info.get("cover") or show.get("poster"),
+        "backdrop": show.get("backdrop"),
+        "banner": anime_info.get("banner"),
+        # `description` may contain AniList HTML; `summary` is the plain TMDB overview.
+        "description": anime_info.get("description") or show.get("overview"),
+        "summary": show.get("overview"),
+        "status": anime_info.get("status"),
+        "year": year,
+        "total_episodes": anime_info.get("total_episodes"),
         "total_seasons": len(seasons_data),
         "seasons": seasons_data,
         "extras": get_show_extras(tmdb_id),
