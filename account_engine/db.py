@@ -25,6 +25,8 @@ from db_pool import get_connection, lock_schema_init
 # Lifetimes.
 SESSION_TTL = timedelta(days=30)
 CHALLENGE_TTL = timedelta(minutes=5)
+VERIFY_TOKEN_TTL = timedelta(hours=24)   # email verification link
+RESET_TOKEN_TTL = timedelta(hours=1)     # password reset link
 
 # Soft per-account row caps. An authenticated account can otherwise insert an
 # unbounded number of distinct item_keys (one row each), bloating the DB. Updates
@@ -91,6 +93,33 @@ class AccountStore:
                     expires_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+                -- Email+password identity. Added alongside the original Ed25519
+                -- mnemonic identity (see module docstring): an account now has a
+                -- public_key OR an email (or, in principle, both). public_key is
+                -- therefore nullable, and the email columns are added in-place on
+                -- already-deployed databases via the ALTERs below.
+                ALTER TABLE accounts ALTER COLUMN public_key DROP NOT NULL;
+                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email          TEXT;
+                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS password_hash  TEXT;
+                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+                -- Case-insensitive email uniqueness (NULLs — the crypto accounts —
+                -- are allowed to coexist).
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email
+                    ON accounts (LOWER(email)) WHERE email IS NOT NULL;
+
+                -- One-time, single-use tokens emailed for verification / reset.
+                -- Only the SHA-256 hash is stored (the raw token lives only in the
+                -- link), mirroring how sessions are stored — a DB leak exposes no
+                -- usable token.
+                CREATE TABLE IF NOT EXISTS email_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id    BIGINT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
+                    purpose    TEXT NOT NULL,   -- 'verify' | 'reset'
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_email_tokens_user ON email_tokens(user_id);
 
                 CREATE TABLE IF NOT EXISTS challenges (
                     challenge  TEXT PRIMARY KEY,
@@ -167,6 +196,96 @@ class AccountStore:
                 "UPDATE accounts SET last_login_at = %s WHERE user_id = %s",
                 (_iso(_now()), user_id),
             )
+
+    # -- email + password accounts --------------------------------------
+    def get_account_by_email(self, email: str) -> Optional[Dict]:
+        """Look up an account by email (case-insensitive)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE LOWER(email) = LOWER(%s)", (email,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_email_account(
+        self, email: str, password_hash: str, label: Optional[str] = None
+    ) -> Dict:
+        """Create an email+password account (unverified). Raises
+        psycopg.errors.UniqueViolation if the email is already taken."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO accounts (email, password_hash, label, email_verified, created_at)
+                VALUES (%s, %s, %s, FALSE, %s) RETURNING user_id
+                """,
+                (email, password_hash, label, _iso(_now())),
+            ).fetchone()
+            user_id = row["user_id"]
+        return self.get_account(user_id)
+
+    def set_password(self, user_id: int, password_hash: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET password_hash = %s WHERE user_id = %s",
+                (password_hash, user_id),
+            )
+
+    def set_email_verified(self, user_id: int, verified: bool = True) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET email_verified = %s WHERE user_id = %s",
+                (verified, user_id),
+            )
+
+    # -- email tokens (verification / password reset) -------------------
+    def create_email_token(self, user_id: int, purpose: str, ttl: timedelta) -> str:
+        """Issue a single-use token for ``purpose`` ('verify' | 'reset'). Returns
+        the raw token (store only its hash). Any earlier token of the same purpose
+        for this user is invalidated so only the newest link works."""
+        raw = secrets.token_urlsafe(32)
+        expires = _now() + ttl
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM email_tokens WHERE user_id = %s AND purpose = %s",
+                (user_id, purpose),
+            )
+            conn.execute(
+                "INSERT INTO email_tokens (token_hash, user_id, purpose, created_at, expires_at)"
+                " VALUES (%s, %s, %s, %s, %s)",
+                (_hash_token(raw), user_id, purpose, _iso(_now()), _iso(expires)),
+            )
+        return raw
+
+    def consume_email_token(self, raw_token: str, purpose: str) -> Optional[int]:
+        """Atomically validate + delete a token. Returns the user_id on success,
+        else None (unknown, wrong purpose, or expired). Single-use: the DELETE
+        rowcount gates consumption so the same link can't be replayed."""
+        if not raw_token:
+            return None
+        token_hash = _hash_token(raw_token)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT user_id, purpose, expires_at FROM email_tokens WHERE token_hash = %s",
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            cur = conn.execute(
+                "DELETE FROM email_tokens WHERE token_hash = %s", (token_hash,)
+            )
+            if cur.rowcount == 0 or row["purpose"] != purpose:
+                return None
+            try:
+                if datetime.fromisoformat(row["expires_at"]) <= _now():
+                    return None
+            except ValueError:
+                return None
+            return row["user_id"]
+
+    def revoke_user_sessions(self, user_id: int) -> None:
+        """Drop every active session for an account (used after a password reset
+        so a leaked session can't outlive the credential change)."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
 
     # -- challenges (one-time login nonces) -----------------------------
     def create_challenge(self, public_key: str, purpose: str) -> Tuple[str, str]:
@@ -376,3 +495,4 @@ class AccountStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM sessions WHERE expires_at <= %s", (now,))
             conn.execute("DELETE FROM challenges WHERE expires_at <= %s", (now,))
+            conn.execute("DELETE FROM email_tokens WHERE expires_at <= %s", (now,))

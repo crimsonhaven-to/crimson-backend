@@ -1,6 +1,7 @@
 import asyncio
 import os
 import gzip
+import hashlib
 import time
 import logging
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,7 @@ from db_pool import get_pool, close_pool
 from rate_limit import limiter
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from starlette.concurrency import run_in_threadpool
 
 # Configure logging
 logging.basicConfig(
@@ -46,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "2.4.5"
+VERSION = "3.0.0"
 
 
 def _utcnow_iso() -> str:
@@ -79,6 +81,13 @@ class Config:
     # replica is wasteful — keep it enabled on exactly one replica (see README
     # "Deploying to Docker Swarm").
     RUN_DB_SYNC = os.getenv("RUN_DB_SYNC", "true").lower() not in ("0", "false", "no")
+
+    # Site-wide login wall. When true (default) every content endpoint requires a
+    # valid session bearer token (see the require_login middleware); a small set
+    # of paths — auth, health, the signed stream proxies/player that media
+    # elements load without headers, and the Ko-fi webhook — stay public. Set to
+    # false to revert to a fully open API.
+    REQUIRE_LOGIN = os.getenv("REQUIRE_LOGIN", "true").lower() not in ("0", "false", "no")
 
     # CORS Origins. Overridable via the ALLOWED_ORIGINS env var (comma-separated)
     # so the deploy can lock these down without a code change; falls back to the
@@ -273,6 +282,106 @@ app = FastAPI(
 # returns a clean JSON error with Retry-After.
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# --- SITE-WIDE LOGIN WALL ---------------------------------------------------
+# Everything is private unless explicitly whitelisted. The whitelist covers:
+#   * auth endpoints (you can't log in without them),
+#   * health/root (uptime probes),
+#   * the signed stream proxies + player — these are loaded directly by <iframe>/
+#     <video>/hls.js which can't attach an Authorization header; they're already
+#     HMAC-signed and you only get a working URL from an authenticated /watch call,
+#     so they're gated indirectly,
+#   * the Ko-fi webhook (called by Ko-fi, not a browser),
+#   * docs.
+# Defined BEFORE the CORS middleware below so CORS remains the outermost layer and
+# its headers are attached even to the 401 we return here (browsers need that to
+# surface the error instead of an opaque CORS failure).
+_PUBLIC_EXACT = {"/", "/health", "/openapi.json", "/docs", "/redoc"}
+_PUBLIC_PREFIXES = (
+    "/auth/",
+    "/kofi/webhook",
+    "/player",
+    "/movish_proxy",
+    "/playimdb_proxy",
+    "/voe_proxy",
+    "/vidmoly_proxy",
+    "/vidsrc_proxy",
+    "/cinemabz_proxy",
+    "/animesuge_proxy",
+    "/jellyfin_proxy",
+    "/docs",
+)
+
+# Tiny in-process cache of validated session tokens so the login wall doesn't add
+# a DB round-trip to every content request. A hit (the common case) skips the DB
+# entirely; entries are short-lived so a logout/expiry takes effect within the
+# TTL. Keyed by the token's SHA-256 (never the raw token).
+_SESSION_OK_TTL = 60.0          # seconds
+_SESSION_OK_MAX = 20_000        # hard cap to bound memory
+_session_ok_cache: Dict[str, float] = {}
+
+
+async def _session_is_valid(raw_token: str) -> bool:
+    if not raw_token:
+        return False
+    key = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    exp = _session_ok_cache.get(key)
+    if exp is not None and exp > now:
+        return True
+    # Cache miss — verify against the DB off the event loop.
+    user = await run_in_threadpool(account_store.get_user_by_session, raw_token)
+    if user:
+        if len(_session_ok_cache) >= _SESSION_OK_MAX:
+            _session_ok_cache.clear()  # cheap, bounded reset under abuse
+        _session_ok_cache[key] = now + _SESSION_OK_TTL
+        return True
+    _session_ok_cache.pop(key, None)
+    return False
+
+
+class LoginWallMiddleware:
+    """Pure-ASGI login wall. Implemented at the ASGI layer (not BaseHTTPMiddleware)
+    so it adds zero buffering to the progressive NDJSON /watch stream — it only
+    inspects the request scope, then either short-circuits with a 401 or passes
+    the untouched send/receive channels straight through."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not Config.REQUIRE_LOGIN:
+            return await self.app(scope, receive, send)
+
+        path = scope.get("path", "")
+        if (
+            scope.get("method") == "OPTIONS"
+            or path in _PUBLIC_EXACT
+            or path.startswith(_PUBLIC_PREFIXES)
+        ):
+            return await self.app(scope, receive, send)
+
+        token = ""
+        for name, value in scope.get("headers", []):
+            if name == b"authorization":
+                val = value.decode("latin-1")
+                if val[:7].lower() == "bearer ":
+                    token = val.split(" ", 1)[1].strip()
+                break
+
+        if await _session_is_valid(token):
+            return await self.app(scope, receive, send)
+
+        response = JSONResponse(
+            {"detail": "Authentication required", "success": False},
+            status_code=401,
+        )
+        await response(scope, receive, send)
+
+
+# Added BEFORE CORS so CORS stays the outermost layer and its headers are applied
+# even to the 401 this returns (the browser needs them to surface the error).
+app.add_middleware(LoginWallMiddleware)
 
 # CORS Middleware
 app.add_middleware(

@@ -26,14 +26,16 @@ Favorites are show-level; watch progress is per-episode. Both are stored as
 plain structured rows (so the backend can serve "continue watching" etc.).
 """
 
+import os
 import re
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
+from starlette.concurrency import run_in_threadpool
 
-from . import ed25519
-from .db import AccountStore, QuotaExceeded
+from . import ed25519, mailer, passwords
+from .db import AccountStore, QuotaExceeded, VERIFY_TOKEN_TTL, RESET_TOKEN_TTL
 from rate_limit import limiter
 
 router = APIRouter(tags=["account"])
@@ -41,7 +43,23 @@ store = AccountStore()
 
 _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")   # 32-byte public key
 _HEX128 = re.compile(r"^[0-9a-fA-F]{128}$")  # 64-byte signature
+# Pragmatic email shape check (we deliberately avoid the email-validator dep on
+# the slim image). Good enough to reject obvious garbage; deliverability is
+# proven by the verification link, not by this regex.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CHALLENGE_PURPOSE = "auth"
+
+
+def _allowed_invite_codes() -> set:
+    """Invite codes that may register an email account, from SIGNUP_INVITE_CODE
+    (comma-separated). Empty/unset => registration is closed (no code matches),
+    which fails safe for a 'login required' site."""
+    raw = os.getenv("SIGNUP_INVITE_CODE", "")
+    return {c.strip() for c in raw.split(",") if c.strip()}
+
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
 
 
 # --- helpers ---------------------------------------------------------------
@@ -240,6 +258,187 @@ async def auth_logout(authorization: Optional[str] = Header(None)):
     return {"success": True}
 
 
+# --- email + password auth -------------------------------------------------
+# Added alongside the mnemonic/Ed25519 flow above. Registration is gated by an
+# invite code (SIGNUP_INVITE_CODE) and requires email verification before login,
+# so the site stays closed to strangers. Password hashing (PBKDF2, ~0.3s) and
+# SMTP sending both run in a threadpool so the event loop is never blocked.
+class EmailRegisterRequest(BaseModel):
+    email: str
+    password: str
+    invite_code: str
+    label: Optional[str] = Field(default=None, max_length=100)
+
+
+class EmailLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class EmailTokenRequest(BaseModel):
+    token: str
+
+
+class EmailOnlyRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str
+
+
+def _validate_email(email: str) -> str:
+    email = _normalize_email(email)
+    if not _EMAIL_RE.match(email) or len(email) > 254:
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    return email
+
+
+def _validate_password(password: str) -> None:
+    if not isinstance(password, str) or not (
+        passwords.MIN_PASSWORD_LENGTH <= len(password) <= passwords.MAX_PASSWORD_LENGTH
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be {passwords.MIN_PASSWORD_LENGTH}–{passwords.MAX_PASSWORD_LENGTH} characters",
+        )
+
+
+def _session_payload(account: dict, created: bool) -> dict:
+    token, expires_at = store.create_session(account["user_id"])
+    store.touch_login(account["user_id"])
+    return {
+        "success": True,
+        "email": account.get("email"),
+        "label": account.get("label"),
+        "session_token": token,
+        "expires_at": expires_at,
+        "created": created,
+    }
+
+
+@router.post("/auth/email/register")
+@limiter.limit("5/minute")
+async def email_register(request: Request, body: EmailRegisterRequest):
+    """Create an email+password account (invite-gated, unverified) and email a
+    verification link. Returns 403 on a bad invite code, 409 if the email is
+    taken. No session is issued until the email is verified."""
+    email = _validate_email(body.email)
+    _validate_password(body.password)
+
+    allowed = _allowed_invite_codes()
+    if not allowed or body.invite_code.strip() not in allowed:
+        raise HTTPException(status_code=403, detail="Invalid invite code")
+
+    if store.get_account_by_email(email):
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+    pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
+    account = store.create_email_account(email, pw_hash, body.label)
+
+    token = store.create_email_token(account["user_id"], "verify", VERIFY_TOKEN_TTL)
+    await run_in_threadpool(mailer.send_verification_email, email, token)
+
+    return {
+        "success": True,
+        "requires_verification": True,
+        "email": email,
+        "message": "Account created. Check your email to verify your account.",
+    }
+
+
+@router.post("/auth/email/login")
+@limiter.limit("10/minute")
+async def email_login(request: Request, body: EmailLoginRequest):
+    """Log in with email + password. Returns a session on success. 401 on bad
+    credentials (deliberately generic, no account-existence oracle); 403 if the
+    email isn't verified yet."""
+    email = _normalize_email(body.email)
+    account = store.get_account_by_email(email)
+
+    # Always run a hash comparison (against the stored hash, or a throwaway) so
+    # the response time doesn't reveal whether the email exists.
+    stored_hash = account.get("password_hash") if account else None
+    ok = await run_in_threadpool(
+        passwords.verify_password,
+        body.password,
+        stored_hash or "pbkdf2_sha256$1$AAAA$AAAA",
+    )
+    if not account or not stored_hash or not ok:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not account.get("email_verified"):
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email before signing in. Check your inbox or request a new link.",
+        )
+
+    # Transparently upgrade an out-of-date hash now that we have the plaintext.
+    if passwords.needs_rehash(stored_hash):
+        new_hash = await run_in_threadpool(passwords.hash_password, body.password)
+        store.set_password(account["user_id"], new_hash)
+
+    return _session_payload(account, created=False)
+
+
+@router.post("/auth/email/verify")
+@limiter.limit("20/minute")
+async def email_verify(request: Request, body: EmailTokenRequest):
+    """Consume a verification token, mark the email verified, and sign the user
+    in (returns a session) so verifying lands them straight in the app."""
+    user_id = store.consume_email_token(body.token, "verify")
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
+    store.set_email_verified(user_id, True)
+    account = store.get_account(user_id)
+    return _session_payload(account, created=True)
+
+
+@router.post("/auth/email/resend")
+@limiter.limit("5/minute")
+async def email_resend(request: Request, body: EmailOnlyRequest):
+    """Resend the verification email. Always returns success (no account-exists
+    oracle); only actually sends for an existing, still-unverified account."""
+    email = _normalize_email(body.email)
+    account = store.get_account_by_email(email)
+    if account and account.get("email") and not account.get("email_verified"):
+        token = store.create_email_token(account["user_id"], "verify", VERIFY_TOKEN_TTL)
+        await run_in_threadpool(mailer.send_verification_email, email, token)
+    return {"success": True, "message": "If that account exists and is unverified, a new link is on its way."}
+
+
+@router.post("/auth/email/forgot")
+@limiter.limit("5/minute")
+async def email_forgot(request: Request, body: EmailOnlyRequest):
+    """Start a password reset. Always returns success (no account-exists oracle);
+    only sends for an existing email+password account."""
+    email = _normalize_email(body.email)
+    account = store.get_account_by_email(email)
+    if account and account.get("password_hash"):
+        token = store.create_email_token(account["user_id"], "reset", RESET_TOKEN_TTL)
+        await run_in_threadpool(mailer.send_reset_email, email, token)
+    return {"success": True, "message": "If that account exists, a reset link is on its way."}
+
+
+@router.post("/auth/email/reset")
+@limiter.limit("5/minute")
+async def email_reset(request: Request, body: ResetPasswordRequest):
+    """Complete a password reset: consume the token, set the new password, revoke
+    all existing sessions, and (since controlling the inbox proves ownership)
+    mark the email verified."""
+    _validate_password(body.password)
+    user_id = store.consume_email_token(body.token, "reset")
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired")
+
+    pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
+    store.set_password(user_id, pw_hash)
+    store.set_email_verified(user_id, True)
+    store.revoke_user_sessions(user_id)
+    return {"success": True, "message": "Password updated. You can now sign in."}
+
+
 # --- account info ----------------------------------------------------------
 @router.get("/account/me")
 async def account_me(user: dict = Depends(require_user)):
@@ -247,7 +446,9 @@ async def account_me(user: dict = Depends(require_user)):
     prog = store.list_progress(user["user_id"])
     return {
         "success": True,
-        "public_key": user["public_key"],
+        "public_key": user.get("public_key"),
+        "email": user.get("email"),
+        "email_verified": user.get("email_verified"),
         "label": user.get("label"),
         "created_at": user.get("created_at"),
         "last_login_at": user.get("last_login_at"),
