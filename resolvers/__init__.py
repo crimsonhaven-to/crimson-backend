@@ -10,6 +10,7 @@ from .cinemabz import (
     CinemabzIpcloudResolver,
     CinemabzNgcloudResolver,
 )
+from .vidsrc import VidSrcResolver
 
 # The unified list of all our resolvers.
 # MovishResolver matches on the distinct "api.movish.net" host.
@@ -27,4 +28,5 @@ ALL_RESOLVERS = [
     CinemabzTcloudResolver,
     CinemabzIpcloudResolver,
     CinemabzNgcloudResolver,
+    VidSrcResolver,  # aniwatch.co.at "VidSrc" server -> megaplay HLS
 ]

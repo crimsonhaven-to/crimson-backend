@@ -24,6 +24,7 @@ from resolvers.movish import proxy_fetch as movish_proxy_fetch
 from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
 from resolvers.voe import proxy_fetch as voe_proxy_fetch
 from resolvers.vidmoly import proxy_fetch as vidmoly_proxy_fetch
+from resolvers.vidsrc import proxy_fetch as vidsrc_proxy_fetch
 from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.cinemabz import proxy_fetch as cinemabz_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "2.4.2"
+VERSION = "2.4.3"
 
 
 def _utcnow_iso() -> str:
@@ -1637,6 +1638,40 @@ async def vidmoly_proxy(request: Request):
         raise HTTPException(status_code=403, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"Vidmoly proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- VIDSRC STREAM PROXY ("VidSrc" / aniwatch megaplay source) ---
+@app.get("/vidsrc_proxy")
+async def vidsrc_proxy(request: Request):
+    """Signed, same-origin HLS proxy for aniwatch's "VidSrc" (megaplay) source.
+    The megaplay delivery CDN is Referer-gated (403s without
+    ``Referer: https://megaplay.buzz/``), which the viewer's browser can't set on
+    its media fetches, so the playlist/segments are fetched server-side here (with
+    that Referer), playlists rewritten so sub-resources flow back through this
+    proxy, and segments streamed through with Range passthrough.
+
+    The CDN host rotates, so instead of a host allow-list this proxy verifies an
+    HMAC on the ``u`` URL (see resolvers.vidsrc) and refuses anything unsigned —
+    closing the open-proxy / SSRF hole."""
+    url = request.query_params.get("u")
+    sig = request.query_params.get("s")
+    try:
+        status, content_type, headers, payload = await vidsrc_proxy_fetch(
+            url=url,
+            sig=sig,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"VidSrc proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     if isinstance(payload, (bytes, bytearray)):

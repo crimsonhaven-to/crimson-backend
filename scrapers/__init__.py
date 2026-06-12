@@ -8,10 +8,12 @@ from .animekai_scraper import AnimekaiScraper
 from .animesuge_scraper import AnimeSugeScraper
 from .aniworld_scraper import AniworldScraper
 from .cinemabz_scraper import CinemabzScraper
+from .aniwatch_scraper import AniwatchScraper
 
 ALL_SCRAPERS = [
     GogoScraper,
     AniworldScraper,  # German s.to-family site; feeds VOE/Vidmoly embeds.
+    AniwatchScraper,  # WordPress site; feeds "VidSrc" (megaplay) embeds.
     #VoeScraper,
     MovishScraper,
     PlayimdbScraper,
