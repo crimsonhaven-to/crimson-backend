@@ -15,6 +15,7 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
 - **Automatic Sync**: Built-in scheduler keeps the local mapping database up-to-date with upstream sources.
 - **Internal Proxies**: Custom reverse proxies for providers like AnimeSuge, Movish, and Jellyfin to bypass ads and CORS.
 - **Crimson Player**: A minimal, ad-free HLS/MP4 player served directly from the backend for a seamless experience.
+- **Accounts & Login Wall**: Two coexisting sign-in methods — Ed25519 mnemonic (P-Stream style) **and** invite-gated email + password with SMTP verification/reset — behind a site-wide, opt-out login wall so the whole API is members-only.
 - **Rate Limiting**: Built-in protection against scraping abuse and brute-force attempts on sensitive endpoints.
 
 ## 🛠 Tech Stack
@@ -85,6 +86,13 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `RATE_LIMIT_STORAGE_URI` | no | `memory://` | Storage backend for rate limiting. Set to `redis://redis:6379` for shared limits across replicas. |
 | `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
 | `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional Jellyfin source. |
+| `REQUIRE_LOGIN` | no | `true` | Site-wide login wall — require a valid session on all content endpoints. `false` reopens the API. |
+| `SIGNUP_INVITE_CODE` | no | – | Invite code(s) (comma-separated) required to register an email account. **Empty ⇒ signups closed** (every register `403`s). |
+| `ALLOW_MNEMONIC_REGISTRATION` | no | `false` | Allow creating NEW Ed25519 mnemonic accounts. Off by default so a freshly minted mnemonic can't bypass the invite gate; existing mnemonic accounts still log in. |
+| `FRONTEND_BASE_URL` | no | `https://crimsonhaven.to` | Origin used to build the emailed verify / reset links. |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURITY` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_FROM_NAME` | no | – / `587` / `starttls` / … | SMTP for verification + reset email. Unset `SMTP_HOST` disables sending (registration still works; mail no-ops). |
+
+> **Containers:** Compose/Swarm only inject env vars **explicitly listed** in a service's `environment:` block — the `.env` file is used for `${...}` substitution, *not* auto-injected. The login-wall + SMTP vars are wired into the `api` services in `docker-compose-dev.yml` and `docker-stack.yml`; recreate the container (`docker compose up -d`) after changing them.
 
 All state (the TMDB↔AniList mapping, the API cache, and accounts/favorites/
 progress) lives in **one PostgreSQL database**, reached through a process-wide
@@ -209,21 +217,65 @@ for extras (specials/OVAs/movies).
 
 ---
 
-## 🔐 Accounts (mnemonic sign-in)
+## 🔐 Accounts
+
+Two sign-in methods coexist; an account row carries **either** an Ed25519
+`public_key` **or** an `email`/`password_hash` (`public_key` is nullable). User
+data (favorites + watch progress) lives in its own PostgreSQL tables, untouched
+by mapping resyncs. The schema upgrades itself on boot — `AccountStore.init_db()`
+runs idempotent `ALTER ... IF NOT EXISTS` migrations, so pointing a new build at
+an existing database "just works" with no manual SQL.
+
+### Site-wide login wall
+
+When `REQUIRE_LOGIN=true` (default) the site is **members-only**: a pure-ASGI
+middleware (`LoginWallMiddleware` in `api.py`) rejects any request without a valid
+`Authorization: Bearer <session_token>` with `401`, except a small whitelist —
+the auth endpoints, `/health` + `/`, the Ko-fi webhook, and the signed stream
+proxies + `/player` (loaded by `<iframe>`/`<video>` which can't send headers;
+they're already HMAC-signed and only reachable via an authenticated `/watch`).
+Validated tokens are cached in-process for 60s so the wall adds no DB hit on hot
+paths, and it sits *inside* CORS so 401s still carry CORS headers. Set
+`REQUIRE_LOGIN=false` to reopen the whole API.
+
+### Mnemonic (Ed25519) sign-in
 
 No usernames, no passwords. An account **is** an Ed25519 public key derived from a
 12-word BIP39 mnemonic that lives entirely on the client (like P-Stream). The
 server stores only the public key and *verifies* signatures over one-time
 challenges — the mnemonic / private key never reach the backend, so a DB leak
-exposes no credential. User data (favorites + watch progress) lives in its own
-PostgreSQL tables, untouched by mapping resyncs.
+exposes no credential.
 
-### Endpoints
+> **Registration is disabled by default** (`ALLOW_MNEMONIC_REGISTRATION=false`).
+> A freshly generated mnemonic would otherwise be an un-gated way onto an
+> invite-only site, so `/auth/register` returns `403` unless explicitly re-enabled.
+> Existing mnemonic accounts are unaffected — they still sign in via `/auth/login`.
+> The frontend no longer surfaces a mnemonic login option at all.
+
+### Email + password sign-in
+
+Registration is **invite-gated** (`SIGNUP_INVITE_CODE`, comma-separated; empty ⇒
+signups closed → `403`) and requires email verification before the first login.
+Passwords are hashed with PBKDF2-HMAC-SHA256 (600k iters, stdlib `hashlib` — no
+native deps); hashing and SMTP both run in a threadpool so the event loop never
+blocks. Verification + password-reset links are emailed (single-use, hashed
+tokens) via SMTP (`SMTP_*`, `FRONTEND_BASE_URL` builds the link).
+
+| Method | Endpoint | Auth | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/auth/email/register` | – | Create an invite-gated, unverified account → sends verification email. |
+| `POST` | `/auth/email/login` | – | Email + password → session (`403` until verified). |
+| `POST` | `/auth/email/verify` | – | Consume a verification token → marks verified **and** returns a session. |
+| `POST` | `/auth/email/resend` | – | Resend the verification email (always `200`, no account-exists oracle). |
+| `POST` | `/auth/email/forgot` | – | Start a password reset → sends reset email (always `200`). |
+| `POST` | `/auth/email/reset` | – | Consume a reset token + set a new password (revokes existing sessions). |
+
+### Mnemonic + shared account endpoints
 
 | Method | Endpoint | Auth | Description |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/auth/challenge` | – | Get a one-time challenge for a `public_key`. |
-| `POST` | `/auth/register` | – | Create the account (signed challenge proves key ownership) → session. |
+| `POST` | `/auth/register` | – | Create the account (signed challenge proves key ownership) → session. **Disabled by default** (`403`); see `ALLOW_MNEMONIC_REGISTRATION`. |
 | `POST` | `/auth/login` | – | Log in to an existing account via signed challenge → session. |
 | `POST` | `/auth/logout` | Bearer | Revoke the current session. |
 | `GET`  | `/account/me` | Bearer | Profile + favorite/progress counts. |

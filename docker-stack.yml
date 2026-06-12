@@ -54,6 +54,21 @@ services:
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
+      # Login wall (email+password) — lives on the serving service. Supplied via
+      # crimson.env on the manager. An empty SIGNUP_INVITE_CODE closes signups
+      # (every register 403s), so set it. SMTP powers verification/reset email.
+      - REQUIRE_LOGIN=${REQUIRE_LOGIN:-true}
+      - SIGNUP_INVITE_CODE=${SIGNUP_INVITE_CODE:-}
+      # New mnemonic account creation stays OFF by default (no invite-bypass).
+      - ALLOW_MNEMONIC_REGISTRATION=${ALLOW_MNEMONIC_REGISTRATION:-false}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://crimsonhaven.to}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_SECURITY=${SMTP_SECURITY:-starttls}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
 
     # Front this with your reverse proxy. Remove if you attach the proxy directly
     # to crimson_net instead of publishing a host port. Only THIS service may

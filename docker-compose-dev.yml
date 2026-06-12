@@ -80,6 +80,23 @@ services:
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
+      # Login wall (email+password). These come from your host env / .env via
+      # substitution — Compose does NOT auto-inject the .env into the container,
+      # so they MUST be listed here or the app sees them as unset (an empty
+      # SIGNUP_INVITE_CODE means registration is closed → every signup 403s).
+      - REQUIRE_LOGIN=${REQUIRE_LOGIN:-true}
+      - SIGNUP_INVITE_CODE=${SIGNUP_INVITE_CODE:-}
+      # New mnemonic account creation stays OFF by default (no invite-bypass).
+      - ALLOW_MNEMONIC_REGISTRATION=${ALLOW_MNEMONIC_REGISTRATION:-false}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:5173}
+      # SMTP (verification + password-reset email).
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_SECURITY=${SMTP_SECURITY:-starttls}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
