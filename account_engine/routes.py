@@ -58,6 +58,16 @@ def _allowed_invite_codes() -> set:
     return {c.strip() for c in raw.split(",") if c.strip()}
 
 
+def _mnemonic_registration_enabled() -> bool:
+    """Whether NEW mnemonic (Ed25519) accounts may be created. Default OFF: a
+    fresh mnemonic would otherwise be an un-gated way onto an invite-only site
+    (you can mint a brand-new keypair client-side and self-register), which some
+    jurisdictions don't allow. Existing mnemonic accounts can still /auth/login —
+    only account *creation* is blocked. Set ALLOW_MNEMONIC_REGISTRATION=true to
+    re-open it."""
+    return os.getenv("ALLOW_MNEMONIC_REGISTRATION", "false").lower() in ("1", "true", "yes")
+
+
 def _normalize_email(email: str) -> str:
     return (email or "").strip().lower()
 
@@ -205,7 +215,18 @@ async def auth_register(request: Request, body: RegisterRequest):
     The account-exists check runs BEFORE the (one-time) challenge is consumed,
     so a 409 leaves the challenge intact for a /auth/login retry with the same
     challenge — supporting a frontend that tries register then falls back to
-    login (and vice-versa) on a single challenge."""
+    login (and vice-versa) on a single challenge.
+
+    New mnemonic account creation is disabled by default (see
+    _mnemonic_registration_enabled): a freshly generated mnemonic would otherwise
+    bypass the invite-only signup, which local law forbids. Existing mnemonic
+    accounts are unaffected — they still sign in via /auth/login."""
+    if not _mnemonic_registration_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="Mnemonic registration is disabled. Please register with an email and invite code.",
+        )
+
     pk = (body.public_key or "").lower()
     if not _HEX64.match(pk):
         raise HTTPException(status_code=400, detail="public_key must be 64 hex chars")
