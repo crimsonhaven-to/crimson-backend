@@ -182,6 +182,51 @@ services:
     networks:
       - crimson_net
 
+  # --- Discord invite bot (optional, exactly one) ----------------------------
+  # Same image as the API but runs the gateway bot (python -m discord_bot) rather
+  # than uvicorn. It only needs the DB (it mints single-use invite tokens into the
+  # same PostgreSQL the api reads at /auth/email/register), so it publishes no
+  # port. MUST stay at replicas: 1 — a second gateway login with the same token
+  # fights the first (and would double-mint). With DISCORD_BOT_TOKEN unset the
+  # process just logs "disabled" and idles, so it's harmless to leave deployed.
+  discord-bot:
+    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+    command: ["python", "-m", "discord_bot"]
+
+    environment:
+      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
+      # Supplied via crimson.env on the manager. Empty token => bot stays off.
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_OWNER_ID=${DISCORD_OWNER_ID:-}
+      - DISCORD_COMMAND_PREFIX=${DISCORD_COMMAND_PREFIX:-!}
+      # For the "register at <url>" hint shown next to minted codes.
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://crimsonhaven.to}
+
+    stop_grace_period: 20s
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        # Never run two gateway connections at once (start-first would overlap).
+        order: stop-first
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 32M
+
+    networks:
+      - crimson_net
+
 networks:
   crimson_net:
     driver: overlay

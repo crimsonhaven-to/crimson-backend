@@ -348,12 +348,25 @@ async def email_register(request: Request, body: EmailRegisterRequest):
     email = _validate_email(body.email)
     _validate_password(body.password)
 
-    allowed = _allowed_invite_codes()
-    if not allowed or body.invite_code.strip() not in allowed:
+    # Two kinds of invite are accepted in the same field:
+    #   * a shared, reusable code from SIGNUP_INVITE_CODE (unchanged), or
+    #   * a single-use token minted by the Discord bot (see discord_bot/), which
+    #     can register exactly one account.
+    # The single-use token is validated here but only *consumed* once we're
+    # committed to creating the account, so a 409 (email taken) doesn't burn it.
+    code = (body.invite_code or "").strip()
+    static_codes = _allowed_invite_codes()
+    is_static = bool(static_codes) and code in static_codes
+    if not is_static and not store.invite_token_is_available(code):
         raise HTTPException(status_code=403, detail="Invalid invite code")
 
     if store.get_account_by_email(email):
         raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+    # Burn the single-use token now (race-safe). If a concurrent signup consumed
+    # it in the gap since the availability check above, fail closed.
+    if not is_static and not store.consume_invite_token(code, used_by=email):
+        raise HTTPException(status_code=403, detail="This invite code has already been used")
 
     pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
     account = store.create_email_account(email, pw_hash, body.label)

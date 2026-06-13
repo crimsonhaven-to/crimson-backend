@@ -17,3 +17,6 @@ slowapi==0.1.9
 # prebuilt cp314 manylinux/musllinux wheel (no compiler / Rust needed on
 # python:3.14-slim); [pool] is pure-Python. Verified wheels exist for 3.3.4.
 psycopg[binary,pool]==3.3.4
+# Discord invite bot gateway client (see discord_bot/). Pure-Python (no Rust),
+# so it installs cleanly on python:3.14-slim; the C speedups are optional.
+websockets==15.0.1
