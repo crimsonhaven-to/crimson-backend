@@ -1161,7 +1161,7 @@ async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, 
     return results
 
 
-async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 12) -> List[Dict]:
+async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> List[Dict]:
     """Fetch trending non-anime TV shows from TMDB (popular, excluding animation)."""
     cache_key = "tmdb:trending_shows"
 
