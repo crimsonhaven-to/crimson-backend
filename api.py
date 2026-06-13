@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "4.0.0"
+VERSION = "4.0.1"
 
 
 def _utcnow_iso() -> str:
@@ -1172,6 +1172,47 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 12) -> Li
     return trending_list
 
 # --- SCRAPER HELPER FUNCTIONS ---
+async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -> List[str]:
+    """German-language titles for a TMDB show, for the German scraper sites.
+
+    The German streaming sources (s.to, aniworld) list many shows under their
+    *German broadcast title*, not the English one TMDB hands us first — e.g. NCIS
+    is "Navy CIS" on s.to, so plain title matching misses the show entirely. We
+    pull the German title(s) from TMDB so the title-based scrapers get them as
+    extra search candidates: the localized name from ``/translations`` (de) plus
+    any DE/AT/CH entries in ``/alternative_titles``. Cached (these are stable);
+    returns an empty list on failure (matching just falls back to the English
+    title, i.e. today's behaviour)."""
+    cache_key = f"tmdb:detitles:{tmdb_id}"
+    cached = _local_get(cache_key)
+    if cached is not None:
+        return cached
+
+    titles: List[str] = []
+    seen: set = set()
+
+    def _add(value: Optional[str]) -> None:
+        value = (value or "").strip()
+        if value and value.lower() not in seen:
+            seen.add(value.lower())
+            titles.append(value)
+
+    translations, alternatives = await asyncio.gather(
+        fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}/translations"),
+        fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}/alternative_titles"),
+    )
+
+    for t in ((translations or {}).get("translations") or []):
+        if t.get("iso_639_1") == "de":
+            _add((t.get("data") or {}).get("name"))
+    for a in ((alternatives or {}).get("results") or []):
+        if a.get("iso_3166_1") in ("DE", "AT", "CH"):
+            _add(a.get("title"))
+
+    _local_set(cache_key, titles, ttl=86400)
+    return titles
+
+
 async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int, anilist_data: Dict) -> List:
     """Run one scraper through the unified search -> embeds pipeline."""
     scraper = scraper_class()
@@ -1577,6 +1618,24 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
         "anilist_id": anilist_id,
         "title": title,
     })
+
+    # German streaming scrapers (s.to, aniworld) list many non-anime shows under
+    # their German broadcast title — e.g. NCIS is "Navy CIS" on s.to — which TMDB
+    # only exposes via /translations, so English-title matching alone misses them.
+    # Feed the German title(s) in as extra search candidates. Only on the
+    # no-AniList path: AniList-mapped anime already carry their own synonyms and
+    # that matching stays byte-identical.
+    if not anilist_id:
+        try:
+            async with http_client() as client:
+                german_titles = await fetch_tmdb_localized_titles(client, tmdb_id)
+            if german_titles:
+                existing = list(media_ctx.get("synonyms") or [])
+                media_ctx["synonyms"] = existing + [
+                    t for t in german_titles if t not in existing
+                ]
+        except Exception as e:
+            logger.warning(f"localized-title enrichment failed for {tmdb_id}: {e}")
 
     # Each scraper runs as its own task: scrape -> resolve -> push the resolved
     # streams onto a queue the moment they're ready, so a slow source never holds
