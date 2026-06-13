@@ -120,5 +120,32 @@ services:
           cpus: "0.25"
           memory: 256M
 
+  # --- Discord invite bot (optional) -----------------------------------------
+  # Same image as the API, but runs the gateway bot instead of uvicorn. It only
+  # talks to PostgreSQL (mints single-use invite tokens), so it doesn't publish a
+  # port. Disabled unless DISCORD_BOT_TOKEN is set — with it blank the process
+  # logs "disabled" and idles. Keep it at a SINGLE replica (a second gateway
+  # login with the same token fights the first).
+  discord-bot:
+    image: crimson-backend:1.0
+    command: ["python", "-m", "discord_bot"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_OWNER_ID=${DISCORD_OWNER_ID:-}
+      - DISCORD_COMMAND_PREFIX=${DISCORD_COMMAND_PREFIX:-!}
+      # Used to print a "register at <url>" hint alongside minted invite codes.
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:5173}
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
 volumes:
   crimson-pgdata-dev:   # PostgreSQL data directory (named volume)

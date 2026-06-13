@@ -87,7 +87,9 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
 | `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional Jellyfin source. |
 | `REQUIRE_LOGIN` | no | `true` | Site-wide login wall — require a valid session on all content endpoints. `false` reopens the API. |
-| `SIGNUP_INVITE_CODE` | no | – | Invite code(s) (comma-separated) required to register an email account. **Empty ⇒ signups closed** (every register `403`s). |
+| `SIGNUP_INVITE_CODE` | no | – | Shared, **reusable** invite code(s) (comma-separated) for email registration. **Empty ⇒ signups closed** (every register `403`s) — unless a single-use Discord-bot token is used instead. |
+| `DISCORD_BOT_TOKEN` / `DISCORD_OWNER_ID` | no | – | Enable the optional Discord invite bot (`python -m discord_bot`): the one whitelisted `DISCORD_OWNER_ID` can mint **single-use** invite tokens. Empty token ⇒ bot disabled. |
+| `DISCORD_COMMAND_PREFIX` | no | `!` | Chat-command prefix for the Discord invite bot. |
 | `ALLOW_MNEMONIC_REGISTRATION` | no | `false` | Allow creating NEW Ed25519 mnemonic accounts. Off by default so a freshly minted mnemonic can't bypass the invite gate; existing mnemonic accounts still log in. |
 | `FRONTEND_BASE_URL` | no | `https://crimsonhaven.to` | Origin used to build the emailed verify / reset links. |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURITY` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_FROM_NAME` | no | – / `587` / `starttls` / … | SMTP for verification + reset email. Unset `SMTP_HOST` disables sending (registration still works; mail no-ops). |
@@ -269,6 +271,46 @@ tokens) via SMTP (`SMTP_*`, `FRONTEND_BASE_URL` builds the link).
 | `POST` | `/auth/email/resend` | – | Resend the verification email (always `200`, no account-exists oracle). |
 | `POST` | `/auth/email/forgot` | – | Start a password reset → sends reset email (always `200`). |
 | `POST` | `/auth/email/reset` | – | Consume a reset token + set a new password (revokes existing sessions). |
+
+### Discord invite bot (single-use invite tokens)
+
+`SIGNUP_INVITE_CODE` is a *shared, reusable* code. As an alternative you can run a
+small Discord bot (`discord_bot/`) that lets **one** whitelisted operator mint
+**single-use** invite tokens — each registers exactly one account, then is dead.
+Both kinds are accepted in the same signup field, so no frontend change is needed.
+
+Setup:
+
+1. Create a bot at <https://discord.com/developers/applications> → **Bot**, copy
+   its **token**, and enable **Message Content Intent** under *Privileged Gateway
+   Intents* (needed to read commands in servers; DMs work without it).
+2. Set `DISCORD_BOT_TOKEN` and `DISCORD_OWNER_ID` (your numeric Discord user id —
+   enable Developer Mode, right-click your name → *Copy User ID*). Only that user
+   may use the bot; everyone else is silently ignored.
+3. Invite the bot to a server it shares with you (or just DM it).
+
+Run it as its own process — **exactly one instance** (a second gateway login with
+the same token fights the first and double-mints):
+
+```bash
+python -m discord_bot          # locally
+# or, in the bundled stacks, the `discord-bot` service (replicas: 1)
+```
+
+Then DM the bot (commands are owner-only; default prefix `!`):
+
+| Command | Action |
+| :--- | :--- |
+| `!invite [n]` | Mint *n* one-time invite tokens (1–20, default 1). |
+| `!invites` | List outstanding (unused) tokens. |
+| `!revoke <code>` | Delete an unused token. |
+| `!ping` / `!help` | Liveness / usage. |
+
+The bot is hand-rolled on `websockets` + `httpx` (no discord.py) to stay
+wheel-friendly on `python:3.14-slim`, in the same spirit as the vendored Ed25519.
+It only needs the database (tokens land in the same PostgreSQL the API reads at
+`/auth/email/register`), so its container publishes no port. With
+`DISCORD_BOT_TOKEN` unset the process just logs *disabled* and idles.
 
 ### Mnemonic + shared account endpoints
 

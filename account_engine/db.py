@@ -128,6 +128,22 @@ class AccountStore:
                     expires_at TEXT NOT NULL
                 );
 
+                -- Single-use invite tokens minted by the Discord bot (see
+                -- discord_bot/). Unlike the shared, reusable SIGNUP_INVITE_CODE,
+                -- each of these can register exactly ONE account: registration
+                -- stamps used_at/used_by and a second attempt with the same code
+                -- fails. Kept as a ledger (used rows are never auto-deleted) so the
+                -- bot can show who consumed which invite.
+                CREATE TABLE IF NOT EXISTS invite_tokens (
+                    code        TEXT PRIMARY KEY,
+                    created_by  TEXT,          -- discord user id that minted it
+                    created_at  TEXT NOT NULL,
+                    expires_at  TEXT,          -- NULL = never expires
+                    used_at     TEXT,          -- NULL = still unused
+                    used_by     TEXT           -- email that consumed it
+                );
+                CREATE INDEX IF NOT EXISTS idx_invite_tokens_unused ON invite_tokens(used_at);
+
                 CREATE TABLE IF NOT EXISTS favorites (
                     user_id       BIGINT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
                     item_key      TEXT NOT NULL,
@@ -286,6 +302,94 @@ class AccountStore:
         so a leaked session can't outlive the credential change)."""
         with self._connect() as conn:
             conn.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
+
+    # -- single-use invite tokens (minted by the Discord bot) -----------
+    def create_invite_token(
+        self, created_by: Optional[str] = None, ttl: Optional[timedelta] = None
+    ) -> str:
+        """Mint a fresh single-use invite code and return it. ``created_by`` is the
+        Discord user id that requested it; ``ttl`` optionally expires the code (None
+        => never expires, only single-use). The code is a short, copy-pasteable hex
+        string the recipient types into the signup form's invite field."""
+        code = secrets.token_hex(8)  # 16 hex chars — unguessable but easy to paste
+        expires = _iso(_now() + ttl) if ttl else None
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO invite_tokens (code, created_by, created_at, expires_at)"
+                " VALUES (%s, %s, %s, %s)",
+                (code, created_by, _iso(_now()), expires),
+            )
+        return code
+
+    def invite_token_is_available(self, code: str) -> bool:
+        """True if ``code`` is a known invite token that is still unused and not
+        expired. Read-only pre-check for a clean error message; consumption is
+        gated authoritatively (and race-safely) by consume_invite_token."""
+        if not code:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT expires_at, used_at FROM invite_tokens WHERE code = %s", (code,)
+            ).fetchone()
+        if row is None or row["used_at"] is not None:
+            return False
+        if row["expires_at"]:
+            try:
+                if datetime.fromisoformat(row["expires_at"]) <= _now():
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    def consume_invite_token(self, code: str, used_by: Optional[str] = None) -> bool:
+        """Atomically burn a single-use invite token. Returns True only if it
+        existed, was unused, and had not expired. The ``used_at IS NULL`` guard in
+        the UPDATE makes this race-safe: two concurrent signups with the same code
+        contend on the row and only one UPDATE matches (rowcount 1)."""
+        if not code:
+            return False
+        now = _iso(_now())
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE invite_tokens
+                   SET used_at = %s, used_by = %s
+                 WHERE code = %s
+                   AND used_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > %s)
+                """,
+                (now, used_by, code, now),
+            )
+            return cur.rowcount > 0
+
+    def list_invite_tokens(self, include_used: bool = False, limit: int = 50) -> List[Dict]:
+        """Most-recently-minted invite tokens. By default only the unused ones
+        (what the bot's 'list' command shows); include_used returns the full
+        ledger."""
+        with self._connect() as conn:
+            if include_used:
+                rows = conn.execute(
+                    "SELECT * FROM invite_tokens ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM invite_tokens WHERE used_at IS NULL"
+                    " ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def revoke_invite_token(self, code: str) -> bool:
+        """Delete an UNUSED invite token (the bot's 'revoke' command). Returns
+        False if the code is unknown or already used (used rows stay as a ledger)."""
+        if not code:
+            return False
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM invite_tokens WHERE code = %s AND used_at IS NULL", (code,)
+            )
+            return cur.rowcount > 0
 
     # -- challenges (one-time login nonces) -----------------------------
     def create_challenge(self, public_key: str, purpose: str) -> Tuple[str, str]:
