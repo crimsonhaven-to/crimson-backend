@@ -480,9 +480,11 @@ async def account_me(user: dict = Depends(require_user)):
     prog = store.list_progress(user["user_id"])
     return {
         "success": True,
+        "user_id": user.get("user_id"),
         "public_key": user.get("public_key"),
         "email": user.get("email"),
         "email_verified": user.get("email_verified"),
+        "is_admin": bool(user.get("is_admin")),
         "label": user.get("label"),
         "created_at": user.get("created_at"),
         "last_login_at": user.get("last_login_at"),
