@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "3.2.1"
+VERSION = "4.0.0"
 
 
 def _utcnow_iso() -> str:
@@ -1060,6 +1060,117 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
     _local_set(cache_key, trending_list)
     return trending_list
 
+# --- NON-ANIME TV SHOWS (secondary, additive) -------------------------------
+# These mirror the anime discovery helpers above but invert the AniList gate:
+# they surface TMDB TV results that are NOT mapped anime, so the site can also
+# play general (non-anime) series through the same TMDB-keyed pipeline (/info,
+# /watch/{tmdb_id}/{season}/{episode}) and the s.to scraper, which matches by
+# title. Anime stays priority 1 — these are a separate, parallel surface and the
+# anime helpers/endpoints above are left completely untouched.
+
+def _looks_like_anime(item: Dict) -> bool:
+    """Heuristic: a TMDB TV item that is Japanese Animation. Used to keep anime
+    (including titles we haven't mapped in Fribb yet) out of the *shows* surface,
+    so the two stay cleanly separated even at the edges."""
+    genres = item.get("genre_ids") or []
+    return 16 in genres and item.get("original_language") == "ja"
+
+
+def _show_item(item: Dict) -> Dict:
+    """Shape one TMDB TV search/discover result as a non-anime show entry. Keyed
+    by tmdb_id (no anilist_id) and tagged ``kind: "show"`` so the frontend routes
+    it through the TMDB-keyed show pages instead of the AniList ones."""
+    return {
+        "title": item.get("name") or item.get("original_name"),
+        "tmdb_id": item.get("id"),
+        "anilist_id": None,
+        "kind": "show",
+        "poster": _tmdb_img(item.get("poster_path")) if item.get("poster_path") else None,
+        "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
+        "vote_average": item.get("vote_average"),
+    }
+
+
+async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
+    """Search TMDB for general TV shows, excluding anime.
+
+    Excludes (a) titles that already map to an AniList entry — those are anime,
+    served by /search/anime — and (b) anything that looks like Japanese animation,
+    so unmapped anime doesn't leak into the shows surface."""
+    cache_key = f"tmdb:search_shows:{query.lower()}"
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        return cached_data.get("results", [])
+
+    url = "https://api.themoviedb.org/3/search/tv"
+    data = await fetch_with_retry(client, url, params={"query": query, "include_adult": "false"})
+    if not data:
+        return []
+
+    items = data.get("results", [])
+    # One batched lookup so we can drop anything already mapped as anime.
+    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+
+    results: List[Dict] = []
+    for item in items:
+        tmdb_id = item.get("id")
+        if not tmdb_id or anilist_by_tmdb.get(tmdb_id) or _looks_like_anime(item):
+            continue
+        if not item.get("poster_path"):
+            continue  # posterless rows are usually junk/duplicates — skip for a clean grid
+        results.append(_show_item(item))
+        if len(results) >= limit:
+            break
+
+    await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+    return results
+
+
+async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 12) -> List[Dict]:
+    """Fetch trending non-anime TV shows from TMDB (popular, excluding animation)."""
+    cache_key = "tmdb:trending_shows"
+
+    local = _local_get(cache_key)
+    if local is not None:
+        return local
+
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        results = cached_data.get("results", [])
+        _local_set(cache_key, results)
+        return results
+
+    url = "https://api.themoviedb.org/3/discover/tv"
+    params = {
+        "page": 1,
+        "include_adult": "false",
+        "language": "en-US",
+        "without_genres": "16",          # exclude Animation (keeps anime out)
+        "sort_by": "popularity.desc",
+        "vote_count.gte": 200,           # quality floor
+    }
+    data = await fetch_with_retry(client, url, params=params)
+    if not data:
+        return []
+
+    items = data.get("results", [])
+    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+
+    trending_list: List[Dict] = []
+    for item in items:
+        tmdb_id = item.get("id")
+        if not tmdb_id or anilist_by_tmdb.get(tmdb_id) or _looks_like_anime(item):
+            continue
+        if not item.get("poster_path"):
+            continue
+        trending_list.append(_show_item(item))
+        if len(trending_list) >= limit:
+            break
+
+    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+    _local_set(cache_key, trending_list)
+    return trending_list
+
 # --- SCRAPER HELPER FUNCTIONS ---
 async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int, anilist_data: Dict) -> List:
     """Run one scraper through the unified search -> embeds pipeline."""
@@ -1237,7 +1348,7 @@ async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Nu
     try:
         async with http_client() as client:
             results = await fetch_trending_anime(client, limit)
-        
+
         return {
             "success": True,
             "count": len(results),
@@ -1246,6 +1357,44 @@ async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Nu
     except Exception as e:
         logger.error(f"Trending error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch trending anime")
+
+# --- Non-anime TV shows (secondary surface) ---------------------------------
+# Parallel to /search/anime + /trending, but for general TV shows. They reuse the
+# existing TMDB-keyed playback path (/info + /watch/{tmdb_id}/{season}/{episode}),
+# so no new watch/info routes are needed — only discovery + a TMDB-keyed overview.
+
+@app.get("/search/shows")
+async def search_shows_by_name(query_name: str = Query(..., min_length=1, description="TV show name to search")):
+    """Search for non-anime TV shows by name (kind='show', keyed by tmdb_id)."""
+    if not Config.TMDB_API_KEY:
+        raise HTTPException(status_code=500, detail="TMDB API key not configured")
+    try:
+        async with http_client() as client:
+            results = await fetch_tmdb_show_search_results(client, query_name)
+        return {
+            "success": True,
+            "query": query_name,
+            "count": len(results),
+            "suggestions": results,
+        }
+    except Exception as e:
+        logger.error(f"Show search error: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+@app.get("/trending/shows")
+async def get_trending_shows(limit: int = Query(12, ge=1, le=50, description="Number of results to return")):
+    """Get trending non-anime TV shows."""
+    try:
+        async with http_client() as client:
+            results = await fetch_trending_shows(client, limit)
+        return {
+            "success": True,
+            "count": len(results),
+            "shows": results,
+        }
+    except Exception as e:
+        logger.error(f"Trending shows error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch trending shows")
 
 @app.get("/catalogue")
 async def get_catalogue(
@@ -1998,6 +2147,47 @@ async def get_anime_overview(anilist_id: int):
         "total_seasons": len(seasons_data),
         "seasons": seasons_data,
         "extras": get_show_extras(tmdb_id),
+    }
+
+@app.get("/show-overview/{tmdb_id}")
+async def get_show_overview(tmdb_id: int):
+    """Aggregated overview for a NON-ANIME TV show, keyed by tmdb_id.
+
+    The TMDB-keyed twin of /overview/{anilist_id}: same response shape (so the
+    frontend can render it with the shared overview UI), but built purely from
+    TMDB — there is no AniList entry for a general show. Seasons come from TMDB's
+    real season list via _build_season_list (any anilist_id fields are simply
+    null), and per-season episodes are still fetched lazily by the frontend via
+    /info/{tmdb_id}?season=. Playback uses /watch/{tmdb_id}/{season}/{episode}.
+    """
+    async with http_client() as client:
+        show = await fetch_tmdb_show(client, tmdb_id)
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found on TMDB")
+
+    seasons_data = _build_season_list(tmdb_id, show)
+    year = (show.get("first_air_date") or "")[:4] or None
+
+    return {
+        "success": True,
+        "kind": "show",
+        "anilist_id": None,
+        "tmdb_id": tmdb_id,
+        "title": show.get("title"),
+        "title_romaji": None,
+        "title_english": show.get("title"),
+        "poster": show.get("poster"),
+        "backdrop": show.get("backdrop"),
+        "banner": None,
+        "description": show.get("overview"),
+        "summary": show.get("overview"),
+        "status": None,
+        "year": year,
+        "total_episodes": None,
+        "total_seasons": len(seasons_data),
+        "seasons": seasons_data,
+        # General shows carry no AniList specials/OVAs/movies mapping.
+        "extras": [],
     }
 
 # --- HEALTH CHECK ENDPOINT ---
