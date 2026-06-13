@@ -193,6 +193,14 @@ services:
     image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
     command: ["python", "-m", "discord_bot"]
 
+    # Disable the image's baked-in HEALTHCHECK (it probes http://127.0.0.1:8000/
+    # health). This service runs the gateway bot, NOT uvicorn, so nothing listens
+    # on :8000 — the inherited check would fail forever, Swarm would mark the task
+    # unhealthy and keep restarting it (stuck "starting" -> error loop). ["NONE"]
+    # turns the healthcheck off so the bot is judged by its process staying up.
+    healthcheck:
+      test: ["NONE"]
+
     environment:
       - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
       # Supplied via crimson.env on the manager. Empty token => bot stays off.
