@@ -32,6 +32,7 @@ from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configure
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
+from account_engine.admin_routes import router as admin_router, set_resync_handler
 from supporters_engine import router as supporters_router, store as supporters_store
 from db_pool import get_pool, close_pool
 from rate_limit import limiter
@@ -81,6 +82,14 @@ class Config:
     # replica is wasteful — keep it enabled on exactly one replica (see README
     # "Deploying to Docker Swarm").
     RUN_DB_SYNC = os.getenv("RUN_DB_SYNC", "true").lower() not in ("0", "false", "no")
+
+    # Emails promoted to admin on startup (comma-separated). Seeds the first
+    # admin so the /admin dashboard is reachable without hand-editing the DB;
+    # afterwards admins can promote others from the dashboard itself. Only takes
+    # effect for accounts that already exist (it never creates one).
+    ADMIN_EMAILS = [
+        e.strip() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
+    ]
 
     # Site-wide login wall. When true (default) every content endpoint requires a
     # valid session bearer token (see the require_login middleware); a small set
@@ -193,6 +202,17 @@ async def lifespan(app: FastAPI):
     db_engine.init_db()
     account_store.init_db()  # account tables (untouched by mapping resyncs)
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
+
+    # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
+    # that already exist). Lets the operator reach the /admin dashboard without
+    # editing the DB by hand. Safe on every replica.
+    if Config.ADMIN_EMAILS:
+        try:
+            promoted = account_store.bootstrap_admins(Config.ADMIN_EMAILS)
+            if promoted:
+                logger.info(f"Promoted {promoted} account(s) to admin from ADMIN_EMAILS")
+        except Exception as e:
+            logger.error(f"Admin bootstrap failed: {e}")
 
     # One scheduler per replica. It always owns cheap housekeeping (expired
     # session/challenge purge); the heavy Fribb mapping resync is added to it on
@@ -394,6 +414,21 @@ app.add_middleware(
 
 # Account system (mnemonic/Ed25519 sign-in, favorites, watch progress).
 app.include_router(account_router)
+
+# Admin dashboard (user management, invite minting, metadata resync, stats).
+# Gated by require_admin on every route; the login wall already covers /admin.
+app.include_router(admin_router)
+
+
+# The admin "trigger metadata resync" endpoint runs the same forced Fribb
+# rebuild as metadata_engine.resync, but in-process on the live db_engine (warm
+# pool, MVCC-safe single transaction). Injected here so admin_routes doesn't have
+# to import the engine (and api.py).
+async def _admin_forced_resync():
+    await db_engine.sync_database_async(force=True)
+
+
+set_resync_handler(_admin_forced_resync)
 
 # Ko-fi supporters (webhook ingest + public "Lumi's Loved Mortals" list).
 app.include_router(supporters_router)

@@ -103,6 +103,11 @@ class AccountStore:
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email          TEXT;
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS password_hash  TEXT;
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+                -- Admin flag — gates the /admin dashboard (see admin_routes). Off by
+                -- default; the first admin is seeded from ADMIN_EMAILS at startup
+                -- (see bootstrap_admins) so the dashboard is reachable without
+                -- hand-editing the database.
+                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_admin       BOOLEAN NOT NULL DEFAULT FALSE;
                 -- Case-insensitive email uniqueness (NULLs — the crypto accounts —
                 -- are allowed to coexist).
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email
@@ -212,6 +217,121 @@ class AccountStore:
                 "UPDATE accounts SET last_login_at = %s WHERE user_id = %s",
                 (_iso(_now()), user_id),
             )
+
+    # -- admin ----------------------------------------------------------
+    def set_admin(self, user_id: int, is_admin: bool) -> None:
+        """Flip an account's admin flag (used by the admin dashboard)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET is_admin = %s WHERE user_id = %s",
+                (is_admin, user_id),
+            )
+
+    def bootstrap_admins(self, emails: List[str]) -> int:
+        """Promote the given emails to admin (idempotent). Seeds the first admin
+        from ADMIN_EMAILS at startup so the dashboard is reachable without DB
+        surgery; returns how many rows were newly promoted."""
+        lowered = [e.strip().lower() for e in (emails or []) if e and e.strip()]
+        if not lowered:
+            return 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE accounts SET is_admin = TRUE"
+                " WHERE LOWER(email) = ANY(%s) AND is_admin = FALSE",
+                (lowered,),
+            )
+            return cur.rowcount
+
+    def count_admins(self) -> int:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM accounts WHERE is_admin = TRUE"
+            ).fetchone()["n"]
+
+    def delete_account(self, user_id: int) -> bool:
+        """Delete an account and (via ON DELETE CASCADE) all its sessions,
+        favorites, progress and email tokens. Returns False if it didn't exist."""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM accounts WHERE user_id = %s", (user_id,))
+            return cur.rowcount > 0
+
+    def list_accounts(
+        self, search: Optional[str] = None, limit: int = 50, offset: int = 0
+    ) -> List[Dict]:
+        """Accounts (newest first) with per-user favorite / progress / active-session
+        counts, for the admin user table. Never returns password_hash. Optional
+        case-insensitive search over email / label / numeric id."""
+        params: list = []
+        where = ""
+        if search and search.strip():
+            term = search.strip()
+            like = f"%{term}%"
+            where = (
+                "WHERE a.email ILIKE %s OR a.label ILIKE %s"
+                " OR CAST(a.user_id AS TEXT) = %s"
+            )
+            params += [like, like, term]
+        now = _iso(_now())
+        params += [now, limit, offset]
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT a.user_id, a.email, a.label, a.email_verified, a.is_admin,
+                       (a.public_key IS NOT NULL) AS has_mnemonic,
+                       a.created_at, a.last_login_at,
+                       (SELECT COUNT(*) FROM favorites f WHERE f.user_id = a.user_id) AS favorites_count,
+                       (SELECT COUNT(*) FROM watch_progress w WHERE w.user_id = a.user_id) AS progress_count,
+                       (SELECT COUNT(*) FROM sessions s WHERE s.user_id = a.user_id AND s.expires_at > %s) AS sessions_count
+                FROM accounts a
+                {where}
+                ORDER BY a.created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                tuple(params),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def count_accounts(self, search: Optional[str] = None) -> int:
+        params: list = []
+        where = ""
+        if search and search.strip():
+            term = search.strip()
+            like = f"%{term}%"
+            where = (
+                "WHERE email ILIKE %s OR label ILIKE %s OR CAST(user_id AS TEXT) = %s"
+            )
+            params += [like, like, term]
+        with self._connect() as conn:
+            return conn.execute(
+                f"SELECT COUNT(*) AS n FROM accounts {where}", tuple(params)
+            ).fetchone()["n"]
+
+    def admin_overview(self) -> Dict:
+        """Aggregate account-system stats for the admin health dashboard."""
+        with self._connect() as conn:
+            def scalar(sql: str, p: tuple = ()) -> int:
+                return conn.execute(sql, p).fetchone()["n"]
+
+            now = _iso(_now())
+            day_ago = _iso(_now() - timedelta(days=1))
+            week_ago = _iso(_now() - timedelta(days=7))
+            return {
+                "users_total": scalar("SELECT COUNT(*) AS n FROM accounts"),
+                "users_verified": scalar("SELECT COUNT(*) AS n FROM accounts WHERE email_verified = TRUE"),
+                "users_admin": scalar("SELECT COUNT(*) AS n FROM accounts WHERE is_admin = TRUE"),
+                "users_email": scalar("SELECT COUNT(*) AS n FROM accounts WHERE email IS NOT NULL"),
+                "users_mnemonic": scalar("SELECT COUNT(*) AS n FROM accounts WHERE public_key IS NOT NULL"),
+                "users_new_24h": scalar("SELECT COUNT(*) AS n FROM accounts WHERE created_at >= %s", (day_ago,)),
+                "users_new_7d": scalar("SELECT COUNT(*) AS n FROM accounts WHERE created_at >= %s", (week_ago,)),
+                "sessions_active": scalar("SELECT COUNT(*) AS n FROM sessions WHERE expires_at > %s", (now,)),
+                "invites_total": scalar("SELECT COUNT(*) AS n FROM invite_tokens"),
+                "invites_unused": scalar("SELECT COUNT(*) AS n FROM invite_tokens WHERE used_at IS NULL"),
+                "invites_used": scalar("SELECT COUNT(*) AS n FROM invite_tokens WHERE used_at IS NOT NULL"),
+                "favorites_total": scalar("SELECT COUNT(*) AS n FROM favorites"),
+                "progress_total": scalar("SELECT COUNT(*) AS n FROM watch_progress"),
+                "progress_completed": scalar("SELECT COUNT(*) AS n FROM watch_progress WHERE status = 'completed'"),
+                "progress_in_progress": scalar("SELECT COUNT(*) AS n FROM watch_progress WHERE status = 'in_progress'"),
+            }
 
     # -- email + password accounts --------------------------------------
     def get_account_by_email(self, email: str) -> Optional[Dict]:

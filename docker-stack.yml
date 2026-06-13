@@ -61,6 +61,8 @@ services:
       - SIGNUP_INVITE_CODE=${SIGNUP_INVITE_CODE:-}
       # New mnemonic account creation stays OFF by default (no invite-bypass).
       - ALLOW_MNEMONIC_REGISTRATION=${ALLOW_MNEMONIC_REGISTRATION:-false}
+      # Seed admin accounts for the /admin dashboard (comma-separated emails).
+      - ADMIN_EMAILS=${ADMIN_EMAILS:-}
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://crimsonhaven.to}
       - SMTP_HOST=${SMTP_HOST:-}
       - SMTP_PORT=${SMTP_PORT:-587}
