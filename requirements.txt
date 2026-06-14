@@ -3,6 +3,11 @@
 fastapi==0.136.3
 uvicorn==0.48.0
 httpx==0.28.1
+# Browser-impersonating HTTP client used by the scrapers (scrapers/base_scraper.py)
+# to clear Cloudflare's passive TLS/JA3 fingerprint checks (e.g. s.to's Turnstile
+# redirect gate). Ships forward-compatible abi3 wheels (manylinux + Windows), so it
+# installs on python:3.14-slim without a compiler.
+curl_cffi==0.15.0
 python-dotenv==1.2.2
 apscheduler==3.11.2
 beautifulsoup4==4.14.3

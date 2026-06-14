@@ -1,20 +1,32 @@
 import abc
-import httpx
+
+from curl_cffi.requests import AsyncSession
+
 
 class BaseAnimeScraper(abc.ABC):
     """
-    The blueprint for all future anime scrapers. 
+    The blueprint for all future anime scrapers.
     Every new provider MUST implement these methods.
     """
-    
+
+    # Browser profile curl_cffi impersonates at the TLS + HTTP/2 layer. A plain
+    # httpx client sends a Python-shaped TLS ClientHello (JA3/JA4) and HTTP/2
+    # frame ordering that anti-bot front-ends fingerprint instantly; matching a
+    # real Chrome is what clears Cloudflare's *passive* checks — e.g. s.to's
+    # Turnstile "redirect gate", which a vanilla client trips before it ever
+    # gets a response. "chrome" tracks a recent stable Chrome build.
+    _IMPERSONATE = "chrome"
+
     def __init__(self):
-        # Every provider gets its own async HTTP client with pre-configured headers
-        self.client = httpx.AsyncClient(
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            },
+        # Every provider gets its own browser-impersonating async HTTP client.
+        # We deliberately don't set a User-Agent: ``impersonate`` already installs
+        # one (plus the matching sec-ch-ua/Accept headers) consistent with the
+        # spoofed TLS fingerprint. Overriding it would make the UA and the JA3
+        # disagree, which is itself a bot signal.
+        self.client = AsyncSession(
+            impersonate=self._IMPERSONATE,
             timeout=10.0,
-            follow_redirects=True
+            allow_redirects=True,
         )
 
     @abc.abstractmethod
@@ -40,4 +52,4 @@ class BaseAnimeScraper(abc.ABC):
 
     async def close(self):
         """Clean up the HTTP client connection when done."""
-        await self.client.aclose()
+        await self.client.close()
