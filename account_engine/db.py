@@ -149,9 +149,14 @@ class AccountStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_invite_tokens_unused ON invite_tokens(used_at);
 
+                -- "favorites" doubles as the watchlists table: each row belongs to
+                -- a named list (list_name). The original single-tab behaviour is just
+                -- the default 'favorites' list, so legacy clients keep working. A show
+                -- may appear in several lists at once, hence list_name is in the PK.
                 CREATE TABLE IF NOT EXISTS favorites (
                     user_id       BIGINT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
                     item_key      TEXT NOT NULL,
+                    list_name     TEXT NOT NULL DEFAULT 'favorites',
                     tmdb_id       INTEGER,
                     anilist_id    INTEGER,
                     season_number INTEGER,
@@ -159,9 +164,26 @@ class AccountStore:
                     title         TEXT,
                     poster        TEXT,
                     added_at      TEXT NOT NULL,
-                    PRIMARY KEY (user_id, item_key)
+                    PRIMARY KEY (user_id, item_key, list_name)
                 );
+                -- In-place upgrade for databases created before watchlists existed:
+                -- add the column, then widen the primary key to include it (once).
+                ALTER TABLE favorites ADD COLUMN IF NOT EXISTS list_name TEXT NOT NULL DEFAULT 'favorites';
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.key_column_usage
+                        WHERE table_name = 'favorites'
+                          AND constraint_name = 'favorites_pkey'
+                          AND column_name = 'list_name'
+                    ) THEN
+                        ALTER TABLE favorites DROP CONSTRAINT IF EXISTS favorites_pkey;
+                        ALTER TABLE favorites
+                            ADD CONSTRAINT favorites_pkey PRIMARY KEY (user_id, item_key, list_name);
+                    END IF;
+                END $$;
                 CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, added_at);
+                CREATE INDEX IF NOT EXISTS idx_favorites_list ON favorites(user_id, list_name, added_at);
 
                 CREATE TABLE IF NOT EXISTS watch_progress (
                     user_id          BIGINT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
@@ -591,15 +613,20 @@ class AccountStore:
                 "DELETE FROM sessions WHERE token_hash = %s", (_hash_token(raw_token),)
             )
 
-    # -- favorites ------------------------------------------------------
-    def upsert_favorite(self, user_id: int, fav: Dict) -> Dict:
+    # -- favorites / watchlists -----------------------------------------
+    # A "favorite" is a row in a named list (``list_name``). The default list is
+    # 'favorites', which reproduces the original single-tab behaviour; any other
+    # name is a custom watchlist (e.g. 'Todo', 'Done', 'Paused'). The same show
+    # may live in several lists at once.
+    def upsert_favorite(self, user_id: int, fav: Dict, list_name: str = "favorites") -> Dict:
         with self._connect() as conn:
             # Soft cap: reject only NEW keys past the limit; updates always pass.
             # Done in the same transaction as the insert so it's race-free enough
-            # (a tiny concurrent overshoot is harmless for a storage guard).
+            # (a tiny concurrent overshoot is harmless for a storage guard). The cap
+            # is per account across all lists.
             exists = conn.execute(
-                "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s",
-                (user_id, fav["item_key"]),
+                "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
+                (user_id, fav["item_key"], list_name),
             ).fetchone()
             if exists is None:
                 count = conn.execute(
@@ -610,45 +637,80 @@ class AccountStore:
             conn.execute(
                 """
                 INSERT INTO favorites
-                    (user_id, item_key, tmdb_id, anilist_id, season_number,
+                    (user_id, item_key, list_name, tmdb_id, anilist_id, season_number,
                      media_type, title, poster, added_at)
-                VALUES (%(user_id)s, %(item_key)s, %(tmdb_id)s, %(anilist_id)s, %(season_number)s,
-                        %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
-                ON CONFLICT(user_id, item_key) DO UPDATE SET
+                VALUES (%(user_id)s, %(item_key)s, %(list_name)s, %(tmdb_id)s, %(anilist_id)s,
+                        %(season_number)s, %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
+                ON CONFLICT(user_id, item_key, list_name) DO UPDATE SET
                     tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
                     season_number=excluded.season_number, media_type=excluded.media_type,
                     title=excluded.title, poster=excluded.poster
                 """,
-                {"user_id": user_id, "added_at": _iso(_now()), **fav},
+                {"user_id": user_id, "list_name": list_name, "added_at": _iso(_now()), **fav},
             )
             row = conn.execute(
-                "SELECT * FROM favorites WHERE user_id = %s AND item_key = %s",
-                (user_id, fav["item_key"]),
+                "SELECT * FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
+                (user_id, fav["item_key"], list_name),
             ).fetchone()
             return dict(row)
 
-    def list_favorites(self, user_id: int) -> List[Dict]:
+    def list_favorites(self, user_id: int, list_name: Optional[str] = None) -> List[Dict]:
+        """Rows in one list, or every list (newest first) when ``list_name`` is None."""
+        with self._connect() as conn:
+            if list_name is None:
+                rows = conn.execute(
+                    "SELECT * FROM favorites WHERE user_id = %s ORDER BY added_at DESC",
+                    (user_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM favorites WHERE user_id = %s AND list_name = %s "
+                    "ORDER BY added_at DESC",
+                    (user_id, list_name),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_watchlists(self, user_id: int) -> List[Dict]:
+        """Distinct list names for a user with each list's item count."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM favorites WHERE user_id = %s ORDER BY added_at DESC",
+                "SELECT list_name, COUNT(*) AS count FROM favorites WHERE user_id = %s "
+                "GROUP BY list_name ORDER BY list_name",
                 (user_id,),
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def remove_favorite(self, user_id: int, item_key: str) -> bool:
+    def remove_favorite(
+        self, user_id: int, item_key: str, list_name: Optional[str] = None
+    ) -> bool:
+        """Remove a show from one list, or from every list when ``list_name`` is None."""
         with self._connect() as conn:
-            cur = conn.execute(
-                "DELETE FROM favorites WHERE user_id = %s AND item_key = %s",
-                (user_id, item_key),
-            )
+            if list_name is None:
+                cur = conn.execute(
+                    "DELETE FROM favorites WHERE user_id = %s AND item_key = %s",
+                    (user_id, item_key),
+                )
+            else:
+                cur = conn.execute(
+                    "DELETE FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
+                    (user_id, item_key, list_name),
+                )
             return cur.rowcount > 0
 
-    def is_favorite(self, user_id: int, item_key: str) -> bool:
+    def is_favorite(
+        self, user_id: int, item_key: str, list_name: Optional[str] = None
+    ) -> bool:
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s",
-                (user_id, item_key),
-            ).fetchone()
+            if list_name is None:
+                row = conn.execute(
+                    "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s",
+                    (user_id, item_key),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
+                    (user_id, item_key, list_name),
+                ).fetchone()
             return row is not None
 
     # -- watch progress -------------------------------------------------
