@@ -3,6 +3,7 @@ from .voe import VoeResolver
 from .movish import MovishResolver
 from .playimdb import PlayimdbResolver
 from .jellyfin import JellyfinResolver
+from .local import LocalResolver
 from .animekai import AnimekaiResolver
 from .animesuge import AnimeSugeResolver, DirectM3U8Resolver, AsbGamesResolver
 from .cinemabz import (
@@ -20,6 +21,7 @@ ALL_RESOLVERS = [
     MovishResolver,
     PlayimdbResolver,
     JellyfinResolver,
+    LocalResolver,  # admin-registered local dirs / NAS mounts -> /local_proxy (direct play)
     AnimekaiResolver,
     AnimeSugeResolver,  # ad-free: extracts direct mp4/m3u8, proxies + /player
     DirectM3U8Resolver,
