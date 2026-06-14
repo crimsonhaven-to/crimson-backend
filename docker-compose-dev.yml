@@ -100,6 +100,16 @@ services:
       - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
 
+    # --- Local media sources (the "Local" direct-play source) ----------------
+    # Bind-mount any directory / NAS share you want the haven to stream from,
+    # then register the IN-CONTAINER path from the Admin Dashboard → Sources tab
+    # (e.g. mount below, then add "/crimson/movies1"). Read-only (:ro) is
+    # recommended — the backend only ever reads these files. MVP is direct play
+    # only: browser-playable containers (mp4/m4v/mov/webm).
+    # volumes:
+    #   - /movies:/crimson/movies1:ro
+    #   - /mnt/nas/anime:/crimson/anime:ro
+
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
       interval: 30s

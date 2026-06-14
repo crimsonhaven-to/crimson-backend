@@ -10,6 +10,7 @@ from .aniworld_scraper import AniworldScraper
 from .sto_scraper import StoScraper
 from .cinemabz_scraper import CinemabzScraper
 from .aniwatch_scraper import AniwatchScraper
+from .local_scraper import LocalScraper
 
 ALL_SCRAPERS = [
     GogoScraper,
@@ -20,6 +21,7 @@ ALL_SCRAPERS = [
     MovishScraper,
     PlayimdbScraper,
     JellyfinScraper,
+    LocalScraper,     # Admin-registered local directories / NAS mounts (direct play only).
     AnimekaiScraper,
     AnimeSugeScraper,
     CinemabzScraper,  # TMDB-keyed HLS aggregator; 3 providers -> 3 tiles

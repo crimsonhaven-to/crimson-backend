@@ -25,6 +25,7 @@ from the shared pool.
 """
 
 import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -34,11 +35,14 @@ from starlette.concurrency import run_in_threadpool
 
 from db_pool import get_connection
 from rate_limit import limiter
+from local_engine.db import LocalSourceStore
+from local_engine.fs import inspect_path, discover_mountpoints
 from .db import AccountStore
 from .routes import require_user
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 store = AccountStore()
+local_store = LocalSourceStore()
 
 
 def _now_iso() -> str:
@@ -278,3 +282,94 @@ async def trigger_resync(user: dict = Depends(require_admin)):
     triggered_by = f"admin:{user.get('email') or user['user_id']}"
     asyncio.create_task(_run_resync(triggered_by))
     return {"success": True, "message": "Resync started", "resync": _resync_state}
+
+
+# --- local media sources (the "Local" direct-play source) ------------------
+# CRUD for the directories the operator exposes to the haven (a NAS share or a
+# Docker bind-mount, e.g. -v /movies:/crimson/movies1 -> register /crimson/movies1).
+# The "Local" scraper streams browser-playable files straight off these roots.
+class LocalSourceCreate(BaseModel):
+    label: str = Field(..., min_length=1, max_length=100)
+    path: str = Field(..., min_length=1, max_length=1000)
+
+
+class LocalSourceUpdate(BaseModel):
+    label: Optional[str] = Field(None, min_length=1, max_length=100)
+    enabled: Optional[bool] = None
+
+
+def _local_with_status(row: dict) -> dict:
+    """Merge a stored source row with a live filesystem probe for the dashboard."""
+    out = dict(row)
+    out["enabled"] = bool(out.get("enabled"))
+    out["status"] = inspect_path(row["path"])
+    return out
+
+
+@router.get("/local-sources")
+async def list_local_sources(user: dict = Depends(require_admin)):
+    rows = await run_in_threadpool(local_store.list_sources)
+    # inspect_path walks the tree (bounded) — do the whole list in one threadpool hop.
+    items = await run_in_threadpool(lambda: [_local_with_status(r) for r in rows])
+    return {"success": True, "count": len(items), "sources": items}
+
+
+@router.get("/local-sources/discover")
+async def discover_local_sources(user: dict = Depends(require_admin)):
+    """Best-effort candidate directories (Docker bind-mounts / NAS mounts visible
+    inside the container) the admin can add with one click. Advisory only."""
+    mounts = await run_in_threadpool(discover_mountpoints)
+    existing = await run_in_threadpool(local_store.list_sources)
+    have = {os.path.normpath(r["path"]) for r in existing}
+    for m in mounts:
+        m["already_added"] = os.path.normpath(m["path"]) in have
+    return {"success": True, "count": len(mounts), "mounts": mounts}
+
+
+@router.post("/local-sources")
+async def add_local_source(body: LocalSourceCreate, user: dict = Depends(require_admin)):
+    """Register a directory. Validated up front (must be an absolute, existing,
+    readable directory *inside the backend container*) so a wrong path / missing
+    bind-mount fails loudly here instead of silently resolving nothing later."""
+    path = os.path.normpath(body.path.strip())
+    if not os.path.isabs(path):
+        raise HTTPException(
+            status_code=400,
+            detail="Path must be absolute — the in-container path, e.g. /crimson/movies1",
+        )
+    info = await run_in_threadpool(inspect_path, path)
+    if not info["exists"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Path does not exist inside the backend container. Bind-mount it in docker-compose first (e.g. - /movies:/crimson/movies1).",
+        )
+    if not info["is_dir"]:
+        raise HTTPException(status_code=400, detail="Path is not a directory")
+    if not info["readable"]:
+        raise HTTPException(status_code=400, detail="Path is not readable by the backend")
+
+    existing = await run_in_threadpool(local_store.list_sources)
+    if any(os.path.normpath(r["path"]) == path for r in existing):
+        raise HTTPException(status_code=409, detail="That path is already registered")
+
+    row = await run_in_threadpool(local_store.add_source, body.label.strip(), path)
+    return {"success": True, "source": await run_in_threadpool(_local_with_status, row)}
+
+
+@router.patch("/local-sources/{source_id}")
+async def update_local_source(source_id: int, body: LocalSourceUpdate, user: dict = Depends(require_admin)):
+    """Toggle a source on/off or rename it (the path is immutable — delete + re-add)."""
+    target = await run_in_threadpool(local_store.get_source, source_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Source not found")
+    label = body.label.strip() if body.label is not None else None
+    row = await run_in_threadpool(local_store.update_source, source_id, label, body.enabled)
+    return {"success": True, "source": await run_in_threadpool(_local_with_status, row)}
+
+
+@router.delete("/local-sources/{source_id}")
+async def delete_local_source(source_id: int, user: dict = Depends(require_admin)):
+    removed = await run_in_threadpool(local_store.delete_source, source_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return {"success": True, "deleted": source_id}

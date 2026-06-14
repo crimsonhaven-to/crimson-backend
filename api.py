@@ -12,7 +12,7 @@ import httpx
 import json
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.requests import Request
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,6 +29,12 @@ from resolvers.vidsrc import proxy_fetch as vidsrc_proxy_fetch
 from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.cinemabz import proxy_fetch as cinemabz_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
+from local_engine.db import LocalSourceStore
+from local_engine.fs import (
+    safe_resolve as local_safe_resolve,
+    media_type_for as local_media_type,
+    is_configured as local_is_configured,
+)
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
@@ -50,6 +56,11 @@ logger = logging.getLogger(__name__)
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
 VERSION = "4.0.2"
+
+# Admin-managed local media sources (the "Local" direct-play source). The store
+# is schema-init'd in lifespan; the scraper/resolver read the enabled roots
+# directly via their own LocalSourceStore (the enabled-roots cache is class-wide).
+local_source_store = LocalSourceStore()
 
 
 def _utcnow_iso() -> str:
@@ -202,6 +213,7 @@ async def lifespan(app: FastAPI):
     db_engine.init_db()
     account_store.init_db()  # account tables (untouched by mapping resyncs)
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
+    local_source_store.init_db()  # admin-managed local media sources (resync-safe)
 
     # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
     # that already exist). Lets the operator reach the /admin dashboard without
@@ -2132,6 +2144,22 @@ async def jellyfin_proxy(request: Request, path: str):
     )
 
 
+# --- LOCAL SOURCE PROXY ("Local" source: admin-registered dirs / NAS) ---
+@app.get("/local_proxy/{token}")
+async def local_proxy(token: str):
+    """Stream a browser-playable file from an admin-registered local source.
+
+    ``token`` is an opaque base64url of the absolute path the LocalScraper found.
+    ``safe_resolve`` maps it back to a real file ONLY when it currently lives
+    inside an *enabled* source root (path traversal / symlink escapes / disabled
+    sources all resolve to None → 404), re-checked on every request. Starlette's
+    FileResponse handles HTTP Range requests, so the player can seek."""
+    real_path = await run_in_threadpool(local_safe_resolve, token)
+    if not real_path:
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(real_path, media_type=local_media_type(real_path))
+
+
 # --- BACKEND-HOSTED PLAYER (Crimson-themed hls.js/mp4 player) ---
 @app.get("/player")
 async def player(
@@ -2300,7 +2328,8 @@ async def health_check():
             "entries_count": count,
             "scrapers_available": len(ALL_SCRAPERS),
             "resolvers_available": len(ALL_RESOLVERS),
-            "jellyfin_configured": jellyfin_is_configured()
+            "jellyfin_configured": jellyfin_is_configured(),
+            "local_sources_configured": local_is_configured()
         }
     except Exception as e:
         # Log the real cause server-side; don't leak DB/internal detail to an
