@@ -15,7 +15,7 @@ Flow:
 
     POST /auth/challenge {public_key}                 -> {challenge}
     # client signs the challenge string with its Ed25519 private key
-    POST /auth/register  {public_key, challenge, signature, label?}  -> session
+    POST /auth/register  {public_key, challenge, signature, invite_code, label?}  -> session
     POST /auth/login     {public_key, challenge, signature}          -> session
     # authenticated requests:  Authorization: Bearer <session_token>
     GET/POST/DELETE /account/favorites   (?list_name=... selects a watchlist)
@@ -61,14 +61,36 @@ def _allowed_invite_codes() -> set:
     return {c.strip() for c in raw.split(",") if c.strip()}
 
 
-def _mnemonic_registration_enabled() -> bool:
-    """Whether NEW mnemonic (Ed25519) accounts may be created. Default OFF: a
-    fresh mnemonic would otherwise be an un-gated way onto an invite-only site
-    (you can mint a brand-new keypair client-side and self-register), which some
-    jurisdictions don't allow. Existing mnemonic accounts can still /auth/login —
-    only account *creation* is blocked. Set ALLOW_MNEMONIC_REGISTRATION=true to
-    re-open it."""
-    return os.getenv("ALLOW_MNEMONIC_REGISTRATION", "false").lower() in ("1", "true", "yes")
+def _check_invite_code(code: str) -> bool:
+    """Validate an invite code for NEW-account creation, shared by both the email
+    and mnemonic signup flows. Two kinds of invite are accepted in the same field:
+
+      * a shared, reusable code from SIGNUP_INVITE_CODE, or
+      * a single-use token minted by the Discord bot (see discord_bot/), which can
+        register exactly one account.
+
+    Returns True if the code is a shared static code, False if it's an available
+    single-use token; raises HTTPException(403) if it's neither. This does NOT
+    consume a single-use token — burn that with _consume_invite_code only once
+    you're committed to creating the account, so a later 409/validation failure
+    doesn't waste it."""
+    code = (code or "").strip()
+    static_codes = _allowed_invite_codes()
+    is_static = bool(static_codes) and code in static_codes
+    if not is_static and not store.invite_token_is_available(code):
+        raise HTTPException(status_code=403, detail="Invalid invite code")
+    return is_static
+
+
+def _consume_invite_code(code: str, is_static: bool, used_by: str) -> None:
+    """Burn a single-use invite token now that we're committed to creating the
+    account. No-op for a shared static code. Race-safe via consume_invite_token:
+    if a concurrent signup consumed the token in the gap since _check_invite_code,
+    this fails closed with 403."""
+    if is_static:
+        return
+    if not store.consume_invite_token((code or "").strip(), used_by=used_by):
+        raise HTTPException(status_code=403, detail="This invite code has already been used")
 
 
 def _normalize_email(email: str) -> str:
@@ -144,6 +166,10 @@ class RegisterRequest(BaseModel):
     public_key: str
     challenge: str
     signature: str
+    # Required: creating a NEW mnemonic account is invite-gated exactly like email
+    # signup, so a freshly minted keypair can't bypass the invite system. Existing
+    # mnemonic accounts log in via /auth/login and need no code.
+    invite_code: str
     label: Optional[str] = Field(default=None, max_length=100)
 
 
@@ -219,29 +245,33 @@ async def auth_register(request: Request, body: RegisterRequest):
     signed challenge) and return a session. 409 if the key is already
     registered — use /auth/login instead.
 
-    The account-exists check runs BEFORE the (one-time) challenge is consumed,
-    so a 409 leaves the challenge intact for a /auth/login retry with the same
-    challenge — supporting a frontend that tries register then falls back to
-    login (and vice-versa) on a single challenge.
+    Creating a NEW mnemonic account is invite-gated (``invite_code``) exactly like
+    email signup, so a freshly minted client-side keypair can't bypass the
+    invite-only site. Existing mnemonic accounts are unaffected — they sign in via
+    /auth/login and need no code.
 
-    New mnemonic account creation is disabled by default (see
-    _mnemonic_registration_enabled): a freshly generated mnemonic would otherwise
-    bypass the invite-only signup, which local law forbids. Existing mnemonic
-    accounts are unaffected — they still sign in via /auth/login."""
-    if not _mnemonic_registration_enabled():
-        raise HTTPException(
-            status_code=403,
-            detail="Mnemonic registration is disabled. Please register with an email and invite code.",
-        )
-
+    Ordering is deliberate so nothing one-time is wasted on a doomed attempt:
+    the account-exists check (409) and invite-code validity check (403) both run
+    BEFORE the (one-time) challenge is consumed — so a 409 leaves the challenge
+    intact for a /auth/login retry with the same challenge (the frontend tries
+    register then falls back to login on a single challenge) — and the single-use
+    invite token is only burned once the signed challenge has verified."""
     pk = (body.public_key or "").lower()
     if not _HEX64.match(pk):
         raise HTTPException(status_code=400, detail="public_key must be 64 hex chars")
 
+    # Existence check first (before invite validation) so a register→login
+    # fallback for an already-registered key still 409s cleanly regardless of code.
     if store.get_account_by_public_key(pk):
         raise HTTPException(status_code=409, detail="Account already exists; use /auth/login")
 
+    # Validate the invite (does not consume single-use tokens yet) before the
+    # one-time challenge, so a bad code doesn't burn the challenge.
+    is_static = _check_invite_code(body.invite_code)
+
     _verify_signed_challenge(pk, body.challenge, body.signature)
+    # Committed now: burn the single-use token (race-safe; no-op for static codes).
+    _consume_invite_code(body.invite_code, is_static, used_by=f"mnemonic:{pk}")
     account = store.create_account(pk, body.label)
     token, expires_at = store.create_session(account["user_id"])
     store.touch_login(account["user_id"])
@@ -355,25 +385,15 @@ async def email_register(request: Request, body: EmailRegisterRequest):
     email = _validate_email(body.email)
     _validate_password(body.password)
 
-    # Two kinds of invite are accepted in the same field:
-    #   * a shared, reusable code from SIGNUP_INVITE_CODE (unchanged), or
-    #   * a single-use token minted by the Discord bot (see discord_bot/), which
-    #     can register exactly one account.
-    # The single-use token is validated here but only *consumed* once we're
-    # committed to creating the account, so a 409 (email taken) doesn't burn it.
-    code = (body.invite_code or "").strip()
-    static_codes = _allowed_invite_codes()
-    is_static = bool(static_codes) and code in static_codes
-    if not is_static and not store.invite_token_is_available(code):
-        raise HTTPException(status_code=403, detail="Invalid invite code")
+    # Invite-gated (shared static code OR single-use Discord-bot token); validated
+    # here but only *consumed* once we're committed to creating the account, so a
+    # 409 (email taken) doesn't burn a single-use token. See _check_invite_code.
+    is_static = _check_invite_code(body.invite_code)
 
     if store.get_account_by_email(email):
         raise HTTPException(status_code=409, detail="An account with this email already exists")
 
-    # Burn the single-use token now (race-safe). If a concurrent signup consumed
-    # it in the gap since the availability check above, fail closed.
-    if not is_static and not store.consume_invite_token(code, used_by=email):
-        raise HTTPException(status_code=403, detail="This invite code has already been used")
+    _consume_invite_code(body.invite_code, is_static, used_by=email)
 
     pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
     account = store.create_email_account(email, pw_hash, body.label)

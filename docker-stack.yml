@@ -58,9 +58,9 @@ services:
       # crimson.env on the manager. An empty SIGNUP_INVITE_CODE closes signups
       # (every register 403s), so set it. SMTP powers verification/reset email.
       - REQUIRE_LOGIN=${REQUIRE_LOGIN:-true}
+      # Gates BOTH email and mnemonic signup — mnemonic /auth/register is
+      # invite-gated too now, so a fresh client-side keypair can't bypass it.
       - SIGNUP_INVITE_CODE=${SIGNUP_INVITE_CODE:-}
-      # New mnemonic account creation stays OFF by default (no invite-bypass).
-      - ALLOW_MNEMONIC_REGISTRATION=${ALLOW_MNEMONIC_REGISTRATION:-false}
       # Seed admin accounts for the /admin dashboard (comma-separated emails).
       - ADMIN_EMAILS=${ADMIN_EMAILS:-}
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://crimsonhaven.to}

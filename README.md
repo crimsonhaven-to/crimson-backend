@@ -87,10 +87,9 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
 | `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional Jellyfin source. |
 | `REQUIRE_LOGIN` | no | `true` | Site-wide login wall — require a valid session on all content endpoints. `false` reopens the API. |
-| `SIGNUP_INVITE_CODE` | no | – | Shared, **reusable** invite code(s) (comma-separated) for email registration. **Empty ⇒ signups closed** (every register `403`s) — unless a single-use Discord-bot token is used instead. |
+| `SIGNUP_INVITE_CODE` | no | – | Shared, **reusable** invite code(s) (comma-separated) gating **both** email and mnemonic registration. **Empty ⇒ signups closed** (every register `403`s) — unless a single-use Discord-bot token is used instead. |
 | `DISCORD_BOT_TOKEN` / `DISCORD_OWNER_ID` | no | – | Enable the optional Discord invite bot (`python -m discord_bot`): the one whitelisted `DISCORD_OWNER_ID` can mint **single-use** invite tokens. Empty token ⇒ bot disabled. |
 | `DISCORD_COMMAND_PREFIX` | no | `!` | Chat-command prefix for the Discord invite bot. |
-| `ALLOW_MNEMONIC_REGISTRATION` | no | `false` | Allow creating NEW Ed25519 mnemonic accounts. Off by default so a freshly minted mnemonic can't bypass the invite gate; existing mnemonic accounts still log in. |
 | `FRONTEND_BASE_URL` | no | `https://crimsonhaven.to` | Origin used to build the emailed verify / reset links. |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURITY` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_FROM_NAME` | no | – / `587` / `starttls` / … | SMTP for verification + reset email. Unset `SMTP_HOST` disables sending (registration still works; mail no-ops). |
 
@@ -248,11 +247,12 @@ server stores only the public key and *verifies* signatures over one-time
 challenges — the mnemonic / private key never reach the backend, so a DB leak
 exposes no credential.
 
-> **Registration is disabled by default** (`ALLOW_MNEMONIC_REGISTRATION=false`).
-> A freshly generated mnemonic would otherwise be an un-gated way onto an
-> invite-only site, so `/auth/register` returns `403` unless explicitly re-enabled.
-> Existing mnemonic accounts are unaffected — they still sign in via `/auth/login`.
-> The frontend no longer surfaces a mnemonic login option at all.
+> **Registration is invite-gated**, exactly like email signup. `/auth/register`
+> requires a valid `invite_code` (a shared `SIGNUP_INVITE_CODE` **or** a single-use
+> Discord-bot token), so a freshly generated mnemonic can't bypass the invite-only
+> site. Without a valid code `/auth/register` returns `403`. Existing mnemonic
+> accounts sign in via `/auth/login` and need no code — so a user with an invite
+> can choose either a mnemonic or an email+password account.
 
 ### Email + password sign-in
 
@@ -317,7 +317,7 @@ It only needs the database (tokens land in the same PostgreSQL the API reads at
 | Method | Endpoint | Auth | Description |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/auth/challenge` | – | Get a one-time challenge for a `public_key`. |
-| `POST` | `/auth/register` | – | Create the account (signed challenge proves key ownership) → session. **Disabled by default** (`403`); see `ALLOW_MNEMONIC_REGISTRATION`. |
+| `POST` | `/auth/register` | – | Create the account (signed challenge proves key ownership) → session. **Invite-gated**: requires a valid `invite_code` (`403` otherwise), like email signup. |
 | `POST` | `/auth/login` | – | Log in to an existing account via signed challenge → session. |
 | `POST` | `/auth/logout` | Bearer | Revoke the current session. |
 | `GET`  | `/account/me` | Bearer | Profile + favorite/progress counts. |
@@ -357,6 +357,8 @@ const signature = Buffer.from(
   await ed.signAsync(new TextEncoder().encode(challenge), seed)).toString('hex');
 const res = await fetch('/auth/login',                    // or /auth/register
   { method:'POST', headers:{'Content-Type':'application/json'},
+    // /auth/register additionally requires an `invite_code` (shared SIGNUP_INVITE_CODE
+    // or a single-use Discord-bot token); /auth/login does not.
     body: JSON.stringify({ public_key: publicKey, challenge, signature }) });
 const { session_token } = await res.json();
 ```
