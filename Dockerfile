@@ -28,6 +28,7 @@ COPY metadata_engine ./metadata_engine
 COPY account_engine ./account_engine
 COPY supporters_engine ./supporters_engine
 COPY discord_bot ./discord_bot
+COPY local_engine ./local_engine
 
 # Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
 # container is stateless and needs no writable data volume.
