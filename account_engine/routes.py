@@ -18,12 +18,15 @@ Flow:
     POST /auth/register  {public_key, challenge, signature, label?}  -> session
     POST /auth/login     {public_key, challenge, signature}          -> session
     # authenticated requests:  Authorization: Bearer <session_token>
-    GET/POST/DELETE /account/favorites
+    GET/POST/DELETE /account/favorites   (?list_name=... selects a watchlist)
+    GET /account/watchlists
     GET/POST/DELETE /account/progress
     GET /account/continue-watching, GET /account/recent
 
 Favorites are show-level; watch progress is per-episode. Both are stored as
 plain structured rows (so the backend can serve "continue watching" etc.).
+A favorite belongs to a named list (``list_name``, default 'favorites'); custom
+lists are watchlists like 'Todo'/'Done'/'Paused' and a show may be in several.
 """
 
 import os
@@ -165,6 +168,10 @@ class FavoriteIn(BaseModel):
     media_type: Optional[str] = None
     title: Optional[str] = None
     poster: Optional[str] = None
+    # Which list this belongs to. Omitted -> the default 'favorites' list, so
+    # legacy clients keep their single-tab behaviour. Any other name is a custom
+    # watchlist (e.g. 'Todo', 'Done', 'Paused').
+    list_name: str = Field(default="favorites", min_length=1, max_length=100)
 
     @model_validator(mode="after")
     def _need_an_id(self):
@@ -493,22 +500,35 @@ async def account_me(user: dict = Depends(require_user)):
     }
 
 
-# --- favorites -------------------------------------------------------------
+# --- favorites / watchlists ------------------------------------------------
+# The default list is 'favorites' (original single-tab behaviour); any other
+# list_name is a custom watchlist. A show may live in several lists at once.
 @router.get("/account/favorites")
-async def get_favorites(user: dict = Depends(require_user)):
-    items = store.list_favorites(user["user_id"])
+async def get_favorites(
+    user: dict = Depends(require_user),
+    list_name: Optional[str] = Query(None, description="Filter to one list; omit for all lists"),
+):
+    items = store.list_favorites(user["user_id"], list_name)
     return {"success": True, "count": len(items), "favorites": items}
+
+
+@router.get("/account/watchlists")
+async def get_watchlists(user: dict = Depends(require_user)):
+    """The user's distinct list names, each with its item count."""
+    lists = store.list_watchlists(user["user_id"])
+    return {"success": True, "count": len(lists), "watchlists": lists}
 
 
 @router.post("/account/favorites")
 @limiter.limit("60/minute")
 async def add_favorite(request: Request, body: FavoriteIn, user: dict = Depends(require_user)):
     item_key = _favorite_item_key(body.tmdb_id, body.anilist_id)
+    fav = {"item_key": item_key, **body.model_dump(exclude={"list_name"})}
     try:
-        fav = store.upsert_favorite(user["user_id"], {"item_key": item_key, **body.model_dump()})
+        saved = store.upsert_favorite(user["user_id"], fav, list_name=body.list_name)
     except QuotaExceeded as e:
         raise HTTPException(status_code=409, detail=str(e))
-    return {"success": True, "favorite": fav}
+    return {"success": True, "favorite": saved}
 
 
 @router.delete("/account/favorites")
@@ -517,13 +537,18 @@ async def remove_favorite(
     tmdb_id: Optional[int] = Query(None),
     anilist_id: Optional[int] = Query(None),
     item_key: Optional[str] = Query(None),
+    list_name: Optional[str] = Query(None, description="Remove from one list; omit for all lists"),
 ):
-    """Remove a favorite by item_key, or by tmdb_id / anilist_id."""
+    """Remove a favorite by item_key, or by tmdb_id / anilist_id.
+
+    With ``list_name`` the show is removed from that list only; without it the
+    show is removed from every list it belongs to.
+    """
     if not item_key:
         if tmdb_id is None and anilist_id is None:
             raise HTTPException(status_code=400, detail="Provide item_key, tmdb_id or anilist_id")
         item_key = _favorite_item_key(tmdb_id, anilist_id)
-    removed = store.remove_favorite(user["user_id"], item_key)
+    removed = store.remove_favorite(user["user_id"], item_key, list_name)
     if not removed:
         raise HTTPException(status_code=404, detail="Favorite not found")
     return {"success": True, "removed": item_key}
