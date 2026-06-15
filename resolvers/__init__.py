@@ -12,6 +12,7 @@ from .cinemabz import (
     CinemabzNgcloudResolver,
 )
 from .vidsrc import VidSrcResolver
+from .febbox import FebboxResolver
 
 # The unified list of all our resolvers.
 # MovishResolver matches on the distinct "api.movish.net" host.
@@ -31,4 +32,5 @@ ALL_RESOLVERS = [
     CinemabzIpcloudResolver,
     CinemabzNgcloudResolver,
     VidSrcResolver,  # aniwatch.co.at "VidSrc" server -> megaplay HLS
+    FebboxResolver,  # ShowBox/Febbox direct-file source (env-gated on FEBBOX_UI_TOKEN)
 ]
