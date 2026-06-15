@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.1.2"
+VERSION = "6.1.3"
 
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
@@ -1493,7 +1493,7 @@ async def search_shows_by_name(query_name: str = Query(..., min_length=1, descri
         raise HTTPException(status_code=500, detail="Search failed")
 
 @app.get("/trending/shows")
-async def get_trending_shows(limit: int = Query(12, ge=1, le=50, description="Number of results to return")):
+async def get_trending_shows(limit: int = Query(10, ge=1, le=50, description="Number of results to return")):
     """Get trending non-anime TV shows."""
     try:
         async with http_client() as client:
