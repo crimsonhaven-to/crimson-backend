@@ -80,6 +80,11 @@ services:
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
+      # ShowBox/Febbox direct-file source. MUST be listed here (Compose does NOT
+      # auto-inject .env into the container) or the app sees FEBBOX_UI_TOKEN unset
+      # and the source disables itself (is_configured() False => never surfaces).
+      - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
+      - FEBBOX_REGION=${FEBBOX_REGION:-}
       # Login wall (email+password). These come from your host env / .env via
       # substitution — Compose does NOT auto-inject the .env into the container,
       # so they MUST be listed here or the app sees them as unset (an empty
