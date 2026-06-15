@@ -1327,7 +1327,25 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
         
         if matched_resolver:
             try:
-                direct_video_url = await matched_resolver.resolve(embed_url)
+                resolved = await matched_resolver.resolve(embed_url)
+                # A resolver may return a bare URL string (the common case) or a
+                # dict {"url", "subtitles"} when it also has external subtitle
+                # tracks (ShowBox/Febbox). Normalise to (url, subtitles).
+                subtitles = None
+                if isinstance(resolved, dict):
+                    subtitles = resolved.get("subtitles") or None
+                    direct_video_url = resolved.get("url")
+                else:
+                    direct_video_url = resolved
+                # Subtitle URLs are same-origin proxy paths too — absolutize them
+                # against the backend base like the main stream URL.
+                if subtitles and base_url:
+                    subtitles = [
+                        {**s, "url": base_url.rstrip("/") + s["url"]}
+                        if isinstance(s.get("url"), str) and s["url"].startswith("/")
+                        else s
+                        for s in subtitles
+                    ]
                 if direct_video_url:
                     # Decide the stream's shape by the URL the resolver returned,
                     # NOT by source_name (which is a mutable display label):
@@ -1355,11 +1373,14 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                         })
                     else:
                         stream_type = "hls" if "m3u8" in direct_video_url.lower() else "mp4"
-                        resolved_streams.append({
+                        stream_obj = {
                             "source": matched_resolver.source_name,
                             "type": stream_type,
                             "url": abs_url
-                        })
+                        }
+                        if subtitles:
+                            stream_obj["subtitles"] = subtitles
+                        resolved_streams.append(stream_obj)
                 else:
                     # resolve() found nothing playable. Only fall back to
                     # iframing the raw embed_url if it's a genuine http(s) embed
@@ -1745,6 +1766,7 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
                 "streamType": stream["type"],
                 "url": stream["url"],
                 "language": stream.get("language"),
+                "subtitles": stream.get("subtitles"),
             })
         yield _ndjson({"type": "done", "count": count})
     finally:

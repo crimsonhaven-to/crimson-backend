@@ -291,6 +291,8 @@ class ShowBoxScraper(BaseAnimeScraper):
         fid = match.get("fid")
         if not fid:
             return []
-        marker = f"{EMBED_MARKER}:{share_key}:{fid}"
+        # season/episode ride along so the resolver can filter Febbox's subtitle
+        # pool (which mixes episodes) down to this one.
+        marker = f"{EMBED_MARKER}:{share_key}:{fid}:{season_num}:{episode_num}"
         logger.info(f"[ShowBox] matched {match.get('file_name')!r} -> {marker}")
         return [marker]

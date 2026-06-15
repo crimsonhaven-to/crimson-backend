@@ -123,6 +123,25 @@ def _is_playlist_url(url: str) -> bool:
     return ".m3u8" in urlparse(url).path.lower()
 
 
+def _is_subtitle_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith(".srt") or path.endswith(".vtt")
+
+
+def _srt_to_vtt(text: str) -> str:
+    """Minimal SRT -> WebVTT: prepend the header and dot-separate the millisecond
+    field in cue timings (``00:00:01,200`` -> ``00:00:01.200``). SRT numeric
+    indices are left as-is — WebVTT accepts them as cue identifiers. Browsers'
+    <track> only speak WebVTT, so this runs in the proxy for every .srt we serve."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    out = ["WEBVTT", ""]
+    for line in text.split("\n"):
+        if "-->" in line:
+            line = line.replace(",", ".")
+        out.append(line)
+    return "\n".join(out)
+
+
 def rewrite_playlist(text: str, base_url: str) -> str:
     """Rewrite an HLS m3u8 so every sub-resource is absolutized against
     ``base_url`` and routed back through this signed proxy."""
@@ -179,6 +198,19 @@ async def proxy_fetch(
     resp = await client.send(req, stream=True)
     content_type = resp.headers.get("content-type", "application/octet-stream")
 
+    # Subtitles: read fully and (for .srt) convert to WebVTT so the browser's
+    # <track> can use them. Served same-origin from here, so no CORS dance.
+    if _is_subtitle_url(url):
+        try:
+            raw = await resp.aread()
+        finally:
+            await resp.aclose()
+            await client.aclose()
+        body = raw.decode("utf-8", errors="replace")
+        if urlparse(url).path.lower().endswith(".srt"):
+            body = _srt_to_vtt(body)
+        return resp.status_code, "text/vtt; charset=utf-8", {}, body.encode("utf-8")
+
     if _is_playlist_url(url):
         try:
             raw = await resp.aread()
@@ -215,9 +247,10 @@ def _quality_rank(label: str) -> int:
     return len(_QUALITY_ORDER)  # unknown labels sort last
 
 
-async def fetch_best_stream(share_key: str, fid: str) -> Optional[str]:
-    """POST the Febbox player endpoint for one file and return the best-quality
-    direct file URL, or None.
+async def fetch_player_html(share_key: str, fid: str) -> Optional[str]:
+    """POST the Febbox player endpoint for one file and return its raw HTML
+    (which carries both the ``var sources`` quality list and the subtitle
+    ``<li data-url=…>`` panel), or None.
 
     Requires FEBBOX_UI_TOKEN — without the ``ui`` cookie the endpoint answers
     ``{"code":-1,"msg":"please login"}`` and we get nothing."""
@@ -242,20 +275,23 @@ async def fetch_best_stream(share_key: str, fid: str) -> Optional[str]:
         resp = await session.post(
             FEBBOX_PLAYER_URL, data={"fid": str(fid), "share_key": share_key}, headers=headers
         )
-        body = resp.text
+        return resp.text
     finally:
         await session.close()
 
-    match = re.search(r"var\s+sources\s*=\s*(\[.*?\])\s*;", body, re.S)
+
+def _best_source(html: str, fid: str) -> Optional[str]:
+    """Pick the best-quality direct file URL from a player response's
+    ``var sources = [...]`` array."""
+    match = re.search(r"var\s+sources\s*=\s*(\[.*?\])\s*;", html, re.S)
     if not match:
         # Surface the login wall / region error explicitly — it's the usual cause.
         try:
-            msg = json.loads(body).get("msg")
+            msg = json.loads(html).get("msg")
             logger.warning(f"[febbox] no sources for fid {fid}: {msg!r}")
         except (json.JSONDecodeError, AttributeError):
             logger.warning(f"[febbox] no sources for fid {fid} (unparseable response)")
         return None
-
     try:
         sources = json.loads(match.group(1))
     except json.JSONDecodeError:
@@ -268,7 +304,6 @@ async def fetch_best_stream(share_key: str, fid: str) -> Optional[str]:
     ]
     if not candidates:
         return None
-
     candidates.sort(key=lambda s: _quality_rank(s.get("label", "")))
     best = candidates[0]
     logger.info(f"[febbox] fid {fid}: picked {best.get('label')!r} of "
@@ -276,32 +311,103 @@ async def fetch_best_stream(share_key: str, fid: str) -> Optional[str]:
     return best["file"]
 
 
-class FebboxResolver(BaseResolver):
-    """Resolves a ``crimson-febbox:{share_key}:{fid}`` marker to a backend-proxied
-    direct file (ShowBox/Febbox source).
+# Cap on how many subtitle tracks we surface (one per language, ordered).
+_MAX_SUBTITLES = 12
+# Languages float to the top of the track list (anime is JPN audio + EN subs).
+_PREFERRED_LANGS = ("english", "german", "spanish", "french", "portuguese (br)")
 
-    Disabled (returns None) unless FEBBOX_UI_TOKEN is set. Returns a signed
-    ``/febbox_proxy`` path (tagged hls/mp4 by api.py — not a /player iframe), or
-    None when the file can't be unlocked (login wall, region gate, expired share).
-    """
+
+def _episode_patterns(season: int, episode: int) -> List[re.Pattern]:
+    """Filename patterns that mark a subtitle as belonging to this episode.
+    Febbox returns the *whole show's* subtitle pool per file, so we must keep
+    only the ones for the episode being watched."""
+    s, e = season, episode
+    return [
+        re.compile(rf"s0*{s}[._ -]?e0*{e}(?!\d)", re.I),   # S01E01 / s1.e1
+        re.compile(rf"(?:^|[^\d])e0*{e}(?!\d)", re.I),       # E01
+        re.compile(rf"[ ._-]0*{e}[ ._-].*\.(?:srt|vtt)$", re.I),  # " - 01 " anime style
+        re.compile(rf"\b0*{e}(?:en|eng)?\.(?:srt|vtt)$", re.I),   # "01en.srt"
+    ]
+
+
+def _parse_subtitles(html: str, season: int, episode: int) -> List[dict]:
+    """Extract subtitle tracks from the player HTML for this episode.
+
+    Each ``<li data-lang data-language data-url=…><p>filename</p>`` entry is a
+    candidate; we keep those whose filename matches the target episode, dedupe to
+    one track per language, and order with the common languages first. Returns
+    ``[{"label","lang","url"}]`` with raw (unproxied) .srt URLs — the caller wraps
+    them in the signed proxy (which converts srt -> vtt on the way out)."""
+    if season is None or episode is None:
+        return []
+    pats = _episode_patterns(season, episode)
+    # <li ...attrs...><p ...>filename</p>
+    entry_re = re.compile(r"<li\b([^>]*)>\s*<p[^>]*>([^<]*)</p>", re.I)
+    out: List[dict] = []
+    seen_langs: set = set()
+    for attrs, fname in entry_re.findall(html):
+        url_m = re.search(r'data-url="([^"]+)"', attrs)
+        if not url_m:
+            continue
+        url = url_m.group(1)
+        if not _is_subtitle_url(url):
+            continue
+        name = fname.strip()
+        if not any(p.search(name) for p in pats):
+            continue  # wrong episode (the pool mixes them)
+        lang_m = re.search(r'data-language="([^"]*)"', attrs)
+        language = (lang_m.group(1).strip() if lang_m else "") or "Unknown"
+        code_m = re.search(r'data-lang="([^"]*)"', attrs)
+        code = (code_m.group(1).strip().lower() if code_m else language[:2].lower())
+        # Dedupe on the language CODE, not the display label: uploaders sometimes
+        # tag the same language inconsistently ("English" vs "En"), and the code
+        # is the stable key that collapses those into one track.
+        key = code or language.lower()
+        if key in seen_langs:
+            continue  # one track per language (first decent match wins)
+        seen_langs.add(key)
+        out.append({"label": language, "lang": code, "url": url})
+
+    def _rank(track: dict) -> int:
+        try:
+            return _PREFERRED_LANGS.index(track["label"].lower())
+        except ValueError:
+            return len(_PREFERRED_LANGS)
+
+    out.sort(key=_rank)
+    return out[:_MAX_SUBTITLES]
+
+
+class FebboxResolver(BaseResolver):
+    """Resolves a ``crimson-febbox:{share_key}:{fid}:{season}:{episode}`` marker to
+    a backend-proxied direct file (ShowBox/Febbox source), plus subtitle tracks.
+
+    Disabled (returns None) unless FEBBOX_UI_TOKEN is set. On success returns a
+    ``{"url", "subtitles"}`` dict — ``url`` is a signed ``/febbox_proxy`` path
+    (tagged hls/mp4 by api.py, not a /player iframe) and ``subtitles`` is a list of
+    ``{"label","lang","url"}`` (each url a signed proxy path serving WebVTT).
+    Returns None when the file can't be unlocked (login wall, region gate, expired
+    share)."""
 
     domain_keyword: str = EMBED_MARKER
     source_name: str = "ShowBox"
 
-    async def resolve(self, embed_url: str) -> Optional[str]:
+    async def resolve(self, embed_url: str):
         if not is_configured():
             return None
 
-        # Marker: crimson-febbox:{share_key}:{fid}  (share_key keeps its case;
-        # resolve_streams only lowercases for the keyword *match*, not here).
+        # Marker: crimson-febbox:{share_key}:{fid}:{season}:{episode}  (share_key
+        # keeps its case; resolve_streams only lowercases for the keyword *match*).
         parts = embed_url.split(":")
         if len(parts) < 3 or parts[0] != EMBED_MARKER:
             logger.warning(f"[febbox] unrecognised marker: {embed_url}")
             return None
         share_key, fid = parts[1], parts[2]
+        season = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
+        episode = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None
 
         try:
-            best = await fetch_best_stream(share_key, fid)
+            html = await fetch_player_html(share_key, fid)
         except httpx.RequestError as e:
             logger.warning(f"[febbox] request failed: {type(e).__name__} - {e}")
             return None
@@ -309,9 +415,17 @@ class FebboxResolver(BaseResolver):
             logger.warning(f"[febbox] player fetch failed: {type(e).__name__} - {e}")
             return None
 
+        if not html:
+            return None
+
+        best = _best_source(html, fid)
         if not best:
             return None
 
-        proxy_path = _proxy_path_for(best)
-        logger.info(f"[febbox] resolved fid {fid} -> proxied stream ({best[:60]}…)")
-        return proxy_path
+        subtitles = [
+            {"label": t["label"], "lang": t["lang"], "url": _proxy_path_for(t["url"])}
+            for t in _parse_subtitles(html, season, episode)
+        ]
+        logger.info(f"[febbox] resolved fid {fid} -> proxied stream ({best[:60]}…), "
+                    f"{len(subtitles)} subtitle track(s)")
+        return {"url": _proxy_path_for(best), "subtitles": subtitles}
