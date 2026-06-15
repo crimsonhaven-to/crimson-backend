@@ -28,6 +28,7 @@ from resolvers.vidmoly import proxy_fetch as vidmoly_proxy_fetch
 from resolvers.vidsrc import proxy_fetch as vidsrc_proxy_fetch
 from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.cinemabz import proxy_fetch as cinemabz_proxy_fetch
+from resolvers.febbox import proxy_fetch as febbox_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from local_engine.db import LocalSourceStore
 from local_engine.fs import (
@@ -339,6 +340,7 @@ _PUBLIC_PREFIXES = (
     "/vidmoly_proxy",
     "/vidsrc_proxy",
     "/cinemabz_proxy",
+    "/febbox_proxy",
     "/animesuge_proxy",
     "/jellyfin_proxy",
     "/docs",
@@ -2071,6 +2073,40 @@ async def cinemabz_proxy(request: Request):
         raise HTTPException(status_code=403, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"Cinema.bz proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- SHOWBOX/FEBBOX DIRECT-FILE PROXY ("showbox" source) ---
+@app.get("/febbox_proxy")
+async def febbox_proxy(request: Request):
+    """Signed, same-origin proxy for the ShowBox/Febbox source. Febbox's player
+    hands back direct mp4 links on a rotating OSS CDN; proxying keeps playback
+    same-origin (no CORS surprises), survives host rotation and gives Range
+    passthrough for seeking. Some qualities come back as HLS, which is rewritten
+    so sub-resources flow back through here.
+
+    The OSS host rotates, so instead of a host allow-list this proxy verifies an
+    HMAC on the ``u`` URL (see resolvers.febbox) and refuses anything unsigned —
+    closing the open-proxy / SSRF hole. The febbox ``ui`` token never reaches the
+    browser: it's only used server-side to mint the direct link in the resolver."""
+    url = request.query_params.get("u")
+    sig = request.query_params.get("s")
+    try:
+        status, content_type, headers, payload = await febbox_proxy_fetch(
+            url=url,
+            sig=sig,
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"Febbox proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     if isinstance(payload, (bytes, bytearray)):

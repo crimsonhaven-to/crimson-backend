@@ -9,6 +9,7 @@ from .animesuge_scraper import AnimeSugeScraper
 from .aniworld_scraper import AniworldScraper
 from .sto_scraper import StoScraper
 from .cinemabz_scraper import CinemabzScraper
+from .showbox_scraper import ShowBoxScraper
 from .aniwatch_scraper import AniwatchScraper
 from .local_scraper import LocalScraper
 
@@ -25,4 +26,5 @@ ALL_SCRAPERS = [
     AnimekaiScraper,
     AnimeSugeScraper,
     CinemabzScraper,  # TMDB-keyed HLS aggregator; 3 providers -> 3 tiles
+    ShowBoxScraper,   # ShowBox/Febbox direct-file source; env-gated on FEBBOX_UI_TOKEN
 ]
