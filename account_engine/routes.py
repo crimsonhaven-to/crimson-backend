@@ -29,11 +29,16 @@ A favorite belongs to a named list (``list_name``, default 'favorites'); custom
 lists are watchlists like 'Todo'/'Done'/'Paused' and a show may be in several.
 """
 
+import csv
+import io
+import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
@@ -537,6 +542,59 @@ async def get_watchlists(user: dict = Depends(require_user)):
     """The user's distinct list names, each with its item count."""
     lists = store.list_watchlists(user["user_id"])
     return {"success": True, "count": len(lists), "watchlists": lists}
+
+
+# Columns exported per show, in order. These are the human-meaningful fields of a
+# favorite row — internal keys (id, user_id, item_key) are intentionally dropped.
+# Order puts the list first so a CSV groups naturally when sorted on that column.
+_EXPORT_FIELDS = (
+    "list_name", "title", "media_type", "tmdb_id", "anilist_id",
+    "season_number", "poster", "added_at",
+)
+
+
+@router.get("/account/favorites/export")
+async def export_favorites(
+    user: dict = Depends(require_user),
+    format: str = Query("csv", pattern="^(csv|json)$", description="csv (default) or json"),
+):
+    """Download every watchlist (all lists at once) as a single file.
+
+    ``csv`` is the spreadsheet-friendly default; ``json`` is a round-trippable
+    backup that preserves types/nulls. Either way it's one row/object per show,
+    newest-first, carrying the list it belongs to in ``list_name`` so all lists
+    coexist in one file. Served as an attachment so the browser saves it.
+    """
+    rows = store.list_favorites(user["user_id"])  # all lists, newest first
+    now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y%m%d")
+
+    if format == "json":
+        payload = {
+            "exported_at": now.isoformat(),
+            "count": len(rows),
+            "watchlists": [{k: r.get(k) for k in _EXPORT_FIELDS} for r in rows],
+        }
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        return Response(
+            content=body,
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="crimson-watchlists-{stamp}.json"'},
+        )
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_EXPORT_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r.get(k) for k in _EXPORT_FIELDS})
+    # Excel reads UTF-8 reliably only with a BOM; prepend one so non-ASCII titles
+    # (e.g. Japanese) aren't mangled when the file is opened in a spreadsheet.
+    body = "﻿" + buf.getvalue()
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="crimson-watchlists-{stamp}.csv"'},
+    )
 
 
 @router.post("/account/favorites")
