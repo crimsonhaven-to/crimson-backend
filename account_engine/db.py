@@ -680,6 +680,57 @@ class AccountStore:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def bulk_upsert_favorites(
+        self, user_id: int, items: List[Tuple[str, Dict]]
+    ) -> Dict:
+        """Insert/update many favorites in a single transaction (for import).
+
+        ``items`` is a list of ``(list_name, fav)`` pairs where ``fav`` carries
+        item_key/tmdb_id/anilist_id/season_number/media_type/title/poster. New
+        keys are inserted only while the per-account cap (across all lists) has
+        room; keys that already exist always update (and don't count against the
+        cap). Returns ``{"imported", "skipped_quota"}``."""
+        imported = 0
+        skipped_quota = 0
+        now = _iso(_now())
+        with self._connect() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM favorites WHERE user_id = %s", (user_id,)
+            ).fetchone()["n"]
+            for list_name, fav in items:
+                exists = conn.execute(
+                    "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
+                    (user_id, fav["item_key"], list_name),
+                ).fetchone()
+                if exists is None:
+                    if count >= MAX_FAVORITES_PER_USER:
+                        skipped_quota += 1
+                        continue
+                    count += 1
+                conn.execute(
+                    """
+                    INSERT INTO favorites
+                        (user_id, item_key, list_name, tmdb_id, anilist_id, season_number,
+                         media_type, title, poster, added_at)
+                    VALUES (%(user_id)s, %(item_key)s, %(list_name)s, %(tmdb_id)s, %(anilist_id)s,
+                            %(season_number)s, %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
+                    ON CONFLICT(user_id, item_key, list_name) DO UPDATE SET
+                        tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
+                        season_number=excluded.season_number, media_type=excluded.media_type,
+                        title=excluded.title, poster=excluded.poster
+                    """,
+                    {"user_id": user_id, "list_name": list_name, "added_at": now, **fav},
+                )
+                imported += 1
+        return {"imported": imported, "skipped_quota": skipped_quota}
+
+    def clear_favorites(self, user_id: int) -> int:
+        """Delete every favorite in every list for a user (the 'replace' import
+        mode clears first). Returns how many rows were removed."""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM favorites WHERE user_id = %s", (user_id,))
+            return cur.rowcount
+
     def remove_favorite(
         self, user_id: int, item_key: str, list_name: Optional[str] = None
     ) -> bool:

@@ -51,6 +51,11 @@ services:
       - RUN_DB_SYNC=true
       # Optional: comma-separated CORS origins (defaults to the built-in list).
       # - ALLOWED_ORIGINS=https://crimsonhaven.to,https://www.crimsonhaven.to
+      # Optional public /changelog from this repo's GitHub Releases. Must be listed
+      # here to reach the container; unset => /changelog returns 503. Read-only
+      # token (fine-grained PAT with Contents:read, or classic repo scope).
+      # - GITHUB_TOKEN=
+      # - GITHUB_REPO=crimsonhaven-to/crimson-backend
       # Optional Jellyfin source (see .env.example).
       # - JELLYFIN_URL=
       # - JELLYFIN_USERNAME=

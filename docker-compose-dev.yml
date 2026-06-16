@@ -77,6 +77,12 @@ services:
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
       # Optional features (parity with production), disabled when unset.
       - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN:-}
+      # Public /changelog — cached view of this repo's GitHub Releases. MUST be
+      # listed here (Compose does NOT auto-inject .env into the container) or the
+      # app sees GITHUB_TOKEN unset and /changelog returns 503. The token only
+      # needs read access (fine-grained PAT with Contents:read, or classic repo).
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_REPO=${GITHUB_REPO:-crimsonhaven-to/crimson-backend}
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
