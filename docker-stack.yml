@@ -51,6 +51,12 @@ services:
       # These are optional (`:-` => empty when unset disables the feature), but
       # are supplied via crimson.env on the manager to match production.
       - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN:-}
+      # Public /changelog — cached view of this repo's GitHub Releases. Lives on
+      # the serving service (it answers the ingress GET /changelog), not api-sync.
+      # Supplied via crimson.env on the manager; unset => /changelog returns 503.
+      # The token only needs read access (fine-grained PAT with Contents:read).
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_REPO=${GITHUB_REPO:-crimsonhaven-to/crimson-backend}
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}

@@ -41,6 +41,7 @@ from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
 from account_engine.admin_routes import router as admin_router, set_resync_handler
 from supporters_engine import router as supporters_router, store as supporters_store
+from changelog_engine import router as changelog_router, service as changelog_service
 from db_pool import get_pool, close_pool
 from rate_limit import limiter
 from slowapi import _rate_limit_exceeded_handler
@@ -257,6 +258,36 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Changelog cache (every replica keeps its own in-process copy; ETag
+    # conditional requests keep the refresh near-free against GitHub's rate
+    # limit). Only active when a GITHUB_TOKEN is configured. The initial warm-up
+    # runs off the event loop so a slow/unreachable GitHub never delays startup;
+    # the periodic refresh runs in the scheduler's worker thread.
+    if changelog_service.configured():
+        async def _warm_changelog():
+            try:
+                await run_in_threadpool(changelog_service.refresh)
+                logger.info("Changelog cache warmed from GitHub Releases")
+            except Exception as e:
+                logger.error(f"Initial changelog warm-up failed (will retry on schedule): {e}")
+
+        asyncio.create_task(_warm_changelog())  # fire-and-forget
+
+        def _refresh_changelog():
+            try:
+                changelog_service.refresh()
+            except Exception as e:
+                logger.error(f"Changelog refresh failed: {e}")
+
+        scheduler.add_job(
+            _refresh_changelog,
+            trigger=IntervalTrigger(minutes=30),
+            id="changelog_refresh_job",
+            replace_existing=True,
+        )
+    else:
+        logger.info("GITHUB_TOKEN not set — /changelog will return 503 until configured")
+
     # The Fribb resync rebuilds the mapping tables wholesale. In a multi-replica
     # Swarm deploy only ONE replica should own it (RUN_DB_SYNC), otherwise every
     # replica downloads + rebuilds in lockstep, wasting bandwidth and contending
@@ -333,6 +364,7 @@ _PUBLIC_EXACT = {"/", "/health", "/openapi.json", "/docs", "/redoc"}
 _PUBLIC_PREFIXES = (
     "/auth/",
     "/kofi/webhook",
+    "/changelog",
     "/player",
     "/movish_proxy",
     "/playimdb_proxy",
@@ -446,6 +478,9 @@ set_resync_handler(_admin_forced_resync)
 
 # Ko-fi supporters (webhook ingest + public "Lumi's Loved Mortals" list).
 app.include_router(supporters_router)
+
+# Public changelog (cached view of this repo's GitHub Releases).
+app.include_router(changelog_router)
 
 # --- DATABASE HELPER FUNCTIONS ---
 def get_db_connection():

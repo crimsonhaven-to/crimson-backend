@@ -597,6 +597,131 @@ async def export_favorites(
     )
 
 
+# Upper bound on an uploaded export so a malicious client can't stream a huge
+# body into memory. 5 MiB is far more than even a maxed-out account's export.
+_MAX_IMPORT_BYTES = 5 * 1024 * 1024
+
+
+def _coerce_int(val) -> Optional[int]:
+    """Best-effort int from a CSV string / JSON value. CSV gives everything as
+    strings (and empty cells as ''); tolerate '5', '5.0', ints, and blanks."""
+    if val is None:
+        return None
+    if isinstance(val, bool):  # guard: bool is an int subclass
+        return None
+    if isinstance(val, int):
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return None
+
+
+def _clean_str(val) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s or None
+
+
+def _parse_export(raw: bytes) -> List[dict]:
+    """Parse an uploaded file back into a list of row dicts. Accepts what /export
+    produces: our JSON ({"watchlists": [...]}), a bare JSON array, or our CSV
+    (with or without the UTF-8 BOM). Format is sniffed from the content (JSON
+    starts with '{' or '['; anything else is CSV). Raises on anything unreadable."""
+    text = raw.decode("utf-8-sig", errors="replace").strip()
+    if not text:
+        return []
+    if text[:1] in "[{":
+        data = json.loads(text)
+        if isinstance(data, dict):
+            rows = data.get("watchlists") or data.get("favorites") or []
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+        return [r for r in rows if isinstance(r, dict)]
+    reader = csv.DictReader(io.StringIO(text))
+    return [dict(r) for r in reader]
+
+
+@router.post("/account/favorites/import")
+@limiter.limit("6/minute")
+async def import_favorites(
+    request: Request,
+    user: dict = Depends(require_user),
+    mode: str = Query(
+        "merge",
+        pattern="^(merge|replace)$",
+        description="merge (default) adds to your existing lists; replace clears all your lists first",
+    ),
+):
+    """Restore watchlists from a previously-exported CSV or JSON file.
+
+    The file is sent as the raw request body (no multipart — keeps the slim image
+    dependency-free); its format is sniffed from the content. Round-trips the
+    /export output: each row is upserted into the list named in its ``list_name``
+    column (defaulting to 'favorites'), keyed by AniList id when present else TMDB
+    id, so re-importing is idempotent. ``mode=replace`` wipes every existing list
+    first (a clean restore); the default ``merge`` keeps what's there and
+    adds/updates. Rows without any id are skipped; rows past the account cap are
+    reported in ``skipped``.
+    """
+    raw = await request.body()
+    if len(raw) > _MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="That file is too large to import (max 5 MB)")
+    try:
+        rows = _parse_export(raw)
+    except (json.JSONDecodeError, csv.Error, UnicodeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't read that file — upload a Crimson watchlist CSV or JSON export",
+        )
+
+    # Coerce rows into favorite dicts up front, dropping anything without an id.
+    favs: List[tuple] = []
+    skipped_no_id = 0
+    for r in rows:
+        tmdb_id = _coerce_int(r.get("tmdb_id"))
+        anilist_id = _coerce_int(r.get("anilist_id"))
+        if tmdb_id is None and anilist_id is None:
+            skipped_no_id += 1
+            continue
+        list_name = (_clean_str(r.get("list_name")) or "favorites")[:100]
+        favs.append((
+            list_name,
+            {
+                "item_key": _favorite_item_key(tmdb_id, anilist_id),
+                "tmdb_id": tmdb_id,
+                "anilist_id": anilist_id,
+                "season_number": _coerce_int(r.get("season_number")),
+                "media_type": _clean_str(r.get("media_type")),
+                "title": _clean_str(r.get("title")),
+                "poster": _clean_str(r.get("poster")),
+            },
+        ))
+
+    def _apply() -> dict:
+        if mode == "replace":
+            store.clear_favorites(user["user_id"])
+        return store.bulk_upsert_favorites(user["user_id"], favs)
+
+    result = await run_in_threadpool(_apply)
+    skipped = skipped_no_id + result["skipped_quota"]
+    return {
+        "success": True,
+        "mode": mode,
+        "total": len(rows),
+        "imported": result["imported"],
+        "skipped": skipped,
+        "skipped_no_id": skipped_no_id,
+        "skipped_quota": result["skipped_quota"],
+    }
+
+
 @router.post("/account/favorites")
 @limiter.limit("60/minute")
 async def add_favorite(request: Request, body: FavoriteIn, user: dict = Depends(require_user)):
