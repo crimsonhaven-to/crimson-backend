@@ -12,7 +12,7 @@ import httpx
 import json
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.requests import Request
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.1.6"
+VERSION = "6.1.7"
 
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
@@ -1920,12 +1920,15 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
         raise HTTPException(status_code=404, detail="AniList ID not mapped")
 
     tmdb_id, season_number = mapping
-    if season_number is not None:
-        return RedirectResponse(url=f"/watch/{tmdb_id}/{season_number}/{episode_number}", status_code=301)
-
-    # Extra (special/OVA/movie): no numbered season — serve directly (season 1 for URL builders).
+    # Serve the stream directly rather than 301-redirecting to the canonical
+    # 3-segment route. A redirect is fatal on WebKit (all iOS browsers + Safari):
+    # it drops the Authorization header when fetch() follows the redirect, so the
+    # redirected request hits the login wall unauthenticated → 401 → the client
+    # clears the session and the user is bounced to the login wall. Extras
+    # (special/OVA/movie) have no numbered season — use season 1 for URL builders.
     return StreamingResponse(
-        stream_watch_response(tmdb_id, 1, episode_number, anilist_id,
+        stream_watch_response(tmdb_id, season_number if season_number is not None else 1,
+                              episode_number, anilist_id,
                               base_url=_public_base_url(request)),
         media_type="application/x-ndjson",
         headers=_STREAM_HEADERS,
