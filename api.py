@@ -115,16 +115,8 @@ class Config:
     # so the deploy can lock these down without a code change; falls back to the
     # built-in dev + crimsonhaven.to list.
     _DEFAULT_ORIGINS = [
-        "http://localhost",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1",
-        "http://127.0.0.1:8080",
-        "http://localhost:8080",
-        "https://dev.crimsonhaven.to",
         "https://crimsonhaven.to",
         "https://www.crimsonhaven.to",
-        "https://dev-backend.crimsonhaven.to",
     ]
     ALLOWED_ORIGINS = [
         o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()
