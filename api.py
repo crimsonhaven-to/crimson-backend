@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.1.7"
+VERSION = "6.1.8"
 
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
@@ -115,16 +115,8 @@ class Config:
     # so the deploy can lock these down without a code change; falls back to the
     # built-in dev + crimsonhaven.to list.
     _DEFAULT_ORIGINS = [
-        "http://localhost",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1",
-        "http://127.0.0.1:8080",
-        "http://localhost:8080",
-        "https://dev.crimsonhaven.to",
         "https://crimsonhaven.to",
         "https://www.crimsonhaven.to",
-        "https://dev-backend.crimsonhaven.to",
     ]
     ALLOWED_ORIGINS = [
         o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()
@@ -538,6 +530,31 @@ def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, Optional[int]]]:
     except Exception as e:
         logger.error(f"Database error in get_tmdb_season: {e}")
         return None
+
+def get_anime_genres(anilist_id: int) -> List[str]:
+    """Genres for a single anime, read from the local anime_entries DB.
+
+    Same source the catalogue uses (genres is a JSON-encoded list, null for
+    entries synced before the column existed). Cheap single-row read so the
+    /overview endpoint can ship genres without an extra external API call.
+    Returns [] for non-anime / unknown ids.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT genres FROM anime_entries WHERE anilist_id = %s",
+                (anilist_id,)
+            )
+            row = cursor.fetchone()
+        if not row or not row["genres"]:
+            return []
+        return json.loads(row["genres"])
+    except (TypeError, ValueError):
+        return []
+    except Exception as e:
+        logger.error(f"Database error in get_anime_genres: {e}")
+        return []
 
 def get_show_seasons(tmdb_id: int) -> List[Dict]:
     """Returns all seasons with season_number, anilist_id, title_romaji, etc."""
@@ -2363,6 +2380,9 @@ async def get_anime_overview(anilist_id: int):
         "year": year,
         "total_episodes": anime_info.get("total_episodes"),
         "total_seasons": len(seasons_data),
+        # Genres from the local anime DB (same source as the catalogue). Anime-only;
+        # the show-overview twin omits this, so genre tags stay anime-specific.
+        "genres": get_anime_genres(anilist_id),
         "seasons": seasons_data,
         "extras": get_show_extras(tmdb_id),
     }
