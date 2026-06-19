@@ -32,6 +32,7 @@ lists are watchlists like 'Todo'/'Done'/'Paused' and a show may be in several.
 import csv
 import io
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -46,8 +47,34 @@ from . import ed25519, mailer, passwords
 from .db import AccountStore, QuotaExceeded, VERIFY_TOKEN_TTL, RESET_TOKEN_TTL
 from rate_limit import limiter
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["account"])
 store = AccountStore()
+
+# Optional hook injected by api.py at startup (see set_episode_enricher). Given the
+# deduped per-show progress rows, it annotates each with "next episode" hints
+# (season_episode_count / next_episode_exists / next_episode_air_date) from TMDB,
+# so the frontend never points at a non-existent or not-yet-aired next episode.
+# Kept as injection to avoid importing the heavy api module here (circular import).
+_episode_enricher = None  # async callable(rows: List[dict]) -> None  (mutates in place)
+
+
+def set_episode_enricher(handler) -> None:
+    """Register the progress-row enricher (called by api.py once it's defined)."""
+    global _episode_enricher
+    _episode_enricher = handler
+
+
+async def _enrich(rows: List[dict]) -> List[dict]:
+    """Run the injected enricher over rows (best-effort; rows returned unchanged if
+    it isn't set or raises). Enrichment is purely additive metadata, never load-bearing."""
+    if _episode_enricher and rows:
+        try:
+            await _episode_enricher(rows)
+        except Exception as e:
+            logger.warning(f"progress enrichment failed: {e}")
+    return rows
 
 _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")   # 32-byte public key
 _HEX128 = re.compile(r"^[0-9a-fA-F]{128}$")  # 64-byte signature
@@ -821,7 +848,7 @@ async def continue_watching(user: dict = Depends(require_user)):
 
     Collapsed to one entry per show (latest in-progress episode), so a series
     you're partway through several episodes of appears once."""
-    items = _dedup_by_show(store.list_progress(user["user_id"], status="in_progress"))
+    items = await _enrich(_dedup_by_show(store.list_progress(user["user_id"], status="in_progress")))
     return {"success": True, "count": len(items), "items": items}
 
 
@@ -838,7 +865,7 @@ async def recent(
     progress). Rows are newest-first, so the first time we see a show is its
     latest episode. Unlike /account/continue-watching (which is in_progress only),
     this keeps finished episodes so the history stays populated after completion."""
-    items = _dedup_by_show(store.list_progress(user["user_id"]), limit=limit)
+    items = await _enrich(_dedup_by_show(store.list_progress(user["user_id"]), limit=limit))
     return {"success": True, "count": len(items), "items": items}
 
 
