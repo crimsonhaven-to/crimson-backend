@@ -52,6 +52,12 @@ bootstrap:
     - local   all             all                                  scram-sha-256
     - host    all             all       127.0.0.1/32               scram-sha-256
     - host    all             all       ::1/128                    scram-sha-256
+    # Patroni probes its OWN local Postgres over loopback with a *replication*
+    # connection (get_replica_timeline). The `all` rules above do NOT cover the
+    # special `replication` database, so these explicit loopback rules are
+    # REQUIRED or a restarted node can't read its timeline and never recovers.
+    - host    replication     replicator 127.0.0.1/32             scram-sha-256
+    - host    replication     replicator ::1/128                  scram-sha-256
     # DB hosts reach each other for replication / pg_rewind (THIS subnet).
     - host    all             all       192.168.2.0/24             scram-sha-256
     - host    replication     replicator 192.168.2.0/24            scram-sha-256
