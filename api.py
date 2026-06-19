@@ -39,6 +39,7 @@ from local_engine.fs import (
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
+from account_engine.routes import set_episode_enricher
 from account_engine.admin_routes import router as admin_router, set_resync_handler
 from supporters_engine import router as supporters_router, store as supporters_store
 from changelog_engine import router as changelog_router, service as changelog_service
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.1.8"
+VERSION = "6.1.9"
 
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
@@ -950,6 +951,89 @@ async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: i
 
     return result
 
+
+def _is_future_air_date(air_date: Optional[str]) -> bool:
+    """True when a TMDB episode air_date is strictly after today (UTC).
+
+    TMDB air dates are bare calendar dates ('YYYY-MM-DD', no time/zone), so an
+    episode airing *today* counts as aired — only a strictly-later date is "not
+    yet aired". Unknown/empty/garbage dates are treated as aired so we never block
+    playback on missing metadata."""
+    if not air_date:
+        return False
+    try:
+        d = datetime.strptime(air_date[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return False
+    return d > datetime.now(timezone.utc).date()
+
+
+async def _season_episode_info(tmdb_id: int, season_number: int) -> Dict:
+    """{count, air_dates:{ep_num: 'YYYY-MM-DD'|None}} for a TMDB season.
+
+    Derived from the (DB-cached) TMDB season metadata and additionally held in the
+    in-process L1 cache, since both the unaired gate and the progress enricher hit
+    it on hot paths. Best-effort: returns {} when the season can't be loaded so
+    callers degrade gracefully (no episode-count gating, no unaired check)."""
+    key = f"epinfo:{tmdb_id}:s{season_number}"
+    cached = _local_get(key)
+    if cached is not None:
+        return cached
+    try:
+        async with http_client() as client:
+            meta = await fetch_tmdb_metadata(client, tmdb_id, season_number)
+    except Exception as e:
+        logger.warning(f"season episode-info fetch failed for {tmdb_id} s{season_number}: {e}")
+        return {}
+    eps = meta.get("episodes") or []
+    info = {
+        "count": len(eps),
+        "air_dates": {e.get("episode_number"): e.get("air_date") for e in eps},
+    }
+    _local_set(key, info)
+    return info
+
+
+async def _enrich_progress_rows(rows: List[Dict]) -> None:
+    """Attach per-show "next episode" hints to deduped watch-progress rows so the
+    frontend never offers a non-existent or not-yet-aired next episode.
+
+    Each row is one show, carrying its latest watched season+episode. We look up
+    that season's TMDB episode list (L1-cached) and add, in place:
+      * season_episode_count  — total episodes in the season
+      * next_episode_exists   — whether episode_number+1 is a real episode
+      * next_episode_air_date — that next episode's air_date (None if n/a/unknown)
+
+    Best-effort and concurrency-bounded; on any per-row failure the row is just
+    left unannotated (the frontend then falls back to its old behaviour)."""
+    sem = asyncio.Semaphore(8)
+
+    async def _one(row: Dict) -> None:
+        tmdb_id, season = row.get("tmdb_id"), row.get("season_number")
+        ep = row.get("episode_number")
+        if not tmdb_id or season is None:
+            return
+        async with sem:
+            info = await _season_episode_info(int(tmdb_id), int(season))
+        if not info:
+            return
+        row["season_episode_count"] = info.get("count")
+        if ep is not None:
+            air = info.get("air_dates") or {}
+            nxt = int(ep) + 1
+            row["next_episode_exists"] = nxt in air
+            row["next_episode_air_date"] = air.get(nxt)
+
+    await asyncio.gather(*(_one(r) for r in rows), return_exceptions=True)
+
+
+# Inject the enricher into the account router (defined here so the heavy TMDB/cache
+# helpers live with the rest of api.py instead of in account_engine — same
+# dependency-injection pattern as set_resync_handler). Done at definition time
+# because the module-level wiring near include_router runs before this point.
+set_episode_enricher(_enrich_progress_rows)
+
+
 async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> Dict:
     """Fetch anime metadata from AniList"""
     cache_key = f"anilist:meta:{anilist_id}"
@@ -1740,6 +1824,24 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
         "anilist_id": anilist_id,
         "title": title,
     })
+
+    # Don't waste scraper work on an episode that hasn't aired yet. TMDB carries a
+    # per-episode air_date; when the requested episode is dated in the future, tell
+    # the client to render a "not yet aired" state instead of racing every scraper
+    # only to resolve zero sources. Extras (specials/OVAs/movies) aren't in the
+    # numbered-season episode list, so they have no air_date here and play normally.
+    ep_info = await _season_episode_info(tmdb_id, season_number)
+    air_date = (ep_info.get("air_dates") or {}).get(episode_number)
+    if _is_future_air_date(air_date):
+        yield _ndjson({
+            "type": "unaired",
+            "air_date": air_date,
+            "title": title,
+            "season_number": season_number,
+            "episode_number": episode_number,
+        })
+        yield _ndjson({"type": "done", "count": 0})
+        return
 
     # German streaming scrapers (s.to, aniworld) list many non-anime shows under
     # their German broadcast title — e.g. NCIS is "Navy CIS" on s.to — which TMDB
