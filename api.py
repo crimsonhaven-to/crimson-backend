@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.1.9"
+VERSION = "6.2.0"
 
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
@@ -827,6 +827,18 @@ async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional
                 wait_time = Config.RETRY_BACKOFF_FACTOR * (2 ** attempt)
                 logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}")
                 await asyncio.sleep(wait_time)
+                continue
+            elif response.status_code in (500, 502, 503, 504):
+                # Transient upstream failure (TMDB occasionally 502s on individual
+                # records — see status_code 43 "Couldn't connect to the backend").
+                # Back off and retry rather than treating it as a hard failure.
+                logger.warning(
+                    f"TMDB upstream {response.status_code} for URL {url} "
+                    f"(attempt {attempt + 1}/{Config.MAX_RETRIES})"
+                )
+                if attempt == Config.MAX_RETRIES - 1:
+                    return None
+                await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
                 continue
             else:
                 logger.warning(f"TMDB API error: Status {response.status_code} for URL {url}")
@@ -1705,6 +1717,48 @@ async def get_catalogue(
         "animes": animes,
     })
 
+# Themed notice shown on an overview page when the live TMDB show fetch failed and
+# the page was rebuilt from local/AniList metadata only (see _degraded_season_list
+# and the /overview fallback). Phrased in Lumi's voice for the frontend banner.
+DEGRADED_OVERVIEW_NOTICE = {
+    "kind": "degraded",
+    "title": "The Archives Flicker",
+    "message": (
+        "The Crimson Archives refused to answer for this title, so Lumi has rewoven "
+        "this page from her own faded memory. Some seasons, episodes, or art may be "
+        "missing until the archive stirs awake — try again in a little while, mortal."
+    ),
+}
+
+
+def _degraded_season_list(tmdb_id: int) -> List[Dict]:
+    """Season list built purely from the locally-stored AniList<->TMDB mapping, for
+    when the live TMDB show fetch is unavailable.
+
+    Carries enough for the frontend to render the season tabs and route the
+    (anilist-keyed) play buttons, but omits the TMDB-only fields (poster, air date,
+    episode count) we couldn't fetch — those simply come back null.
+    """
+    seasons = []
+    for s in get_show_seasons(tmdb_id):
+        num = s["season_number"]
+        seasons.append({
+            "season_number": num,
+            "anilist_id": s.get("anilist_id"),
+            "tmdb_id": tmdb_id,
+            "tmdb_season": num,
+            "name": f"Season {num}",
+            "poster": None,
+            "summary": None,
+            "air_date": None,
+            "episode_count": None,
+            "title_romaji": s.get("title_romaji"),
+            "title_english": s.get("title_english"),
+            "anime_type": s.get("anime_type"),
+        })
+    return seasons
+
+
 def _build_season_list(tmdb_id: int, show: Dict) -> List[Dict]:
     """Build the per-season list from TMDB's real seasons, attaching AniList mapping.
 
@@ -2449,11 +2503,30 @@ async def get_anime_overview(anilist_id: int):
             fetch_tmdb_show(client, tmdb_id),
             fetch_anilist_metadata(client, anilist_id),
         )
-    if not show:
-        raise HTTPException(status_code=404, detail="Show not found on TMDB")
 
     anime_info = anime_info or {}
-    seasons_data = _build_season_list(tmdb_id, show)
+
+    # TMDB-down fallback: if the live show fetch failed (e.g. TMDB 502s on a single
+    # broken record), don't hard-404 the whole page. As long as we have *some*
+    # metadata — AniList and/or the locally-stored tmdb_shows row — rebuild a
+    # degraded overview from what we have and flag it so the frontend can say so.
+    degraded = not show
+    if degraded:
+        stored = get_show_info(tmdb_id)
+        if not stored and not anime_info:
+            raise HTTPException(status_code=404, detail="Show not found on TMDB")
+        show = {
+            "title": stored.get("title"),
+            "overview": stored.get("overview"),
+            "poster": _tmdb_img(stored.get("poster_path")),
+            "backdrop": _tmdb_img(stored.get("backdrop_path"), "original"),
+            "first_air_date": stored.get("first_air_date"),
+            "seasons": [],
+        }
+        seasons_data = _degraded_season_list(tmdb_id)
+    else:
+        seasons_data = _build_season_list(tmdb_id, show)
+
     title = anime_info.get("title") or show.get("title") or "Unknown Anime"
 
     # Year: prefer TMDB's first-air-date, fall back to AniList's start year.
@@ -2487,6 +2560,10 @@ async def get_anime_overview(anilist_id: int):
         "genres": get_anime_genres(anilist_id),
         "seasons": seasons_data,
         "extras": get_show_extras(tmdb_id),
+        # When TMDB was unavailable, this page was rebuilt from local/AniList data
+        # only; the frontend renders DEGRADED_OVERVIEW_NOTICE as a themed banner.
+        "degraded": degraded,
+        "notice": DEGRADED_OVERVIEW_NOTICE if degraded else None,
     }
 
 @app.get("/show-overview/{tmdb_id}")
@@ -2502,10 +2579,26 @@ async def get_show_overview(tmdb_id: int):
     """
     async with http_client() as client:
         show = await fetch_tmdb_show(client, tmdb_id)
-    if not show:
-        raise HTTPException(status_code=404, detail="Show not found on TMDB")
 
-    seasons_data = _build_season_list(tmdb_id, show)
+    # TMDB-down fallback (twin of /overview): rebuild from the locally-stored
+    # tmdb_shows row instead of hard-404ing when the live fetch failed. Shows have
+    # no AniList entry, so the stored row is the only fallback source.
+    degraded = not show
+    if degraded:
+        stored = get_show_info(tmdb_id)
+        if not stored:
+            raise HTTPException(status_code=404, detail="Show not found on TMDB")
+        show = {
+            "title": stored.get("title"),
+            "overview": stored.get("overview"),
+            "poster": _tmdb_img(stored.get("poster_path")),
+            "backdrop": _tmdb_img(stored.get("backdrop_path"), "original"),
+            "first_air_date": stored.get("first_air_date"),
+            "seasons": [],
+        }
+        seasons_data = _degraded_season_list(tmdb_id)
+    else:
+        seasons_data = _build_season_list(tmdb_id, show)
     year = (show.get("first_air_date") or "")[:4] or None
 
     return {
@@ -2528,6 +2621,9 @@ async def get_show_overview(tmdb_id: int):
         "seasons": seasons_data,
         # General shows carry no AniList specials/OVAs/movies mapping.
         "extras": [],
+        # When TMDB was unavailable, this page was rebuilt from local data only.
+        "degraded": degraded,
+        "notice": DEGRADED_OVERVIEW_NOTICE if degraded else None,
     }
 
 # --- HEALTH CHECK ENDPOINT ---
