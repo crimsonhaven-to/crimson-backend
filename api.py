@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 # metadata (OpenAPI/docs) and the "/" root greeting.
 VERSION = "6.2.0"
 
+#! TODO:
+#! - Support for the local source which lets admins add a NAS-location directly from the admin dashboard (to keep everything stateless, no stupid container mounts)
+#  - (Optional) Local Cache: Download every streamed episode onto a NAS-Storage (ZFS for example), add a database entry and then play it from local Storage in the future. Requires a shitload of storage. 
+
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
 # directly via their own LocalSourceStore (the enabled-roots cache is class-wide).
