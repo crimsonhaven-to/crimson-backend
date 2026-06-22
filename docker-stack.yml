@@ -98,8 +98,9 @@ services:
     # ingress traffic, so it does NOT need the mount.) Register the in-container
     # path — /crimson/cache — in Admin → Cache. Uncomment this together with the
     # `crimson_cache` volume definition at the bottom of the file.
-    # volumes:
-    #   - crimson_cache:/crimson/cache
+    volumes:
+      - crimson_cache1:/crimson/cache1
+      - crimson_cache2:/crimson/cache2
 
     # Front this with your reverse proxy. Remove if you attach the proxy directly
     # to crimson_net instead of publishing a host port. Only THIS service may
@@ -284,16 +285,27 @@ networks:
 #   TMDB_API_KEY=... PROXY_SECRET=... DATABASE_URL=... \
 #   docker stack deploy -c docker-stack.yml crimson-api
 #
-# volumes:
-#   crimson_cache:
-#     driver: local
-#     driver_opts:
-#       type: cifs
-#       # //<host-or-ip>/<share> — forward slashes even for a Windows share.
-#       device: "//${NAS_IP}/${NAS_SHARE}"
-#       # uid/gid 10001 == the image's non-root `appuser`, so ffmpeg may write;
-#       # vers=3.0 suits modern Windows/Samba (drop to 2.1 for very old servers).
-#       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
+volumes:
+  crimson_cache1:
+    driver: local
+    driver_opts:
+      type: cifs
+      # // <host-or-ip>/<share> — forward slashes even for a Windows share.
+      device: "//${NAS_IP}/${NAS_SHARE1}"
+      uid/gid 10001 # == the image's non-root `appuser`, so ffmpeg may write;
+      vers=3.0 # suits modern Windows/Samba (drop to 2.1 for very old servers).
+      o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
+
+volumes:
+  crimson_cache2:
+    driver: local
+    driver_opts:
+      type: cifs
+      # // <host-or-ip>/<share> — forward slashes even for a Windows share.
+      device: "//${NAS_IP}/${NAS_SHARE2}"
+      uid/gid 10001 # == the image's non-root `appuser`, so ffmpeg may write;
+      vers=3.0 # suits modern Windows/Samba (drop to 2.1 for very old servers).
+      o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
 #
 #   # NFS variant (Unix/Linux NAS) — use THIS block instead of the cifs one above:
 #   # crimson_cache:
