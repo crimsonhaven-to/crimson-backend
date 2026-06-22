@@ -35,7 +35,7 @@ from urllib.parse import parse_qs, urlparse
 from starlette.concurrency import run_in_threadpool
 
 from .db import CacheStore
-from . import fs
+from . import fs, ticket
 
 logger = logging.getLogger("cache_engine.downloader")
 
@@ -139,6 +139,82 @@ class DownloadManager:
         self._workers = []
         self._started = False
 
+    # ------------------------------------------------------------------ gate
+    async def _cacheable(self, stream: dict) -> bool:
+        """Shared cacheability gate: caching is on, ffmpeg is present, the stream
+        is a tappable media URL, and it isn't our own cache/local output. Used both
+        by the ticket stamp (watch path) and the real enqueue (confirm path) so the
+        two never disagree on what's cacheable."""
+        if not self._started or self._queue is None:
+            return False
+        if not await run_in_threadpool(self._store.get_enabled):
+            return False
+        url = (stream.get("url") or "")
+        if any(frag in url for frag in _SKIP_URL_FRAGMENTS):
+            return False  # our own cache output / the on-disk Local source
+        if not _media_url_for_stream(stream):
+            return False
+        if not ffmpeg_available():
+            return False
+        return True
+
+    # ----------------------------------------------------------- watch ticket
+    async def mint_ticket(
+        self,
+        stream: dict,
+        *,
+        tmdb_id: int,
+        season_number: int,
+        episode_number: int,
+        anilist_id: Optional[int],
+    ) -> Optional[str]:
+        """If this stream is cacheable right now, return an opaque, signed ticket
+        the player echoes back to ``/cache/confirm`` once the viewer has actually
+        watched it — else None. Stamping (not downloading) here is what lets us
+        cache the source the viewer *chose*, not whichever resolved fastest. Safe
+        to call for every resolved stream; never raises into the watch path."""
+        try:
+            if not await self._cacheable(stream):
+                return None
+            return ticket.mint(
+                url=(stream.get("url") or ""),
+                type=(stream.get("type") or ""),
+                source=(stream.get("source") or ""),
+                language=(stream.get("language") or ""),
+                tmdb_id=tmdb_id,
+                season_number=season_number,
+                episode_number=episode_number,
+                anilist_id=anilist_id,
+            )
+        except Exception as e:
+            logger.error(f"mint_ticket failed: {e}")
+            return None
+
+    async def confirm_ticket(self, ticket_str: str) -> bool:
+        """Player-confirmed watch: verify a ticket minted by :meth:`mint_ticket`
+        and enqueue the real download. Returns whether the ticket verified; the
+        enabled/dedupe/space checks happen in :meth:`maybe_enqueue`. Never raises."""
+        try:
+            data = ticket.verify(ticket_str)
+            if not data:
+                return False
+            await self.maybe_enqueue(
+                {
+                    "url": data["url"],
+                    "type": data["type"],
+                    "source": data["source"],
+                    "language": data["language"],
+                },
+                tmdb_id=data["tmdb_id"],
+                season_number=data["season_number"],
+                episode_number=data["episode_number"],
+                anilist_id=data["anilist_id"],
+            )
+            return True
+        except Exception as e:
+            logger.error(f"confirm_ticket failed: {e}")
+            return False
+
     # --------------------------------------------------------------- enqueue
     async def maybe_enqueue(
         self,
@@ -152,25 +228,15 @@ class DownloadManager:
         """Consider a resolved stream for caching. Safe to call for every stream —
         it self-filters and dedupes, and never raises into the watch path."""
         try:
-            if not self._started or self._queue is None:
-                return
-            if not await run_in_threadpool(self._store.get_enabled):
-                return
-
-            url = (stream.get("url") or "")
-            if any(frag in url for frag in _SKIP_URL_FRAGMENTS):
-                return  # our own cache output / the on-disk Local source
-
-            media_url = _media_url_for_stream(stream)
-            if not media_url:
-                return
-            if not ffmpeg_available():
+            if not await self._cacheable(stream):
                 return
 
             target = await run_in_threadpool(fs.pick_write_target, MIN_FREE_BYTES)
             if not target:
                 return
 
+            # _cacheable() already vetted this is a tappable media URL (non-None).
+            media_url = _media_url_for_stream(stream)
             language = (stream.get("language") or "").strip()
             source_origin = stream.get("source") or ""
             rel_path = fs.plan_rel_path(tmdb_id, season_number, episode_number, language)
@@ -239,7 +305,7 @@ class DownloadManager:
         part_path = abs_path + ".part"
 
         await run_in_threadpool(self._store.mark_downloading, entry_id)
-        await run_in_threadpool(os.makedirs, os.path.dirname(abs_path), True)
+        await run_in_threadpool(os.makedirs, os.path.dirname(abs_path), exist_ok=True)
         # Clean any leftover partial from a previous failed attempt.
         await run_in_threadpool(_unlink_quiet, part_path)
 
