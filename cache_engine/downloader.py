@@ -334,21 +334,16 @@ class DownloadManager:
         """Remux ``media_url`` into ``out_path`` (mp4). Returns (returncode,
         stderr-tail).
 
-        Two tiers: first a pure stream copy (``-c copy``, no re-encode — the fast,
-        cheap path that works for the typical AAC-audio source). If that fails to
-        mux — overwhelmingly because the source's audio codec has no mp4 tag, i.e.
-        AC-3 / E-AC-3 / MP2 tracks that German/other **dub** sources ship while the
-        Japanese **sub** versions (AAC) don't — we retry copying the *video* but
-        transcoding only the *audio* to AAC. Video (the expensive, bulky stream) is
-        never re-encoded."""
+        Pure stream copy first (``-c copy``, no re-encode — fast and cheap). A
+        second pass that re-encodes ONLY the audio to AAC is attempted *solely*
+        when the first failed because the source's audio codec has no mp4 tag
+        (AC-3 / E-AC-3 / MP2 — what some dub tracks ship). Other failures (network,
+        missing segments) aren't retried; a second full pull would just fail again.
+        Video (the expensive, bulky stream) is never re-encoded either way."""
         rc, tail = await self._ffmpeg_attempt(media_url, out_path, reencode_audio=False)
-        if rc == 0:
+        if rc == 0 or not _is_audio_tag_error(tail):
             return rc, tail
-        # The mp4 muxer rejecting an un-taggable audio codec surfaces as
-        # AVERROR(EINVAL) (exit 234) / "Error opening output files". Re-encoding
-        # just the audio to AAC is the cheap, reliable fix; only worth a second
-        # pass, not a probe, since the copy path covers the common case.
-        logger.info(f"[cache] copy-mux failed (rc={rc}); retrying with audio re-encode")
+        logger.info(f"[cache] copy-mux failed on audio codec (rc={rc}); retrying with audio re-encode")
         return await self._ffmpeg_attempt(media_url, out_path, reencode_audio=True)
 
     async def _ffmpeg_attempt(
@@ -364,8 +359,15 @@ class DownloadManager:
             "-nostdin",
             "-y",
             "-loglevel", "error",
-            # HLS: segments may be served with disguised extensions (.html) and
-            # AES-128 keys are fetched over http through our proxy.
+            # HLS hardening reversal. Our segment URLs are proxied as
+            # ``/voe_proxy?u=<encoded .ts>`` — the real extension lives in the query
+            # string, so the path looks extension-less. ffmpeg 7.1+ added a strict
+            # ``extension_picky`` check that rejects such segments ("is not in
+            # allowed_segment_extensions") even with ``-allowed_extensions ALL``,
+            # yielding a zero-stream output. Turn the picky check off; keep
+            # allowed_extensions ALL for the playlist/key files (disguised .html,
+            # AES-128 keys fetched over http through our proxy).
+            "-extension_picky", "0",
             "-allowed_extensions", "ALL",
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
             "-i", media_url,
@@ -390,6 +392,19 @@ class DownloadManager:
         # "Error opening output files" line.
         tail = (err or b"").decode("utf-8", errors="replace").strip().splitlines()
         return proc.returncode, " | ".join(tail[-4:]) if tail else ""
+
+
+# Stderr signatures of an mp4 muxer rejecting an audio codec it can't tag (the
+# only failure worth retrying with the audio re-encoded — see ``_run_ffmpeg``).
+_AUDIO_TAG_ERROR_HINTS = (
+    "could not find tag for codec",
+    "codec not currently supported in container",
+)
+
+
+def _is_audio_tag_error(stderr: str) -> bool:
+    s = (stderr or "").lower()
+    return any(h in s for h in _AUDIO_TAG_ERROR_HINTS)
 
 
 def _unlink_quiet(path: str) -> None:
