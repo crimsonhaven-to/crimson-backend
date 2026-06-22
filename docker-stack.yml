@@ -82,6 +82,24 @@ services:
       - SMTP_FROM=${SMTP_FROM:-}
       - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      # --- Server-side video cache (optional) ----------------------------------
+      # Downloader tuning for cache_engine. All have sane defaults baked in, so
+      # you only need these to override them. The NAS itself is mounted via the
+      # `crimson_cache` volume below — NOT through these env vars. Uncomment to tune.
+      # - CACHE_INTERNAL_BASE=http://127.0.0.1:8000  # how ffmpeg reaches our own proxies (loopback)
+      # - CACHE_MAX_CONCURRENT=1                      # simultaneous downloads per replica
+      # - CACHE_DOWNLOAD_TIMEOUT=3600                 # per-episode ffmpeg timeout (seconds)
+      # - CACHE_MIN_FREE_BYTES=2147483648             # skip a download below this much free space (2 GiB)
+      # - CACHE_QUEUE_MAX=200                         # queued downloads before new ones are dropped
+
+    # --- NAS cache mount (optional) ------------------------------------------
+    # The serving replicas BOTH trigger downloads and serve /cache_proxy, so the
+    # cache must be mounted on every node that runs `api`. (api-sync serves no
+    # ingress traffic, so it does NOT need the mount.) Register the in-container
+    # path — /crimson/cache — in Admin → Cache. Uncomment this together with the
+    # `crimson_cache` volume definition at the bottom of the file.
+    # volumes:
+    #   - crimson_cache:/crimson/cache
 
     # Front this with your reverse proxy. Remove if you attach the proxy directly
     # to crimson_net instead of publishing a host port. Only THIS service may
@@ -252,6 +270,38 @@ networks:
   crimson_net:
     driver: overlay
     attachable: true
+
+# --- Optional: NAS volume for the server-side video cache --------------------
+# Windows / Samba shares speak SMB (the Linux mount type is "cifs"); a Unix/Linux
+# NAS exporting NFS uses "nfs" instead (see the NFS variant below). Swarm mounts
+# the volume on every node that runs a task referencing it, so you do NOT have to
+# hand-mount the share on each of the 3 hosts — define it once here and uncomment
+# the `volumes:` block under the `api` service above.
+#
+#
+#   NAS_IP=192.168.1.10 NAS_SHARE=crimson-cache \
+#   NAS_USER=crimson NAS_PASSWORD='super-secret' \
+#   TMDB_API_KEY=... PROXY_SECRET=... DATABASE_URL=... \
+#   docker stack deploy -c docker-stack.yml crimson-api
+#
+# volumes:
+#   crimson_cache:
+#     driver: local
+#     driver_opts:
+#       type: cifs
+#       # //<host-or-ip>/<share> — forward slashes even for a Windows share.
+#       device: "//${NAS_IP}/${NAS_SHARE}"
+#       # uid/gid 10001 == the image's non-root `appuser`, so ffmpeg may write;
+#       # vers=3.0 suits modern Windows/Samba (drop to 2.1 for very old servers).
+#       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
+#
+#   # NFS variant (Unix/Linux NAS) — use THIS block instead of the cifs one above:
+#   # crimson_cache:
+#   #   driver: local
+#   #   driver_opts:
+#   #     type: nfs
+#   #     o: "addr=${NAS_IP},nfsvers=4,rw,hard,timeo=600"
+#   #     device: ":/export/crimson-cache"
 
 # --- Why two services --------------------------------------------------------
 # Only ONE process may run the Fribb resync, but the serving tier must scale. A

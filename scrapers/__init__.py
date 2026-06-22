@@ -12,8 +12,10 @@ from .cinemabz_scraper import CinemabzScraper
 from .showbox_scraper import ShowBoxScraper
 from .aniwatch_scraper import AniwatchScraper
 from .local_scraper import LocalScraper
+from .cache_scraper import CacheScraper
 
 ALL_SCRAPERS = [
+    CacheScraper,     # Server-side video cache: surfaces already-downloaded episodes first.
     GogoScraper,
     AniworldScraper,  # German s.to-family site; feeds VOE/Vidmoly embeds.
     StoScraper,       # s.to: aniworld's general sibling (anime + movies); same VOE/Vidmoly embeds.

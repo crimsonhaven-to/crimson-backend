@@ -37,12 +37,16 @@ from db_pool import get_connection
 from rate_limit import limiter
 from local_engine.db import LocalSourceStore
 from local_engine.fs import inspect_path, discover_mountpoints
+from cache_engine.db import CacheStore
+from cache_engine import fs as cache_fs
+from cache_engine import downloader as cache_dl
 from .db import AccountStore
 from .routes import require_user
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 store = AccountStore()
 local_store = LocalSourceStore()
+cache_store = CacheStore()
 
 
 def _now_iso() -> str:
@@ -373,3 +377,174 @@ async def delete_local_source(source_id: int, user: dict = Depends(require_admin
     if not removed:
         raise HTTPException(status_code=404, detail="Source not found")
     return {"success": True, "deleted": source_id}
+
+
+# --- server-side video cache ------------------------------------------------
+# A global on/off switch, the named NAS targets episodes are downloaded to, and a
+# browsable ledger of what's been cached. When enabled, playing an episode kicks
+# off a background full download (remuxed to mp4 with ffmpeg) to the first
+# writable enabled target; on the next play the Cache source surfaces it, labelled
+# with the target's name + the original language. See cache_engine/.
+class CacheSettingsUpdate(BaseModel):
+    enabled: bool
+
+
+class CacheTargetCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    path: str = Field(..., min_length=1, max_length=1000)
+
+
+class CacheTargetUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    enabled: Optional[bool] = None
+
+
+def _cache_target_with_status(row: dict) -> dict:
+    out = dict(row)
+    out["enabled"] = bool(out.get("enabled"))
+    out["status"] = cache_fs.inspect_target(row["path"])
+    return out
+
+
+@router.get("/cache")
+async def cache_overview(user: dict = Depends(require_admin)):
+    """Global cache status for the dashboard: master switch, ffmpeg availability,
+    download config, and aggregate counts/bytes."""
+    enabled = await run_in_threadpool(cache_store.get_enabled)
+    stats = await run_in_threadpool(cache_store.stats)
+    target_count = len(await run_in_threadpool(cache_store.enabled_targets))
+    return {
+        "success": True,
+        "enabled": enabled,
+        "ffmpeg_available": cache_dl.ffmpeg_available(),
+        "enabled_targets": target_count,
+        "stats": stats,
+        "config": {
+            "max_concurrent": cache_dl.MAX_CONCURRENT,
+            "download_timeout": cache_dl.DOWNLOAD_TIMEOUT,
+            "min_free_bytes": cache_dl.MIN_FREE_BYTES,
+            "internal_base": cache_dl.INTERNAL_BASE,
+        },
+    }
+
+
+@router.put("/cache/settings")
+async def update_cache_settings(body: CacheSettingsUpdate, user: dict = Depends(require_admin)):
+    """Flip the global cache master switch. With it off, no new downloads start;
+    already-cached episodes keep playing as long as their target stays enabled."""
+    enabled = await run_in_threadpool(cache_store.set_enabled, body.enabled)
+    return {"success": True, "enabled": enabled}
+
+
+@router.get("/cache-targets")
+async def list_cache_targets(user: dict = Depends(require_admin)):
+    rows = await run_in_threadpool(cache_store.list_targets)
+    items = await run_in_threadpool(lambda: [_cache_target_with_status(r) for r in rows])
+    return {"success": True, "count": len(items), "targets": items}
+
+
+@router.get("/cache-targets/discover")
+async def discover_cache_targets(user: dict = Depends(require_admin)):
+    """Candidate NAS/bind-mount directories (probed for writability + free space)
+    the admin can register with one click. Advisory only."""
+    mounts = await run_in_threadpool(discover_mountpoints)
+    existing = await run_in_threadpool(cache_store.list_targets)
+    have = {os.path.normpath(r["path"]) for r in existing}
+
+    def _enrich():
+        out = []
+        for m in mounts:
+            entry = {"path": m["path"], "fstype": m.get("fstype")}
+            entry.update(cache_fs.inspect_target(m["path"], count_cap=1))
+            entry["already_added"] = os.path.normpath(m["path"]) in have
+            out.append(entry)
+        return out
+
+    enriched = await run_in_threadpool(_enrich)
+    return {"success": True, "count": len(enriched), "mounts": enriched}
+
+
+@router.post("/cache-targets")
+async def add_cache_target(body: CacheTargetCreate, user: dict = Depends(require_admin)):
+    """Register a NAS directory as a cache target. Must be an absolute, existing,
+    WRITABLE directory inside the backend container (bind-mount it first)."""
+    path = os.path.normpath(body.path.strip())
+    if not os.path.isabs(path):
+        raise HTTPException(
+            status_code=400,
+            detail="Path must be absolute — the in-container path, e.g. /crimson/cache",
+        )
+    info = await run_in_threadpool(cache_fs.inspect_target, path, 1)
+    if not info["exists"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Path does not exist inside the backend container. Bind-mount your NAS share first (e.g. - /nas/cache:/crimson/cache).",
+        )
+    if not info["is_dir"]:
+        raise HTTPException(status_code=400, detail="Path is not a directory")
+    if not info["writable"]:
+        raise HTTPException(status_code=400, detail="Path is not writable by the backend")
+
+    existing = await run_in_threadpool(cache_store.list_targets)
+    if any(os.path.normpath(r["path"]) == path for r in existing):
+        raise HTTPException(status_code=409, detail="That path is already registered")
+
+    row = await run_in_threadpool(cache_store.add_target, body.name.strip(), path)
+    return {"success": True, "target": await run_in_threadpool(_cache_target_with_status, row)}
+
+
+@router.patch("/cache-targets/{target_id}")
+async def update_cache_target(target_id: int, body: CacheTargetUpdate, user: dict = Depends(require_admin)):
+    """Rename a target (its name is what viewers see as the source) or toggle it
+    on/off. The path is immutable — delete + re-add to move it."""
+    target = await run_in_threadpool(cache_store.get_target, target_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+    name = body.name.strip() if body.name is not None else None
+    row = await run_in_threadpool(cache_store.update_target, target_id, name, body.enabled)
+    return {"success": True, "target": await run_in_threadpool(_cache_target_with_status, row)}
+
+
+@router.delete("/cache-targets/{target_id}")
+async def delete_cache_target(target_id: int, user: dict = Depends(require_admin)):
+    """Remove a target. Its cached_episodes rows cascade-delete; the files on the
+    NAS are left in place (delete them on the share if you want the space back)."""
+    removed = await run_in_threadpool(cache_store.delete_target, target_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Target not found")
+    return {"success": True, "deleted": target_id}
+
+
+@router.get("/cached-episodes")
+async def list_cached_episodes(
+    user: dict = Depends(require_admin),
+    status: Optional[str] = Query(None, description="ready / pending / downloading / failed"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    items = await run_in_threadpool(cache_store.list_episodes, status, limit, offset)
+    total = await run_in_threadpool(cache_store.count_episodes, status)
+    return {"success": True, "count": len(items), "total": total, "episodes": items}
+
+
+@router.delete("/cached-episodes/{entry_id}")
+async def delete_cached_episode(entry_id: int, user: dict = Depends(require_admin)):
+    """Drop a cache entry and delete its file from the NAS. Deleting a 'failed'
+    entry also lets the episode be re-cached on its next play."""
+    row = await run_in_threadpool(cache_store.delete_episode, entry_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Cache entry not found")
+
+    def _unlink():
+        target = cache_store.get_target(row["target_id"])
+        if target:
+            abs_path = os.path.join(target["path"], row["rel_path"])
+            try:
+                os.unlink(abs_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+    await run_in_threadpool(_unlink)
+    return {"success": True, "deleted": entry_id}

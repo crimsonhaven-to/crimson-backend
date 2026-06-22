@@ -13,10 +13,12 @@ from .cinemabz import (
 )
 from .vidsrc import VidSrcResolver
 from .febbox import FebboxResolver
+from .cache import CacheResolver
 
 # The unified list of all our resolvers.
 # MovishResolver matches on the distinct "api.movish.net" host.
 ALL_RESOLVERS = [
+    CacheResolver,  # server-side cache -> /cache_proxy (direct play); labelled per NAS target
     VidmolyResolver,
     VoeResolver,
     MovishResolver,
