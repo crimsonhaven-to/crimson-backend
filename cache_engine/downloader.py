@@ -331,8 +331,34 @@ class DownloadManager:
         logger.info(f"[cache] ready {job['label']} ({size / 1_048_576:.1f} MiB) -> {abs_path}")
 
     async def _run_ffmpeg(self, media_url: str, out_path: str) -> tuple[int, str]:
-        """Remux ``media_url`` into ``out_path`` (mp4, no re-encode). Returns
-        (returncode, last-stderr-tail)."""
+        """Remux ``media_url`` into ``out_path`` (mp4). Returns (returncode,
+        stderr-tail).
+
+        Two tiers: first a pure stream copy (``-c copy``, no re-encode — the fast,
+        cheap path that works for the typical AAC-audio source). If that fails to
+        mux — overwhelmingly because the source's audio codec has no mp4 tag, i.e.
+        AC-3 / E-AC-3 / MP2 tracks that German/other **dub** sources ship while the
+        Japanese **sub** versions (AAC) don't — we retry copying the *video* but
+        transcoding only the *audio* to AAC. Video (the expensive, bulky stream) is
+        never re-encoded."""
+        rc, tail = await self._ffmpeg_attempt(media_url, out_path, reencode_audio=False)
+        if rc == 0:
+            return rc, tail
+        # The mp4 muxer rejecting an un-taggable audio codec surfaces as
+        # AVERROR(EINVAL) (exit 234) / "Error opening output files". Re-encoding
+        # just the audio to AAC is the cheap, reliable fix; only worth a second
+        # pass, not a probe, since the copy path covers the common case.
+        logger.info(f"[cache] copy-mux failed (rc={rc}); retrying with audio re-encode")
+        return await self._ffmpeg_attempt(media_url, out_path, reencode_audio=True)
+
+    async def _ffmpeg_attempt(
+        self, media_url: str, out_path: str, *, reencode_audio: bool
+    ) -> tuple[int, str]:
+        codec_args = (
+            ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+            if reencode_audio
+            else ["-c", "copy"]
+        )
         args = [
             "ffmpeg",
             "-nostdin",
@@ -343,7 +369,7 @@ class DownloadManager:
             "-allowed_extensions", "ALL",
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
             "-i", media_url,
-            "-c", "copy",
+            *codec_args,
             "-movflags", "+faststart",
             "-f", "mp4",
             out_path,
@@ -359,8 +385,11 @@ class DownloadManager:
             proc.kill()
             await proc.wait()
             return 124, f"timed out after {DOWNLOAD_TIMEOUT}s"
+        # Keep the last few stderr lines, not just one: the actionable mp4 error
+        # ("Could not find tag for codec …") prints above the generic trailing
+        # "Error opening output files" line.
         tail = (err or b"").decode("utf-8", errors="replace").strip().splitlines()
-        return proc.returncode, (tail[-1] if tail else "")
+        return proc.returncode, " | ".join(tail[-4:]) if tail else ""
 
 
 def _unlink_quiet(path: str) -> None:
