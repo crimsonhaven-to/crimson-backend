@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.4.0"
+VERSION = "6.4.1"
 
 #! TODO:
 #! - Support for the local source which lets admins add a NAS-location directly from the admin dashboard (to keep everything stateless, no stupid container mounts)  [DONE — local_engine]
@@ -1976,10 +1976,12 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
                         if stream["url"] in seen_urls:
                             continue
                         seen_urls.add(stream["url"])
-                    # Server-side cache: when enabled, kick off a background full
-                    # download of this stream to the NAS (self-filters + dedupes;
-                    # never raises into the watch path).
-                    await cache_manager.maybe_enqueue(
+                    # Server-side cache: don't download on resolve (that always
+                    # caches whichever source resolves fastest, not the one the
+                    # viewer picks). Instead stamp cacheable streams with a signed
+                    # ticket; the player redeems it via /cache/confirm after ~10s of
+                    # actual playback, and only then is the download enqueued.
+                    stream["cacheTicket"] = await cache_manager.mint_ticket(
                         stream,
                         tmdb_id=tmdb_id,
                         season_number=season_number,
@@ -2006,14 +2008,19 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
             if stream is None:  # sentinel: all scrapers finished
                 break
             count += 1
-            yield _ndjson({
+            line = {
                 "type": "stream",
                 "source": stream["source"],
                 "streamType": stream["type"],
                 "url": stream["url"],
                 "language": stream.get("language"),
                 "subtitles": stream.get("subtitles"),
-            })
+            }
+            # Only present on cacheable streams (when caching is enabled); the
+            # player echoes it back to /cache/confirm after a few seconds of play.
+            if stream.get("cacheTicket"):
+                line["cacheTicket"] = stream["cacheTicket"]
+            yield _ndjson(line)
         yield _ndjson({"type": "done", "count": count})
     finally:
         # If the client disconnects mid-stream the generator is closed here —
@@ -2046,6 +2053,26 @@ async def get_watch_links(request: Request, tmdb_id: int, season_number: int, ep
         media_type="application/x-ndjson",
         headers=_STREAM_HEADERS,
     )
+
+
+@app.post("/cache/confirm")
+@limiter.limit("120/minute")
+async def confirm_cache(request: Request):
+    """Player calls this once the viewer has actually watched a source for a few
+    seconds, passing back the ``cacheTicket`` that source carried. Only then is
+    that exact stream enqueued for server-side caching — so we cache the source
+    the viewer *chose* (its quality + language), not whichever resolved fastest.
+
+    The ticket is HMAC-signed by ``/watch``, so no arbitrary URL can be injected
+    into the downloader. Behind the login wall; always 200 so it never leaks
+    whether caching is on or whether the episode was already cached."""
+    try:
+        body = await request.json()
+        ticket = (body or {}).get("ticket") or ""
+    except Exception:
+        ticket = ""
+    accepted = await cache_manager.confirm_ticket(ticket) if ticket else False
+    return {"ok": bool(accepted)}
 
 
 @app.get("/anilist/{anilist_id}")
