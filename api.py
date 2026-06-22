@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.2.0"
+VERSION = "6.3.0"
 
 #! TODO:
 #! - Support for the local source which lets admins add a NAS-location directly from the admin dashboard (to keep everything stateless, no stupid container mounts)  [DONE — local_engine]
