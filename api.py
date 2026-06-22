@@ -36,6 +36,12 @@ from local_engine.fs import (
     media_type_for as local_media_type,
     is_configured as local_is_configured,
 )
+from cache_engine.db import CacheStore
+from cache_engine.fs import (
+    safe_resolve as cache_safe_resolve,
+    media_type_for as cache_media_type,
+)
+from cache_engine.downloader import manager as cache_manager
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
@@ -58,12 +64,21 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.2.0"
+VERSION = "6.3.0"
+
+#! TODO:
+#! - Support for the local source which lets admins add a NAS-location directly from the admin dashboard (to keep everything stateless, no stupid container mounts)  [DONE — local_engine]
+#  - Local Cache: Download every streamed episode onto a NAS-Storage, add a database entry and then play it from local Storage in the future. Requires a shitload of storage.  [DONE — cache_engine: admin-toggled, ffmpeg remux to mp4, language-tagged, served as a named source]
 
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
 # directly via their own LocalSourceStore (the enabled-roots cache is class-wide).
 local_source_store = LocalSourceStore()
+
+# Server-side video cache (downloads played episodes to a NAS target and replays
+# them as a named source). Schema-init'd + download manager started in lifespan;
+# the scraper/resolver/proxy read enabled targets via their own CacheStore.
+cache_store = CacheStore()
 
 
 def _utcnow_iso() -> str:
@@ -209,6 +224,7 @@ async def lifespan(app: FastAPI):
     account_store.init_db()  # account tables (untouched by mapping resyncs)
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
     local_source_store.init_db()  # admin-managed local media sources (resync-safe)
+    cache_store.init_db()  # server-side video cache tables (resync-safe)
 
     # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
     # that already exist). Lets the operator reach the /admin dashboard without
@@ -314,10 +330,16 @@ async def lifespan(app: FastAPI):
     logger.info("Background scheduler started")
     app.state.scheduler = scheduler
 
+    # Server-side video-cache download manager (background ffmpeg workers). Runs on
+    # every replica; the DB claim (CacheStore.claim_download) makes sure only one
+    # replica actually downloads any given episode.
+    await cache_manager.start()
+
     yield
 
     # Shutdown
     logger.info("Shutting down...")
+    await cache_manager.stop()
     if getattr(app.state, 'scheduler', None) is not None:
         app.state.scheduler.shutdown()
     if _http_client is not None:
@@ -368,6 +390,7 @@ _PUBLIC_PREFIXES = (
     "/febbox_proxy",
     "/animesuge_proxy",
     "/jellyfin_proxy",
+    "/cache_proxy",
     "/docs",
 )
 
@@ -1480,8 +1503,12 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                 # dict {"url", "subtitles"} when it also has external subtitle
                 # tracks (ShowBox/Febbox). Normalise to (url, subtitles).
                 subtitles = None
+                source_override = None
                 if isinstance(resolved, dict):
                     subtitles = resolved.get("subtitles") or None
+                    # A resolver may override the display label per-stream (the
+                    # Cache source labels each stream with its NAS target's name).
+                    source_override = resolved.get("source") or None
                     direct_video_url = resolved.get("url")
                 else:
                     direct_video_url = resolved
@@ -1509,20 +1536,21 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                     abs_url = direct_video_url
                     if is_proxy_path and base_url:
                         abs_url = base_url.rstrip("/") + direct_video_url
+                    source_label = source_override or matched_resolver.source_name
 
                     if "_proxy/h/" in direct_video_url or direct_video_url.startswith("/player"):
                         # Backend-hosted player page (Movish player-proxy, or our
                         # /player wrapping a Jellyfin/PlayIMDb/AnimeSuge stream):
                         # the frontend just iframes it.
                         resolved_streams.append({
-                            "source": matched_resolver.source_name,
+                            "source": source_label,
                             "type": "iframe",
                             "url": abs_url
                         })
                     else:
                         stream_type = "hls" if "m3u8" in direct_video_url.lower() else "mp4"
                         stream_obj = {
-                            "source": matched_resolver.source_name,
+                            "source": source_label,
                             "type": stream_type,
                             "url": abs_url
                         }
@@ -1948,6 +1976,16 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
                         if stream["url"] in seen_urls:
                             continue
                         seen_urls.add(stream["url"])
+                    # Server-side cache: when enabled, kick off a background full
+                    # download of this stream to the NAS (self-filters + dedupes;
+                    # never raises into the watch path).
+                    await cache_manager.maybe_enqueue(
+                        stream,
+                        tmdb_id=tmdb_id,
+                        season_number=season_number,
+                        episode_number=episode_number,
+                        anilist_id=anilist_id,
+                    )
                     await queue.put(stream)
         except Exception as e:
             logger.error(f"Streaming scraper error for {scraper_class.__name__}: {e}")
@@ -2427,6 +2465,21 @@ async def local_proxy(token: str):
     if not real_path:
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(real_path, media_type=local_media_type(real_path))
+
+
+@app.get("/cache_proxy/{token}")
+async def cache_proxy(token: str):
+    """Stream a server-side-cached episode straight off the NAS.
+
+    ``token`` is an opaque base64url of the cached file's absolute path.
+    ``cache_safe_resolve`` maps it back to a real file ONLY when it currently
+    lives inside an *enabled* cache target (traversal/symlink escapes / disabled
+    targets all 404), re-checked per request. FileResponse handles Range so the
+    player can seek. Mirrors /local_proxy."""
+    real_path = await run_in_threadpool(cache_safe_resolve, token)
+    if not real_path:
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(real_path, media_type=cache_media_type(real_path))
 
 
 # --- BACKEND-HOSTED PLAYER (Crimson-themed hls.js/mp4 player) ---

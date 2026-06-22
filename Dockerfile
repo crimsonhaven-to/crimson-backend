@@ -7,10 +7,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Install system dependencies required by lxml and other native packages.
+# ffmpeg powers the server-side video cache (remuxes played HLS/mp4 streams to a
+# single .mp4 on the NAS — see cache_engine/).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libxml2 \
     libxslt1.1 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies first (better layer caching).
@@ -29,6 +32,7 @@ COPY account_engine ./account_engine
 COPY supporters_engine ./supporters_engine
 COPY discord_bot ./discord_bot
 COPY local_engine ./local_engine
+COPY cache_engine ./cache_engine
 COPY changelog_engine ./changelog_engine
 
 # Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
