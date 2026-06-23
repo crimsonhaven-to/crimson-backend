@@ -267,6 +267,101 @@ services:
     networks:
       - crimson_net
 
+  # --- Old-image janitor (global, one-shot per release) ----------------------
+  # Swarm keeps the previously-deployed image on every node so it can roll back
+  # instantly, and it never cleans the one before that — so each release leaves
+  # another full backend image (~hundreds of MB) stranded on disk forever. Over
+  # dozens of releases that grows into tens of GB of dead images per node.
+  #
+  # This service reclaims it WITHOUT breaking rollback. It is `mode: global`, so
+  # Swarm runs exactly one task per node — including nodes that don't run `api`,
+  # which may still hold images from past schedulings. On each node it:
+  #   1. lists the locally-present release tags (vX.Y.Z) of our image,
+  #   2. version-sorts them and KEEPS the newest 3 (this release + 2 to roll back
+  #      to — well past Swarm's single-step rollback target),
+  #   3. `docker image rm` (NOT `-f`) every older one. Un-forced removal is the
+  #      safety net: Docker refuses to delete an image any container — running OR
+  #      a draining/old rollback task — still references, so "not used anymore"
+  #      is enforced by the daemon, not guessed by us. Refusals are logged, not
+  #      fatal, and that image is simply retried on the next release.
+  # `:dev`, `:dev-<sha>`, `:latest` and `:buildcache` never match the vX.Y.Z
+  # filter, so they're untouched. The image stays in GHCR regardless, so even a
+  # pruned release can be re-pulled if you ever force a deeper rollback.
+  #
+  # It runs once and exits (restart_policy condition: none) — a batch janitor,
+  # not a daemon, so a completed 0/0 task count is expected and healthy. Because
+  # PRUNE_RELEASE is pinned to the new image ref, the service spec changes every
+  # release, which is what makes `docker stack deploy` re-schedule this one-shot
+  # task across all nodes. It mounts the host Docker socket (root-equivalent on
+  # that node) — that's required to talk to the daemon and is standard for a
+  # cluster maintenance task; it touches only our own repo's old tags.
+  pruner:
+    image: docker:28-cli
+    # POSIX sh on docker:cli. Self-contained: each node derives its own keep-set
+    # from what it actually has on disk, so no version list needs to be passed in.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        IMAGE="ghcr.io/crimsonhaven-to/crimson-backend"
+        KEEP=3
+        echo "[pruner] $(hostname): keeping newest ${KEEP} release tags of ${IMAGE}"
+        # Numeric key sort (newest first) instead of `sort -V`, which busybox
+        # (docker:cli is Alpine-based) doesn't reliably ship — strip the leading
+        # v, sort major/minor/patch numerically so v1.10.0 outranks v1.9.0, re-add.
+        tags="$(docker image ls --format '{{.Tag}}' "$IMAGE" 2>/dev/null \
+                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                  | sed 's/^v//' | sort -t. -k1,1nr -k2,2nr -k3,3nr \
+                  | sed 's/^/v/' || true)"
+        if [ -z "$tags" ]; then
+          echo "[pruner] no vX.Y.Z release images present — nothing to do"; exit 0
+        fi
+        echo "[pruner] present (newest first):"; echo "$tags" | sed 's/^/[pruner]   /'
+        old="$(echo "$tags" | tail -n +$((KEEP + 1)))"
+        if [ -z "$old" ]; then
+          echo "[pruner] <= ${KEEP} release images, nothing to remove"; exit 0
+        fi
+        for t in $old; do
+          # Un-forced: the daemon refuses if any container still references it,
+          # which protects the live + draining rollback targets automatically.
+          if docker image rm "${IMAGE}:${t}" >/dev/null 2>&1; then
+            echo "[pruner] removed   ${IMAGE}:${t}"
+          else
+            echo "[pruner] kept (in use / gone) ${IMAGE}:${t}"
+          fi
+        done
+        # Sweep dangling (untagged) layers left behind when a tag was overwritten;
+        # without -a this only touches unreferenced images, never tagged ones.
+        docker image prune -f >/dev/null 2>&1 || true
+        echo "[pruner] done"
+
+    environment:
+      # Pinned to the rolled-out image ref so the spec — and thus the one-shot
+      # task — changes on every release, re-triggering the prune fleet-wide.
+      - PRUNE_RELEASE=${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+
+    # Talk to the node's own daemon to list/remove its local images.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    # Batch job, not a server — it never binds a port, so no healthcheck.
+    healthcheck:
+      test: ["NONE"]
+
+    deploy:
+      mode: global
+      restart_policy:
+        # Run once per (re)deploy and stop. Don't relaunch on exit — a failed
+        # pass is harmless and simply retried at the next release.
+        condition: none
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+        reservations:
+          cpus: "0.01"
+          memory: 16M
+
 networks:
   crimson_net:
     driver: overlay
