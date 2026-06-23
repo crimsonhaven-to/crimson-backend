@@ -129,6 +129,14 @@ class CacheStore:
                 "CREATE INDEX IF NOT EXISTS cached_episodes_lookup "
                 "ON cached_episodes (tmdb_id, season_number, episode_number, status)"
             )
+            # The resolved, signed stream URL the cache-worker feeds ffmpeg. Stored
+            # on the row so the download can run out-of-process (in the cache-worker
+            # service) instead of in the api replica that handled /cache/confirm —
+            # the DB row IS the job queue now. Added via ALTER for DBs created before
+            # the worker split.
+            conn.execute(
+                "ALTER TABLE cached_episodes ADD COLUMN IF NOT EXISTS media_url TEXT"
+            )
 
     # ----------------------------------------------------------- settings
     def get_enabled(self) -> bool:
@@ -315,29 +323,34 @@ class CacheStore:
         source_origin: str,
         target_id: int,
         rel_path: str,
+        media_url: str,
         container: str = "mp4",
     ) -> Optional[dict]:
         """Atomically reserve a download slot for this (tmdb,season,episode,language).
 
-        Inserts a ``pending`` row, or — if a row already exists but previously
-        ``failed`` — flips it back to ``pending`` for a retry. Returns the row when
-        THIS caller won the slot (so it should run the download), or None when a
-        ``pending``/``downloading``/``ready`` row already exists (someone else owns
-        it, possibly another replica — the shared unique constraint makes this the
-        cross-replica dedup point)."""
+        Inserts a ``pending`` row (carrying ``media_url`` — the resolved, signed
+        stream the cache-worker will hand ffmpeg), or — if a row already exists but
+        previously ``failed`` — flips it back to ``pending`` for a retry. Returns the
+        row when THIS caller won the slot, or None when a ``pending``/``downloading``/
+        ``ready`` row already exists (someone else owns it, possibly another replica —
+        the shared unique constraint makes this the cross-replica dedup point).
+
+        The caller does NOT download here; the dedicated cache-worker service polls
+        for ``pending`` rows (see :meth:`fetch_pending` / :meth:`begin_download`)."""
         now = _now_iso()
         with get_connection() as conn:
             return conn.execute(
                 f"""
                 INSERT INTO cached_episodes
                     (target_id, tmdb_id, season_number, episode_number, anilist_id,
-                     language, source_origin, rel_path, container, status, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     language, source_origin, rel_path, media_url, container, status, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (tmdb_id, season_number, episode_number, language)
                 DO UPDATE SET
                     status = EXCLUDED.status,
                     target_id = EXCLUDED.target_id,
                     rel_path = EXCLUDED.rel_path,
+                    media_url = EXCLUDED.media_url,
                     source_origin = EXCLUDED.source_origin,
                     anilist_id = EXCLUDED.anilist_id,
                     container = EXCLUDED.container,
@@ -349,17 +362,43 @@ class CacheStore:
                 """,
                 (
                     target_id, tmdb_id, season_number, episode_number, anilist_id,
-                    language, source_origin, rel_path, container, STATUS_PENDING, now, now,
+                    language, source_origin, rel_path, media_url, container, STATUS_PENDING, now, now,
                     STATUS_FAILED,
                 ),
             ).fetchone()
 
-    def mark_downloading(self, entry_id: int) -> None:
+    def fetch_pending(self, limit: int = 8) -> List[dict]:
+        """Oldest ``pending`` download rows, joined to their still-enabled target so
+        the worker knows the NAS root to write under and the URL to pull. Rows whose
+        target was disabled/removed drop out via the JOIN (a later restart's
+        ``reset_stale_jobs`` tidies them). The cache-worker's poll loop drains this."""
         with get_connection() as conn:
-            conn.execute(
-                "UPDATE cached_episodes SET status = %s, updated_at = %s WHERE id = %s",
-                (STATUS_DOWNLOADING, _now_iso(), entry_id),
-            )
+            return conn.execute(
+                """
+                SELECT ce.id, ce.tmdb_id, ce.season_number, ce.episode_number,
+                       ce.language, ce.source_origin, ce.rel_path, ce.media_url,
+                       ct.path AS target_path
+                FROM cached_episodes ce
+                JOIN cache_targets ct ON ct.id = ce.target_id AND ct.enabled = TRUE
+                WHERE ce.status = %s
+                ORDER BY ce.created_at, ce.id
+                LIMIT %s
+                """,
+                (STATUS_PENDING, limit),
+            ).fetchall()
+
+    def begin_download(self, entry_id: int) -> bool:
+        """Atomically transition a row ``pending`` -> ``downloading``. Returns True
+        if THIS caller won it (it was still pending), False if another worker/slot
+        already claimed it. This is the cross-worker claim point now that downloads
+        run in the cache-worker service, separate from the watch/confirm path."""
+        with get_connection() as conn:
+            row = conn.execute(
+                "UPDATE cached_episodes SET status = %s, updated_at = %s "
+                "WHERE id = %s AND status = %s RETURNING id",
+                (STATUS_DOWNLOADING, _now_iso(), entry_id, STATUS_PENDING),
+            ).fetchone()
+        return row is not None
 
     def mark_ready(self, entry_id: int, file_size: int) -> None:
         with get_connection() as conn:
@@ -383,19 +422,27 @@ class CacheStore:
             ).fetchone()
 
     def reset_stale_jobs(self) -> int:
-        """On startup, mark any pending/downloading rows as failed — they belong to
-        a previous process that died mid-download (their in-memory queue is gone).
-        Marked failed (not deleted) so the next play re-triggers them. Returns the
-        number reset."""
+        """On worker startup, requeue any orphaned in-progress download by flipping
+        it ``downloading`` -> ``pending`` so this worker simply picks it up again. A
+        row stuck in ``downloading`` belongs to a previous worker that died mid-remux
+        (a deploy that outran ``stop_grace_period``, a crash); the old "interrupted by
+        restart" failure is gone — it auto-retries instead. Returns the number
+        requeued.
+
+        ``pending`` rows are deliberately left untouched: they're durable claims the
+        api's ``/cache/confirm`` wrote that no worker has started yet — the poll loop
+        will drain them. Safe to reset ``downloading`` here because the cache-worker
+        deploys stop-first (never two at once), so at startup any ``downloading`` row
+        is genuinely orphaned, not actively held by a peer."""
         with get_connection() as conn:
             rows = conn.execute(
                 """
                 UPDATE cached_episodes
-                SET status = %s, error = 'interrupted by restart', updated_at = %s
-                WHERE status IN (%s, %s)
+                SET status = %s, error = NULL, updated_at = %s
+                WHERE status = %s
                 RETURNING id
                 """,
-                (STATUS_FAILED, _now_iso(), STATUS_PENDING, STATUS_DOWNLOADING),
+                (STATUS_PENDING, _now_iso(), STATUS_DOWNLOADING),
             ).fetchall()
         return len(rows)
 
