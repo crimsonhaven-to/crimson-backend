@@ -17,6 +17,13 @@ class BaseAnimeScraper(abc.ABC):
     # gets a response. "chrome" tracks a recent stable Chrome build.
     _IMPERSONATE = "chrome"
 
+    # Whether this scraper can resolve a standalone MOVIE (a TMDB *movie* id, no
+    # season/episode). Defaults to False so the title/episode-oriented anime
+    # scrapers are simply skipped for movie requests instead of building a bogus
+    # season-1/episode-1 URL. The TMDB-keyed movie sources opt in by overriding
+    # this to True and honouring media_ctx["media_type"] == "movie".
+    SUPPORTS_MOVIES = False
+
     def __init__(self):
         # Every provider gets its own browser-impersonating async HTTP client.
         # We deliberately don't set a User-Agent: ``impersonate`` already installs

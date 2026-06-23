@@ -163,18 +163,34 @@ def require_user(authorization: Optional[str] = Header(None)) -> dict:
     return user
 
 
-def _favorite_item_key(tmdb_id: Optional[int], anilist_id: Optional[int]) -> str:
-    """Stable dedup key for a show-level favorite (AniList id preferred)."""
+def _favorite_item_key(
+    tmdb_id: Optional[int], anilist_id: Optional[int], media_type: Optional[str] = None
+) -> str:
+    """Stable dedup key for a show-level favorite (AniList id preferred).
+
+    A general MOVIE gets its own ``movie:{tmdb_id}`` namespace: TMDB *movie* and
+    *tv* ids share the same numeric space, so a movie and a TV show could collide
+    on ``tmdb:{id}`` otherwise. Anime (anilist) and TV/show keys are unchanged, so
+    existing favorites keep their exact keys (no migration)."""
     if anilist_id is not None:
         return f"anilist:{anilist_id}"
+    if media_type == "movie":
+        return f"movie:{tmdb_id}"
     return f"tmdb:{tmdb_id}"
 
 
 def _progress_item_key(
     tmdb_id: Optional[int], anilist_id: Optional[int],
     season_number: Optional[int], episode_number: Optional[int],
+    media_type: Optional[str] = None,
 ) -> str:
-    """Stable dedup key for a single episode's progress."""
+    """Stable dedup key for a single episode's progress (or a whole movie).
+
+    Movies are namespaced ``movie:{tmdb_id}`` (no season/episode — a movie is one
+    item) for the same id-collision reason as _favorite_item_key. TV/anime keys are
+    byte-identical to before."""
+    if anilist_id is None and media_type == "movie":
+        return f"movie:{tmdb_id}"
     base = f"anilist:{anilist_id}" if anilist_id is not None else f"tmdb:{tmdb_id}"
     if season_number is not None:
         base += f":s{season_number}"
@@ -248,6 +264,9 @@ class ProgressIn(BaseModel):
     status: Optional[str] = None  # 'in_progress' | 'completed' (auto if omitted)
     title: Optional[str] = None
     poster: Optional[str] = None
+    # 'movie' namespaces the progress key (and lets the frontend route history rows
+    # back to /watch-movie). Optional, so existing TV/anime clients are unaffected.
+    media_type: Optional[str] = None
 
     @model_validator(mode="after")
     def _need_an_id(self):
@@ -721,7 +740,7 @@ async def import_favorites(
         favs.append((
             list_name,
             {
-                "item_key": _favorite_item_key(tmdb_id, anilist_id),
+                "item_key": _favorite_item_key(tmdb_id, anilist_id, _clean_str(r.get("media_type"))),
                 "tmdb_id": tmdb_id,
                 "anilist_id": anilist_id,
                 "season_number": _coerce_int(r.get("season_number")),
@@ -752,7 +771,7 @@ async def import_favorites(
 @router.post("/account/favorites")
 @limiter.limit("60/minute")
 async def add_favorite(request: Request, body: FavoriteIn, user: dict = Depends(require_user)):
-    item_key = _favorite_item_key(body.tmdb_id, body.anilist_id)
+    item_key = _favorite_item_key(body.tmdb_id, body.anilist_id, body.media_type)
     fav = {"item_key": item_key, **body.model_dump(exclude={"list_name"})}
     try:
         saved = store.upsert_favorite(user["user_id"], fav, list_name=body.list_name)
@@ -767,6 +786,7 @@ async def remove_favorite(
     tmdb_id: Optional[int] = Query(None),
     anilist_id: Optional[int] = Query(None),
     item_key: Optional[str] = Query(None),
+    media_type: Optional[str] = Query(None, description="'movie' to target the movie namespace"),
     list_name: Optional[str] = Query(None, description="Remove from one list; omit for all lists"),
 ):
     """Remove a favorite by item_key, or by tmdb_id / anilist_id.
@@ -777,7 +797,7 @@ async def remove_favorite(
     if not item_key:
         if tmdb_id is None and anilist_id is None:
             raise HTTPException(status_code=400, detail="Provide item_key, tmdb_id or anilist_id")
-        item_key = _favorite_item_key(tmdb_id, anilist_id)
+        item_key = _favorite_item_key(tmdb_id, anilist_id, media_type)
     removed = store.remove_favorite(user["user_id"], item_key, list_name)
     if not removed:
         raise HTTPException(status_code=404, detail="Favorite not found")
@@ -794,10 +814,12 @@ def _dedup_by_show(rows: List[dict], limit: Optional[int] = None) -> List[dict]:
     seen: set[str] = set()
     out: List[dict] = []
     for row in rows:
-        show_key = (
-            f"anilist:{row['anilist_id']}" if row.get("anilist_id") is not None
-            else f"tmdb:{row['tmdb_id']}"
-        )
+        if row.get("anilist_id") is not None:
+            show_key = f"anilist:{row['anilist_id']}"
+        elif row.get("media_type") == "movie":
+            show_key = f"movie:{row['tmdb_id']}"
+        else:
+            show_key = f"tmdb:{row['tmdb_id']}"
         if show_key in seen:
             continue
         seen.add(show_key)
@@ -830,7 +852,8 @@ async def get_progress(
 @limiter.limit("60/minute")
 async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depends(require_user)):
     item_key = _progress_item_key(
-        body.tmdb_id, body.anilist_id, body.season_number, body.episode_number
+        body.tmdb_id, body.anilist_id, body.season_number, body.episode_number,
+        body.media_type,
     )
     payload = body.model_dump()
     payload["status"] = _resolve_status(body)
@@ -877,11 +900,12 @@ async def remove_progress(
     anilist_id: Optional[int] = Query(None),
     season_number: Optional[int] = Query(None),
     episode_number: Optional[int] = Query(None),
+    media_type: Optional[str] = Query(None, description="'movie' to target the movie namespace"),
 ):
     if not item_key:
         if tmdb_id is None and anilist_id is None:
             raise HTTPException(status_code=400, detail="Provide item_key, or tmdb_id/anilist_id (+season/episode)")
-        item_key = _progress_item_key(tmdb_id, anilist_id, season_number, episode_number)
+        item_key = _progress_item_key(tmdb_id, anilist_id, season_number, episode_number, media_type)
     removed = store.remove_progress(user["user_id"], item_key)
     if not removed:
         raise HTTPException(status_code=404, detail="Progress entry not found")

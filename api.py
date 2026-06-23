@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "6.4.3"
+VERSION = "7.0.0"
 
 #! TODO:
 #! - Support for the local source which lets admins add a NAS-location directly from the admin dashboard (to keep everything stateless, no stupid container mounts)  [DONE — local_engine]
@@ -694,6 +694,47 @@ def upsert_show_info(show: Dict) -> None:
     except Exception as e:
         logger.error(f"Database error in upsert_show_info: {e}")
 
+def get_movie_info(tmdb_id: int) -> Dict:
+    """Gets movie info from the tmdb_movies table (TMDB *movie* id keyed)."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM tmdb_movies WHERE tmdb_id = %s", (tmdb_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else {}
+    except Exception as e:
+        logger.error(f"Database error in get_movie_info: {e}")
+        return {}
+
+def upsert_movie_info(movie: Dict) -> None:
+    """Persist TMDB movie details fetched on demand (lazy population of
+    tmdb_movies), mirroring upsert_show_info. Used as the TMDB-down fallback for
+    /movie-overview + /watch/movie (a movie has no AniList entry to fall back on)."""
+    if not movie.get("tmdb_id"):
+        return
+    try:
+        def _write():
+            with get_db_connection() as conn:
+                conn.execute("""
+                    INSERT INTO tmdb_movies
+                        (tmdb_id, title, overview, poster_path, backdrop_path, release_date)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (tmdb_id) DO UPDATE SET
+                        title=EXCLUDED.title, overview=EXCLUDED.overview,
+                        poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
+                        release_date=EXCLUDED.release_date
+                """, (
+                    movie.get("tmdb_id"),
+                    movie.get("title"),
+                    movie.get("overview"),
+                    movie.get("poster_path"),
+                    movie.get("backdrop_path"),
+                    movie.get("release_date"),
+                ))
+        _write()
+    except Exception as e:
+        logger.error(f"Database error in upsert_movie_info: {e}")
+
 def get_catalogue_items() -> List[Dict]:
     """Build the full anime catalogue from the local DB only (no external calls).
 
@@ -931,6 +972,43 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
 
     upsert_show_info({k: result.get(k) for k in
                       ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "first_air_date")})
+    await set_cached_response(cache_key, result)
+    return result
+
+async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
+    """Fetch a TMDB *movie* (the /movie/{id} entity — a different id space from
+    /tv). Cached, and persists core fields into tmdb_movies on first fetch so the
+    overview/watch pages can degrade gracefully when TMDB is unavailable.
+
+    Movies have no seasons/episodes; the TMDB-keyed sources play them off the bare
+    movie id, so this is all the metadata the movie surface needs."""
+    cache_key = f"tmdb:movie:{TMDB_CACHE_VERSION}:{tmdb_id}"
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        return cached_data
+
+    data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/movie/{tmdb_id}")
+    if not data:
+        return {}
+
+    result = {
+        "tmdb_id": tmdb_id,
+        "title": data.get("title") or data.get("original_title"),
+        "overview": data.get("overview"),
+        "poster_path": data.get("poster_path"),
+        "backdrop_path": data.get("backdrop_path"),
+        "poster": _tmdb_img(data.get("poster_path")),
+        "backdrop": _tmdb_img(data.get("backdrop_path"), "original"),
+        "release_date": data.get("release_date"),
+        "original_title": data.get("original_title"),
+        "runtime": data.get("runtime"),
+        "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
+        "vote_average": data.get("vote_average"),
+        "status": data.get("status"),
+    }
+
+    upsert_movie_info({k: result.get(k) for k in
+                       ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "release_date")})
     await set_cached_response(cache_key, result)
     return result
 
@@ -1391,6 +1469,104 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
     _local_set(cache_key, trending_list)
     return trending_list
 
+# --- GENERAL (NON-ANIME) MOVIES (secondary, additive) -----------------------
+# The movie twin of the non-anime SHOWS surface above. Movies are a distinct TMDB
+# entity (/movie/{id}, no seasons/episodes), so they get their own discovery
+# helpers + a dedicated /watch/movie route. They are served by the TMDB-keyed
+# sources (PlayIMDb, Cinema.bz, Movish, ShowBox, Jellyfin), whose resolvers already
+# speak /movie/{tmdb}; the title-based anime scrapers are skipped for movies. Anime
+# stays priority 1 and is left completely untouched.
+
+def _looks_like_anime_movie(item: Dict) -> bool:
+    """Heuristic twin of _looks_like_anime for movie results: Japanese Animation.
+    Keeps anime films out of the general-movie surface."""
+    genres = item.get("genre_ids") or []
+    return 16 in genres and item.get("original_language") == "ja"
+
+
+def _movie_item(item: Dict) -> Dict:
+    """Shape one TMDB movie search/discover result as a general-movie entry. Keyed
+    by tmdb_id (no anilist_id) and tagged ``kind: "movie"`` so the frontend routes
+    it through the movie pages and the account layer namespaces its key."""
+    return {
+        "title": item.get("title") or item.get("original_title"),
+        "tmdb_id": item.get("id"),
+        "anilist_id": None,
+        "kind": "movie",
+        "poster": _tmdb_img(item.get("poster_path")) if item.get("poster_path") else None,
+        "year": item.get("release_date", "")[:4] if item.get("release_date") else None,
+        "vote_average": item.get("vote_average"),
+    }
+
+
+async def fetch_tmdb_movie_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
+    """Search TMDB for general movies, excluding Japanese animation (anime films
+    stay on the anime surface). Posterless rows are dropped for a clean grid."""
+    cache_key = f"tmdb:search_movies:{query.lower()}"
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        return cached_data.get("results", [])
+
+    url = "https://api.themoviedb.org/3/search/movie"
+    data = await fetch_with_retry(client, url, params={"query": query, "include_adult": "false"})
+    if not data:
+        return []
+
+    results: List[Dict] = []
+    for item in data.get("results", []):
+        if not item.get("id") or _looks_like_anime_movie(item):
+            continue
+        if not item.get("poster_path"):
+            continue
+        results.append(_movie_item(item))
+        if len(results) >= limit:
+            break
+
+    await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+    return results
+
+
+async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> List[Dict]:
+    """Fetch trending general movies from TMDB (popular, excluding animation)."""
+    cache_key = "tmdb:trending_movies"
+
+    local = _local_get(cache_key)
+    if local is not None:
+        return local
+
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        results = cached_data.get("results", [])
+        _local_set(cache_key, results)
+        return results
+
+    url = "https://api.themoviedb.org/3/discover/movie"
+    params = {
+        "page": 1,
+        "include_adult": "false",
+        "language": "en-US",
+        "without_genres": "16",          # exclude Animation (keeps anime films out)
+        "sort_by": "popularity.desc",
+        "vote_count.gte": 300,           # quality floor
+    }
+    data = await fetch_with_retry(client, url, params=params)
+    if not data:
+        return []
+
+    trending_list: List[Dict] = []
+    for item in data.get("results", []):
+        if not item.get("id") or _looks_like_anime_movie(item):
+            continue
+        if not item.get("poster_path"):
+            continue
+        trending_list.append(_movie_item(item))
+        if len(trending_list) >= limit:
+            break
+
+    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+    _local_set(cache_key, trending_list)
+    return trending_list
+
 # --- SCRAPER HELPER FUNCTIONS ---
 async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -> List[str]:
     """German-language titles for a TMDB show, for the German scraper sites.
@@ -1433,13 +1609,22 @@ async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -
     return titles
 
 
-async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int, anilist_data: Dict) -> List:
-    """Run one scraper through the unified search -> embeds pipeline."""
+async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int,
+                             anilist_data: Dict, media_type: str = "tv") -> List:
+    """Run one scraper through the unified search -> embeds pipeline.
+
+    ``media_type`` is "tv" (the default — every existing caller) or "movie".
+    Scrapers that don't declare ``SUPPORTS_MOVIES`` are skipped for movie requests
+    so the title/episode-oriented anime sources never build a bogus
+    season-1/episode-1 URL for a standalone film."""
+    if media_type == "movie" and not getattr(scraper_class, "SUPPORTS_MOVIES", False):
+        return []
     scraper = scraper_class()
     try:
         media_ctx = {
             "tmdb_id": tmdb_id,
             "tmdb_season": season_num,
+            "media_type": media_type,
             **anilist_data
         }
         slug = await scraper.search_anime(media_ctx)
@@ -1683,6 +1868,44 @@ async def get_trending_shows(limit: int = Query(10, ge=1, le=50, description="Nu
         logger.error(f"Trending shows error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch trending shows")
 
+# --- General (non-anime) movies (secondary surface) -------------------------
+# Parallel to /search/shows + /trending/shows, but for standalone movies. They are
+# played by /watch/movie/{tmdb_id} (movies have no season/episode) and described by
+# /movie-overview/{tmdb_id}.
+
+@app.get("/search/movies")
+async def search_movies_by_name(query_name: str = Query(..., min_length=1, description="Movie name to search")):
+    """Search for general movies by name (kind='movie', keyed by tmdb_id)."""
+    if not Config.TMDB_API_KEY:
+        raise HTTPException(status_code=500, detail="TMDB API key not configured")
+    try:
+        async with http_client() as client:
+            results = await fetch_tmdb_movie_search_results(client, query_name)
+        return {
+            "success": True,
+            "query": query_name,
+            "count": len(results),
+            "suggestions": results,
+        }
+    except Exception as e:
+        logger.error(f"Movie search error: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+@app.get("/trending/movies")
+async def get_trending_movies(limit: int = Query(10, ge=1, le=50, description="Number of results to return")):
+    """Get trending general movies."""
+    try:
+        async with http_client() as client:
+            results = await fetch_trending_movies(client, limit)
+        return {
+            "success": True,
+            "count": len(results),
+            "movies": results,
+        }
+    except Exception as e:
+        logger.error(f"Trending movies error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch trending movies")
+
 @app.get("/catalogue")
 async def get_catalogue(
     request: Request,
@@ -1873,9 +2096,14 @@ _STREAM_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
 
 async def stream_watch_response(tmdb_id: int, season_number: int, episode_number: int,
                                 anilist_id: Optional[int], fallback_title: Optional[str] = None,
-                                base_url: str = ""):
+                                base_url: str = "", media_type: str = "tv"):
     """Progressively scrape + resolve an episode, yielding NDJSON lines as each
     source is found — instead of waiting for every scraper to finish.
+
+    ``media_type`` is "tv" (every existing caller) or "movie". For a movie there's
+    no season/episode and no AniList mapping: the air-date / localized-title /
+    cache-ticket steps (all TV/episode concepts) are skipped, and only the
+    movie-capable TMDB-keyed sources run (see run_single_scraper).
 
     Emits, in order:
       * one ``{"type": "meta", ...}`` line (ids + title), flushed immediately;
@@ -1912,26 +2140,29 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
     # the client to render a "not yet aired" state instead of racing every scraper
     # only to resolve zero sources. Extras (specials/OVAs/movies) aren't in the
     # numbered-season episode list, so they have no air_date here and play normally.
-    ep_info = await _season_episode_info(tmdb_id, season_number)
-    air_date = (ep_info.get("air_dates") or {}).get(episode_number)
-    if _is_future_air_date(air_date):
-        yield _ndjson({
-            "type": "unaired",
-            "air_date": air_date,
-            "title": title,
-            "season_number": season_number,
-            "episode_number": episode_number,
-        })
-        yield _ndjson({"type": "done", "count": 0})
-        return
+    # Movies have no episode list at all — skip the check entirely.
+    if media_type != "movie":
+        ep_info = await _season_episode_info(tmdb_id, season_number)
+        air_date = (ep_info.get("air_dates") or {}).get(episode_number)
+        if _is_future_air_date(air_date):
+            yield _ndjson({
+                "type": "unaired",
+                "air_date": air_date,
+                "title": title,
+                "season_number": season_number,
+                "episode_number": episode_number,
+            })
+            yield _ndjson({"type": "done", "count": 0})
+            return
 
     # German streaming scrapers (s.to, aniworld) list many non-anime shows under
     # their German broadcast title — e.g. NCIS is "Navy CIS" on s.to — which TMDB
     # only exposes via /translations, so English-title matching alone misses them.
     # Feed the German title(s) in as extra search candidates. Only on the
     # no-AniList path: AniList-mapped anime already carry their own synonyms and
-    # that matching stays byte-identical.
-    if not anilist_id:
+    # that matching stays byte-identical. Skipped for movies (that endpoint is the
+    # TV /translations entity; the movie sources are TMDB-id keyed anyway).
+    if not anilist_id and media_type != "movie":
         try:
             async with http_client() as client:
                 german_titles = await fetch_tmdb_localized_titles(client, tmdb_id)
@@ -1956,7 +2187,8 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
     async def _work(scraper_class):
         try:
             embeds = await run_single_scraper(
-                scraper_class, tmdb_id, season_number, episode_number, media_ctx
+                scraper_class, tmdb_id, season_number, episode_number, media_ctx,
+                media_type=media_type,
             )
             for embed in embeds:
                 # Embeds are either a bare URL string or a {"url", "language"}
@@ -1981,12 +2213,16 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
                     # viewer picks). Instead stamp cacheable streams with a signed
                     # ticket; the player redeems it via /cache/confirm after ~10s of
                     # actual playback, and only then is the download enqueued.
+                    # Movies aren't cached (the cache key is TV-shaped, tmdb/season/
+                    # episode); mint_ticket owns that policy and returns None for a
+                    # movie, so no ticket is emitted (no extra branch needed here).
                     stream["cacheTicket"] = await cache_manager.mint_ticket(
                         stream,
                         tmdb_id=tmdb_id,
-                        season_number=season_number,
-                        episode_number=episode_number,
+                        season_number=season_number if season_number is not None else 0,
+                        episode_number=episode_number if episode_number is not None else 0,
                         anilist_id=anilist_id,
+                        media_type=media_type,
                     )
                     await queue.put(stream)
         except Exception as e:
@@ -2050,6 +2286,38 @@ async def get_watch_links(request: Request, tmdb_id: int, season_number: int, ep
     return StreamingResponse(
         stream_watch_response(tmdb_id, season_number, episode_number, anilist_id,
                               fallback_title, base_url=_public_base_url(request)),
+        media_type="application/x-ndjson",
+        headers=_STREAM_HEADERS,
+    )
+
+
+@app.get("/watch/movie/{tmdb_id}")
+@limiter.limit("30/minute")
+async def get_movie_watch_links(request: Request, tmdb_id: int):
+    """Streaming links for a standalone MOVIE (TMDB *movie* id), as the same
+    progressive NDJSON the TV watch route emits — one line per source. Movies have
+    no season/episode and no AniList mapping; only the movie-capable TMDB-keyed
+    sources run. Declared before /watch/{anilist_id}/{episode_number} so the literal
+    'movie' segment is matched here rather than failing that route's int parse.
+
+    The meta line carries null season_number/episode_number; the player ignores
+    them for movies."""
+    # A title helps the title-based movie source (ShowBox). Prefer the stored row,
+    # then a live TMDB fetch; never hard-fail (sources can still play off the id).
+    info = get_movie_info(tmdb_id)
+    fallback_title = info.get("title") if info else None
+    if not fallback_title:
+        try:
+            async with http_client() as client:
+                movie = await fetch_tmdb_movie(client, tmdb_id)
+            fallback_title = movie.get("title")
+        except Exception as e:
+            logger.warning(f"movie title fetch failed for {tmdb_id}: {e}")
+
+    return StreamingResponse(
+        stream_watch_response(tmdb_id, None, None, None,
+                              fallback_title, base_url=_public_base_url(request),
+                              media_type="movie"),
         media_type="application/x-ndjson",
         headers=_STREAM_HEADERS,
     )
@@ -2702,6 +2970,67 @@ async def get_show_overview(tmdb_id: int):
         # General shows carry no AniList specials/OVAs/movies mapping.
         "extras": [],
         # When TMDB was unavailable, this page was rebuilt from local data only.
+        "degraded": degraded,
+        "notice": DEGRADED_OVERVIEW_NOTICE if degraded else None,
+    }
+
+@app.get("/movie-overview/{tmdb_id}")
+async def get_movie_overview(tmdb_id: int):
+    """Aggregated overview for a standalone MOVIE, keyed by its TMDB *movie* id.
+
+    The movie twin of /show-overview: same overall response shape so the frontend
+    reuses the shared overview UI, but with no seasons (movies have none) — instead
+    a single ``play`` descriptor the page links to /watch-movie. Built purely from
+    TMDB (movies have no AniList entry); falls back to the locally-stored
+    tmdb_movies row when the live TMDB fetch fails, exactly like /show-overview.
+    """
+    async with http_client() as client:
+        movie = await fetch_tmdb_movie(client, tmdb_id)
+
+    degraded = not movie
+    if degraded:
+        stored = get_movie_info(tmdb_id)
+        if not stored:
+            raise HTTPException(status_code=404, detail="Movie not found on TMDB")
+        movie = {
+            "title": stored.get("title"),
+            "overview": stored.get("overview"),
+            "poster": _tmdb_img(stored.get("poster_path")),
+            "backdrop": _tmdb_img(stored.get("backdrop_path"), "original"),
+            "release_date": stored.get("release_date"),
+            "runtime": None,
+            "genres": [],
+            "vote_average": None,
+            "status": None,
+        }
+    year = (movie.get("release_date") or "")[:4] or None
+
+    return {
+        "success": True,
+        "kind": "movie",
+        "anilist_id": None,
+        "tmdb_id": tmdb_id,
+        "title": movie.get("title"),
+        "title_romaji": None,
+        "title_english": movie.get("title"),
+        "poster": movie.get("poster"),
+        "backdrop": movie.get("backdrop"),
+        "banner": None,
+        "description": movie.get("overview"),
+        "summary": movie.get("overview"),
+        "status": movie.get("status"),
+        "year": year,
+        # Movie-specific extras the overview UI can show if it wants to.
+        "runtime": movie.get("runtime"),
+        "genres": movie.get("genres") or [],
+        "vote_average": movie.get("vote_average"),
+        # No seasons/episodes for a movie; the page plays the single feature.
+        "total_episodes": None,
+        "total_seasons": 0,
+        "seasons": [],
+        "extras": [],
+        # The single playable item — the frontend links this to /watch-movie/{id}.
+        "play": {"tmdb_id": tmdb_id, "media_type": "movie"},
         "degraded": degraded,
         "notice": DEGRADED_OVERVIEW_NOTICE if degraded else None,
     }
