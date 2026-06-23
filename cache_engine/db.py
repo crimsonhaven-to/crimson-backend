@@ -115,6 +115,12 @@ class CacheStore:
                     error          TEXT,
                     created_at     TEXT NOT NULL,
                     updated_at     TEXT NOT NULL,
+                    -- TV-only key. tmdb_id here is a TMDB *tv* id; movie ids share
+                    -- the same numeric space, so this would collide a movie with a
+                    -- same-id show. Movies are therefore NOT cached (enforced in
+                    -- cache_engine.downloader.mint_ticket / maybe_enqueue). To allow
+                    -- movie caching, add a media_type discriminator to this UNIQUE
+                    -- key (and the lookup index + claim_download) first.
                     UNIQUE (tmdb_id, season_number, episode_number, language)
                 );
                 """

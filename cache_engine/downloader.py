@@ -167,13 +167,23 @@ class DownloadManager:
         season_number: int,
         episode_number: int,
         anilist_id: Optional[int],
+        media_type: str = "tv",
     ) -> Optional[str]:
         """If this stream is cacheable right now, return an opaque, signed ticket
         the player echoes back to ``/cache/confirm`` once the viewer has actually
         watched it — else None. Stamping (not downloading) here is what lets us
         cache the source the viewer *chose*, not whichever resolved fastest. Safe
-        to call for every resolved stream; never raises into the watch path."""
+        to call for every resolved stream; never raises into the watch path.
+
+        MOVIES ARE NOT CACHED (returns None): the cache key is
+        (tmdb_id, season, episode, language), and TMDB movie ids share that numeric
+        space with tv ids — a movie would collide with a same-id show. This is the
+        single owner of that policy; the watch path can call this for every stream
+        regardless of media type. To enable movie caching, namespace the cache key
+        (e.g. add media_type to cached_episodes' UNIQUE key) and drop this guard."""
         try:
+            if media_type == "movie":
+                return None
             if not await self._cacheable(stream):
                 return None
             return ticket.mint(
@@ -185,6 +195,7 @@ class DownloadManager:
                 season_number=season_number,
                 episode_number=episode_number,
                 anilist_id=anilist_id,
+                media_type=media_type,
             )
         except Exception as e:
             logger.error(f"mint_ticket failed: {e}")
@@ -209,6 +220,7 @@ class DownloadManager:
                 season_number=data["season_number"],
                 episode_number=data["episode_number"],
                 anilist_id=data["anilist_id"],
+                media_type=data.get("media_type") or "tv",
             )
             return True
         except Exception as e:
@@ -224,10 +236,21 @@ class DownloadManager:
         season_number: int,
         episode_number: int,
         anilist_id: Optional[int],
+        media_type: str = "tv",
     ) -> None:
         """Consider a resolved stream for caching. Safe to call for every stream —
         it self-filters and dedupes, and never raises into the watch path."""
         try:
+            # Second tripwire (mint_ticket is the first): never cache a movie. The
+            # cache key (tmdb, season, episode, language) shares its id space with
+            # tv, so a movie would collide with a same-id show. Refuse loudly until
+            # the cache key is namespaced for movies. See mint_ticket / db.py.
+            if media_type == "movie":
+                logger.warning(
+                    f"Refusing to cache movie tmdb-{tmdb_id}: cache key is TV-keyed "
+                    f"and would collide; namespace the key before enabling movie caching."
+                )
+                return
             if not await self._cacheable(stream):
                 return
 

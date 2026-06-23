@@ -19,9 +19,9 @@ name: Build and Deploy
 # which has Docker + buildx and passwordless SSH to the swarm managers.
 
 on:
-  push:
-    branches:
-      - dev
+#  push:
+#    branches:
+#      - dev
   release:
     types: [published]
 

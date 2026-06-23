@@ -153,6 +153,24 @@ class MappingDatabaseEngine:
                 """
             )
 
+            # General (non-anime) MOVIES, keyed by their TMDB *movie* id. Wholly
+            # separate from tmdb_shows (TMDB *tv* ids) — the two id spaces overlap
+            # numerically, so movies live in their own table. Lazily populated by
+            # the /movie* endpoints (fetch_tmdb_movie), exactly like tmdb_shows;
+            # the Fribb anime resync never touches it (additive, resync-safe).
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tmdb_movies (
+                    tmdb_id       INTEGER PRIMARY KEY,
+                    title         TEXT,
+                    overview      TEXT,
+                    poster_path   TEXT,
+                    backdrop_path TEXT,
+                    release_date  TEXT
+                )
+                """
+            )
+
             # One AniList id per real TMDB season (season_number >= 1).
             cursor.execute(
                 """

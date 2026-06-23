@@ -197,9 +197,13 @@ class AccountStore:
                     status           TEXT NOT NULL DEFAULT 'in_progress',
                     title            TEXT,
                     poster           TEXT,
+                    media_type       TEXT,
                     updated_at       TEXT NOT NULL,
                     PRIMARY KEY (user_id, item_key)
                 );
+                -- In-place upgrade for DBs created before movies: lets a progress row
+                -- carry 'movie' so history can route back to /watch-movie. Additive.
+                ALTER TABLE watch_progress ADD COLUMN IF NOT EXISTS media_type TEXT;
                 CREATE INDEX IF NOT EXISTS idx_progress_user ON watch_progress(user_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_progress_status ON watch_progress(user_id, status);
                 """
@@ -784,18 +788,19 @@ class AccountStore:
                 INSERT INTO watch_progress
                     (user_id, item_key, tmdb_id, anilist_id, season_number,
                      episode_number, position_seconds, duration_seconds, status,
-                     title, poster, updated_at)
+                     title, poster, media_type, updated_at)
                 VALUES (%(user_id)s, %(item_key)s, %(tmdb_id)s, %(anilist_id)s, %(season_number)s,
                         %(episode_number)s, %(position_seconds)s, %(duration_seconds)s, %(status)s,
-                        %(title)s, %(poster)s, %(updated_at)s)
+                        %(title)s, %(poster)s, %(media_type)s, %(updated_at)s)
                 ON CONFLICT(user_id, item_key) DO UPDATE SET
                     tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
                     season_number=excluded.season_number, episode_number=excluded.episode_number,
                     position_seconds=excluded.position_seconds, duration_seconds=excluded.duration_seconds,
                     status=excluded.status, title=excluded.title, poster=excluded.poster,
-                    updated_at=excluded.updated_at
+                    media_type=excluded.media_type, updated_at=excluded.updated_at
                 """,
-                {"user_id": user_id, "updated_at": _iso(_now()), **prog},
+                {"user_id": user_id, "updated_at": _iso(_now()),
+                 "media_type": None, **prog},
             )
             row = conn.execute(
                 "SELECT * FROM watch_progress WHERE user_id = %s AND item_key = %s",

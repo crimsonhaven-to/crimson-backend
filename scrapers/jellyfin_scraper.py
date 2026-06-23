@@ -225,8 +225,83 @@ class JellyfinScraper(BaseAnimeScraper):
     proxied, ad-free stream. See [[jellyfin-source]].
     """
 
+    # Jellyfin holds movies as Type "Movie" items, keyed by their TMDB *movie* id;
+    # the resolver's crimson-jellyfin:{itemId} marker is item-based, so a movie
+    # resolves exactly like an episode once we locate its item.
+    SUPPORTS_MOVIES = True
+
+    async def _search_movie(self, media_ctx: dict) -> Optional[str]:
+        """Locate a Movie item in the library by TMDB *movie* id (then title) and
+        return its crimson-jellyfin marker. media_ctx carries the movie title."""
+        if not is_configured():
+            return None
+        tmdb_id = media_ctx.get("tmdb_id")
+        try:
+            _token, uid = await _ensure_auth()
+        except Exception as e:
+            print(f"[JellyfinScraper] Auth failed: {type(e).__name__} - {e}")
+            return None
+
+        found: Optional[dict] = None
+        try:
+            if tmdb_id is not None:
+                data = await api_get(
+                    "/Items",
+                    {
+                        "userId": uid,
+                        "recursive": "true",
+                        "includeItemTypes": "Movie",
+                        "anyProviderIdEquals": f"tmdb.{tmdb_id}",
+                        "fields": "ProviderIds",
+                        "limit": 10,
+                    },
+                )
+                found = next(
+                    (it for it in (data.get("Items") or []) if _tmdb_of(it) == str(tmdb_id)),
+                    None,
+                )
+
+            if not found:
+                # Fall back to a title match (library may be tagged via another id).
+                norm_targets = {_norm(t) for t in _search_titles(media_ctx)}
+                norm_targets.discard("")
+                for term in _search_titles(media_ctx):
+                    data = await api_get(
+                        "/Items",
+                        {
+                            "userId": uid,
+                            "recursive": "true",
+                            "includeItemTypes": "Movie",
+                            "searchTerm": term,
+                            "fields": "ProviderIds",
+                            "limit": 20,
+                        },
+                    )
+                    found = next(
+                        (it for it in (data.get("Items") or []) if _norm(it.get("Name")) in norm_targets),
+                        None,
+                    )
+                    if found:
+                        break
+        except Exception as e:
+            print(f"[JellyfinScraper] Movie lookup failed: {type(e).__name__} - {e}")
+            return None
+
+        if not found or not found.get("Id"):
+            print(f"[JellyfinScraper] No movie found (tmdb={tmdb_id}).")
+            return None
+        marker = f"{EMBED_MARKER}:{found['Id']}"
+        print(f"[JellyfinScraper] Matched movie {found.get('Name')!r} -> {marker}")
+        self._movie_marker = marker
+        return marker
+
     async def search_anime(self, media_ctx: dict) -> Optional[str]:
-        """Collect candidate Jellyfin Series for this show (TMDB id + title)."""
+        """Collect candidate Jellyfin Series for this show (TMDB id + title), or
+        locate a single Movie item when this is a movie request."""
+        self._media_type = media_ctx.get("media_type") or "tv"
+        self._movie_marker: Optional[str] = None
+        if self._media_type == "movie":
+            return await self._search_movie(media_ctx)
         self._candidates: list = []
         self._ep_cache: dict = {}
         self._uid: Optional[str] = None
@@ -333,9 +408,13 @@ class JellyfinScraper(BaseAnimeScraper):
     async def get_episode_embeds(
         self, anime_slug: str, episode_num: int, season_num: int = 1
     ) -> list[str]:
-        """Locate the target episode across the show's candidate series."""
+        """Locate the target episode across the show's candidate series (or return
+        the already-located movie marker for a movie request)."""
         if not anime_slug or not is_configured():
             return []
+        if getattr(self, "_media_type", "tv") == "movie":
+            marker = getattr(self, "_movie_marker", None)
+            return [marker] if marker else []
         candidates = getattr(self, "_candidates", None) or [{"Id": anime_slug, "Name": ""}]
 
         try:

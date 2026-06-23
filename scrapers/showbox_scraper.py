@@ -59,20 +59,33 @@ class ShowBoxScraper(BaseAnimeScraper):
     the cinema.bz / PlayIMDb scrapers. See [[jellyfin-source]] / [[cinemabz-source]].
     """
 
+    # ShowBox is a general movie/TV file host: it indexes movies too, so this
+    # source serves standalone films (a single video file in the Febbox share)
+    # alongside TV episodes. media_type is stashed in search_anime and steers the
+    # /movie vs /tv lookups below.
+    SUPPORTS_MOVIES = True
+
+    def __init__(self):
+        super().__init__()
+        self._media_type = "tv"
+
     async def _tmdb_year(self, tmdb_id) -> Optional[str]:
-        """Show's first-air-date year from TMDB (used to disambiguate the slug /
-        search). Optional — without it we fall back to keyword search."""
+        """Title's year from TMDB (used to disambiguate the slug / search).
+        Optional — without it we fall back to keyword search. Reads the movie or
+        tv record depending on the request."""
         key = os.getenv("TMDB_API_KEY")
         if not key or tmdb_id is None:
             return None
+        kind = "movie" if self._media_type == "movie" else "tv"
         try:
             resp = await self.client.get(
-                f"https://api.themoviedb.org/3/tv/{tmdb_id}",
+                f"https://api.themoviedb.org/3/{kind}/{tmdb_id}",
                 headers={"Authorization": f"Bearer {key}", "accept": "application/json"},
             )
             if resp.status_code != 200:
                 return None
-            date = resp.json().get("first_air_date") or ""
+            data = resp.json()
+            date = (data.get("release_date") if kind == "movie" else data.get("first_air_date")) or ""
             return date[:4] if len(date) >= 4 else None
         except Exception as e:
             logger.info(f"[ShowBox] TMDB year lookup failed: {type(e).__name__} - {e}")
@@ -122,7 +135,9 @@ class ShowBoxScraper(BaseAnimeScraper):
         return m.group(1)
 
     async def _search_id(self, keyword: str, norm_targets: set) -> Optional[str]:
-        """Search ShowBox and return the content id of the best TV match."""
+        """Search ShowBox and return the content id of the best match (movie or TV
+        depending on this request's media_type)."""
+        want = "/movie/" if self._media_type == "movie" else "/tv/"
         try:
             resp = await self.client.get(
                 f"{SHOWBOX_BASE}/search", params={"keyword": keyword}
@@ -140,7 +155,7 @@ class ShowBoxScraper(BaseAnimeScraper):
                 continue
             href = a.attributes.get("href") or ""
             title = a.attributes.get("title") or a.text()
-            if "/tv/" not in href:  # we always look up as TV
+            if want not in href:  # match the requested kind (movie vs tv)
                 continue
             nt = _norm(title)
             if nt and any(nt == t or (len(t) > 3 and (t in nt or nt in t)) for t in norm_targets):
@@ -153,9 +168,10 @@ class ShowBoxScraper(BaseAnimeScraper):
         return await self._detail_id(detail_url, norm_targets)
 
     async def _share_key(self, content_id: str) -> Optional[str]:
-        """Resolve a ShowBox content id to its Febbox share_key. Tries the TV
-        type first, then movie (some anime are catalogued as movies)."""
-        for type_val in ("2", "1"):
+        """Resolve a ShowBox content id to its Febbox share_key. Tries the most
+        likely type first for this request (movie=1, tv=2), then the other."""
+        type_order = ("1", "2") if self._media_type == "movie" else ("2", "1")
+        for type_val in type_order:
             try:
                 resp = await self.client.get(
                     f"{SHOWBOX_BASE}/index/share_link",
@@ -172,10 +188,11 @@ class ShowBoxScraper(BaseAnimeScraper):
         return None
 
     async def search_anime(self, media_ctx: dict) -> Optional[str]:
-        """Resolve the show to a Febbox ``share_key`` (used as the slug)."""
+        """Resolve the title to a Febbox ``share_key`` (used as the slug)."""
         if not is_configured():
             return None  # no FEBBOX_UI_TOKEN -> source disabled, skip all work
 
+        self._media_type = media_ctx.get("media_type") or "tv"
         candidates = self._candidate_titles(media_ctx)
         if not candidates:
             logger.warning("[ShowBox] no title in media_ctx, cannot search")
@@ -186,6 +203,10 @@ class ShowBoxScraper(BaseAnimeScraper):
         year = await self._tmdb_year(media_ctx.get("tmdb_id"))
 
         content_id: Optional[str] = None
+        # ShowBox slugs movies under /movie/m-{slug}-{year}, TV under /tv/t-{slug}-{year}.
+        kind_seg, slug_prefix = (
+            ("movie", "m") if self._media_type == "movie" else ("tv", "t")
+        )
 
         # Fast path: construct the detail URL directly from slug + year.
         if year:
@@ -193,7 +214,7 @@ class ShowBoxScraper(BaseAnimeScraper):
                 slug = _slugify(title)
                 if not slug:
                     continue
-                url = f"{SHOWBOX_BASE}/tv/t-{slug}-{year}"
+                url = f"{SHOWBOX_BASE}/{kind_seg}/{slug_prefix}-{slug}-{year}"
                 content_id = await self._detail_id(url, norm_targets)
                 if content_id:
                     logger.info(f"[ShowBox] direct slug hit: {url} -> id {content_id}")
@@ -241,11 +262,43 @@ class ShowBoxScraper(BaseAnimeScraper):
     def _is_video(f: dict) -> bool:
         return not f.get("is_dir") and str(f.get("ext", "")).lower() in ("mp4", "mkv", "avi")
 
+    @staticmethod
+    def _file_size(f: dict) -> int:
+        try:
+            return int(f.get("file_size") or f.get("size") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def _movie_embeds(self, share_key: str, root: List[dict]) -> List[str]:
+        """Pick the movie's video file from the Febbox share and emit its marker.
+
+        A movie share is a single film, not a season tree: take the largest video
+        file at the root (largest = the main feature, not a sample/extra); if the
+        root only holds folders, descend into the first and take the largest there.
+        No season/episode rides along (the resolver's subtitle filter just stays
+        off for movies)."""
+        videos = [f for f in root if self._is_video(f)]
+        if not videos:
+            folder = next((f for f in root if f.get("is_dir")), None)
+            if folder:
+                videos = [f for f in await self._list_share(share_key, folder.get("fid"))
+                          if self._is_video(f)]
+        if not videos:
+            logger.info(f"[ShowBox] no movie file in share {share_key}")
+            return []
+        best = max(videos, key=self._file_size)
+        fid = best.get("fid")
+        if not fid:
+            return []
+        marker = f"{EMBED_MARKER}:{share_key}:{fid}"
+        logger.info(f"[ShowBox] matched movie {best.get('file_name')!r} -> {marker}")
+        return [marker]
+
     async def get_episode_embeds(
         self, anime_slug: str, episode_num: int, season_num: int = 1
     ) -> List[str]:
-        """Locate the episode file's ``fid`` in the Febbox share and emit the
-        ``crimson-febbox:{share_key}:{fid}`` marker the resolver unlocks."""
+        """Locate the episode (or movie) file's ``fid`` in the Febbox share and emit
+        the ``crimson-febbox:{share_key}:{fid}`` marker the resolver unlocks."""
         if not anime_slug or not is_configured():
             return []
         share_key = anime_slug
@@ -253,6 +306,9 @@ class ShowBoxScraper(BaseAnimeScraper):
         root = await self._list_share(share_key)
         if not root:
             return []
+
+        if self._media_type == "movie":
+            return await self._movie_embeds(share_key, root)
 
         # Episodes live under a "Season N" folder; some shares hold them at the
         # root. Build the candidate file list accordingly.

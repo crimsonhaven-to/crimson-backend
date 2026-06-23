@@ -48,10 +48,17 @@ def mint(
     season_number: int,
     episode_number: int,
     anilist_id: Optional[int],
+    media_type: str = "tv",
 ) -> str:
     """A compact ``<payload>.<sig>`` ticket carrying everything ``maybe_enqueue``
     needs to reconstruct this exact stream. Short keys keep it small — it rides in
-    every NDJSON stream line."""
+    every NDJSON stream line.
+
+    ``media_type`` ("tv" | "movie") rides along so the downloader can refuse to
+    cache movies: the cache key is (tmdb_id, season, episode, language), and TMDB
+    movie ids share that numeric space with tv ids, so a movie would collide with
+    a same-id show until the cache is namespaced. Defaults to "tv" so older tickets
+    decode unchanged."""
     payload = {
         "u": url,
         "t": type,
@@ -61,6 +68,7 @@ def mint(
         "sn": int(season_number),
         "en": int(episode_number),
         "ai": int(anilist_id) if anilist_id is not None else None,
+        "mt": media_type or "tv",
     }
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -87,6 +95,7 @@ def verify(ticket: str) -> Optional[dict]:
             "season_number": int(p["sn"]),
             "episode_number": int(p["en"]),
             "anilist_id": int(p["ai"]) if p.get("ai") is not None else None,
+            "media_type": p.get("mt") or "tv",
         }
     except Exception:
         return None
