@@ -64,11 +64,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "7.0.1"
-
-#! TODO:
-#! - Support for the local source which lets admins add a NAS-location directly from the admin dashboard (to keep everything stateless, no stupid container mounts)  [DONE — local_engine]
-#  - Local Cache: Download every streamed episode onto a NAS-Storage, add a database entry and then play it from local Storage in the future. Requires a shitload of storage.  [DONE — cache_engine: admin-toggled, ffmpeg remux to mp4, language-tagged, served as a named source]
+VERSION = "7.1.0"
 
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
@@ -111,6 +107,14 @@ class Config:
     # replica is wasteful — keep it enabled on exactly one replica (see README
     # "Deploying to Docker Swarm").
     RUN_DB_SYNC = os.getenv("RUN_DB_SYNC", "true").lower() not in ("0", "false", "no")
+
+    # Only the dedicated cache-worker service runs the background ffmpeg download
+    # loop; the api/api-sync replicas just mint cache tickets and claim pending
+    # rows (the DB row is the job queue, so a download survives an api redeploy).
+    # Defaults true so a single-container (docker-compose) deploy still caches
+    # without extra config; the Swarm stack sets it false on api/api-sync and true
+    # on cache-worker. The DB claim dedupes if more than one process runs it.
+    RUN_CACHE_WORKER = os.getenv("RUN_CACHE_WORKER", "true").lower() not in ("0", "false", "no")
 
     # Emails promoted to admin on startup (comma-separated). Seeds the first
     # admin so the /admin dashboard is reachable without hand-editing the DB;
@@ -330,10 +334,17 @@ async def lifespan(app: FastAPI):
     logger.info("Background scheduler started")
     app.state.scheduler = scheduler
 
-    # Server-side video-cache download manager (background ffmpeg workers). Runs on
-    # every replica; the DB claim (CacheStore.claim_download) makes sure only one
-    # replica actually downloads any given episode.
-    await cache_manager.start()
+    # Server-side video-cache download worker (background ffmpeg). Only the
+    # dedicated cache-worker service runs it (RUN_CACHE_WORKER); api/api-sync just
+    # mint tickets + claim pending rows. The job lives in Postgres (claim_download),
+    # so a download survives an api redeploy and any worker can drain the queue.
+    if Config.RUN_CACHE_WORKER:
+        await cache_manager.start_worker()
+    else:
+        logger.info(
+            "RUN_CACHE_WORKER disabled — this replica mints/claims cache rows but "
+            "does not download (the cache-worker service does)"
+        )
 
     yield
 

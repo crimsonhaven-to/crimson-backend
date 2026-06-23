@@ -49,6 +49,8 @@ INTERNAL_BASE = os.getenv("CACHE_INTERNAL_BASE", "http://127.0.0.1:8000").rstrip
 MAX_CONCURRENT = max(1, int(os.getenv("CACHE_MAX_CONCURRENT", "1")))
 DOWNLOAD_TIMEOUT = int(os.getenv("CACHE_DOWNLOAD_TIMEOUT", "3600"))  # seconds, per episode
 QUEUE_MAX = int(os.getenv("CACHE_QUEUE_MAX", "200"))
+# How often the cache-worker polls the DB for newly-claimed (pending) downloads.
+POLL_INTERVAL = max(2, int(os.getenv("CACHE_POLL_INTERVAL", "10")))  # seconds
 # Don't start a download unless the target has at least this much headroom.
 MIN_FREE_BYTES = int(os.getenv("CACHE_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024)))  # 2 GiB
 
@@ -94,9 +96,7 @@ def _to_internal(url: str) -> str:
     parsed = urlparse(url)
     # Only same-backend proxy/player paths are rewritten; a raw CDN URL (direct
     # play) is fetched as-is.
-    if parsed.path.startswith(("/", "")) and (
-        "_proxy" in parsed.path or parsed.path.rstrip("/").endswith("player")
-    ):
+    if "_proxy" in parsed.path or parsed.path.rstrip("/").endswith("player"):
         q = f"?{parsed.query}" if parsed.query else ""
         return f"{INTERNAL_BASE}{parsed.path}{q}"
     return url
@@ -107,11 +107,16 @@ class DownloadManager:
         self._store = CacheStore()
         self._queue: Optional[asyncio.Queue] = None
         self._workers: list[asyncio.Task] = []
+        self._poller: Optional[asyncio.Task] = None
         self._inflight: set[int] = set()  # entry ids currently queued/running (this process)
         self._started = False
 
     # ------------------------------------------------------------- lifecycle
-    async def start(self) -> None:
+    async def start_worker(self) -> None:
+        """Start the out-of-process download worker: a small ffmpeg pool fed by a DB
+        poll loop. ONLY the dedicated cache-worker service calls this
+        (RUN_CACHE_WORKER); the api/api-sync replicas just mint tickets and claim
+        rows (mint_ticket / maybe_enqueue), they never download. Idempotent."""
         if self._started:
             return
         self._started = True
@@ -121,19 +126,38 @@ class DownloadManager:
                 "ffmpeg not found on PATH — video caching is inert (downloads will "
                 "fail). Install ffmpeg in the image to enable caching."
             )
-        # Recover from a previous process that died mid-download.
+        # Requeue any download a previous worker was interrupted mid-remux on (deploy
+        # that outran stop_grace_period, crash) — downloading -> pending, retried.
         try:
             n = await run_in_threadpool(self._store.reset_stale_jobs)
             if n:
-                logger.info(f"Reset {n} stale cache job(s) from a previous run")
+                logger.info(f"Requeued {n} interrupted download(s) from a previous worker")
         except Exception as e:
-            logger.error(f"Stale-job reset failed: {e}")
+            logger.error(f"Stale-job requeue failed: {e}")
         self._workers = [
             asyncio.create_task(self._worker(i)) for i in range(MAX_CONCURRENT)
         ]
-        logger.info(f"Cache download manager started ({MAX_CONCURRENT} worker(s))")
+        self._poller = asyncio.create_task(self._poll())
+        logger.info(
+            f"Cache download worker started ({MAX_CONCURRENT} ffmpeg slot(s), "
+            f"polling every {POLL_INTERVAL}s)"
+        )
 
-    async def stop(self) -> None:
+    async def stop(self, drain_timeout: float = 110.0) -> None:
+        """Graceful stop. Stop pulling new work first, then give in-flight remuxes a
+        bounded chance to finish (Docker's stop_grace_period covers this window)
+        before cancelling. Anything still running past the deadline is abandoned;
+        its row stays ``downloading`` and the next worker's reset_stale_jobs requeues
+        it. A no-op on the api/api-sync replicas (no poller, nothing in flight)."""
+        if self._poller is not None:
+            self._poller.cancel()
+            self._poller = None
+        if self._inflight:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + drain_timeout
+            logger.info(f"Draining {len(self._inflight)} in-flight cache download(s) before stop")
+            while self._inflight and loop.time() < deadline:
+                await asyncio.sleep(0.5)
         for w in self._workers:
             w.cancel()
         self._workers = []
@@ -143,10 +167,9 @@ class DownloadManager:
     async def _cacheable(self, stream: dict) -> bool:
         """Shared cacheability gate: caching is on, ffmpeg is present, the stream
         is a tappable media URL, and it isn't our own cache/local output. Used both
-        by the ticket stamp (watch path) and the real enqueue (confirm path) so the
-        two never disagree on what's cacheable."""
-        if not self._started or self._queue is None:
-            return False
+        by the ticket stamp (watch path) and the row claim (confirm path) so the two
+        never disagree on what's cacheable. Deliberately independent of the worker
+        being started — the api replicas mint/claim without running the worker."""
         if not await run_in_threadpool(self._store.get_enabled):
             return False
         url = (stream.get("url") or "")
@@ -202,9 +225,10 @@ class DownloadManager:
             return None
 
     async def confirm_ticket(self, ticket_str: str) -> bool:
-        """Player-confirmed watch: verify a ticket minted by :meth:`mint_ticket`
-        and enqueue the real download. Returns whether the ticket verified; the
-        enabled/dedupe/space checks happen in :meth:`maybe_enqueue`. Never raises."""
+        """Player-confirmed watch: verify a ticket minted by :meth:`mint_ticket` and
+        claim the download (write the pending DB row the cache-worker drains).
+        Returns whether the ticket verified; the enabled/dedupe/space checks happen
+        in :meth:`maybe_enqueue`. Never raises."""
         try:
             data = ticket.verify(ticket_str)
             if not data:
@@ -238,8 +262,11 @@ class DownloadManager:
         anilist_id: Optional[int],
         media_type: str = "tv",
     ) -> None:
-        """Consider a resolved stream for caching. Safe to call for every stream —
-        it self-filters and dedupes, and never raises into the watch path."""
+        """Claim a resolved stream for caching by writing (or reviving) the pending
+        DB row the cache-worker drains. Safe to call for every stream — it
+        self-filters, dedupes via the DB claim, and never raises into the watch/
+        confirm path. The actual ffmpeg download happens out-of-process in the
+        cache-worker service (see :meth:`start_worker` / :meth:`_poll`)."""
         try:
             # Second tripwire (mint_ticket is the first): never cache a movie. The
             # cache key (tmdb, season, episode, language) shares its id space with
@@ -259,12 +286,17 @@ class DownloadManager:
                 return
 
             # _cacheable() already vetted this is a tappable media URL (non-None).
+            # Store the absolute (public-origin) URL; the worker rewrites it onto
+            # loopback at download time via _to_internal.
             media_url = _media_url_for_stream(stream)
             language = (stream.get("language") or "").strip()
             source_origin = stream.get("source") or ""
             rel_path = fs.plan_rel_path(tmdb_id, season_number, episode_number, language)
 
-            row = await run_in_threadpool(
+            # Write/revive the pending row. The cache-worker's poll loop picks it up;
+            # the unique constraint dedupes across replicas, so this is safe to call
+            # from every api replica that handles the /cache/confirm.
+            await run_in_threadpool(
                 self._store.claim_download,
                 tmdb_id=tmdb_id,
                 season_number=season_number,
@@ -274,31 +306,77 @@ class DownloadManager:
                 source_origin=source_origin,
                 target_id=target["id"],
                 rel_path=rel_path,
+                media_url=media_url or "",
             )
-            if not row:
-                return  # already pending/downloading/ready (here or another replica)
+        except Exception as e:
+            logger.error(f"maybe_enqueue failed: {e}")
 
+    # ----------------------------------------------------------- poll (worker)
+    async def _poll(self) -> None:
+        """Producer: periodically drain newly-claimed (pending) rows from the DB into
+        the ffmpeg slots. The DB row is the queue now — the api service's /cache/
+        confirm writes pending rows, this worker downloads them — which is exactly
+        what lets a download survive an api redeploy (the job lives in Postgres, not
+        in the api process that handled the confirm)."""
+        while True:
+            try:
+                await self._enqueue_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"cache poll failed: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
+
+    async def _enqueue_pending(self) -> None:
+        assert self._queue is not None
+        if not await run_in_threadpool(self._store.get_enabled):
+            return
+        # Only pull as many as we have free ffmpeg slots, so the in-process queue
+        # stays tiny and pending work keeps surviving in the DB until a slot frees.
+        available = MAX_CONCURRENT - len(self._inflight)
+        if available <= 0:
+            return
+        rows = await run_in_threadpool(self._store.fetch_pending, available)
+        for row in rows:
             entry_id = row["id"]
             if entry_id in self._inflight:
-                return
+                continue
+            job = self._row_to_job(row)
+            if not job:
+                await run_in_threadpool(
+                    self._store.mark_failed, entry_id, "uncacheable row (no media_url)"
+                )
+                continue
+            # Atomically claim pending -> downloading; lose the race (another slot or
+            # replica grabbed it first) -> skip it.
+            if not await run_in_threadpool(self._store.begin_download, entry_id):
+                continue
             self._inflight.add(entry_id)
-            job = {
-                "entry_id": entry_id,
-                "media_url": _to_internal(media_url),
-                "abs_path": os.path.join(target["path"], rel_path),
-                "source_origin": source_origin,
-                "language": language,
-                "label": f"tmdb-{tmdb_id} S{season_number}E{episode_number}"
-                + (f" [{language}]" if language else ""),
-            }
             try:
                 self._queue.put_nowait(job)
             except asyncio.QueueFull:
+                # We only ever fetch `available` <= free slots, so this is defensive.
                 self._inflight.discard(entry_id)
                 await run_in_threadpool(self._store.mark_failed, entry_id, "cache queue full")
-                logger.warning(f"Cache queue full; dropped {job['label']}")
-        except Exception as e:
-            logger.error(f"maybe_enqueue failed: {e}")
+                return
+
+    @staticmethod
+    def _row_to_job(row: dict) -> Optional[dict]:
+        """Build the in-process download job from a pending DB row, or None when the
+        row can't be turned into a fetchable URL (missing media_url)."""
+        media_url = (row.get("media_url") or "").strip()
+        if not media_url:
+            return None
+        language = row.get("language") or ""
+        tmdb_id, sn, en = row["tmdb_id"], row["season_number"], row["episode_number"]
+        return {
+            "entry_id": row["id"],
+            "media_url": _to_internal(media_url),
+            "abs_path": os.path.join(row["target_path"], row["rel_path"]),
+            "source_origin": row.get("source_origin") or "",
+            "language": language,
+            "label": f"tmdb-{tmdb_id} S{sn}E{en}" + (f" [{language}]" if language else ""),
+        }
 
     # ---------------------------------------------------------------- worker
     async def _worker(self, idx: int) -> None:
@@ -327,7 +405,7 @@ class DownloadManager:
         abs_path = job["abs_path"]
         part_path = abs_path + ".part"
 
-        await run_in_threadpool(self._store.mark_downloading, entry_id)
+        # Row is already 'downloading' (begin_download claimed it in the poll loop).
         await run_in_threadpool(os.makedirs, os.path.dirname(abs_path), exist_ok=True)
         # Clean any leftover partial from a previous failed attempt.
         await run_in_threadpool(_unlink_quiet, part_path)

@@ -1,6 +1,5 @@
 # scrapers/__init__.py
 from .gogo_scraper import GogoScraper
-from .voe_scraper import VoeScraper
 from .movish_scraper import MovishScraper
 from .playimdb_scraper import PlayimdbScraper
 from .jellyfin_scraper import JellyfinScraper
@@ -22,7 +21,6 @@ ALL_SCRAPERS = [
     StoScraper,       # s.to: aniworld's general sibling (anime + movies); same VOE/Vidmoly embeds.
     StoMirrorScraper, # Cloudflare/Turnstile-free IP mirror of s.to; resolves /r?t= where s.to's gate stalls.
     AniwatchScraper,  # WordPress site; feeds "VidSrc" (megaplay) embeds.
-    #VoeScraper,
     MovishScraper,
     PlayimdbScraper,
     JellyfinScraper,

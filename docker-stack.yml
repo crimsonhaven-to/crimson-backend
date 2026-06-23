@@ -83,6 +83,11 @@ services:
       - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
       # --- Server-side video cache (optional) ----------------------------------
+      # The serving replicas mint cache tickets and claim pending rows, but they do
+      # NOT run the ffmpeg download loop — that lives in the dedicated cache-worker
+      # service below, so a long remux isn't killed every time `api` rolls. Keep
+      # this false here; only cache-worker sets it true.
+      - RUN_CACHE_WORKER=false
       # Downloader tuning for cache_engine. All have sane defaults baked in, so
       # you only need these to override them. The NAS itself is mounted via the
       # `crimson_cache` volume below — NOT through these env vars. Uncomment to tune.
@@ -165,6 +170,8 @@ services:
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
       # The one process that runs the Fribb resync.
       - RUN_DB_SYNC=true
+      # api-sync serves no ingress and has no NAS mount; it never downloads.
+      - RUN_CACHE_WORKER=false
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
@@ -207,6 +214,104 @@ services:
           # gets OOM-killed (task error "non-zero exit (137)") during the rebuild,
           # raise this limit (e.g. 1024M / 1536M).
           memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+    networks:
+      - crimson_net
+
+  # --- Cache download worker (optional, exactly one) -------------------------
+  # The ffmpeg remux job, moved off the serving tier. Same image, same default CMD
+  # (uvicorn) as `api` — so its OWN loopback (CACHE_INTERNAL_BASE=127.0.0.1:8000)
+  # serves the signed stream proxies ffmpeg pulls through, exactly like a serving
+  # replica would; nothing about signing/CORS changes. It just sets
+  # RUN_CACHE_WORKER=true (runs the background download loop) and publishes no port
+  # (serves no ingress). The api replicas mint cache tickets and write `pending`
+  # rows on /cache/confirm; this worker polls Postgres for them and runs ffmpeg —
+  # so the job is DB-durable and a download is no longer killed every time `api`
+  # rolls. MUST stay replicas: 1 (CACHE_MAX_CONCURRENT bounds parallelism within
+  # it); a second instance is harmless though — the DB claim (begin_download)
+  # dedupes. Needs the NAS mount (it writes the files) and the same source env the
+  # proxies it replays through require (e.g. Jellyfin token injection).
+  cache-worker:
+    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
+      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
+      # Same secret as api, or the proxy URLs ffmpeg pulls won't verify their sig.
+      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
+      # Never the resync owner; always the download worker.
+      - RUN_DB_SYNC=false
+      - RUN_CACHE_WORKER=true
+      # Source env the replayed proxies may need on this worker's own loopback
+      # (a cached Jellyfin/ShowBox stream is pulled back through these proxies).
+      - JELLYFIN_URL=${JELLYFIN_URL:-}
+      - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
+      - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
+      - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
+      - FEBBOX_REGION=${FEBBOX_REGION:-}
+      # Downloader tuning (same knobs as api's commented block). Defaults are baked
+      # in; uncomment to override. CACHE_INTERNAL_BASE stays loopback — this worker
+      # runs its own uvicorn, so the proxies are right here on 127.0.0.1:8000.
+      # - CACHE_MAX_CONCURRENT=1     # simultaneous ffmpeg remuxes
+      # - CACHE_POLL_INTERVAL=10     # seconds between DB polls for new pending rows
+      # - CACHE_DOWNLOAD_TIMEOUT=3600
+      # - CACHE_MIN_FREE_BYTES=2147483648
+      # - CACHE_QUEUE_MAX=200
+
+    # Writes the cached files — needs the same NAS mount the serving replicas use
+    # to read them back via /cache_proxy. Same volumes, so register the same
+    # in-container paths (/crimson/cache1, /crimson/cache2) in Admin → Cache.
+    volumes:
+      - crimson_cache1:/crimson/cache1
+      - crimson_cache2:/crimson/cache2
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # No resync on this service, so uvicorn binds within seconds like `api`.
+      start_period: 60s
+
+    # Give an in-flight remux time to finish on graceful shutdown rather than being
+    # killed mid-download (which would just mark the row failed for a later retry).
+    stop_grace_period: 120s
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        # stop-first: never run two workers at once. The old one drains its current
+        # remux within stop_grace_period and exits BEFORE the new one starts, so the
+        # new worker's startup requeue (downloading -> pending) only ever sees
+        # genuinely-orphaned rows — it can't grab a row the old worker is still
+        # downloading. A brief no-worker gap is fine (this serves no ingress; pending
+        # rows just wait in Postgres).
+        order: stop-first
+        failure_action: rollback
+        monitor: 30s
+        max_failure_ratio: 0.3
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+        order: stop-first
+      resources:
+        limits:
+          # ffmpeg is the workload here (mostly -c copy remux; the audio-only
+          # re-encode fallback is the heaviest path), so give it more headroom than
+          # a serving replica.
+          cpus: "2.00"
+          memory: 1024M
         reservations:
           cpus: "0.25"
           memory: 256M
@@ -266,6 +371,101 @@ services:
 
     networks:
       - crimson_net
+
+  # --- Old-image janitor (global, one-shot per release) ----------------------
+  # Swarm keeps the previously-deployed image on every node so it can roll back
+  # instantly, and it never cleans the one before that — so each release leaves
+  # another full backend image (~hundreds of MB) stranded on disk forever. Over
+  # dozens of releases that grows into tens of GB of dead images per node.
+  #
+  # This service reclaims it WITHOUT breaking rollback. It is `mode: global`, so
+  # Swarm runs exactly one task per node — including nodes that don't run `api`,
+  # which may still hold images from past schedulings. On each node it:
+  #   1. lists the locally-present release tags (vX.Y.Z) of our image,
+  #   2. version-sorts them and KEEPS the newest 3 (this release + 2 to roll back
+  #      to — well past Swarm's single-step rollback target),
+  #   3. `docker image rm` (NOT `-f`) every older one. Un-forced removal is the
+  #      safety net: Docker refuses to delete an image any container — running OR
+  #      a draining/old rollback task — still references, so "not used anymore"
+  #      is enforced by the daemon, not guessed by us. Refusals are logged, not
+  #      fatal, and that image is simply retried on the next release.
+  # `:dev`, `:dev-<sha>`, `:latest` and `:buildcache` never match the vX.Y.Z
+  # filter, so they're untouched. The image stays in GHCR regardless, so even a
+  # pruned release can be re-pulled if you ever force a deeper rollback.
+  #
+  # It runs once and exits (restart_policy condition: none) — a batch janitor,
+  # not a daemon, so a completed 0/0 task count is expected and healthy. Because
+  # PRUNE_RELEASE is pinned to the new image ref, the service spec changes every
+  # release, which is what makes `docker stack deploy` re-schedule this one-shot
+  # task across all nodes. It mounts the host Docker socket (root-equivalent on
+  # that node) — that's required to talk to the daemon and is standard for a
+  # cluster maintenance task; it touches only our own repo's old tags.
+  pruner:
+    image: docker:28-cli
+    # POSIX sh on docker:cli. Self-contained: each node derives its own keep-set
+    # from what it actually has on disk, so no version list needs to be passed in.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        IMAGE="ghcr.io/crimsonhaven-to/crimson-backend"
+        KEEP=3
+        echo "[pruner] $(hostname): keeping newest ${KEEP} release tags of ${IMAGE}"
+        # Numeric key sort (newest first) instead of `sort -V`, which busybox
+        # (docker:cli is Alpine-based) doesn't reliably ship — strip the leading
+        # v, sort major/minor/patch numerically so v1.10.0 outranks v1.9.0, re-add.
+        tags="$(docker image ls --format '{{.Tag}}' "$IMAGE" 2>/dev/null \
+                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                  | sed 's/^v//' | sort -t. -k1,1nr -k2,2nr -k3,3nr \
+                  | sed 's/^/v/' || true)"
+        if [ -z "$tags" ]; then
+          echo "[pruner] no vX.Y.Z release images present — nothing to do"; exit 0
+        fi
+        echo "[pruner] present (newest first):"; echo "$tags" | sed 's/^/[pruner]   /'
+        old="$(echo "$tags" | tail -n +$((KEEP + 1)))"
+        if [ -z "$old" ]; then
+          echo "[pruner] <= ${KEEP} release images, nothing to remove"; exit 0
+        fi
+        for t in $old; do
+          # Un-forced: the daemon refuses if any container still references it,
+          # which protects the live + draining rollback targets automatically.
+          if docker image rm "${IMAGE}:${t}" >/dev/null 2>&1; then
+            echo "[pruner] removed   ${IMAGE}:${t}"
+          else
+            echo "[pruner] kept (in use / gone) ${IMAGE}:${t}"
+          fi
+        done
+        # Sweep dangling (untagged) layers left behind when a tag was overwritten;
+        # without -a this only touches unreferenced images, never tagged ones.
+        docker image prune -f >/dev/null 2>&1 || true
+        echo "[pruner] done"
+
+    environment:
+      # Pinned to the rolled-out image ref so the spec — and thus the one-shot
+      # task — changes on every release, re-triggering the prune fleet-wide.
+      - PRUNE_RELEASE=${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+
+    # Talk to the node's own daemon to list/remove its local images.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    # Batch job, not a server — it never binds a port, so no healthcheck.
+    healthcheck:
+      test: ["NONE"]
+
+    deploy:
+      mode: global
+      restart_policy:
+        # Run once per (re)deploy and stop. Don't relaunch on exit — a failed
+        # pass is harmless and simply retried at the next release.
+        condition: none
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+        reservations:
+          cpus: "0.01"
+          memory: 16M
 
 networks:
   crimson_net:
