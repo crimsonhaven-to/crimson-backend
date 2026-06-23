@@ -568,7 +568,47 @@ async def account_me(user: dict = Depends(require_user)):
         "last_login_at": user.get("last_login_at"),
         "favorites_count": len(favs),
         "progress_count": len(prog),
+        # Saved client preferences (e.g. preferred dub/sub language). Additive: an
+        # account that never set any gets an empty object, and older clients simply
+        # ignore the field.
+        "preferences": store.get_preferences(user["user_id"]),
     }
+
+
+# --- client preferences ----------------------------------------------------
+# A small, open key/value bag of per-account client settings (currently the
+# preferred dub/sub language that biases which stream source auto-plays). Kept
+# generic so adding a new preference later is a frontend-only change. The blob is
+# capped defensively; the client only ever stores a tiny object.
+_MAX_PREFERENCES_BYTES = 4096
+
+
+@router.get("/account/preferences")
+async def get_preferences(user: dict = Depends(require_user)):
+    """The account's stored client preferences (``{}`` when none set yet)."""
+    return {"success": True, "preferences": store.get_preferences(user["user_id"])}
+
+
+@router.put("/account/preferences")
+@limiter.limit("30/minute")
+async def put_preferences(request: Request, user: dict = Depends(require_user)):
+    """Replace the account's client preferences with the JSON object in the body.
+
+    The body is a small JSON object (sent raw, mirroring the import endpoint to
+    keep the slim image multipart-free). Purely additive: it never affects auth,
+    favorites or progress, and a client that never calls this is unchanged.
+    """
+    raw = await request.body()
+    if len(raw) > _MAX_PREFERENCES_BYTES:
+        raise HTTPException(status_code=413, detail="Preferences payload too large")
+    try:
+        data = json.loads(raw or b"{}")
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Preferences must be a JSON object")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Preferences must be a JSON object")
+    saved = store.set_preferences(user["user_id"], data)
+    return {"success": True, "preferences": saved}
 
 
 # --- favorites / watchlists ------------------------------------------------

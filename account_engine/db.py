@@ -16,6 +16,7 @@ SHA-256 hash so a DB leak can't be replayed.
 """
 
 import hashlib
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -108,6 +109,11 @@ class AccountStore:
                 -- (see bootstrap_admins) so the dashboard is reachable without
                 -- hand-editing the database.
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_admin       BOOLEAN NOT NULL DEFAULT FALSE;
+                -- Per-account client preferences (e.g. preferred dub/sub language
+                -- used to bias which stream source auto-plays). Stored as a small
+                -- JSON object in TEXT so new preference keys are a frontend-only
+                -- change. NULL/absent => the client falls back to its local default.
+                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS preferences    TEXT;
                 -- Case-insensitive email uniqueness (NULLs — the crypto accounts —
                 -- are allowed to coexist).
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email
@@ -243,6 +249,33 @@ class AccountStore:
                 "UPDATE accounts SET last_login_at = %s WHERE user_id = %s",
                 (_iso(_now()), user_id),
             )
+
+    # -- preferences ----------------------------------------------------
+    def get_preferences(self, user_id: int) -> Dict:
+        """The account's stored client preferences as a dict (``{}`` when unset or
+        unparseable). Stored as a JSON object in the ``preferences`` TEXT column."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT preferences FROM accounts WHERE user_id = %s", (user_id,)
+            ).fetchone()
+        if not row or not row.get("preferences"):
+            return {}
+        try:
+            data = json.loads(row["preferences"])
+        except (ValueError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def set_preferences(self, user_id: int, preferences: Dict) -> Dict:
+        """Overwrite the account's preferences with ``preferences`` (a JSON-able
+        dict). Returns the stored dict."""
+        blob = json.dumps(preferences, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET preferences = %s WHERE user_id = %s",
+                (blob, user_id),
+            )
+        return preferences
 
     # -- admin ----------------------------------------------------------
     def set_admin(self, user_id: int, is_admin: bool) -> None:
