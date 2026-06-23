@@ -8,6 +8,7 @@ from .animekai_scraper import AnimekaiScraper
 from .animesuge_scraper import AnimeSugeScraper
 from .aniworld_scraper import AniworldScraper
 from .sto_scraper import StoScraper
+from .stomirror_scraper import StoMirrorScraper
 from .cinemabz_scraper import CinemabzScraper
 from .showbox_scraper import ShowBoxScraper
 from .aniwatch_scraper import AniwatchScraper
@@ -19,6 +20,7 @@ ALL_SCRAPERS = [
     GogoScraper,
     AniworldScraper,  # German s.to-family site; feeds VOE/Vidmoly embeds.
     StoScraper,       # s.to: aniworld's general sibling (anime + movies); same VOE/Vidmoly embeds.
+    StoMirrorScraper, # Cloudflare/Turnstile-free IP mirror of s.to; resolves /r?t= where s.to's gate stalls.
     AniwatchScraper,  # WordPress site; feeds "VidSrc" (megaplay) embeds.
     #VoeScraper,
     MovishScraper,
