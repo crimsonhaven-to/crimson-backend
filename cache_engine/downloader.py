@@ -198,15 +198,11 @@ class DownloadManager:
         cache the source the viewer *chose*, not whichever resolved fastest. Safe
         to call for every resolved stream; never raises into the watch path.
 
-        MOVIES ARE NOT CACHED (returns None): the cache key is
-        (tmdb_id, season, episode, language), and TMDB movie ids share that numeric
-        space with tv ids — a movie would collide with a same-id show. This is the
-        single owner of that policy; the watch path can call this for every stream
-        regardless of media type. To enable movie caching, namespace the cache key
-        (e.g. add media_type to cached_episodes' UNIQUE key) and drop this guard."""
+        ``media_type`` ("tv" | "movie") rides into the ticket so the confirm path
+        keys the cache correctly. Movies and tv share one TMDB id space, so the
+        cache key is namespaced by media_type (see CacheStore / fs.plan_rel_path) —
+        a cached movie can't collide with a same-id show."""
         try:
-            if media_type == "movie":
-                return None
             if not await self._cacheable(stream):
                 return None
             return ticket.mint(
@@ -268,16 +264,6 @@ class DownloadManager:
         confirm path. The actual ffmpeg download happens out-of-process in the
         cache-worker service (see :meth:`start_worker` / :meth:`_poll`)."""
         try:
-            # Second tripwire (mint_ticket is the first): never cache a movie. The
-            # cache key (tmdb, season, episode, language) shares its id space with
-            # tv, so a movie would collide with a same-id show. Refuse loudly until
-            # the cache key is namespaced for movies. See mint_ticket / db.py.
-            if media_type == "movie":
-                logger.warning(
-                    f"Refusing to cache movie tmdb-{tmdb_id}: cache key is TV-keyed "
-                    f"and would collide; namespace the key before enabling movie caching."
-                )
-                return
             if not await self._cacheable(stream):
                 return
 
@@ -291,7 +277,9 @@ class DownloadManager:
             media_url = _media_url_for_stream(stream)
             language = (stream.get("language") or "").strip()
             source_origin = stream.get("source") or ""
-            rel_path = fs.plan_rel_path(tmdb_id, season_number, episode_number, language)
+            rel_path = fs.plan_rel_path(
+                tmdb_id, season_number, episode_number, language, media_type=media_type
+            )
 
             # Write/revive the pending row. The cache-worker's poll loop picks it up;
             # the unique constraint dedupes across replicas, so this is safe to call
@@ -299,6 +287,7 @@ class DownloadManager:
             await run_in_threadpool(
                 self._store.claim_download,
                 tmdb_id=tmdb_id,
+                media_type=media_type,
                 season_number=season_number,
                 episode_number=episode_number,
                 anilist_id=anilist_id,
@@ -369,13 +358,18 @@ class DownloadManager:
             return None
         language = row.get("language") or ""
         tmdb_id, sn, en = row["tmdb_id"], row["season_number"], row["episode_number"]
+        media_type = row.get("media_type") or "tv"
+        if media_type == "movie":
+            label = f"movie-tmdb-{tmdb_id}"
+        else:
+            label = f"tmdb-{tmdb_id} S{sn}E{en}"
         return {
             "entry_id": row["id"],
             "media_url": _to_internal(media_url),
             "abs_path": os.path.join(row["target_path"], row["rel_path"]),
             "source_origin": row.get("source_origin") or "",
             "language": language,
-            "label": f"tmdb-{tmdb_id} S{sn}E{en}" + (f" [{language}]" if language else ""),
+            "label": label + (f" [{language}]" if language else ""),
         }
 
     # ---------------------------------------------------------------- worker

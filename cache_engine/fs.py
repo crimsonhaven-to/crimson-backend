@@ -121,11 +121,22 @@ def plan_rel_path(
     episode_number: int,
     language: Optional[str],
     container: str = "mp4",
+    media_type: str = "tv",
 ) -> str:
-    """Relative path (under a target root) for a cached episode, organised for
-    human browsing: ``tmdb-<id>/S<ss>E<ee>[ - <language>].<container>``."""
+    """Relative path (under a target root) for a cached file, organised for human
+    browsing.
+
+      * TV    -> ``tmdb-<id>/S<ss>E<ee>[ - <language>].<container>``
+      * movie -> ``movie-tmdb-<id>/movie[ - <language>].<container>``
+
+    Movies get the ``movie-`` dir prefix so a film never shares a directory with a
+    TV show carrying the same numeric TMDB id (the two id spaces overlap) — the
+    filesystem mirror of the media_type-namespaced cache key."""
     lang = (language or "").strip()
     suffix = f" - {lang}" if lang else ""
+    if media_type == "movie":
+        fname = f"movie{suffix}.{container}"
+        return os.path.join(f"movie-tmdb-{int(tmdb_id)}", fname)
     fname = f"S{int(season_number):02d}E{int(episode_number):02d}{suffix}.{container}"
     return os.path.join(f"tmdb-{int(tmdb_id)}", fname)
 
