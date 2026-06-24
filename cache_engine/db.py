@@ -151,7 +151,7 @@ class CacheStore:
                     JOIN pg_class rel ON rel.oid = con.conrelid
                     WHERE rel.relname = 'cached_episodes' AND con.contype = 'u'
                       AND (
-                        SELECT array_agg(att.attname ORDER BY att.attname)
+                        SELECT array_agg(att.attname::text ORDER BY att.attname::text)
                         FROM unnest(con.conkey) AS k
                         JOIN pg_attribute att
                           ON att.attrelid = con.conrelid AND att.attnum = k
