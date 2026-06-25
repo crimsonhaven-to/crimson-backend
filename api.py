@@ -2,6 +2,8 @@ import asyncio
 import os
 import gzip
 import hashlib
+import platform
+import random
 import time
 import logging
 from datetime import datetime, timedelta, timezone
@@ -41,15 +43,22 @@ from cache_engine.fs import (
     safe_resolve as cache_safe_resolve,
     media_type_for as cache_media_type,
 )
-from cache_engine.downloader import manager as cache_manager
+from cache_engine.downloader import manager as cache_manager, ffmpeg_available
 from player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
-from account_engine.routes import set_episode_enricher
-from account_engine.admin_routes import router as admin_router, set_resync_handler
+from account_engine.routes import set_episode_enricher, set_warmup_handler
+from account_engine.admin_routes import (
+    router as admin_router,
+    set_resync_handler,
+    set_system_handler,
+    set_source_health_handler,
+)
 from supporters_engine import router as supporters_router, store as supporters_store
 from changelog_engine import router as changelog_router, service as changelog_service
-from db_pool import get_pool, close_pool
+from db_pool import get_pool, close_pool, pool_stats
+import lumi
+import source_health
 from rate_limit import limiter
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -64,7 +73,11 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "7.3.1"
+VERSION = "9.0.0"
+
+# Wall-clock at process start — the admin dashboard derives this replica's uptime
+# from it. Module-load time is close enough to "boot" for an operator metric.
+_PROCESS_STARTED_AT = time.time()
 
 # Admin-managed local media sources (the "Local" direct-play source). The store
 # is schema-init'd in lifespan; the scraper/resolver read the enabled roots
@@ -371,7 +384,28 @@ app = FastAPI(
 # decorators on the expensive/abusable endpoints take effect; the 429 handler
 # returns a clean JSON error with Retry-After.
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+async def _voiced_rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Like slowapi's default 429, but in Lumi's voice. Delegates to the original
+    to get the correct status + ``Retry-After``, then re-skins the body."""
+    base = _rate_limit_exceeded_handler(request, exc)
+    retry_after = {
+        k: v for k, v in base.headers.items() if k.lower() == "retry-after"
+    }
+    return JSONResponse(
+        status_code=429,
+        content={
+            "success": False,
+            "error": "Rate limit exceeded",
+            "message": lumi.voiced_error(429),
+            "status_code": 429,
+        },
+        headers=retry_after or None,
+    )
+
+
+app.add_exception_handler(RateLimitExceeded, _voiced_rate_limit_handler)
 
 # --- SITE-WIDE LOGIN WALL ---------------------------------------------------
 # Everything is private unless explicitly whitelisted. The whitelist covers:
@@ -386,7 +420,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # Defined BEFORE the CORS middleware below so CORS remains the outermost layer and
 # its headers are attached even to the 401 we return here (browsers need that to
 # surface the error instead of an opaque CORS failure).
-_PUBLIC_EXACT = {"/", "/health", "/openapi.json", "/docs", "/redoc"}
+_PUBLIC_EXACT = {"/", "/lumi", "/health", "/openapi.json", "/docs", "/redoc"}
 _PUBLIC_PREFIXES = (
     "/auth/",
     "/kofi/webhook",
@@ -466,7 +500,11 @@ class LoginWallMiddleware:
             return await self.app(scope, receive, send)
 
         response = JSONResponse(
-            {"detail": "Authentication required", "success": False},
+            {
+                "detail": "Authentication required",
+                "message": lumi.voiced_error(401),
+                "success": False,
+            },
             status_code=401,
         )
         await response(scope, receive, send)
@@ -484,6 +522,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class LumiHeaderMiddleware:
+    """Stamp every response with Lumi's voice. Pure-ASGI (like the login wall) so
+    it only touches the response *start* message — it appends two headers and
+    never buffers the body, leaving the progressive NDJSON /watch stream untouched.
+
+    ``X-Lumi`` carries a rotating, ASCII-only sarcastic quip (devtools easter egg);
+    ``X-Powered-By`` names the empress. Best-effort: a quip that somehow fails to
+    encode is simply dropped rather than breaking the response."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                try:
+                    headers.append((b"x-lumi", lumi.header_quip().encode("latin-1")))
+                except Exception:
+                    pass
+                headers.append(
+                    (b"x-powered-by", f"{lumi.EMPRESS}, {lumi.TITLE}".encode("latin-1"))
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+# Added after CORS so CORS stays outermost; this only appends response headers and
+# never buffers, so the NDJSON stream is unaffected.
+app.add_middleware(LumiHeaderMiddleware)
 
 # Account system (mnemonic/Ed25519 sign-in, favorites, watch progress).
 app.include_router(account_router)
@@ -1805,6 +1879,19 @@ async def root():
         "message": "Hehe, you found me, Luminas Crimsonveil, the eternal empress of this realm. Be proud, little mortal. ✨",
     }
 
+
+@app.get("/lumi")
+async def lumi_blessing():
+    """A little shrine to the empress. Returns a random royal blessing — used by
+    the frontend's Konami-code secret page and anyone curious enough to find it.
+    Public (whitelisted on the login wall) so Lumi greets even the uninvited."""
+    return {
+        "empress": lumi.EMPRESS,
+        "title": lumi.TITLE,
+        "blessing": lumi.blessing(),
+        "sigil": "🦇",
+    }
+
 @app.get("/search/anime")
 async def search_anime_by_name(query_name: str = Query(..., min_length=1, description="Anime name to search")):
     """Search for anime by name"""
@@ -2352,6 +2439,452 @@ async def confirm_cache(request: Request):
         ticket = ""
     accepted = await cache_manager.confirm_ticket(ticket) if ticket else False
     return {"ok": bool(accepted)}
+
+
+# --- CONTINUE-WATCHING WARMUP ----------------------------------------------
+# When a viewer saves progress on an episode, we look ahead to the NEXT one,
+# scrape+resolve it in the background, and hand the source closest to their
+# language/dub-sub preference to the cache engine — so by the time they hit "next"
+# it's already remuxed onto the NAS and plays instantly. The progress-upsert route
+# (account_engine) calls _schedule_warmup via the injected handler; everything here
+# is best-effort and fire-and-forget, and self-skips when caching is disabled.
+
+# Don't re-scrape the same next-episode on every progress tick: progress posts fire
+# every few seconds of playback, so collapse repeats for one (show, season, ep) into
+# a single scrape window. The cache engine's DB claim dedupes the actual download
+# regardless; this just spares the redundant scraping.
+_WARMUP_TTL = 900.0          # seconds — one warmup per next-episode per 15 min
+_WARMUP_MAX = 5000           # hard cap to bound memory
+_warmup_seen: Dict[str, float] = {}
+# Strong refs to in-flight warmup tasks so the event loop doesn't GC them mid-run.
+_warmup_tasks: set = set()
+
+
+async def _resolve_all_streams(tmdb_id: int, season_number: int, episode_number: int,
+                               anilist_id: Optional[int], fallback_title: Optional[str],
+                               base_url: str, media_type: str = "tv") -> List[Dict]:
+    """Collect every resolvable stream for one episode into a list — a
+    non-progressive sibling of ``stream_watch_response`` used by the warmup. Runs
+    all scrapers concurrently, resolves their embeds, dedupes by embed/URL, and
+    returns the streams. Best-effort: a failing scraper is skipped.
+
+    The media-context build mirrors ``stream_watch_response`` (AniList metadata +
+    German-title synonyms for the no-AniList path) so the warmup resolves the same
+    sources the real /watch call would — kept deliberately in sync."""
+    anilist_data = {}
+    if anilist_id:
+        async with http_client() as client:
+            anilist_data = await fetch_anilist_metadata(client, anilist_id) or {}
+    title = anilist_data.get("title") or fallback_title
+    media_ctx = {**anilist_data, "title": title}
+    if not anilist_id and media_type != "movie":
+        try:
+            async with http_client() as client:
+                german_titles = await fetch_tmdb_localized_titles(client, tmdb_id)
+            if german_titles:
+                existing = list(media_ctx.get("synonyms") or [])
+                media_ctx["synonyms"] = existing + [
+                    t for t in german_titles if t not in existing
+                ]
+        except Exception as e:
+            logger.warning(f"warmup localized-title enrichment failed for {tmdb_id}: {e}")
+
+    seen_embeds: set = set()
+    seen_urls: set = set()
+    out: List[Dict] = []
+    lock = asyncio.Lock()
+
+    async def _work(scraper_class):
+        try:
+            embeds = await run_single_scraper(
+                scraper_class, tmdb_id, season_number, episode_number, media_ctx,
+                media_type=media_type,
+            )
+            for embed in embeds:
+                if isinstance(embed, dict):
+                    embed_url, language = embed.get("url"), embed.get("language")
+                else:
+                    embed_url, language = embed, None
+                if not embed_url:
+                    continue
+                async with lock:
+                    if embed_url in seen_embeds:
+                        continue
+                    seen_embeds.add(embed_url)
+                for stream in await resolve_streams([embed_url], base_url=base_url, language=language):
+                    async with lock:
+                        if stream["url"] in seen_urls:
+                            continue
+                        seen_urls.add(stream["url"])
+                        out.append(stream)
+        except Exception as e:
+            logger.error(f"warmup scraper error for {scraper_class.__name__}: {e}")
+
+    await asyncio.gather(*(_work(sc) for sc in ALL_SCRAPERS), return_exceptions=True)
+    return out
+
+
+def _warmup_pick_best(streams: List[Dict], preferences: Optional[Dict]) -> Optional[Dict]:
+    """Pick the stream the viewer would most likely auto-play, mirroring the
+    frontend ranker (crimson-client/src/hooks.js ``streamRank``): the language/
+    dub-sub preference is the PRIMARY key (×1000), the global source priority
+    (Cache > Voe > Jellyfin) is the tiebreaker within a language tier. Lower wins.
+    With no preference set, source priority alone decides. Returns None for []."""
+    prefs = preferences or {}
+    pref_lang = (prefs.get("language") or "").strip().lower()
+    pref_type = (prefs.get("type") or "").strip().lower()
+
+    def _mismatch(stream: Dict) -> int:
+        if not pref_lang and not pref_type:
+            return 0
+        tag = (stream.get("language") or "").lower()
+        miss = 0
+        if pref_lang and pref_lang not in tag:
+            miss += 1
+        if pref_type and pref_type not in tag:
+            miss += 1
+        return miss
+
+    def _priority(stream: Dict) -> int:
+        if "/cache_proxy/" in (stream.get("url") or ""):
+            return 0
+        s = (stream.get("source") or "").lower()
+        if "voe" in s:
+            return 1
+        if "jellyfin" in s:
+            return 2
+        return 100
+
+    if not streams:
+        return None
+    return min(streams, key=lambda s: _mismatch(s) * 1000 + _priority(s))
+
+
+async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: int,
+                               episode_number: int, preferences: Optional[Dict]) -> None:
+    """Scrape+resolve the episode after the one just watched and hand the
+    preference-closest cacheable source to the cache engine. Fully best-effort;
+    never raises (it runs detached from the request)."""
+    try:
+        if tmdb_id is None or season_number is None or episode_number is None:
+            return
+        # Caching off? Resolving would be wasted work — bail before any scraping.
+        if not await run_in_threadpool(cache_manager._store.get_enabled):
+            return
+
+        next_ep = int(episode_number) + 1
+
+        # TTL dedupe (see _warmup_seen): one warmup per next-episode per window.
+        now = time.monotonic()
+        key = f"{tmdb_id}:{season_number}:{next_ep}"
+        seen_until = _warmup_seen.get(key)
+        if seen_until is not None and seen_until > now:
+            return
+        if len(_warmup_seen) >= _WARMUP_MAX:
+            _warmup_seen.clear()
+        _warmup_seen[key] = now + _WARMUP_TTL
+
+        # The next episode must actually exist in the season and already have aired.
+        info = await _season_episode_info(int(tmdb_id), int(season_number))
+        air = info.get("air_dates") or {}
+        if next_ep not in air:
+            return  # end of season (or unknown episode list) — nothing to warm
+        if _is_future_air_date(air.get(next_ep)):
+            return  # not out yet
+
+        # Resolve the AniList mapping the same way /watch does (same season as the
+        # episode just watched, so the mapping is identical). Falls back to a TMDB
+        # title for the title-based scrapers when the season isn't AniList-mapped.
+        anilist_id = get_anilist_id(int(tmdb_id), int(season_number))
+        fallback_title = None
+        if not anilist_id:
+            show = get_show_info(int(tmdb_id))
+            fallback_title = show.get("title") if show else None
+            if not fallback_title:
+                try:
+                    async with http_client() as client:
+                        meta = await fetch_tmdb_show(client, int(tmdb_id))
+                    fallback_title = meta.get("title")
+                except Exception:
+                    pass
+
+        streams = await _resolve_all_streams(
+            int(tmdb_id), int(season_number), next_ep, anilist_id,
+            fallback_title, base_url=base_url, media_type="tv",
+        )
+        # Only weigh sources the cache engine would actually accept (enabled +
+        # ffmpeg present + tappable, non-self URL) so we pick the best *cacheable*
+        # match rather than a source we'd silently fail to cache.
+        cacheable = [s for s in streams if await cache_manager._cacheable(s)]
+        best = _warmup_pick_best(cacheable, preferences)
+        if not best:
+            return
+
+        await cache_manager.maybe_enqueue(
+            best,
+            tmdb_id=int(tmdb_id),
+            season_number=int(season_number),
+            episode_number=next_ep,
+            anilist_id=int(anilist_id) if anilist_id is not None else None,
+            media_type="tv",
+        )
+        logger.info(
+            f"warmup: queued next episode for caching tmdb={tmdb_id} "
+            f"s{season_number}e{next_ep} source={best.get('source')!r} "
+            f"lang={best.get('language')!r}"
+        )
+    except Exception as e:
+        logger.warning(f"continue-watching warmup failed: {e}")
+
+
+def _schedule_warmup(request: Request, *, tmdb_id: int, season_number: int,
+                     episode_number: int, preferences: Optional[Dict]) -> None:
+    """Account router's warmup hook: fire the warmup as a detached background task
+    (keeping a strong ref so it isn't GC'd) and return immediately, so saving watch
+    progress is never delayed by it. The public base URL is captured from the
+    request here (where the forwarded-header logic lives) for the proxy sources."""
+    base_url = _public_base_url(request)
+    task = asyncio.create_task(_warmup_next_episode(
+        base_url=base_url, tmdb_id=tmdb_id, season_number=season_number,
+        episode_number=episode_number, preferences=preferences,
+    ))
+    _warmup_tasks.add(task)
+    task.add_done_callback(_warmup_tasks.discard)
+
+
+set_warmup_handler(_schedule_warmup)
+
+
+# --- ADMIN: RUNTIME / SYSTEM SNAPSHOT --------------------------------------
+# Powers the dashboard's expanded "System" view. Lives here (not admin_routes)
+# because it reads VERSION + the scraper/resolver registries + the warm pool;
+# injected into the admin router via set_system_handler (same DI pattern as the
+# resync handler). Every DB-touching call hops the threadpool so we never block
+# the event loop.
+
+def _human_duration(seconds: float) -> str:
+    """Compact uptime string, e.g. '3d 04h 12m'."""
+    s = int(max(0, seconds))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, _ = divmod(s, 60)
+    if d:
+        return f"{d}d {h:02d}h {m:02d}m"
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+async def _admin_system_info() -> Dict:
+    """A rich runtime snapshot for one replica: version + uptime, registry sizes,
+    capability flags, DB-pool utilisation, and the server-side cache aggregate."""
+    pool = await run_in_threadpool(pool_stats)
+    cache_enabled = await run_in_threadpool(cache_store.get_enabled)
+    cache_stats = await run_in_threadpool(cache_store.stats)
+    cache_targets = await run_in_threadpool(cache_store.enabled_targets)
+    local_sources = await run_in_threadpool(local_source_store.list_sources)
+    local_enabled = sum(1 for s in local_sources if s.get("enabled"))
+
+    now = time.time()
+    return {
+        "version": VERSION,
+        "started_at": datetime.fromtimestamp(_PROCESS_STARTED_AT, timezone.utc).isoformat(),
+        "uptime_seconds": int(now - _PROCESS_STARTED_AT),
+        "uptime_human": _human_duration(now - _PROCESS_STARTED_AT),
+        "hostname": platform.node(),
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "registry": {
+            "scrapers": len(ALL_SCRAPERS),
+            "resolvers": len(ALL_RESOLVERS),
+        },
+        "flags": {
+            "require_login": bool(getattr(Config, "REQUIRE_LOGIN", False)),
+            "jellyfin_configured": jellyfin_is_configured(),
+            "local_configured": local_is_configured(),
+            "showbox_configured": bool(os.getenv("FEBBOX_UI_TOKEN")),
+            "cache_enabled": bool(cache_enabled),
+            "ffmpeg_available": ffmpeg_available(),
+            "tmdb_key_set": bool(getattr(Config, "TMDB_API_KEY", None)),
+            "rate_limit_storage": os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
+            "github_token_set": bool(os.getenv("GITHUB_TOKEN")),
+        },
+        "db_pool": pool,
+        "cache": {
+            "enabled": bool(cache_enabled),
+            "targets_enabled": len(cache_targets),
+            **cache_stats,
+        },
+        "local_sources": {"total": len(local_sources), "enabled": local_enabled},
+    }
+
+
+set_system_handler(_admin_system_info)
+
+
+# --- ADMIN: SOURCE HEALTH ---------------------------------------------------
+# Probe every external scrape source against a known canary title (the real
+# search→embeds pipeline, so green == would actually play), and report the
+# operator-provided library sources' configuration. Results are cached for a few
+# minutes so flipping to the dashboard tab doesn't re-hammer 11 upstreams; the
+# dashboard's "Re-probe" button passes force=True. Injected via set_source_health_handler.
+_SOURCE_HEALTH_TTL = float(os.getenv("SOURCE_HEALTH_TTL", "300"))
+_source_health_cache: Dict[str, object] = {"at": 0.0, "data": None}
+_source_health_lock = asyncio.Lock()
+
+
+async def _probe_scrape_source(scraper_class, anilist_data: Dict) -> Dict:
+    """End-to-end probe of one external source against the canary. Returns a row
+    with status (ok/empty/error/disabled), latency, embed count and a human note."""
+    name = scraper_class.__name__
+    meta = source_health.meta_for(name)
+    entry = {
+        "id": name,
+        "label": meta["label"],
+        "category": "scrape",
+        "note": meta.get("note"),
+        "base_url": getattr(scraper_class, "BASE_URL", None),
+        "supports_movies": bool(getattr(scraper_class, "SUPPORTS_MOVIES", False)),
+        "latency_ms": None,
+        "embeds": 0,
+    }
+    gate = meta.get("env_gate")
+    if gate and not os.getenv(gate):
+        entry.update(status="disabled", detail=f"{gate} not configured — source is dormant")
+        return entry
+
+    c = source_health.CANARY
+    t0 = time.perf_counter()
+    try:
+        embeds = await run_single_scraper(
+            scraper_class, c["tmdb_id"], c["season"], c["episode"], anilist_data,
+            media_type="tv",
+        )
+        entry["latency_ms"] = round((time.perf_counter() - t0) * 1000)
+        n = len(embeds or [])
+        entry["embeds"] = n
+        if n > 0:
+            entry.update(status="ok", detail=f"Resolved {n} embed(s) for the canary")
+        else:
+            entry.update(status="empty", detail="Reachable, but found no embeds for the canary title")
+    except Exception as e:
+        entry["latency_ms"] = round((time.perf_counter() - t0) * 1000)
+        entry.update(status="error", detail=(str(e)[:240] or e.__class__.__name__))
+    return entry
+
+
+async def _probe_library_sources() -> List[Dict]:
+    """Config/occupancy status for the operator-provided sources (cache, local,
+    Jellyfin). These only hold what the operator added, so they're reported by
+    'is it set up and does it hold anything' rather than the canary probe."""
+    out: List[Dict] = []
+
+    cache_enabled = await run_in_threadpool(cache_store.get_enabled)
+    cstats = await run_in_threadpool(cache_store.stats)
+    targets = await run_in_threadpool(cache_store.enabled_targets)
+    ready = cstats.get("ready") or 0
+    if not cache_enabled:
+        c_status, c_detail = "disabled", "Caching is switched off"
+    elif ready > 0:
+        c_status, c_detail = "active", f"{ready} episode(s) ready · {len(targets)} target(s)"
+    else:
+        c_status, c_detail = "idle", f"Enabled · {len(targets)} target(s), nothing cached yet"
+    out.append({
+        "id": "CacheScraper", "label": "Server Cache", "category": "library",
+        "note": source_health.meta_for("CacheScraper").get("note"),
+        "status": c_status, "detail": c_detail, "latency_ms": None,
+        "metrics": {
+            "ready": cstats.get("ready"), "pending": cstats.get("pending"),
+            "downloading": cstats.get("downloading"), "failed": cstats.get("failed"),
+            "targets": len(targets),
+        },
+    })
+
+    local_sources = await run_in_threadpool(local_source_store.list_sources)
+    enabled = [s for s in local_sources if s.get("enabled")]
+    if not local_sources:
+        l_status, l_detail = "disabled", "No local directories registered"
+    elif enabled:
+        l_status, l_detail = "active", f"{len(enabled)} of {len(local_sources)} directory(ies) enabled"
+    else:
+        l_status, l_detail = "idle", f"{len(local_sources)} directory(ies) registered, all disabled"
+    out.append({
+        "id": "LocalScraper", "label": "Local Media", "category": "library",
+        "note": source_health.meta_for("LocalScraper").get("note"),
+        "status": l_status, "detail": l_detail, "latency_ms": None,
+        "metrics": {"total": len(local_sources), "enabled": len(enabled)},
+    })
+
+    jelly = jellyfin_is_configured()
+    out.append({
+        "id": "JellyfinScraper", "label": "Jellyfin", "category": "library",
+        "note": source_health.meta_for("JellyfinScraper").get("note"),
+        "status": "active" if jelly else "disabled",
+        "detail": "Configured via JELLYFIN_* env" if jelly else "JELLYFIN_* env not set",
+        "latency_ms": None, "metrics": {},
+    })
+    return out
+
+
+async def _do_source_health() -> Dict:
+    """Run the full probe sweep: shared canary metadata once, then every scrape
+    source concurrently, plus the library sources. Assembles the summary tally."""
+    anilist_data: Dict = {}
+    try:
+        async with http_client() as client:
+            anilist_data = await fetch_anilist_metadata(client, source_health.CANARY["anilist_id"]) or {}
+    except Exception as e:
+        logger.warning(f"source-health canary metadata fetch failed: {e}")
+    if not anilist_data.get("title"):
+        anilist_data = {**anilist_data, "title": source_health.CANARY["title"]}
+
+    scrape_classes = [
+        c for c in ALL_SCRAPERS
+        if source_health.meta_for(c.__name__)["category"] == "scrape"
+    ]
+    scrape_results = await asyncio.gather(
+        *(_probe_scrape_source(c, anilist_data) for c in scrape_classes),
+        return_exceptions=False,
+    )
+    library_results = await _probe_library_sources()
+    sources = library_results + list(scrape_results)
+
+    summary = {"total": len(sources)}
+    for s in sources:
+        summary[s["status"]] = summary.get(s["status"], 0) + 1
+    # Latency stats over the scrape probes that actually ran.
+    lats = [s["latency_ms"] for s in scrape_results if s.get("latency_ms") is not None]
+    summary["avg_latency_ms"] = round(sum(lats) / len(lats)) if lats else None
+    summary["slowest_ms"] = max(lats) if lats else None
+
+    return {
+        "canary": dict(source_health.CANARY),
+        "sources": sources,
+        "summary": summary,
+    }
+
+
+async def _admin_source_health(force: bool = False) -> Dict:
+    """Cached wrapper around the probe sweep (TTL ``SOURCE_HEALTH_TTL``). The lock
+    collapses a thundering herd of dashboard loads into a single sweep."""
+    now = time.monotonic()
+    cached = _source_health_cache.get("data")
+    if not force and cached and (now - float(_source_health_cache["at"]) < _SOURCE_HEALTH_TTL):
+        return {**cached, "cached": True}
+
+    async with _source_health_lock:
+        now = time.monotonic()
+        cached = _source_health_cache.get("data")
+        if not force and cached and (now - float(_source_health_cache["at"]) < _SOURCE_HEALTH_TTL):
+            return {**cached, "cached": True}
+        data = await _do_source_health()
+        data["probed_at"] = datetime.now(timezone.utc).isoformat()
+        _source_health_cache["at"] = time.monotonic()
+        _source_health_cache["data"] = data
+        return {**data, "cached": False}
+
+
+set_source_health_handler(_admin_source_health)
 
 
 @app.get("/anilist/{anilist_id}")
@@ -3080,12 +3613,14 @@ async def health_check():
 # --- ERROR HANDLERS ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Custom HTTP exception handler"""
+    """Custom HTTP exception handler. Keeps the real technical detail in ``error``
+    (the frontend may key on it) and adds Lumi's voiced ``message`` for the banner."""
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "success": False,
             "error": exc.detail,
+            "message": lumi.voiced_error(exc.status_code),
             "status_code": exc.status_code
         }
     )
@@ -3099,6 +3634,7 @@ async def general_exception_handler(request: Request, exc: Exception):
         content={
             "success": False,
             "error": "Internal server error",
+            "message": lumi.voiced_error(500),
             "detail": str(exc) if os.getenv("DEBUG") else None
         }
     )
