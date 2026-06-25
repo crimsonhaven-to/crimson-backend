@@ -25,6 +25,8 @@ COPY api.py .
 COPY player.py .
 COPY db_pool.py .
 COPY rate_limit.py .
+COPY lumi.py .
+COPY source_health.py .
 COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY metadata_engine ./metadata_engine
