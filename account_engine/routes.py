@@ -66,6 +66,20 @@ def set_episode_enricher(handler) -> None:
     _episode_enricher = handler
 
 
+# Optional hook injected by api.py (same pattern as the enricher). When a viewer
+# saves progress on a TV/anime episode, this is called — fire-and-forget — to
+# warm the server-side cache for the NEXT episode: scrape + resolve it ahead of
+# time and hand the source closest to the viewer's preference to the cache engine,
+# so "Continue Watching" plays instantly off the NAS. Best-effort; no-op when unset.
+_warmup_handler = None  # callable(request, *, tmdb_id, season_number, episode_number, preferences)
+
+
+def set_warmup_handler(handler) -> None:
+    """Register the continue-watching warmup scheduler (called by api.py)."""
+    global _warmup_handler
+    _warmup_handler = handler
+
+
 async def _enrich(rows: List[dict]) -> List[dict]:
     """Run the injected enricher over rows (best-effort; rows returned unchanged if
     it isn't set or raises). Enrichment is purely additive metadata, never load-bearing."""
@@ -901,6 +915,29 @@ async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depen
         prog = store.upsert_progress(user["user_id"], {"item_key": item_key, **payload})
     except QuotaExceeded as e:
         raise HTTPException(status_code=409, detail=str(e))
+
+    # Continue-Watching warmup: pre-cache the NEXT episode in the background so it
+    # plays instantly when the viewer advances. Only for TV/anime episodes (movies
+    # have no "next", and the warmup self-skips end-of-season / unaired / caching-off).
+    # Fire-and-forget — never awaited, never allowed to affect this response.
+    if (
+        _warmup_handler
+        and body.media_type != "movie"
+        and body.tmdb_id is not None
+        and body.season_number is not None
+        and body.episode_number is not None
+    ):
+        try:
+            _warmup_handler(
+                request,
+                tmdb_id=body.tmdb_id,
+                season_number=body.season_number,
+                episode_number=body.episode_number,
+                preferences=store.get_preferences(user["user_id"]),
+            )
+        except Exception as e:
+            logger.warning(f"warmup scheduling failed: {e}")
+
     return {"success": True, "progress": prog}
 
 

@@ -156,6 +156,35 @@ def connection() -> Iterator[psycopg.Connection]:
         yield conn
 
 
+def pool_stats() -> dict:
+    """Live pool utilisation + configured bounds, for the admin dashboard.
+
+    Merges psycopg_pool's own counters (``get_stats()`` — pool size, how many
+    connections are currently handed out, how many requests are queued waiting for
+    one, etc.) with the configured min/max so the dashboard can show headroom.
+    Best-effort: returns ``{"available": False}`` if the pool isn't open yet."""
+    if _pool is None:
+        return {"available": False}
+    try:
+        raw = _pool.get_stats()
+    except Exception:
+        raw = {}
+    size = raw.get("pool_size", 0)
+    in_use = raw.get("pool_size") - raw.get("pool_available", 0) if raw.get("pool_size") is not None else None
+    return {
+        "available": True,
+        "min_size": getattr(_pool, "min_size", None),
+        "max_size": getattr(_pool, "max_size", None),
+        "size": size,
+        "idle": raw.get("pool_available"),
+        "in_use": in_use,
+        "waiting": raw.get("requests_waiting"),
+        "requests_total": raw.get("requests_num"),
+        "requests_errors": raw.get("requests_errors"),
+        "connections_total": raw.get("connections_num"),
+    }
+
+
 def close_pool() -> None:
     """Close the pool (called on application shutdown)."""
     global _pool

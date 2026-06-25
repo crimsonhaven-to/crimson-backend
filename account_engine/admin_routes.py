@@ -98,6 +98,26 @@ def set_resync_handler(handler) -> None:
     _resync_handler = handler
 
 
+# --- injected handlers for the richer dashboard views ----------------------
+# Both live in api.py (they need the scraper pipeline / runtime context), so they
+# are injected here the same way the resync handler is — keeping admin_routes free
+# of a circular import on api.py.
+_system_handler = None        # async () -> dict   (runtime / pool / cache snapshot)
+_source_health_handler = None  # async (force: bool) -> dict  (per-source probe)
+
+
+def set_system_handler(handler) -> None:
+    """Wire the runtime/system-info provider (api.py owns VERSION + the registries)."""
+    global _system_handler
+    _system_handler = handler
+
+
+def set_source_health_handler(handler) -> None:
+    """Wire the source-health prober (api.py owns the scraper/resolver pipeline)."""
+    global _source_health_handler
+    _source_health_handler = handler
+
+
 async def _run_resync(triggered_by: str) -> None:
     # The lock makes a second trigger a no-op rebuild rather than two concurrent
     # Fribb downloads contending on the DB.
@@ -164,6 +184,35 @@ async def admin_stats(user: dict = Depends(require_admin)):
         "content": content,
         "resync": _resync_state,
     }
+
+
+@router.get("/system")
+async def admin_system(user: dict = Depends(require_admin)):
+    """Rich runtime snapshot for the dashboard: version + uptime, the scraper/
+    resolver registry sizes, capability flags, DB-pool utilisation and the
+    server-side cache aggregate. Provided by api.py (it owns the registries)."""
+    if _system_handler is None:
+        raise HTTPException(status_code=503, detail="System info is not available on this node")
+    info = await _system_handler()
+    return {"success": True, "generated_at": _now_iso(), "system": info}
+
+
+@router.get("/source-health")
+async def admin_source_health(
+    user: dict = Depends(require_admin),
+    force: bool = Query(False, description="Bypass the short result cache and re-probe now"),
+):
+    """Per-source health: probe every external scrape source against a known canary
+    title (green = embeds resolved, yellow = reachable but empty, red = error) and
+    report the operator-provided library sources' configuration. Results are cached
+    server-side for a few minutes; pass ``force=true`` to re-probe immediately.
+
+    The probe runs the real search→embeds pipeline, so a green source is one that
+    would actually play right now. Provided by api.py (it owns the pipeline)."""
+    if _source_health_handler is None:
+        raise HTTPException(status_code=503, detail="Source health is not available on this node")
+    data = await _source_health_handler(force)
+    return {"success": True, "generated_at": _now_iso(), **data}
 
 
 # --- users -----------------------------------------------------------------
