@@ -130,12 +130,18 @@ def _build_index() -> CatalogueIndex:
         # Posters for anime candidates come from tmdb_shows (sparse).
         posters = {r["tmdb_id"]: r["poster_path"] for r in show_rows}
 
-    # anime candidates: one per show (lowest season) that has genres.
+    # anime candidates: one per show (lowest season) that has genres AND a poster.
+    # The poster comes from tmdb_shows, which is sparse (only titles opened at least
+    # once), so we skip posterless candidates — exactly like /trending and /search do
+    # (a posterless tile just renders a "No Sigil" placeholder on the home rows).
     anime_candidates: List[Dict] = []
     for tmdb_id, sel in lowest_season.items():
         anilist_id = sel["anilist_id"]
         genres = genres_by_anilist.get(anilist_id)
         if not genres:
+            continue
+        poster_path = posters.get(tmdb_id)
+        if not poster_path:
             continue
         e = entries.get(anilist_id, {})
         anime_candidates.append({
@@ -145,7 +151,7 @@ def _build_index() -> CatalogueIndex:
             "season_number": sel["season_number"],
             "title": e.get("title_english") or e.get("title_romaji") or e.get("title_native"),
             "year": e.get("start_year"),
-            "poster_path": posters.get(tmdb_id),
+            "poster_path": poster_path,
             "genres": genres,
         })
 
@@ -155,7 +161,12 @@ def _build_index() -> CatalogueIndex:
         g = _parse_genres(r["genres"])
         if not g:
             continue
+        # A seed still needs its genres even if it has no poster, so register the
+        # genre lookup unconditionally; only the *candidate* (a tile we'd render)
+        # requires a poster.
         genres_by_show[r["tmdb_id"]] = g
+        if not r["poster_path"]:
+            continue
         show_candidates.append({
             "kind": "show",
             "tmdb_id": r["tmdb_id"],
@@ -173,6 +184,8 @@ def _build_index() -> CatalogueIndex:
         if not g:
             continue
         genres_by_movie[r["tmdb_id"]] = g
+        if not r["poster_path"]:
+            continue
         movie_candidates.append({
             "kind": "movie",
             "tmdb_id": r["tmdb_id"],
