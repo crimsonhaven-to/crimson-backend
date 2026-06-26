@@ -56,6 +56,7 @@ from account_engine.admin_routes import (
 )
 from supporters_engine import router as supporters_router, store as supporters_store
 from changelog_engine import router as changelog_router, service as changelog_service
+from recommend_engine import router as recommend_router
 from db_pool import get_pool, close_pool, pool_stats
 import lumi
 import source_health
@@ -73,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "10.0.0"
+VERSION = "11.0.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -583,6 +584,10 @@ app.include_router(supporters_router)
 # Public changelog (cached view of this repo's GitHub Releases).
 app.include_router(changelog_router)
 
+# "What to watch next" — genre-based recommendations derived from the viewer's
+# favorites + watch history (read-only, additive; see recommend_engine).
+app.include_router(recommend_router)
+
 # --- DATABASE HELPER FUNCTIONS ---
 def get_db_connection():
     """Borrow a pooled PostgreSQL connection as a context manager.
@@ -757,16 +762,22 @@ def upsert_show_info(show: Dict) -> None:
     if not show.get("tmdb_id"):
         return
     try:
+        # genres is a JSON list of names; only overwrite the stored value when the
+        # caller actually supplies one, so a later metadata refresh that omits it
+        # (e.g. the degraded path) doesn't blank out genres we already have.
+        genres = show.get("genres")
+        genres_json = json.dumps(genres) if genres else None
         def _write():
             with get_db_connection() as conn:
                 conn.execute("""
                     INSERT INTO tmdb_shows
-                        (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date, genres)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (tmdb_id) DO UPDATE SET
                         title=EXCLUDED.title, overview=EXCLUDED.overview,
                         poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
-                        first_air_date=EXCLUDED.first_air_date
+                        first_air_date=EXCLUDED.first_air_date,
+                        genres=COALESCE(EXCLUDED.genres, tmdb_shows.genres)
                 """, (
                     show.get("tmdb_id"),
                     show.get("title"),
@@ -774,6 +785,7 @@ def upsert_show_info(show: Dict) -> None:
                     show.get("poster_path"),
                     show.get("backdrop_path"),
                     show.get("first_air_date"),
+                    genres_json,
                 ))
         _write()
     except Exception as e:
@@ -798,16 +810,19 @@ def upsert_movie_info(movie: Dict) -> None:
     if not movie.get("tmdb_id"):
         return
     try:
+        genres = movie.get("genres")
+        genres_json = json.dumps(genres) if genres else None
         def _write():
             with get_db_connection() as conn:
                 conn.execute("""
                     INSERT INTO tmdb_movies
-                        (tmdb_id, title, overview, poster_path, backdrop_path, release_date)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (tmdb_id, title, overview, poster_path, backdrop_path, release_date, genres)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (tmdb_id) DO UPDATE SET
                         title=EXCLUDED.title, overview=EXCLUDED.overview,
                         poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
-                        release_date=EXCLUDED.release_date
+                        release_date=EXCLUDED.release_date,
+                        genres=COALESCE(EXCLUDED.genres, tmdb_movies.genres)
                 """, (
                     movie.get("tmdb_id"),
                     movie.get("title"),
@@ -815,6 +830,7 @@ def upsert_movie_info(movie: Dict) -> None:
                     movie.get("poster_path"),
                     movie.get("backdrop_path"),
                     movie.get("release_date"),
+                    genres_json,
                 ))
         _write()
     except Exception as e:
@@ -1008,10 +1024,76 @@ async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional
 
 # Bump when the cached TMDB payload shape changes, so stale entries in the
 # volume-persisted api_cache are ignored after a deploy instead of served.
-TMDB_CACHE_VERSION = "v2"
+TMDB_CACHE_VERSION = "v3"
 
 def _tmdb_img(path: Optional[str], size: str = "w500") -> Optional[str]:
     return f"https://image.tmdb.org/t/p/{size}{path}" if path else None
+
+async def fetch_tmdb_genre_map(client: httpx.AsyncClient, kind: str) -> Dict[int, str]:
+    """TMDB genre id -> name map for ``kind`` ('tv' or 'movie'), cached.
+
+    Discover/search results carry only ``genre_ids`` (ints), not names. This map
+    turns them into the genre-name lists we store in tmdb_shows/tmdb_movies (the
+    non-anime twin of anime_entries.genres), so the recommend engine can score
+    shows/movies the same way it scores anime. The map is tiny and very stable, so
+    it's cached aggressively (L1 + DB)."""
+    if kind not in ("tv", "movie"):
+        return {}
+    cache_key = f"tmdb:genremap:{kind}"
+    local = _local_get(cache_key)
+    if local is not None:
+        return local
+    cached = await get_cached_response(cache_key)
+    if cached and "map" in cached:
+        gmap = {int(k): v for k, v in cached["map"].items()}
+        _local_set(cache_key, gmap)
+        return gmap
+
+    data = await fetch_with_retry(
+        client, f"https://api.themoviedb.org/3/genre/{kind}/list", params={"language": "en-US"}
+    )
+    gmap = {g["id"]: g["name"] for g in (data or {}).get("genres", []) if g.get("id") and g.get("name")}
+    if gmap:
+        await set_cached_response(
+            cache_key, {"map": {str(k): v for k, v in gmap.items()}},
+            ttl_seconds=Config.CACHE_TTL_SECONDS,
+        )
+        _local_set(cache_key, gmap)
+    return gmap
+
+def _genre_names(item: Dict, genre_map: Dict[int, str]) -> List[str]:
+    """Resolve a discover/search item's genre_ids to names via ``genre_map``."""
+    return [genre_map[g] for g in (item.get("genre_ids") or []) if g in genre_map]
+
+def _persist_discovered_show(item: Dict, genre_map: Dict[int, str]) -> None:
+    """Lazily cache a discovered/searched non-anime show into tmdb_shows (title,
+    overview, art, genres) so it can later be a recommendation candidate without a
+    full overview open. Best-effort; mirrors fetch_tmdb_show's upsert."""
+    if not item.get("id"):
+        return
+    upsert_show_info({
+        "tmdb_id": item.get("id"),
+        "title": item.get("name") or item.get("original_name"),
+        "overview": item.get("overview"),
+        "poster_path": item.get("poster_path"),
+        "backdrop_path": item.get("backdrop_path"),
+        "first_air_date": item.get("first_air_date"),
+        "genres": _genre_names(item, genre_map),
+    })
+
+def _persist_discovered_movie(item: Dict, genre_map: Dict[int, str]) -> None:
+    """Movie twin of _persist_discovered_show (caches into tmdb_movies)."""
+    if not item.get("id"):
+        return
+    upsert_movie_info({
+        "tmdb_id": item.get("id"),
+        "title": item.get("title") or item.get("original_title"),
+        "overview": item.get("overview"),
+        "poster_path": item.get("poster_path"),
+        "backdrop_path": item.get("backdrop_path"),
+        "release_date": item.get("release_date"),
+        "genres": _genre_names(item, genre_map),
+    })
 
 async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
     """
@@ -1052,11 +1134,14 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
         "poster": _tmdb_img(data.get("poster_path")),
         "backdrop": _tmdb_img(data.get("backdrop_path"), "original"),
         "first_air_date": data.get("first_air_date"),
+        # Genre names — the non-anime twin of anime_entries.genres. Stored into
+        # tmdb_shows so the recommend engine can score shows by genre too.
+        "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
         "seasons": seasons,
     }
 
     upsert_show_info({k: result.get(k) for k in
-                      ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "first_air_date")})
+                      ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "first_air_date", "genres")})
     await set_cached_response(cache_key, result)
     return result
 
@@ -1093,7 +1178,7 @@ async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
     }
 
     upsert_movie_info({k: result.get(k) for k in
-                       ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "release_date")})
+                       ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "release_date", "genres")})
     await set_cached_response(cache_key, result)
     return result
 
@@ -1493,6 +1578,7 @@ async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, 
     items = data.get("results", [])
     # One batched lookup so we can drop anything already mapped as anime.
     anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+    genre_map = await fetch_tmdb_genre_map(client, "tv")
 
     results: List[Dict] = []
     for item in items:
@@ -1501,6 +1587,8 @@ async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, 
             continue
         if not item.get("poster_path"):
             continue  # posterless rows are usually junk/duplicates — skip for a clean grid
+        # Cache the show's metadata + genres so it can seed recommendations later.
+        _persist_discovered_show(item, genre_map)
         results.append(_show_item(item))
         if len(results) >= limit:
             break
@@ -1538,6 +1626,7 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
 
     items = data.get("results", [])
     anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+    genre_map = await fetch_tmdb_genre_map(client, "tv")
 
     trending_list: List[Dict] = []
     for item in items:
@@ -1546,6 +1635,8 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
             continue
         if not item.get("poster_path"):
             continue
+        # Popular shows make the best recommendation candidates — cache them.
+        _persist_discovered_show(item, genre_map)
         trending_list.append(_show_item(item))
         if len(trending_list) >= limit:
             break
@@ -1597,12 +1688,14 @@ async def fetch_tmdb_movie_search_results(client: httpx.AsyncClient, query: str,
     if not data:
         return []
 
+    genre_map = await fetch_tmdb_genre_map(client, "movie")
     results: List[Dict] = []
     for item in data.get("results", []):
         if not item.get("id") or _looks_like_anime_movie(item):
             continue
         if not item.get("poster_path"):
             continue
+        _persist_discovered_movie(item, genre_map)
         results.append(_movie_item(item))
         if len(results) >= limit:
             break
@@ -1638,12 +1731,14 @@ async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> L
     if not data:
         return []
 
+    genre_map = await fetch_tmdb_genre_map(client, "movie")
     trending_list: List[Dict] = []
     for item in data.get("results", []):
         if not item.get("id") or _looks_like_anime_movie(item):
             continue
         if not item.get("poster_path"):
             continue
+        _persist_discovered_movie(item, genre_map)
         trending_list.append(_movie_item(item))
         if len(trending_list) >= limit:
             break
@@ -3480,12 +3575,19 @@ async def get_show_overview(tmdb_id: int):
         stored = get_show_info(tmdb_id)
         if not stored:
             raise HTTPException(status_code=404, detail="Show not found on TMDB")
+        stored_genres = []
+        if stored.get("genres"):
+            try:
+                stored_genres = json.loads(stored["genres"]) or []
+            except (TypeError, ValueError):
+                stored_genres = []
         show = {
             "title": stored.get("title"),
             "overview": stored.get("overview"),
             "poster": _tmdb_img(stored.get("poster_path")),
             "backdrop": _tmdb_img(stored.get("backdrop_path"), "original"),
             "first_air_date": stored.get("first_air_date"),
+            "genres": stored_genres,
             "seasons": [],
         }
         seasons_data = _degraded_season_list(tmdb_id)
@@ -3511,6 +3613,8 @@ async def get_show_overview(tmdb_id: int):
         "total_episodes": None,
         "total_seasons": len(seasons_data),
         "seasons": seasons_data,
+        # Genre tags — the non-anime twin of /overview's genres (from tmdb_shows).
+        "genres": show.get("genres") or [],
         # General shows carry no AniList specials/OVAs/movies mapping.
         "extras": [],
         # When TMDB was unavailable, this page was rebuilt from local data only.
@@ -3536,6 +3640,12 @@ async def get_movie_overview(tmdb_id: int):
         stored = get_movie_info(tmdb_id)
         if not stored:
             raise HTTPException(status_code=404, detail="Movie not found on TMDB")
+        stored_genres = []
+        if stored.get("genres"):
+            try:
+                stored_genres = json.loads(stored["genres"]) or []
+            except (TypeError, ValueError):
+                stored_genres = []
         movie = {
             "title": stored.get("title"),
             "overview": stored.get("overview"),
@@ -3543,7 +3653,7 @@ async def get_movie_overview(tmdb_id: int):
             "backdrop": _tmdb_img(stored.get("backdrop_path"), "original"),
             "release_date": stored.get("release_date"),
             "runtime": None,
-            "genres": [],
+            "genres": stored_genres,
             "vote_average": None,
             "status": None,
         }

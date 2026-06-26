@@ -148,10 +148,16 @@ class MappingDatabaseEngine:
                     overview       TEXT,
                     poster_path    TEXT,
                     backdrop_path  TEXT,
-                    first_air_date TEXT
+                    first_air_date TEXT,
+                    genres         TEXT
                 )
                 """
             )
+
+            # Backfill the genres column on DBs created before it existed (the anime
+            # genres twin of anime_entries.genres). Stored as a JSON list of genre
+            # names, lazily populated by /show* (fetch_tmdb_show); null until then.
+            cursor.execute("ALTER TABLE tmdb_shows ADD COLUMN IF NOT EXISTS genres TEXT")
 
             # General (non-anime) MOVIES, keyed by their TMDB *movie* id. Wholly
             # separate from tmdb_shows (TMDB *tv* ids) — the two id spaces overlap
@@ -166,10 +172,15 @@ class MappingDatabaseEngine:
                     overview      TEXT,
                     poster_path   TEXT,
                     backdrop_path TEXT,
-                    release_date  TEXT
+                    release_date  TEXT,
+                    genres        TEXT
                 )
                 """
             )
+
+            # Backfill genres on pre-existing tmdb_movies (see tmdb_shows above);
+            # JSON list of genre names, lazily populated by fetch_tmdb_movie.
+            cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS genres TEXT")
 
             # One AniList id per real TMDB season (season_number >= 1).
             cursor.execute(

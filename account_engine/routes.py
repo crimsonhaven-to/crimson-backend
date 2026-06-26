@@ -577,6 +577,7 @@ async def account_me(user: dict = Depends(require_user)):
         "email": user.get("email"),
         "email_verified": user.get("email_verified"),
         "is_admin": bool(user.get("is_admin")),
+        "username": user.get("username"),
         "label": user.get("label"),
         "created_at": user.get("created_at"),
         "last_login_at": user.get("last_login_at"),
@@ -623,6 +624,31 @@ async def put_preferences(request: Request, user: dict = Depends(require_user)):
         raise HTTPException(status_code=400, detail="Preferences must be a JSON object")
     saved = store.set_preferences(user["user_id"], data)
     return {"success": True, "preferences": saved}
+
+
+# --- display name ----------------------------------------------------------
+# A cosmetic, user-editable display name shown in greetings like "Recommended for
+# you, {username}". Deliberately separate from auth (email / public_key) and from
+# the free-form preferences blob: it's a single first-class field the frontend can
+# read off /account/me. Non-unique by design.
+MAX_USERNAME_LENGTH = 32
+
+
+class UsernameIn(BaseModel):
+    # Empty string / null clears the display name (falls back to a generic greeting).
+    username: Optional[str] = Field(default=None, max_length=MAX_USERNAME_LENGTH)
+
+
+@router.put("/account/username")
+@limiter.limit("20/minute")
+async def set_username(request: Request, body: UsernameIn, user: dict = Depends(require_user)):
+    """Set or clear the account's cosmetic display name. Trimmed; an empty value
+    clears it. Purely additive — never affects auth, favorites or progress."""
+    name = (body.username or "").strip()
+    if len(name) > MAX_USERNAME_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Name must be at most {MAX_USERNAME_LENGTH} characters")
+    store.set_username(user["user_id"], name or None)
+    return {"success": True, "username": name or None}
 
 
 # --- favorites / watchlists ------------------------------------------------
