@@ -114,6 +114,12 @@ class AccountStore:
                 -- JSON object in TEXT so new preference keys are a frontend-only
                 -- change. NULL/absent => the client falls back to its local default.
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS preferences    TEXT;
+                -- Optional display name ("Recommended for you, {username}"). Purely
+                -- cosmetic, user-editable from the preferences page; NOT used for
+                -- auth or login (those stay email / public_key). Non-unique on
+                -- purpose — it's a display name, not an identity. NULL => the
+                -- frontend falls back to a generic greeting.
+                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS username       TEXT;
                 -- Case-insensitive email uniqueness (NULLs — the crypto accounts —
                 -- are allowed to coexist).
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email
@@ -276,6 +282,15 @@ class AccountStore:
                 (blob, user_id),
             )
         return preferences
+
+    # -- display name ---------------------------------------------------
+    def set_username(self, user_id: int, username: Optional[str]) -> None:
+        """Set (or clear, with None) the account's cosmetic display name."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET username = %s WHERE user_id = %s",
+                (username, user_id),
+            )
 
     # -- admin ----------------------------------------------------------
     def set_admin(self, user_id: int, is_admin: bool) -> None:
