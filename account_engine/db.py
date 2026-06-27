@@ -21,7 +21,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from db_pool import get_connection, lock_schema_init
+from core.db_pool import get_connection, lock_schema_init
 
 # Lifetimes.
 SESSION_TTL = timedelta(days=30)

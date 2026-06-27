@@ -3,10 +3,9 @@ import os
 import gzip
 import hashlib
 import platform
-import random
 import time
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Tuple
 from contextlib import asynccontextmanager
 
@@ -45,7 +44,7 @@ from cache_engine.fs import (
     media_type_for as cache_media_type,
 )
 from cache_engine.downloader import manager as cache_manager, ffmpeg_available
-from player import render_player, is_safe_src
+from core.player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
 from account_engine.routes import set_episode_enricher, set_warmup_handler
@@ -58,13 +57,42 @@ from account_engine.admin_routes import (
 from supporters_engine import router as supporters_router, store as supporters_store
 from changelog_engine import router as changelog_router, service as changelog_service
 from recommend_engine import router as recommend_router
-from db_pool import get_pool, close_pool, pool_stats
-import lumi
-import source_health
-from rate_limit import limiter
+from core.db_pool import get_pool, close_pool, pool_stats
+from core import lumi
+from core import source_health
+from core.rate_limit import limiter
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from starlette.concurrency import run_in_threadpool
+from core.config import Config
+from core.http_client import (
+    http_client,
+    open_client as open_http_client,
+    close_client as close_http_client,
+)
+from core.response_cache import (
+    _local_cache,
+    _local_get,
+    _local_set,
+    get_cached_response,
+    set_cached_response,
+    purge_expired_cache,
+)
+from metadata_engine.tmdb import (
+    _tmdb_img,
+    fetch_tmdb_show,
+    fetch_tmdb_movie,
+    fetch_tmdb_metadata,
+    _season_episode_info,
+    fetch_tmdb_search_results,
+    fetch_trending_anime,
+    fetch_tmdb_show_search_results,
+    fetch_trending_shows,
+    fetch_tmdb_movie_search_results,
+    fetch_trending_movies,
+    fetch_tmdb_localized_titles,
+)
+from metadata_engine.anilist import fetch_anilist_metadata, _empty
 
 # Configure logging
 logging.basicConfig(
@@ -92,136 +120,12 @@ local_source_store = LocalSourceStore()
 cache_store = CacheStore()
 
 
-def _utcnow_iso() -> str:
-    """Current UTC time as a naive ISO-8601 string.
-
-    ``datetime.utcnow()`` is deprecated (and slated for removal), so we derive
-    UTC from a tz-aware ``now`` but drop the offset to keep the exact same
-    ``YYYY-MM-DDTHH:MM:SS.ffffff`` shape the api_cache rows were written with —
-    so lexicographic ``expires_at`` comparisons stay correct across an upgrade.
-    """
-    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-
 # Load environment variables
 load_dotenv()
 
-# Configuration
-class Config:
-    TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-    # Mapping + accounts now live in PostgreSQL; the connection is configured via
-    # DATABASE_URL / POSTGRES_* and pooled in db_pool (no per-process DB path).
-    CACHE_TTL_SECONDS = 86400  # 24 hours
-    TRENDING_CACHE_TTL_SECONDS = 21600  # 6 hours
-    MAX_CONCURRENT_REQUESTS = 10
-    REQUEST_TIMEOUT = 30.0
-    MAX_RETRIES = 3
-    RETRY_BACKOFF_FACTOR = 1.0
-
-    # Only the replica with this set to true runs the periodic Fribb resync.
-    # The sync rebuilds the mapping tables wholesale, so running it on every
-    # replica is wasteful — keep it enabled on exactly one replica (see README
-    # "Deploying to Docker Swarm").
-    RUN_DB_SYNC = os.getenv("RUN_DB_SYNC", "true").lower() not in ("0", "false", "no")
-
-    # Only the dedicated cache-worker service runs the background ffmpeg download
-    # loop; the api/api-sync replicas just mint cache tickets and claim pending
-    # rows (the DB row is the job queue, so a download survives an api redeploy).
-    # Defaults true so a single-container (docker-compose) deploy still caches
-    # without extra config; the Swarm stack sets it false on api/api-sync and true
-    # on cache-worker. The DB claim dedupes if more than one process runs it.
-    RUN_CACHE_WORKER = os.getenv("RUN_CACHE_WORKER", "true").lower() not in ("0", "false", "no")
-
-    # Emails promoted to admin on startup (comma-separated). Seeds the first
-    # admin so the /admin dashboard is reachable without hand-editing the DB;
-    # afterwards admins can promote others from the dashboard itself. Only takes
-    # effect for accounts that already exist (it never creates one).
-    ADMIN_EMAILS = [
-        e.strip() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
-    ]
-
-    # Site-wide login wall. When true (default) every content endpoint requires a
-    # valid session bearer token (see the require_login middleware); a small set
-    # of paths — auth, health, the signed stream proxies/player that media
-    # elements load without headers, and the Ko-fi webhook — stay public. Set to
-    # false to revert to a fully open API.
-    REQUIRE_LOGIN = os.getenv("REQUIRE_LOGIN", "true").lower() not in ("0", "false", "no")
-
-    # CORS Origins. Overridable via the ALLOWED_ORIGINS env var (comma-separated)
-    # so the deploy can lock these down without a code change; falls back to the
-    # built-in dev + crimsonhaven.to list.
-    _DEFAULT_ORIGINS = [
-        "https://crimsonhaven.to",
-        "https://www.crimsonhaven.to",
-    ]
-    ALLOWED_ORIGINS = [
-        o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()
-    ] or _DEFAULT_ORIGINS
-
-    @classmethod
-    def validate(cls):
-        if not cls.TMDB_API_KEY:
-            raise ValueError("TMDB_API_KEY environment variable is not set")
-
-Config.validate()
-
-# TMDB Headers
-TMDB_HEADERS = {
-    "Authorization": f"Bearer {Config.TMDB_API_KEY}",
-    "accept": "application/json"
-}
 
 # Initialize database engine (storage is the shared PostgreSQL pool; see db_pool)
 db_engine = MappingDatabaseEngine(tmdb_api_key=Config.TMDB_API_KEY)
-
-# --- SHARED HTTP CLIENT ---
-# One process-wide AsyncClient (opened in lifespan) instead of a fresh
-# httpx.AsyncClient() per request. Reusing it keeps the TCP+TLS connections to
-# TMDB / AniList warm across requests rather than paying a new handshake every
-# call — the single biggest latency win on the metadata endpoints. Call sites use
-# the ``http_client()`` context manager below, which yields this shared instance
-# and deliberately does NOT close it on block exit.
-_http_client: Optional[httpx.AsyncClient] = None
-
-
-def get_http_client() -> httpx.AsyncClient:
-    """Return the shared AsyncClient, creating a transient fallback if the
-    lifespan hasn't run yet (only possible outside the normal request path)."""
-    if _http_client is None:
-        return httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT)
-    return _http_client
-
-
-@asynccontextmanager
-async def http_client():
-    """Yield the shared AsyncClient. Drop-in for ``httpx.AsyncClient()`` at the
-    existing ``async with ... as client:`` call sites — but the shared client is
-    kept open (not closed) when the block exits."""
-    yield get_http_client()
-
-
-# --- IN-PROCESS L1 CACHE (hot global keys) ---
-# A tiny TTL cache in front of the PostgreSQL api_cache for the few hot keys that
-# use a fixed global cache key (trending, catalogue). It removes a DB round-trip
-# on every hit. Stateless-friendly: it only ever serves data up to its short TTL
-# and each replica converges independently (no cross-replica invalidation needed
-# because these payloads are read-mostly and already TTL-bounded upstream).
-_LOCAL_CACHE_TTL = 300  # seconds
-_local_cache: Dict[str, Tuple[float, object]] = {}
-
-
-def _local_get(key: str):
-    hit = _local_cache.get(key)
-    if not hit:
-        return None
-    expiry, value = hit
-    if expiry < time.monotonic():
-        _local_cache.pop(key, None)
-        return None
-    return value
-
-
-def _local_set(key: str, value: object, ttl: int = _LOCAL_CACHE_TTL) -> None:
-    _local_cache[key] = (time.monotonic() + ttl, value)
 
 
 # --- LIFESPAN MANAGEMENT ---
@@ -232,11 +136,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up FastAPI application...")
 
     # Open the shared HTTP client (kept warm for the whole process lifetime).
-    global _http_client
-    _http_client = httpx.AsyncClient(
-        timeout=Config.REQUEST_TIMEOUT,
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-    )
+    open_http_client()
 
     # Initialize databases (idempotent — safe on every replica).
     db_engine.init_db()
@@ -368,9 +268,7 @@ async def lifespan(app: FastAPI):
     await cache_manager.stop()
     if getattr(app.state, 'scheduler', None) is not None:
         app.state.scheduler.shutdown()
-    if _http_client is not None:
-        await _http_client.aclose()
-        _http_client = None
+    await close_http_client()
     close_pool()  # drain the PostgreSQL connection pool
     logger.info("Shutdown complete")
 
@@ -692,32 +590,6 @@ def get_show_seasons(tmdb_id: int) -> List[Dict]:
         logger.error(f"Database error in get_show_seasons: {e}")
         return []
 
-def get_first_anilist_ids(tmdb_ids: List[int]) -> Dict[int, int]:
-    """Map each tmdb_id -> its lowest-numbered season's anilist_id, in ONE query.
-
-    Replaces calling ``get_show_seasons`` once per search/trending result (an N+1
-    that borrowed a pooled connection per item). A tmdb_id with no mapped season
-    is simply absent from the result.
-    """
-    if not tmdb_ids:
-        return {}
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """SELECT tmdb_id, anilist_id, season_number
-                   FROM tmdb_seasons
-                   WHERE tmdb_id = ANY(%s)
-                   ORDER BY tmdb_id, season_number""",
-                (list(tmdb_ids),),
-            )
-            out: Dict[int, int] = {}
-            for r in cursor.fetchall():
-                out.setdefault(r["tmdb_id"], r["anilist_id"])  # first = lowest season
-            return out
-    except Exception as e:
-        logger.error(f"Database error in get_first_anilist_ids: {e}")
-        return {}
 
 def get_anime_entry(anilist_id: Optional[int]) -> Dict:
     """Returns the anime_entries row (titles, type, year) for an anilist_id."""
@@ -762,39 +634,6 @@ def get_show_info(tmdb_id: int) -> Dict:
         logger.error(f"Database error in get_show_info: {e}")
         return {}
 
-def upsert_show_info(show: Dict) -> None:
-    """Persist TMDB show details fetched on demand (lazy population of tmdb_shows)."""
-    if not show.get("tmdb_id"):
-        return
-    try:
-        # genres is a JSON list of names; only overwrite the stored value when the
-        # caller actually supplies one, so a later metadata refresh that omits it
-        # (e.g. the degraded path) doesn't blank out genres we already have.
-        genres = show.get("genres")
-        genres_json = json.dumps(genres) if genres else None
-        def _write():
-            with get_db_connection() as conn:
-                conn.execute("""
-                    INSERT INTO tmdb_shows
-                        (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date, genres)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (tmdb_id) DO UPDATE SET
-                        title=EXCLUDED.title, overview=EXCLUDED.overview,
-                        poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
-                        first_air_date=EXCLUDED.first_air_date,
-                        genres=COALESCE(EXCLUDED.genres, tmdb_shows.genres)
-                """, (
-                    show.get("tmdb_id"),
-                    show.get("title"),
-                    show.get("overview"),
-                    show.get("poster_path"),
-                    show.get("backdrop_path"),
-                    show.get("first_air_date"),
-                    genres_json,
-                ))
-        _write()
-    except Exception as e:
-        logger.error(f"Database error in upsert_show_info: {e}")
 
 def get_movie_info(tmdb_id: int) -> Dict:
     """Gets movie info from the tmdb_movies table (TMDB *movie* id keyed)."""
@@ -808,38 +647,6 @@ def get_movie_info(tmdb_id: int) -> Dict:
         logger.error(f"Database error in get_movie_info: {e}")
         return {}
 
-def upsert_movie_info(movie: Dict) -> None:
-    """Persist TMDB movie details fetched on demand (lazy population of
-    tmdb_movies), mirroring upsert_show_info. Used as the TMDB-down fallback for
-    /movie-overview + /watch/movie (a movie has no AniList entry to fall back on)."""
-    if not movie.get("tmdb_id"):
-        return
-    try:
-        genres = movie.get("genres")
-        genres_json = json.dumps(genres) if genres else None
-        def _write():
-            with get_db_connection() as conn:
-                conn.execute("""
-                    INSERT INTO tmdb_movies
-                        (tmdb_id, title, overview, poster_path, backdrop_path, release_date, genres)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (tmdb_id) DO UPDATE SET
-                        title=EXCLUDED.title, overview=EXCLUDED.overview,
-                        poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
-                        release_date=EXCLUDED.release_date,
-                        genres=COALESCE(EXCLUDED.genres, tmdb_movies.genres)
-                """, (
-                    movie.get("tmdb_id"),
-                    movie.get("title"),
-                    movie.get("overview"),
-                    movie.get("poster_path"),
-                    movie.get("backdrop_path"),
-                    movie.get("release_date"),
-                    genres_json,
-                ))
-        _write()
-    except Exception as e:
-        logger.error(f"Database error in upsert_movie_info: {e}")
 
 def get_catalogue_items() -> List[Dict]:
     """Build the full anime catalogue from the local DB only (no external calls).
@@ -916,63 +723,6 @@ def get_catalogue_items() -> List[Dict]:
     return items
 
 
-# --- CACHE HELPER FUNCTIONS ---
-async def get_cached_response(cache_key: str) -> Optional[Dict]:
-    """Retrieve cached response from database"""
-    try:
-        def _query():
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT response_json FROM api_cache WHERE cache_key = %s AND expires_at > %s",
-                    (cache_key, _utcnow_iso())
-                )
-                row = cursor.fetchone()
-                return orjson.loads(row["response_json"]) if row else None
-        
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _query)
-    except Exception as e:
-        logger.error(f"Cache retrieval error for key {cache_key}: {e}")
-        return None
-
-async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Config.CACHE_TTL_SECONDS):
-    """Save response to cache"""
-    if not data:
-        return
-    
-    try:
-        expires_at = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl_seconds)).isoformat()
-        # orjson.dumps returns bytes; the response_json column is TEXT, so decode.
-        payload = orjson.dumps(data).decode("utf-8")
-        
-        def _insert():
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO api_cache (cache_key, response_json, expires_at)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (cache_key) DO UPDATE SET
-                        response_json=EXCLUDED.response_json, expires_at=EXCLUDED.expires_at
-                """, (cache_key, payload, expires_at))
-        
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _insert)
-    except Exception as e:
-        logger.error(f"Cache storage error for key {cache_key}: {e}")
-
-def purge_expired_cache() -> int:
-    """Delete expired api_cache rows. Returns the number removed."""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM api_cache WHERE expires_at < %s", (_utcnow_iso(),))
-        return cursor.rowcount or 0
-
-async def _empty() -> Dict:
-    """A coroutine that resolves to ``{}`` — lets us ``asyncio.gather`` an
-    optional fetch (e.g. AniList when there's no mapping) without branching."""
-    return {}
-
 def _json_gzip_bodies(payload: Dict) -> Tuple[bytes, Optional[bytes]]:
     """Encode ``payload`` to JSON bytes and, when it's worth compressing, its gzip.
 
@@ -1003,261 +753,6 @@ def _gzip_json(request: Request, payload: Dict) -> Response:
     middleware so the progressive NDJSON /watch stream is never buffered."""
     return _gzip_response(request, _json_gzip_bodies(payload))
 
-# --- TMDB API FUNCTIONS ---
-async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
-    """Fetch data from API with retry logic"""
-    for attempt in range(Config.MAX_RETRIES):
-        try:
-            response = await client.get(url, headers=TMDB_HEADERS, params=params, timeout=Config.REQUEST_TIMEOUT)
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:  # Rate limit
-                wait_time = Config.RETRY_BACKOFF_FACTOR * (2 ** attempt)
-                logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}")
-                await asyncio.sleep(wait_time)
-                continue
-            elif response.status_code in (500, 502, 503, 504):
-                # Transient upstream failure (TMDB occasionally 502s on individual
-                # records — see status_code 43 "Couldn't connect to the backend").
-                # Back off and retry rather than treating it as a hard failure.
-                logger.warning(
-                    f"TMDB upstream {response.status_code} for URL {url} "
-                    f"(attempt {attempt + 1}/{Config.MAX_RETRIES})"
-                )
-                if attempt == Config.MAX_RETRIES - 1:
-                    return None
-                await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
-                continue
-            else:
-                logger.warning(f"TMDB API error: Status {response.status_code} for URL {url}")
-                return None
-                
-        except httpx.TimeoutException:
-            logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
-            if attempt == Config.MAX_RETRIES - 1:
-                return None
-            await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
-        except Exception as e:
-            logger.error(f"Request error on attempt {attempt + 1}: {e}")
-            if attempt == Config.MAX_RETRIES - 1:
-                return None
-            await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
-    
-    return None
-
-# Bump when the cached TMDB payload shape changes, so stale entries in the
-# volume-persisted api_cache are ignored after a deploy instead of served.
-TMDB_CACHE_VERSION = "v3"
-
-def _tmdb_img(path: Optional[str], size: str = "w500") -> Optional[str]:
-    return f"https://image.tmdb.org/t/p/{size}{path}" if path else None
-
-async def fetch_tmdb_genre_map(client: httpx.AsyncClient, kind: str) -> Dict[int, str]:
-    """TMDB genre id -> name map for ``kind`` ('tv' or 'movie'), cached.
-
-    Discover/search results carry only ``genre_ids`` (ints), not names. This map
-    turns them into the genre-name lists we store in tmdb_shows/tmdb_movies (the
-    non-anime twin of anime_entries.genres), so the recommend engine can score
-    shows/movies the same way it scores anime. The map is tiny and very stable, so
-    it's cached aggressively (L1 + DB)."""
-    if kind not in ("tv", "movie"):
-        return {}
-    cache_key = f"tmdb:genremap:{kind}"
-    local = _local_get(cache_key)
-    if local is not None:
-        return local
-    cached = await get_cached_response(cache_key)
-    if cached and "map" in cached:
-        gmap = {int(k): v for k, v in cached["map"].items()}
-        _local_set(cache_key, gmap)
-        return gmap
-
-    data = await fetch_with_retry(
-        client, f"https://api.themoviedb.org/3/genre/{kind}/list", params={"language": "en-US"}
-    )
-    gmap = {g["id"]: g["name"] for g in (data or {}).get("genres", []) if g.get("id") and g.get("name")}
-    if gmap:
-        await set_cached_response(
-            cache_key, {"map": {str(k): v for k, v in gmap.items()}},
-            ttl_seconds=Config.CACHE_TTL_SECONDS,
-        )
-        _local_set(cache_key, gmap)
-    return gmap
-
-def _genre_names(item: Dict, genre_map: Dict[int, str]) -> List[str]:
-    """Resolve a discover/search item's genre_ids to names via ``genre_map``."""
-    return [genre_map[g] for g in (item.get("genre_ids") or []) if g in genre_map]
-
-def _persist_discovered_show(item: Dict, genre_map: Dict[int, str]) -> None:
-    """Lazily cache a discovered/searched non-anime show into tmdb_shows (title,
-    overview, art, genres) so it can later be a recommendation candidate without a
-    full overview open. Best-effort; mirrors fetch_tmdb_show's upsert."""
-    if not item.get("id"):
-        return
-    upsert_show_info({
-        "tmdb_id": item.get("id"),
-        "title": item.get("name") or item.get("original_name"),
-        "overview": item.get("overview"),
-        "poster_path": item.get("poster_path"),
-        "backdrop_path": item.get("backdrop_path"),
-        "first_air_date": item.get("first_air_date"),
-        "genres": _genre_names(item, genre_map),
-    })
-
-def _persist_discovered_movie(item: Dict, genre_map: Dict[int, str]) -> None:
-    """Movie twin of _persist_discovered_show (caches into tmdb_movies)."""
-    if not item.get("id"):
-        return
-    upsert_movie_info({
-        "tmdb_id": item.get("id"),
-        "title": item.get("title") or item.get("original_title"),
-        "overview": item.get("overview"),
-        "poster_path": item.get("poster_path"),
-        "backdrop_path": item.get("backdrop_path"),
-        "release_date": item.get("release_date"),
-        "genres": _genre_names(item, genre_map),
-    })
-
-async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
-    """
-    Fetch a TMDB show with its real season list (the authority for what the
-    TMDB-keyed sources can play). Cached, and persists core fields into tmdb_shows
-    on first fetch.
-    """
-    cache_key = f"tmdb:show:{TMDB_CACHE_VERSION}:{tmdb_id}"
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data
-
-    data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}")
-    if not data:
-        return {}
-
-    seasons = []
-    for s in data.get("seasons", []):
-        num = s.get("season_number")
-        # Skip specials (season 0) and empty placeholder seasons.
-        if num is None or num < 1 or (s.get("episode_count") or 0) < 1:
-            continue
-        seasons.append({
-            "season_number": num,
-            "name": s.get("name") or f"Season {num}",
-            "episode_count": s.get("episode_count"),
-            "air_date": s.get("air_date"),
-            "poster": _tmdb_img(s.get("poster_path")),
-            "overview": s.get("overview"),
-        })
-
-    result = {
-        "tmdb_id": tmdb_id,
-        "title": data.get("name") or data.get("original_name"),
-        "overview": data.get("overview"),
-        "poster_path": data.get("poster_path"),
-        "backdrop_path": data.get("backdrop_path"),
-        "poster": _tmdb_img(data.get("poster_path")),
-        "backdrop": _tmdb_img(data.get("backdrop_path"), "original"),
-        "first_air_date": data.get("first_air_date"),
-        # Genre names — the non-anime twin of anime_entries.genres. Stored into
-        # tmdb_shows so the recommend engine can score shows by genre too.
-        "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
-        "seasons": seasons,
-    }
-
-    upsert_show_info({k: result.get(k) for k in
-                      ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "first_air_date", "genres")})
-    await set_cached_response(cache_key, result)
-    return result
-
-async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
-    """Fetch a TMDB *movie* (the /movie/{id} entity — a different id space from
-    /tv). Cached, and persists core fields into tmdb_movies on first fetch so the
-    overview/watch pages can degrade gracefully when TMDB is unavailable.
-
-    Movies have no seasons/episodes; the TMDB-keyed sources play them off the bare
-    movie id, so this is all the metadata the movie surface needs."""
-    cache_key = f"tmdb:movie:{TMDB_CACHE_VERSION}:{tmdb_id}"
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data
-
-    data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/movie/{tmdb_id}")
-    if not data:
-        return {}
-
-    result = {
-        "tmdb_id": tmdb_id,
-        "title": data.get("title") or data.get("original_title"),
-        "overview": data.get("overview"),
-        "poster_path": data.get("poster_path"),
-        "backdrop_path": data.get("backdrop_path"),
-        "poster": _tmdb_img(data.get("poster_path")),
-        "backdrop": _tmdb_img(data.get("backdrop_path"), "original"),
-        "release_date": data.get("release_date"),
-        "original_title": data.get("original_title"),
-        "runtime": data.get("runtime"),
-        "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
-        "vote_average": data.get("vote_average"),
-        "status": data.get("status"),
-    }
-
-    upsert_movie_info({k: result.get(k) for k in
-                       ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "release_date", "genres")})
-    await set_cached_response(cache_key, result)
-    return result
-
-async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: int = 1,
-                              show: Optional[Dict] = None) -> Dict:
-    """Fetch metadata + episode list for a specific TMDB season.
-
-    Falls back to show-level overview when the season overview is empty (common
-    for anime) so a description is always available. ``show`` may be passed in by
-    a caller that already fetched it (e.g. /info), avoiding a redundant cached
-    re-fetch; otherwise it is fetched here.
-    """
-    cache_key = f"tmdb:meta:{TMDB_CACHE_VERSION}:{tmdb_id}:s{season}"
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data
-
-    data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}")
-    if show is None:
-        show = await fetch_tmdb_show(client, tmdb_id)  # cached
-
-    if not data:
-        logger.info(f"Season {season} not found for TMDB ID {tmdb_id}, falling back to show metadata")
-        result = {
-            "summary": show.get("overview"),
-            "poster": show.get("poster"),
-            "backdrop": show.get("backdrop"),
-            "season_name": f"Season {season}",
-            "air_date": None,
-            "episodes": [],
-        }
-    else:
-        episodes = [{
-            "episode_number": ep.get("episode_number"),
-            "title": ep.get("name") or f"Episode {ep.get('episode_number')}",
-            "thumbnail": _tmdb_img(ep.get("still_path")),
-            "overview": ep.get("overview"),
-            "air_date": ep.get("air_date"),
-            "url": None,
-        } for ep in data.get("episodes", [])]
-
-        result = {
-            "summary": data.get("overview") or show.get("overview"),
-            "poster": _tmdb_img(data.get("poster_path")) or show.get("poster"),
-            "backdrop": show.get("backdrop"),
-            "season_name": data.get("name") or f"Season {season}",
-            "air_date": data.get("air_date"),
-            "episodes": episodes,
-        }
-
-    if result:
-        await set_cached_response(cache_key, result)
-
-    return result
-
 
 def _is_future_air_date(air_date: Optional[str]) -> bool:
     """True when a TMDB episode air_date is strictly after today (UTC).
@@ -1273,32 +768,6 @@ def _is_future_air_date(air_date: Optional[str]) -> bool:
     except (ValueError, TypeError):
         return False
     return d > datetime.now(timezone.utc).date()
-
-
-async def _season_episode_info(tmdb_id: int, season_number: int) -> Dict:
-    """{count, air_dates:{ep_num: 'YYYY-MM-DD'|None}} for a TMDB season.
-
-    Derived from the (DB-cached) TMDB season metadata and additionally held in the
-    in-process L1 cache, since both the unaired gate and the progress enricher hit
-    it on hot paths. Best-effort: returns {} when the season can't be loaded so
-    callers degrade gracefully (no episode-count gating, no unaired check)."""
-    key = f"epinfo:{tmdb_id}:s{season_number}"
-    cached = _local_get(key)
-    if cached is not None:
-        return cached
-    try:
-        async with http_client() as client:
-            meta = await fetch_tmdb_metadata(client, tmdb_id, season_number)
-    except Exception as e:
-        logger.warning(f"season episode-info fetch failed for {tmdb_id} s{season_number}: {e}")
-        return {}
-    eps = meta.get("episodes") or []
-    info = {
-        "count": len(eps),
-        "air_dates": {e.get("episode_number"): e.get("air_date") for e in eps},
-    }
-    _local_set(key, info)
-    return info
 
 
 async def _enrich_progress_rows(rows: List[Dict]) -> None:
@@ -1339,478 +808,6 @@ async def _enrich_progress_rows(rows: List[Dict]) -> None:
 # dependency-injection pattern as set_resync_handler). Done at definition time
 # because the module-level wiring near include_router runs before this point.
 set_episode_enricher(_enrich_progress_rows)
-
-
-async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> Dict:
-    """Fetch anime metadata from AniList"""
-    cache_key = f"anilist:meta:{anilist_id}"
-    
-    # Check cache
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data
-    
-    url = "https://graphql.anilist.co"
-    query = """
-    query ($id: Int) {
-      Media (id: $id, type: ANIME) {
-        id
-        status
-        episodes
-        bannerImage
-        coverImage {
-          large
-          extraLarge
-        }
-        title {
-          romaji
-          english
-          native
-        }
-        synonyms
-        description
-        startDate {
-          year
-          month
-          day
-        }
-        endDate {
-          year
-          month
-          day
-        }
-        streamingEpisodes {
-          title
-          thumbnail
-          url
-        }
-        nextAiringEpisode {
-          episode
-          airingAt
-        }
-      }
-    }
-    """
-    
-    try:
-        response = await client.post(
-            url, 
-            json={"query": query, "variables": {"id": anilist_id}},
-            timeout=Config.REQUEST_TIMEOUT
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"AniList API error: Status {response.status_code}")
-            return {}
-        
-        data = response.json()
-        media = data.get("data", {}).get("Media", {})
-        if not media: return {}
-        
-        # Format streaming episodes
-        raw_episodes = media.get("streamingEpisodes", [])
-        formatted_episodes = []
-        
-        for index, ep in enumerate(raw_episodes, start=1):
-            formatted_episodes.append({
-                "episode_number": index,
-                "title": ep.get("title", f"Episode {index}"),
-                "thumbnail": ep.get("thumbnail"),
-                "url": ep.get("url")
-            })
-        
-        # Fallback to generated episode list if no streaming episodes
-        if not formatted_episodes and media.get("episodes"):
-            total_episodes = media.get("episodes")
-            for i in range(1, total_episodes + 1):
-                formatted_episodes.append({
-                    "episode_number": i,
-                    "title": f"Episode {i}",
-                    "thumbnail": None,
-                    "url": None
-                })
-        
-        result = {
-            "anilist_id": media.get("id"),
-            "title": media.get("title", {}).get("english") or media.get("title", {}).get("romaji"),
-            "title_romaji": media.get("title", {}).get("romaji"),
-            "title_english": media.get("title", {}).get("english"),
-            "title_native": media.get("title", {}).get("native"),
-            "synonyms": media.get("synonyms") or [],
-            "total_episodes": media.get("episodes"),
-            "status": media.get("status"),
-            "banner": media.get("bannerImage"),
-            "cover": media.get("coverImage", {}).get("extraLarge") or media.get("coverImage", {}).get("large"),
-            "description": media.get("description"),
-            "start_date": media.get("startDate"),
-            "end_date": media.get("endDate"),
-            "next_airing_episode": media.get("nextAiringEpisode"),
-            "episodes_list": formatted_episodes
-        }
-        
-        # Cache the result
-        if result:
-            await set_cached_response(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error fetching from AniList: {e}")
-        return {}
-
-async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
-    """Search TMDB for anime titles"""
-    cache_key = f"tmdb:search:{query.lower()}"
-    
-    # Check cache
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data.get("results", [])
-    
-    url = "https://api.themoviedb.org/3/search/tv"
-    data = await fetch_with_retry(client, url, params={"query": query, "include_adult": "false"})
-    
-    if not data:
-        return []
-
-    items = data.get("results", [])[:limit]
-    # One batched lookup for every candidate's anilist mapping instead of a query
-    # per result.
-    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
-
-    results = []
-    for item in items:
-        tmdb_id = item.get("id")
-        anilist_id = anilist_by_tmdb.get(tmdb_id) if tmdb_id else None
-        if anilist_id:
-            results.append({
-                "title": item.get("name") or item.get("original_name"),
-                "tmdb_id": tmdb_id,
-                "anilist_id": anilist_id,
-                "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
-                "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
-                "vote_average": item.get("vote_average")
-            })
-
-    # Cache search results for 24 hours
-    await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
-    return results
-
-async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> List[Dict]:
-    """Fetch trending anime from TMDB"""
-    cache_key = "tmdb:trending"
-
-    # L1: in-process cache (no DB round-trip on a hit).
-    local = _local_get(cache_key)
-    if local is not None:
-        return local
-
-    # Check cache
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        results = cached_data.get("results", [])
-        _local_set(cache_key, results)
-        return results
-
-    url = "https://api.themoviedb.org/3/discover/tv"
-    params = {
-        "page": 1,
-        "include_adult": "false",
-        "language": "en-US",
-        "with_genres": "16",  # Animation genre
-        "with_original_language": "ja",  # Japanese originals
-        "sort_by": "popularity.desc",
-        "vote_count.gte": 100  # Minimum votes for quality filter
-    }
-    
-    data = await fetch_with_retry(client, url, params=params)
-    
-    if not data:
-        return []
-
-    items = data.get("results", [])[:limit]
-    # One batched lookup for every candidate's anilist mapping instead of a query
-    # per result.
-    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
-
-    trending_list = []
-    for item in items:
-        tmdb_id = item.get("id")
-        anilist_id = anilist_by_tmdb.get(tmdb_id) if tmdb_id else None
-        if anilist_id:
-            trending_list.append({
-                "title": item.get("name") or item.get("original_name"),
-                "tmdb_id": tmdb_id,
-                "anilist_id": anilist_id,
-                "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
-                "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
-                "vote_average": item.get("vote_average")
-            })
-
-    # Cache trending results (DB for cross-replica reuse + L1 for this process).
-    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
-    _local_set(cache_key, trending_list)
-    return trending_list
-
-# --- NON-ANIME TV SHOWS (secondary, additive) -------------------------------
-# These mirror the anime discovery helpers above but invert the AniList gate:
-# they surface TMDB TV results that are NOT mapped anime, so the site can also
-# play general (non-anime) series through the same TMDB-keyed pipeline (/info,
-# /watch/{tmdb_id}/{season}/{episode}) and the s.to scraper, which matches by
-# title. Anime stays priority 1 — these are a separate, parallel surface and the
-# anime helpers/endpoints above are left completely untouched.
-
-def _looks_like_anime(item: Dict) -> bool:
-    """Heuristic: a TMDB TV item that is Japanese Animation. Used to keep anime
-    (including titles we haven't mapped in Fribb yet) out of the *shows* surface,
-    so the two stay cleanly separated even at the edges."""
-    genres = item.get("genre_ids") or []
-    return 16 in genres and item.get("original_language") == "ja"
-
-
-def _show_item(item: Dict) -> Dict:
-    """Shape one TMDB TV search/discover result as a non-anime show entry. Keyed
-    by tmdb_id (no anilist_id) and tagged ``kind: "show"`` so the frontend routes
-    it through the TMDB-keyed show pages instead of the AniList ones."""
-    return {
-        "title": item.get("name") or item.get("original_name"),
-        "tmdb_id": item.get("id"),
-        "anilist_id": None,
-        "kind": "show",
-        "poster": _tmdb_img(item.get("poster_path")) if item.get("poster_path") else None,
-        "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
-        "vote_average": item.get("vote_average"),
-    }
-
-
-async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
-    """Search TMDB for general TV shows, excluding anime.
-
-    Excludes (a) titles that already map to an AniList entry — those are anime,
-    served by /search/anime — and (b) anything that looks like Japanese animation,
-    so unmapped anime doesn't leak into the shows surface."""
-    cache_key = f"tmdb:search_shows:{query.lower()}"
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data.get("results", [])
-
-    url = "https://api.themoviedb.org/3/search/tv"
-    data = await fetch_with_retry(client, url, params={"query": query, "include_adult": "false"})
-    if not data:
-        return []
-
-    items = data.get("results", [])
-    # One batched lookup so we can drop anything already mapped as anime.
-    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
-    genre_map = await fetch_tmdb_genre_map(client, "tv")
-
-    results: List[Dict] = []
-    for item in items:
-        tmdb_id = item.get("id")
-        if not tmdb_id or anilist_by_tmdb.get(tmdb_id) or _looks_like_anime(item):
-            continue
-        if not item.get("poster_path"):
-            continue  # posterless rows are usually junk/duplicates — skip for a clean grid
-        # Cache the show's metadata + genres so it can seed recommendations later.
-        _persist_discovered_show(item, genre_map)
-        results.append(_show_item(item))
-        if len(results) >= limit:
-            break
-
-    await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
-    return results
-
-
-async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> List[Dict]:
-    """Fetch trending non-anime TV shows from TMDB (popular, excluding animation)."""
-    cache_key = "tmdb:trending_shows"
-
-    local = _local_get(cache_key)
-    if local is not None:
-        return local
-
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        results = cached_data.get("results", [])
-        _local_set(cache_key, results)
-        return results
-
-    url = "https://api.themoviedb.org/3/discover/tv"
-    params = {
-        "page": 1,
-        "include_adult": "false",
-        "language": "en-US",
-        "without_genres": "16",          # exclude Animation (keeps anime out)
-        "sort_by": "popularity.desc",
-        "vote_count.gte": 200,           # quality floor
-    }
-    data = await fetch_with_retry(client, url, params=params)
-    if not data:
-        return []
-
-    items = data.get("results", [])
-    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
-    genre_map = await fetch_tmdb_genre_map(client, "tv")
-
-    trending_list: List[Dict] = []
-    for item in items:
-        tmdb_id = item.get("id")
-        if not tmdb_id or anilist_by_tmdb.get(tmdb_id) or _looks_like_anime(item):
-            continue
-        if not item.get("poster_path"):
-            continue
-        # Popular shows make the best recommendation candidates — cache them.
-        _persist_discovered_show(item, genre_map)
-        trending_list.append(_show_item(item))
-        if len(trending_list) >= limit:
-            break
-
-    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
-    _local_set(cache_key, trending_list)
-    return trending_list
-
-# --- GENERAL (NON-ANIME) MOVIES (secondary, additive) -----------------------
-# The movie twin of the non-anime SHOWS surface above. Movies are a distinct TMDB
-# entity (/movie/{id}, no seasons/episodes), so they get their own discovery
-# helpers + a dedicated /watch/movie route. They are served by the TMDB-keyed
-# sources (PlayIMDb, Cinema.bz, Movish, ShowBox, Jellyfin), whose resolvers already
-# speak /movie/{tmdb}; the title-based anime scrapers are skipped for movies. Anime
-# stays priority 1 and is left completely untouched.
-
-def _looks_like_anime_movie(item: Dict) -> bool:
-    """Heuristic twin of _looks_like_anime for movie results: Japanese Animation.
-    Keeps anime films out of the general-movie surface."""
-    genres = item.get("genre_ids") or []
-    return 16 in genres and item.get("original_language") == "ja"
-
-
-def _movie_item(item: Dict) -> Dict:
-    """Shape one TMDB movie search/discover result as a general-movie entry. Keyed
-    by tmdb_id (no anilist_id) and tagged ``kind: "movie"`` so the frontend routes
-    it through the movie pages and the account layer namespaces its key."""
-    return {
-        "title": item.get("title") or item.get("original_title"),
-        "tmdb_id": item.get("id"),
-        "anilist_id": None,
-        "kind": "movie",
-        "poster": _tmdb_img(item.get("poster_path")) if item.get("poster_path") else None,
-        "year": item.get("release_date", "")[:4] if item.get("release_date") else None,
-        "vote_average": item.get("vote_average"),
-    }
-
-
-async def fetch_tmdb_movie_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
-    """Search TMDB for general movies, excluding Japanese animation (anime films
-    stay on the anime surface). Posterless rows are dropped for a clean grid."""
-    cache_key = f"tmdb:search_movies:{query.lower()}"
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data.get("results", [])
-
-    url = "https://api.themoviedb.org/3/search/movie"
-    data = await fetch_with_retry(client, url, params={"query": query, "include_adult": "false"})
-    if not data:
-        return []
-
-    genre_map = await fetch_tmdb_genre_map(client, "movie")
-    results: List[Dict] = []
-    for item in data.get("results", []):
-        if not item.get("id") or _looks_like_anime_movie(item):
-            continue
-        if not item.get("poster_path"):
-            continue
-        _persist_discovered_movie(item, genre_map)
-        results.append(_movie_item(item))
-        if len(results) >= limit:
-            break
-
-    await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
-    return results
-
-
-async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> List[Dict]:
-    """Fetch trending general movies from TMDB (popular, excluding animation)."""
-    cache_key = "tmdb:trending_movies"
-
-    local = _local_get(cache_key)
-    if local is not None:
-        return local
-
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        results = cached_data.get("results", [])
-        _local_set(cache_key, results)
-        return results
-
-    url = "https://api.themoviedb.org/3/discover/movie"
-    params = {
-        "page": 1,
-        "include_adult": "false",
-        "language": "en-US",
-        "without_genres": "16",          # exclude Animation (keeps anime films out)
-        "sort_by": "popularity.desc",
-        "vote_count.gte": 300,           # quality floor
-    }
-    data = await fetch_with_retry(client, url, params=params)
-    if not data:
-        return []
-
-    genre_map = await fetch_tmdb_genre_map(client, "movie")
-    trending_list: List[Dict] = []
-    for item in data.get("results", []):
-        if not item.get("id") or _looks_like_anime_movie(item):
-            continue
-        if not item.get("poster_path"):
-            continue
-        _persist_discovered_movie(item, genre_map)
-        trending_list.append(_movie_item(item))
-        if len(trending_list) >= limit:
-            break
-
-    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
-    _local_set(cache_key, trending_list)
-    return trending_list
-
-# --- SCRAPER HELPER FUNCTIONS ---
-async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -> List[str]:
-    """German-language titles for a TMDB show, for the German scraper sites.
-
-    The German streaming sources (s.to, aniworld) list many shows under their
-    *German broadcast title*, not the English one TMDB hands us first — e.g. NCIS
-    is "Navy CIS" on s.to, so plain title matching misses the show entirely. We
-    pull the German title(s) from TMDB so the title-based scrapers get them as
-    extra search candidates: the localized name from ``/translations`` (de) plus
-    any DE/AT/CH entries in ``/alternative_titles``. Cached (these are stable);
-    returns an empty list on failure (matching just falls back to the English
-    title, i.e. today's behaviour)."""
-    cache_key = f"tmdb:detitles:{tmdb_id}"
-    cached = _local_get(cache_key)
-    if cached is not None:
-        return cached
-
-    titles: List[str] = []
-    seen: set = set()
-
-    def _add(value: Optional[str]) -> None:
-        value = (value or "").strip()
-        if value and value.lower() not in seen:
-            seen.add(value.lower())
-            titles.append(value)
-
-    translations, alternatives = await asyncio.gather(
-        fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}/translations"),
-        fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}/alternative_titles"),
-    )
-
-    for t in ((translations or {}).get("translations") or []):
-        if t.get("iso_639_1") == "de":
-            _add((t.get("data") or {}).get("name"))
-    for a in ((alternatives or {}).get("results") or []):
-        if a.get("iso_3166_1") in ("DE", "AT", "CH"):
-            _add(a.get("title"))
-
-    _local_set(cache_key, titles, ttl=86400)
-    return titles
 
 
 async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int,

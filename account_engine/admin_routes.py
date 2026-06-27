@@ -33,8 +33,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from db_pool import get_connection
-from rate_limit import limiter
+from core.db_pool import get_connection
+from core.rate_limit import limiter
 from local_engine.db import LocalSourceStore
 from local_engine.fs import inspect_path, discover_mountpoints
 from cache_engine.db import CacheStore

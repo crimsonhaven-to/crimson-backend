@@ -9,7 +9,7 @@ pool, so DATABASE_URL / POSTGRES_* must point at the same database the API uses.
 
 from dotenv import load_dotenv
 
-from db_pool import get_connection
+from core.db_pool import get_connection
 
 load_dotenv()
 

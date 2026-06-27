@@ -45,7 +45,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import ed25519, mailer, passwords
 from .db import AccountStore, QuotaExceeded, VERIFY_TOKEN_TTL, RESET_TOKEN_TTL
-from rate_limit import limiter
+from core.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
