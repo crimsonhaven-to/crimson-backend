@@ -149,7 +149,8 @@ class MappingDatabaseEngine:
                     poster_path    TEXT,
                     backdrop_path  TEXT,
                     first_air_date TEXT,
-                    genres         TEXT
+                    genres         TEXT,
+                    last_updated   TIMESTAMP
                 )
                 """
             )
@@ -158,6 +159,12 @@ class MappingDatabaseEngine:
             # genres twin of anime_entries.genres). Stored as a JSON list of genre
             # names, lazily populated by /show* (fetch_tmdb_show); null until then.
             cursor.execute("ALTER TABLE tmdb_shows ADD COLUMN IF NOT EXISTS genres TEXT")
+            # When a row was last (re)written from TMDB. Drives the periodic
+            # staleness refresher (metadata_engine.maintenance); NULL on pre-existing
+            # rows so they sort oldest-first and get refreshed before anything else.
+            cursor.execute("ALTER TABLE tmdb_shows ADD COLUMN IF NOT EXISTS last_updated TIMESTAMP")
+            # Refresher reads the oldest rows; index keeps that ORDER BY cheap.
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_shows_last_updated ON tmdb_shows(last_updated)")
 
             # General (non-anime) MOVIES, keyed by their TMDB *movie* id. Wholly
             # separate from tmdb_shows (TMDB *tv* ids) — the two id spaces overlap
@@ -167,13 +174,18 @@ class MappingDatabaseEngine:
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tmdb_movies (
-                    tmdb_id       INTEGER PRIMARY KEY,
-                    title         TEXT,
-                    overview      TEXT,
-                    poster_path   TEXT,
-                    backdrop_path TEXT,
-                    release_date  TEXT,
-                    genres        TEXT
+                    tmdb_id        INTEGER PRIMARY KEY,
+                    title          TEXT,
+                    overview       TEXT,
+                    poster_path    TEXT,
+                    backdrop_path  TEXT,
+                    release_date   TEXT,
+                    genres         TEXT,
+                    runtime        INTEGER,
+                    vote_average   DOUBLE PRECISION,
+                    status         TEXT,
+                    original_title TEXT,
+                    last_updated   TIMESTAMP
                 )
                 """
             )
@@ -181,6 +193,43 @@ class MappingDatabaseEngine:
             # Backfill genres on pre-existing tmdb_movies (see tmdb_shows above);
             # JSON list of genre names, lazily populated by fetch_tmdb_movie.
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS genres TEXT")
+            # Richer movie fields that fetch_tmdb_movie already pulls from TMDB but
+            # previously only lived in the api_cache JSON — now persisted so the
+            # table can be queried/sorted by them (and survives a cache miss).
+            cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS runtime INTEGER")
+            cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS vote_average DOUBLE PRECISION")
+            cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS status TEXT")
+            cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS original_title TEXT")
+            # Staleness-refresh bookkeeping, mirroring tmdb_shows above.
+            cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS last_updated TIMESTAMP")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_movies_last_updated ON tmdb_movies(last_updated)")
+
+            # Catalogue-backfill job queue. The admin "Start Backfill" button runs on
+            # a serving replica that can't reach the portless api-sync container, so
+            # the request is written here as a row and the single RUN_DB_SYNC replica
+            # claims + runs it (the same DB-as-queue pattern cache_engine uses). One
+            # row per request; status walks requested -> running -> done|failed.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS metadata_backfill_jobs (
+                    id           SERIAL PRIMARY KEY,
+                    status       TEXT NOT NULL DEFAULT 'requested',
+                    pages        INTEGER,
+                    requested_by TEXT,
+                    requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at   TIMESTAMP,
+                    finished_at  TIMESTAMP,
+                    shows        INTEGER,
+                    movies       INTEGER,
+                    error        TEXT
+                )
+                """
+            )
+            # The drainer claims the oldest still-'requested' row; index that probe.
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_backfill_jobs_status_req "
+                "ON metadata_backfill_jobs(status, requested_at)"
+            )
 
             # One AniList id per real TMDB season (season_number >= 1).
             cursor.execute(

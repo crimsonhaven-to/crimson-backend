@@ -19,6 +19,7 @@ from fastapi.requests import Request
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 # Import all scrapers & resolvers + metadata engine
 from scrapers import ALL_SCRAPERS
@@ -93,6 +94,7 @@ from metadata_engine.tmdb import (
     fetch_tmdb_localized_titles,
 )
 from metadata_engine.anilist import fetch_anilist_metadata, _empty
+from metadata_engine import maintenance as metadata_maintenance
 
 # Configure logging
 logging.basicConfig(
@@ -103,7 +105,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "12.0.0"
+VERSION = "13.0.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -244,6 +246,57 @@ async def lifespan(app: FastAPI):
             id="db_sync_job",
             replace_existing=True,
         )
+
+    # Non-anime metadata maintenance (tmdb_shows / tmdb_movies). ALL of it is pinned
+    # to the single RUN_DB_SYNC replica (api-sync), so exactly one container ever
+    # churns this much metadata. Three pieces:
+    #   1. a nightly slice refresh (no upstream tells us when TMDB changed, so the
+    #      catalogue is swept oldest-1/N each night, cycling over METADATA_REFRESH_BUCKETS);
+    #   2. a short-interval drainer for backfill jobs the Admin dashboard queues
+    #      (the button hits a portless-api-sync-unreachable serving replica, so the
+    #      request arrives via the metadata_backfill_jobs table);
+    #   3. an optional one-shot backfill at startup (RUN_METADATA_BACKFILL).
+    if Config.RUN_DB_SYNC:
+        def _nightly_metadata_refresh():
+            try:
+                shows, movies = asyncio.run(metadata_maintenance.refresh_daily_slice())
+                if shows or movies:
+                    logger.info(f"Nightly metadata refresh: {shows} show(s), {movies} movie(s)")
+            except Exception as e:
+                logger.error(f"Nightly metadata refresh failed: {e}")
+
+        scheduler.add_job(
+            _nightly_metadata_refresh,
+            trigger=CronTrigger(hour=Config.METADATA_REFRESH_HOUR, minute=0),
+            id="metadata_nightly_refresh_job",
+            replace_existing=True,
+        )
+
+        def _drain_backfill_queue():
+            try:
+                asyncio.run(metadata_maintenance.run_pending_backfill())
+            except Exception as e:
+                logger.error(f"Backfill drain failed: {e}")
+
+        # Poll the queue often so an admin-triggered backfill starts promptly. A run
+        # can take minutes; APScheduler's default max_instances=1 skips overlapping
+        # ticks, so a long backfill won't stack.
+        scheduler.add_job(
+            _drain_backfill_queue,
+            trigger=IntervalTrigger(minutes=1),
+            id="metadata_backfill_drain_job",
+            replace_existing=True,
+        )
+
+        if Config.RUN_METADATA_BACKFILL:
+            async def _run_backfill():
+                try:
+                    shows, movies = await metadata_maintenance.backfill_catalogue()
+                    logger.info(f"Startup metadata backfill seeded {shows} show(s), {movies} movie(s)")
+                except Exception as e:
+                    logger.error(f"Startup metadata backfill failed: {e}")
+
+            asyncio.create_task(_run_backfill())  # fire-and-forget; paced internally
 
     scheduler.start()
     logger.info("Background scheduler started")

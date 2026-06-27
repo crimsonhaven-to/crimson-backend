@@ -75,16 +75,21 @@ async def fetch_tmdb_genre_map(client: httpx.AsyncClient, kind: str) -> Dict[int
     return gmap
 
 
-async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
+async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int,
+                          force_refresh: bool = False) -> Dict:
     """
     Fetch a TMDB show with its real season list (the authority for what the
     TMDB-keyed sources can play). Cached, and persists core fields into tmdb_shows
     on first fetch.
+
+    ``force_refresh`` skips the cached-response shortcut so the row is re-pulled
+    from TMDB and re-upserted (used by the staleness refresher).
     """
     cache_key = f"tmdb:show:{TMDB_CACHE_VERSION}:{tmdb_id}"
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data
+    if not force_refresh:
+        cached_data = await get_cached_response(cache_key)
+        if cached_data:
+            return cached_data
 
     data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/tv/{tmdb_id}")
     if not data:
@@ -126,17 +131,20 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
     return result
 
 
-async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
+async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int,
+                           force_refresh: bool = False) -> Dict:
     """Fetch a TMDB *movie* (the /movie/{id} entity — a different id space from
     /tv). Cached, and persists core fields into tmdb_movies on first fetch so the
     overview/watch pages can degrade gracefully when TMDB is unavailable.
 
     Movies have no seasons/episodes; the TMDB-keyed sources play them off the bare
-    movie id, so this is all the metadata the movie surface needs."""
+    movie id, so this is all the metadata the movie surface needs. ``force_refresh``
+    skips the cache shortcut so the staleness refresher can re-pull + re-upsert."""
     cache_key = f"tmdb:movie:{TMDB_CACHE_VERSION}:{tmdb_id}"
-    cached_data = await get_cached_response(cache_key)
-    if cached_data:
-        return cached_data
+    if not force_refresh:
+        cached_data = await get_cached_response(cache_key)
+        if cached_data:
+            return cached_data
 
     data = await fetch_with_retry(client, f"https://api.themoviedb.org/3/movie/{tmdb_id}")
     if not data:
@@ -159,7 +167,8 @@ async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int) -> Dict:
     }
 
     upsert_movie_info({k: result.get(k) for k in
-                       ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "release_date", "genres")})
+                       ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "release_date",
+                        "genres", "runtime", "vote_average", "status", "original_title")})
     await set_cached_response(cache_key, result)
     return result
 
