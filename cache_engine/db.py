@@ -32,7 +32,7 @@ import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from db_pool import get_connection, lock_schema_init
+from core.db_pool import get_connection, lock_schema_init
 
 _TARGET_COLS = "id, name, path, enabled, created_at"
 _EP_COLS = (

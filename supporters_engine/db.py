@@ -33,7 +33,7 @@ and so never reaches the public page. Only events the supporter marked public
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from db_pool import get_connection, lock_schema_init
+from core.db_pool import get_connection, lock_schema_init
 
 
 def _now_iso() -> str:

@@ -22,11 +22,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code.
 COPY api.py .
-COPY player.py .
-COPY db_pool.py .
-COPY rate_limit.py .
-COPY lumi.py .
-COPY source_health.py .
+# Shared infrastructure: config, db pool, rate limiter, HTTP client, response
+# cache, plus the small app-wide modules (lumi, player, source_health).
+COPY core ./core
 COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY metadata_engine ./metadata_engine

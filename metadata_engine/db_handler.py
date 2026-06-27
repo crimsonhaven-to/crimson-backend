@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from db_pool import get_connection, lock_schema_init
+from core.db_pool import get_connection, lock_schema_init
 
 _THIS_DIR = Path(__file__).resolve().parent
 

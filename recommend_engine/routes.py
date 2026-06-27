@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
 from account_engine.routes import require_user, store
-from rate_limit import limiter
+from core.rate_limit import limiter
 
 from .db import get_catalogue_index
 from .recommender import build_genre_weights, score_candidates, top_genres

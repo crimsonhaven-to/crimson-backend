@@ -25,7 +25,7 @@ import threading
 import time
 from typing import Dict, FrozenSet, List, Optional
 
-from db_pool import get_connection
+from core.db_pool import get_connection
 
 CACHE_TTL = 1800  # seconds (30 min)
 

@@ -24,7 +24,7 @@ metadata fetch can take a few minutes) and exits non-zero if it fails.
 import asyncio
 import sys
 
-from db_pool import close_pool
+from core.db_pool import close_pool
 from metadata_engine.db_handler import MappingDatabaseEngine
 
 

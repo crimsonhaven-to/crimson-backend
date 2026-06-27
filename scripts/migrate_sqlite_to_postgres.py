@@ -30,6 +30,12 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+from pathlib import Path
+
+# This script now lives in scripts/; put the repo root on sys.path so it can still
+# be run directly (``python scripts/migrate_sqlite_to_postgres.py``) and import the
+# app packages (account_engine, core).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
 
@@ -67,7 +73,7 @@ def main() -> int:
     # Import after load_dotenv so the pool reads the right DATABASE_URL, and only
     # now (so a missing psycopg surfaces a clear error rather than at top import).
     from account_engine.db import AccountStore
-    import db_pool
+    from core import db_pool
 
     print(f"[migrate] Source SQLite : {sqlite_path}")
     print(f"[migrate] Target Postgres: {db_pool._dsn().rsplit('@', 1)[-1]}")
