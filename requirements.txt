@@ -1,8 +1,16 @@
 # Pinned for reproducible production builds. Versions verified against
 # python:3.14-slim. Bump deliberately (and rebuild) rather than floating.
 fastapi==0.136.3
-uvicorn==0.48.0
+# [standard] pulls in uvloop + httptools (and websockets/watchfiles). For this
+# I/O-bound async app uvloop replaces the stock asyncio loop and httptools
+# replaces h11 — a sizeable free throughput win, no code change. uvloop ships
+# manylinux wheels, so it still installs on python:3.14-slim.
+uvicorn[standard]==0.48.0
 httpx==0.28.1
+# Fast JSON (Rust, abi3 wheels — no compiler needed on python:3.14-slim). Used as
+# FastAPI's default response encoder and for the api_cache (de)serialization so the
+# big /catalogue & /trending payloads encode several times faster than stdlib json.
+orjson==3.11.4
 # Browser-impersonating HTTP client used by the scrapers (scrapers/base_scraper.py)
 # to clear Cloudflare's passive TLS/JA3 fingerprint checks (e.g. s.to's Turnstile
 # redirect gate). Ships forward-compatible abi3 wheels (manylinux + Windows), so it
