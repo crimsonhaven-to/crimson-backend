@@ -9,7 +9,7 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
 - **Multi-Season Intelligence**: Automatically maps TMDB TV shows and seasons to their corresponding AniList IDs using the Fribb dataset.
 - **Unified Search**: Search across TMDB with automatic suggestions and metadata enrichment.
 - **Smart Metadata**: Aggregates data from TMDB and AniList for complete info (titles, posters, episode summaries).
-- **Advanced Scraping**: Multi-threaded, async scraping from various sources (AniWorld, AnimeKai, AnimeSuge, GogoAnime, etc.). Sources like AniWorld even include **language labels** (English Sub, German Dub, etc.).
+- **Advanced Scraping**: Multi-threaded, async scraping from various sources (AniWorld, s.to, AniWatch, AnimeSuge, etc.). Sources like AniWorld even include **language labels** (English Sub, German Dub, etc.).
 - **Stream Resolution**: Resolves third-party embed URLs to direct HLS/MP4 streams or ad-free proxied players.
 - **Progressive Streaming**: `/watch` streams results as **NDJSON** — each source is pushed to the client the instant its scraper + resolver finish, so the fastest source plays first instead of waiting for every source.
 - **Automatic Sync**: Built-in scheduler keeps the local mapping database up-to-date with upstream sources.

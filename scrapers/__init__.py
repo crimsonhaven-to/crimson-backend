@@ -1,9 +1,7 @@
 # scrapers/__init__.py
-from .gogo_scraper import GogoScraper
 from .movish_scraper import MovishScraper
 from .playimdb_scraper import PlayimdbScraper
 from .jellyfin_scraper import JellyfinScraper
-from .animekai_scraper import AnimekaiScraper
 from .animesuge_scraper import AnimeSugeScraper
 from .aniworld_scraper import AniworldScraper
 from .sto_scraper import StoScraper
@@ -16,7 +14,6 @@ from .cache_scraper import CacheScraper
 
 ALL_SCRAPERS = [
     CacheScraper,     # Server-side video cache: surfaces already-downloaded episodes first.
-    GogoScraper,
     AniworldScraper,  # German s.to-family site; feeds VOE/Vidmoly embeds.
     StoScraper,       # s.to: aniworld's general sibling (anime + movies); same VOE/Vidmoly embeds.
     StoMirrorScraper, # Cloudflare/Turnstile-free IP mirror of s.to; resolves /r?t= where s.to's gate stalls.
@@ -25,7 +22,6 @@ ALL_SCRAPERS = [
     PlayimdbScraper,
     JellyfinScraper,
     LocalScraper,     # Admin-registered local directories / NAS mounts (direct play only).
-    AnimekaiScraper,
     AnimeSugeScraper,
     CinemabzScraper,  # TMDB-keyed HLS aggregator; 3 providers -> 3 tiles
     ShowBoxScraper,   # ShowBox/Febbox direct-file source; env-gated on FEBBOX_UI_TOKEN

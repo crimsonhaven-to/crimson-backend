@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "11.0.1"
+VERSION = "11.0.2"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -2821,7 +2821,7 @@ set_system_handler(_admin_system_info)
 # Probe every external scrape source against a known canary title (the real
 # search→embeds pipeline, so green == would actually play), and report the
 # operator-provided library sources' configuration. Results are cached for a few
-# minutes so flipping to the dashboard tab doesn't re-hammer 11 upstreams; the
+# minutes so flipping to the dashboard tab doesn't re-hammer every upstream; the
 # dashboard's "Re-probe" button passes force=True. Injected via set_source_health_handler.
 _SOURCE_HEALTH_TTL = float(os.getenv("SOURCE_HEALTH_TTL", "300"))
 _source_health_cache: Dict[str, object] = {"at": 0.0, "data": None}

@@ -36,14 +36,12 @@ CANARY = {
 # source to be live (probing it while unset reports "disabled" rather than red).
 SOURCE_META = {
     # --- external scrape sources -------------------------------------------
-    "GogoScraper":     {"label": "GogoAnime",   "category": "scrape", "note": "Anime · GogoAnime API"},
     "AniworldScraper": {"label": "AniWorld",     "category": "scrape", "note": "Anime · German (VOE/Vidmoly)"},
     "StoScraper":      {"label": "s.to",         "category": "scrape", "note": "TV + anime · German (VOE/Vidmoly)"},
     "StoMirrorScraper":{"label": "s.to (mirror)","category": "scrape", "note": "Turnstile-free IP mirror of s.to"},
     "AniwatchScraper": {"label": "AniWatch",     "category": "scrape", "note": "Anime · VidSrc/megaplay"},
     "MovishScraper":   {"label": "Movish",       "category": "scrape", "note": "TMDB-keyed · ad-free player"},
     "PlayimdbScraper": {"label": "PlayIMDb",     "category": "scrape", "note": "TMDB-keyed · VidAPI chain"},
-    "AnimekaiScraper": {"label": "AnimeKai",     "category": "scrape", "note": "Anime · 1anime API"},
     "AnimeSugeScraper":{"label": "AnimeSuge",    "category": "scrape", "note": "Anime · ad-free Kiranime"},
     "CinemabzScraper": {"label": "Cinema.bz",    "category": "scrape", "note": "TMDB-keyed · 3-provider HLS"},
     "ShowBoxScraper":  {"label": "ShowBox",      "category": "scrape", "note": "Direct-file · FebBox",
