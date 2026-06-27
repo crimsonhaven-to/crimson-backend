@@ -3,6 +3,7 @@ import os
 import gzip
 import hashlib
 import platform
+import re
 import time
 import logging
 from datetime import datetime, timezone
@@ -55,6 +56,7 @@ from account_engine.admin_routes import (
     set_system_handler,
     set_source_health_handler,
 )
+from apikey_engine import store as apikey_store
 from supporters_engine import router as supporters_router, store as supporters_store
 from changelog_engine import router as changelog_router, service as changelog_service
 from recommend_engine import router as recommend_router
@@ -105,7 +107,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "13.0.0"
+VERSION = "13.1.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -143,6 +145,7 @@ async def lifespan(app: FastAPI):
     # Initialize databases (idempotent — safe on every replica).
     db_engine.init_db()
     account_store.init_db()  # account tables (untouched by mapping resyncs)
+    apikey_store.init_db()  # movie-web bridge API keys (resync-safe)
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
     local_source_store.init_db()  # admin-managed local media sources (resync-safe)
     cache_store.init_db()  # server-side video cache tables (resync-safe)
@@ -424,6 +427,33 @@ async def _session_is_valid(raw_token: str) -> bool:
     return False
 
 
+# Same short-lived validity cache for movie-web bridge API keys (see apikey_engine).
+# Keyed by SHA-256 of the raw key; a hit skips the DB on the hot path. A cache miss
+# validates AND touches last_used_at, so that write happens at most once per key per
+# TTL rather than on every /mw request.
+_APIKEY_OK_TTL = 60.0           # seconds
+_APIKEY_OK_MAX = 5_000          # hard cap to bound memory
+_apikey_ok_cache: Dict[str, float] = {}
+
+
+async def _apikey_is_valid(raw_key: str) -> bool:
+    if not raw_key:
+        return False
+    key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    exp = _apikey_ok_cache.get(key)
+    if exp is not None and exp > now:
+        return True
+    ok = await run_in_threadpool(apikey_store.validate_and_touch, raw_key)
+    if ok:
+        if len(_apikey_ok_cache) >= _APIKEY_OK_MAX:
+            _apikey_ok_cache.clear()  # cheap, bounded reset under abuse
+        _apikey_ok_cache[key] = now + _APIKEY_OK_TTL
+        return True
+    _apikey_ok_cache.pop(key, None)
+    return False
+
+
 class LoginWallMiddleware:
     """Pure-ASGI login wall. Implemented at the ASGI layer (not BaseHTTPMiddleware)
     so it adds zero buffering to the progressive NDJSON /watch stream — it only
@@ -446,14 +476,28 @@ class LoginWallMiddleware:
             return await self.app(scope, receive, send)
 
         token = ""
+        api_key = ""
         for name, value in scope.get("headers", []):
             if name == b"authorization":
                 val = value.decode("latin-1")
                 if val[:7].lower() == "bearer ":
                     token = val.split(" ", 1)[1].strip()
-                break
+            elif name == b"x-api-key":
+                api_key = value.decode("latin-1").strip()
 
-        if await _session_is_valid(token):
+        # A normal signed-in session is accepted on every gated path.
+        if token and await _session_is_valid(token):
+            return await self.app(scope, receive, send)
+
+        # API keys are deliberately scoped to the movie-web bridge ONLY: a valid
+        # X-API-Key unlocks /mw* and nothing else (not /account, /admin, or the
+        # catalogue). That scoping is what lets an admin hand a key to the
+        # movie-web fork without it becoming a skeleton key for the whole backend.
+        if (
+            (path == "/mw" or path.startswith("/mw/"))
+            and api_key
+            and await _apikey_is_valid(api_key)
+        ):
             return await self.app(scope, receive, send)
 
         response = JSONResponse(
@@ -1618,6 +1662,166 @@ async def get_movie_watch_links(request: Request, tmdb_id: int):
         media_type="application/x-ndjson",
         headers=_STREAM_HEADERS,
     )
+
+
+# --- movie-web bridge (/mw) -------------------------------------------------
+# A thin compatibility surface that re-shapes the existing scrape+resolve
+# pipeline into @movie-web/providers' native `Stream` JSON, so a modified
+# movie-web fork can consume Crimson as a single "source" instead of scraping
+# locally. These routes are the ONLY ones an API key can reach (see the login
+# wall): a valid X-API-Key unlocks /mw and nothing else.
+#
+# Two differences from the frontend /watch routes:
+#   * the output is one buffered JSON document (a streams[] array), not the
+#     progressive NDJSON our own player consumes — movie-web's runner wants a
+#     source to return its streams as a value;
+#   * `iframe`-type sources (Movish player-proxy, AnimeSuge /player) are dropped:
+#     movie-web has no iframe player, only direct hls/file playback. The direct
+#     sources (PlayIMDb, Cinema.bz, ShowBox, VidSrc, Jellyfin, Cache, …) carry
+#     through unchanged.
+def _mw_slug(text: Optional[str]) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return s or "src"
+
+
+def _mw_captions(subtitles: Optional[List[Dict]]) -> List[Dict]:
+    """Map Crimson's `{label, lang, url}` subtitle tracks onto movie-web's
+    `Caption` shape. URLs are already absolutized same-origin proxy paths (see
+    resolve_streams), which serve WebVTT — so default the type to vtt, honoring
+    an explicit .srt extension when present."""
+    out: List[Dict] = []
+    for i, s in enumerate(subtitles or []):
+        url = s.get("url")
+        if not url:
+            continue
+        label = s.get("label") or s.get("lang") or "Unknown"
+        ctype = "srt" if ".srt" in url.lower() else "vtt"
+        out.append({
+            "id": f"{_mw_slug(label)}-{i}",
+            "type": ctype,
+            "url": url,
+            "language": s.get("lang") or label,
+            "hasCorsRestrictions": False,
+        })
+    return out
+
+
+def _to_mw_stream(line: Dict, idx: int) -> Optional[Dict]:
+    """One NDJSON `stream` line -> one movie-web `Stream`, or None if movie-web
+    can't play it (iframe sources, or a line with no URL)."""
+    stype = line.get("streamType")
+    url = line.get("url")
+    if not url or stype == "iframe":
+        return None
+    captions = _mw_captions(line.get("subtitles"))
+    # `flags` is intentionally empty: it advertises no special playback
+    # guarantees, so the fork routes the stream through its own proxy (which is
+    # also where it injects the bridge key) rather than fetching us directly.
+    base = {
+        "id": f"crimson-{_mw_slug(line.get('source'))}-{idx}",
+        "flags": [],
+        "captions": captions,
+        # Non-standard hints the fork can surface (source label + dub/sub
+        # language). movie-web ignores unknown keys, so this is additive.
+        "crimsonSource": line.get("source"),
+        "crimsonLanguage": line.get("language"),
+    }
+    if stype == "hls":
+        return {**base, "type": "hls", "playlist": url}
+    # mp4 / any direct file: movie-web's `file` shape keys streams by quality.
+    # Crimson doesn't probe quality, so expose it as the single "unknown" rung.
+    return {**base, "type": "file", "qualities": {"unknown": {"type": "mp4", "url": url}}}
+
+
+async def _collect_mw_streams(agen) -> Tuple[Optional[Dict], List[Dict]]:
+    """Drain the NDJSON watch generator into (meta, movie-web streams[]). Reuses
+    the entire real pipeline (scrape, resolve, dedup, air-date + localized-title
+    handling) — this only reshapes the output, it does not re-implement it."""
+    meta: Optional[Dict] = None
+    streams: List[Dict] = []
+    idx = 0
+    async for raw in agen:
+        try:
+            evt = json.loads(raw)
+        except Exception:
+            continue
+        etype = evt.get("type")
+        if etype == "meta":
+            meta = evt
+        elif etype == "stream":
+            mw = _to_mw_stream(evt, idx)
+            idx += 1
+            if mw:
+                streams.append(mw)
+        elif etype == "unaired":
+            meta = {**(meta or {}), "unaired": True, "air_date": evt.get("air_date")}
+    return meta, streams
+
+
+@app.get("/mw/watch/movie/{tmdb_id}")
+@limiter.limit("30/minute")
+async def mw_watch_movie(request: Request, tmdb_id: int):
+    """movie-web bridge — streams for a standalone MOVIE (TMDB movie id), as a
+    single JSON document of native movie-web `Stream`s. Declared before the TV
+    route so the literal 'movie' segment matches here. Requires a valid
+    X-API-Key (or an admin/user session)."""
+    info = get_movie_info(tmdb_id)
+    fallback_title = info.get("title") if info else None
+    if not fallback_title:
+        try:
+            async with http_client() as client:
+                movie = await fetch_tmdb_movie(client, tmdb_id)
+            fallback_title = movie.get("title")
+        except Exception as e:
+            logger.warning(f"[mw] movie title fetch failed for {tmdb_id}: {e}")
+
+    meta, streams = await _collect_mw_streams(
+        stream_watch_response(tmdb_id, None, None, None, fallback_title,
+                              base_url=_public_base_url(request), media_type="movie")
+    )
+    return {
+        "success": True,
+        "media": "movie",
+        "tmdb_id": tmdb_id,
+        "title": (meta or {}).get("title") or fallback_title,
+        "streams": streams,
+    }
+
+
+@app.get("/mw/watch/{tmdb_id}/{season_number}/{episode_number}")
+@limiter.limit("30/minute")
+async def mw_watch_tv(request: Request, tmdb_id: int, season_number: int, episode_number: int):
+    """movie-web bridge — streams for a TV episode (TMDB show id + season +
+    episode), as a single JSON document of native movie-web `Stream`s. Mirrors
+    the frontend /watch route's id/title resolution, then reshapes the output.
+    Requires a valid X-API-Key (or an admin/user session)."""
+    anilist_id = get_anilist_id(tmdb_id, season_number)
+    fallback_title = None
+    if not anilist_id:
+        info = get_show_info(tmdb_id)
+        fallback_title = info.get("title") if info else None
+        if not fallback_title:
+            async with http_client() as client:
+                show = await fetch_tmdb_show(client, tmdb_id)
+            fallback_title = show.get("title")
+
+    meta, streams = await _collect_mw_streams(
+        stream_watch_response(tmdb_id, season_number, episode_number, anilist_id,
+                              fallback_title, base_url=_public_base_url(request))
+    )
+    payload = {
+        "success": True,
+        "media": "tv",
+        "tmdb_id": tmdb_id,
+        "season": season_number,
+        "episode": episode_number,
+        "title": (meta or {}).get("title") or fallback_title,
+        "streams": streams,
+    }
+    if meta and meta.get("unaired"):
+        payload["unaired"] = True
+        payload["air_date"] = meta.get("air_date")
+    return payload
 
 
 @app.post("/cache/confirm")
