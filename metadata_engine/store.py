@@ -59,13 +59,14 @@ def upsert_show_info(show: Dict) -> None:
             with get_connection() as conn:
                 conn.execute("""
                     INSERT INTO tmdb_shows
-                        (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date, genres)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date, genres, last_updated)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (tmdb_id) DO UPDATE SET
                         title=EXCLUDED.title, overview=EXCLUDED.overview,
                         poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
                         first_air_date=EXCLUDED.first_air_date,
-                        genres=COALESCE(EXCLUDED.genres, tmdb_shows.genres)
+                        genres=COALESCE(EXCLUDED.genres, tmdb_shows.genres),
+                        last_updated=CURRENT_TIMESTAMP
                 """, (
                     show.get("tmdb_id"),
                     show.get("title"),
@@ -91,15 +92,25 @@ def upsert_movie_info(movie: Dict) -> None:
         genres_json = json.dumps(genres) if genres else None
         def _write():
             with get_connection() as conn:
+                # runtime/vote_average/status/original_title come only from the full
+                # /movie/{id} fetch — a discover/search upsert omits them, so COALESCE
+                # to EXCLUDED-then-existing keeps a previously-fetched value rather
+                # than blanking it (same guard as genres).
                 conn.execute("""
                     INSERT INTO tmdb_movies
-                        (tmdb_id, title, overview, poster_path, backdrop_path, release_date, genres)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (tmdb_id, title, overview, poster_path, backdrop_path, release_date,
+                         genres, runtime, vote_average, status, original_title, last_updated)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (tmdb_id) DO UPDATE SET
                         title=EXCLUDED.title, overview=EXCLUDED.overview,
                         poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
                         release_date=EXCLUDED.release_date,
-                        genres=COALESCE(EXCLUDED.genres, tmdb_movies.genres)
+                        genres=COALESCE(EXCLUDED.genres, tmdb_movies.genres),
+                        runtime=COALESCE(EXCLUDED.runtime, tmdb_movies.runtime),
+                        vote_average=COALESCE(EXCLUDED.vote_average, tmdb_movies.vote_average),
+                        status=COALESCE(EXCLUDED.status, tmdb_movies.status),
+                        original_title=COALESCE(EXCLUDED.original_title, tmdb_movies.original_title),
+                        last_updated=CURRENT_TIMESTAMP
                 """, (
                     movie.get("tmdb_id"),
                     movie.get("title"),
@@ -108,6 +119,10 @@ def upsert_movie_info(movie: Dict) -> None:
                     movie.get("backdrop_path"),
                     movie.get("release_date"),
                     genres_json,
+                    movie.get("runtime"),
+                    movie.get("vote_average"),
+                    movie.get("status"),
+                    movie.get("original_title"),
                 ))
         _write()
     except Exception as e:

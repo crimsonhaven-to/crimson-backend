@@ -36,6 +36,30 @@ class Config:
     # "Deploying to Docker Swarm").
     RUN_DB_SYNC = os.getenv("RUN_DB_SYNC", "true").lower() not in ("0", "false", "no")
 
+    # --- Non-anime metadata maintenance (tmdb_shows / tmdb_movies) ----------
+    # The non-anime show/movie tables are written lazily (on open + from search/
+    # trending). These knobs keep them fresh and, optionally, pre-seed them.
+    # ALL of this heavy work is pinned to the single RUN_DB_SYNC replica (the
+    # api-sync container that already owns the Fribb resync) so exactly one
+    # container ever churns this much metadata — the serving replicas never do.
+    #
+    # Nightly staleness refresh: there is no upstream (unlike the Fribb dataset) to
+    # tell us when a TMDB row changed, so the catalogue is swept in slices. Every
+    # night at METADATA_REFRESH_HOUR the oldest 1/METADATA_REFRESH_BUCKETS of each
+    # table is re-pulled from TMDB; over a full cycle (default 14 nights) every row
+    # is refreshed, then it repeats. Freshly-opened rows sort last, so they're
+    # naturally skipped until they age to the front again.
+    METADATA_REFRESH_BUCKETS = int(os.getenv("METADATA_REFRESH_BUCKETS", "14"))
+    METADATA_REFRESH_HOUR = int(os.getenv("METADATA_REFRESH_HOUR", "4"))  # 0-23, server local time
+    #
+    # Catalogue backfill: page TMDB discover to pre-populate the tables beyond what's
+    # been browsed. Off by default (demand-driven fill is enough for most installs).
+    # Can be kicked off from the Admin dashboard at any time — the request is queued
+    # in the DB and drained by api-sync — or run once at startup via the flag below.
+    # Paced between pages to stay rate-limit + WAL/replication friendly.
+    RUN_METADATA_BACKFILL = os.getenv("RUN_METADATA_BACKFILL", "false").lower() in ("1", "true", "yes")
+    METADATA_BACKFILL_PAGES = int(os.getenv("METADATA_BACKFILL_PAGES", "100"))
+
     # Only the dedicated cache-worker service runs the background ffmpeg download
     # loop; the api/api-sync replicas just mint cache tickets and claim pending
     # rows (the DB row is the job queue, so a download survives an api redeploy).

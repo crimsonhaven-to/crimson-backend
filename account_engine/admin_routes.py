@@ -33,8 +33,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from core.config import Config
 from core.db_pool import get_connection
 from core.rate_limit import limiter
+from metadata_engine import maintenance as metadata_maintenance
 from local_engine.db import LocalSourceStore
 from local_engine.fs import inspect_path, discover_mountpoints
 from cache_engine.db import CacheStore
@@ -151,6 +153,7 @@ def _mapping_stats() -> dict:
         out["tmdb_seasons"] = count("tmdb_seasons")
         out["tmdb_extras"] = count("tmdb_extras")
         out["tmdb_shows"] = count("tmdb_shows")
+        out["tmdb_movies"] = count("tmdb_movies")
         out["api_cache"] = count("api_cache")
         try:
             row = conn.execute(
@@ -335,6 +338,45 @@ async def trigger_resync(user: dict = Depends(require_admin)):
     triggered_by = f"admin:{user.get('email') or user['user_id']}"
     asyncio.create_task(_run_resync(triggered_by))
     return {"success": True, "message": "Resync started", "resync": _resync_state}
+
+
+# --- non-anime catalogue backfill (DB-queued, drained by api-sync) ----------
+# Pages TMDB discover to pre-populate the tmdb_shows / tmdb_movies tables beyond
+# what's been browsed (metadata_engine.maintenance.backfill_catalogue). This
+# request usually lands on a serving replica, which can't reach the portless
+# api-sync container that owns the heavy metadata work — so instead of running it
+# here we ENQUEUE it (metadata_backfill_jobs) and let api-sync's drainer claim it.
+# Status is read straight back from that row, so it's correct from any replica.
+class BackfillTrigger(BaseModel):
+    # Optional override; defaults to METADATA_BACKFILL_PAGES. TMDB discover caps at
+    # page 500, and each page is ~20 rows, so this bounds how much gets seeded.
+    pages: Optional[int] = Field(None, ge=1, le=500)
+
+
+@router.get("/backfill/status")
+async def backfill_status(user: dict = Depends(require_admin)):
+    row = await run_in_threadpool(metadata_maintenance.latest_backfill_job)
+    return {
+        "success": True,
+        "backfill": metadata_maintenance.job_status_payload(row),
+        "default_pages": Config.METADATA_BACKFILL_PAGES,
+    }
+
+
+@router.post("/backfill")
+async def trigger_backfill(body: Optional[BackfillTrigger] = None, user: dict = Depends(require_admin)):
+    """Queue a non-anime catalogue backfill — page TMDB discover and lazily cache
+    each (non-anime, postered) show/movie into tmdb_shows / tmdb_movies. The job is
+    written to the DB and picked up within ~a minute by the api-sync container (so
+    only that one container churns the metadata); poll /admin/backfill/status for
+    progress. A no-op if one is already queued or running."""
+    pages = body.pages if (body and body.pages) else Config.METADATA_BACKFILL_PAGES
+    triggered_by = f"admin:{user.get('email') or user['user_id']}"
+    row, created = await run_in_threadpool(metadata_maintenance.request_backfill, pages, triggered_by)
+    payload = metadata_maintenance.job_status_payload(row)
+    if not created:
+        return {"success": False, "message": "A backfill is already queued or running", "backfill": payload}
+    return {"success": True, "message": "Backfill queued — api-sync will start it shortly", "backfill": payload}
 
 
 # --- local media sources (the "Local" direct-play source) ------------------
