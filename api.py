@@ -12,9 +12,10 @@ from contextlib import asynccontextmanager
 
 import httpx
 import json
+import orjson
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, ORJSONResponse, Response, StreamingResponse
 from fastapi.requests import Request
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -74,7 +75,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "11.0.2"
+VERSION = "12.0.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -378,7 +379,11 @@ app = FastAPI(
     title="Anime Streaming API",
     description="API for streaming anime with multi-season support",
     version=VERSION,
-    lifespan=lifespan
+    lifespan=lifespan,
+    # orjson encodes every plain `return {...}` endpoint several times faster than
+    # stdlib json. The hand-rolled streaming (NDJSON /watch) and gzip (/catalogue)
+    # responses build their own Response objects and are unaffected by this.
+    default_response_class=ORJSONResponse,
 )
 
 # Rate limiting (slowapi). Registered on app.state so the @limiter.limit
@@ -923,7 +928,7 @@ async def get_cached_response(cache_key: str) -> Optional[Dict]:
                     (cache_key, _utcnow_iso())
                 )
                 row = cursor.fetchone()
-                return json.loads(row["response_json"]) if row else None
+                return orjson.loads(row["response_json"]) if row else None
         
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _query)
@@ -938,7 +943,8 @@ async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Con
     
     try:
         expires_at = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl_seconds)).isoformat()
-        payload = json.dumps(data)
+        # orjson.dumps returns bytes; the response_json column is TEXT, so decode.
+        payload = orjson.dumps(data).decode("utf-8")
         
         def _insert():
             with get_db_connection() as conn:
@@ -967,17 +973,35 @@ async def _empty() -> Dict:
     optional fetch (e.g. AniList when there's no mapping) without branching."""
     return {}
 
+def _json_gzip_bodies(payload: Dict) -> Tuple[bytes, Optional[bytes]]:
+    """Encode ``payload`` to JSON bytes and, when it's worth compressing, its gzip.
+
+    Returns ``(raw_bytes, gzipped_bytes_or_None)``. Split out from ``_gzip_json`` so
+    a caller that serves the same payload repeatedly (e.g. the unfiltered
+    /catalogue) can cache this once and rebuild the per-request Response cheaply via
+    ``_gzip_response`` instead of re-serializing + re-gzipping every time."""
+    raw = orjson.dumps(payload)
+    gz = gzip.compress(raw, compresslevel=6) if len(raw) >= 1024 else None
+    return raw, gz
+
+
+def _gzip_response(request: Request, bodies: Tuple[bytes, Optional[bytes]]) -> Response:
+    """Build the JSON Response from pre-encoded ``bodies``, picking the gzip variant
+    when the client accepts it and one was produced."""
+    raw, gz = bodies
+    headers = {"Vary": "Accept-Encoding"}
+    if gz is not None and "gzip" in request.headers.get("accept-encoding", "").lower():
+        headers["Content-Encoding"] = "gzip"
+        return Response(content=gz, media_type="application/json", headers=headers)
+    return Response(content=raw, media_type="application/json", headers=headers)
+
+
 def _gzip_json(request: Request, payload: Dict) -> Response:
     """Serialize ``payload`` as JSON, gzip-compressing it when the client accepts
     gzip and the body is worth compressing. Used for the large, non-streaming
     endpoints (e.g. /catalogue) — applied per-response instead of via global
     middleware so the progressive NDJSON /watch stream is never buffered."""
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"Vary": "Accept-Encoding"}
-    if len(body) >= 1024 and "gzip" in request.headers.get("accept-encoding", "").lower():
-        body = gzip.compress(body, compresslevel=6)
-        headers["Content-Encoding"] = "gzip"
-    return Response(content=body, media_type="application/json", headers=headers)
+    return _gzip_response(request, _json_gzip_bodies(payload))
 
 # --- TMDB API FUNCTIONS ---
 async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
@@ -2117,29 +2141,59 @@ async def get_catalogue(
     # v2: item shape gained a `genres` field; bump so pre-genre cached lists
     # (which lack it) aren't served.
     cache_key = "catalogue:v2"
+    derived_key = "catalogue:v2:derived"  # memoized full-catalogue breakdowns
+    body_key = "catalogue:v2:body"        # memoized unfiltered response bodies
     # L1: in-process cache for the whole item list (no DB round-trip on a hit).
     items = _local_get(cache_key)
-    if items is None:
-        cached = await get_cached_response(cache_key)
-        if cached and "items" in cached:
-            items = cached["items"]
-        else:
-            loop = asyncio.get_event_loop()
-            items = await loop.run_in_executor(None, get_catalogue_items)
-            if items:
-                await set_cached_response(cache_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
-        if items:
+    derived = _local_get(derived_key)
+    if items is None or derived is None:
+        if items is None:
+            cached = await get_cached_response(cache_key)
+            if cached and "items" in cached:
+                items = cached["items"]
+            else:
+                loop = asyncio.get_event_loop()
+                items = await loop.run_in_executor(None, get_catalogue_items)
+                if items:
+                    await set_cached_response(cache_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+            items = items or []
             _local_set(cache_key, items)
 
-    # Format + genre breakdowns over the FULL catalogue (before any filtering).
-    counts: Dict[str, int] = {}
-    genre_counts: Dict[str, int] = {}
-    for it in items:
-        counts[it["category"]] = counts.get(it["category"], 0) + 1
-        for g in it.get("genres") or []:
-            genre_counts[g] = genre_counts.get(g, 0) + 1
-    categories = [{"category": k, "count": v} for k, v in sorted(counts.items())]
-    genres = [{"genre": k, "count": v} for k, v in sorted(genre_counts.items())]
+        # Format + genre breakdowns over the FULL catalogue (before any filtering).
+        # They only change when `items` is reloaded, so memoize them rather than
+        # re-scanning the whole list on every request (the previous behaviour, paid
+        # even on a cache hit). Recomputed whenever either L1 slot expired.
+        counts: Dict[str, int] = {}
+        genre_counts: Dict[str, int] = {}
+        for it in items:
+            counts[it["category"]] = counts.get(it["category"], 0) + 1
+            for g in it.get("genres") or []:
+                genre_counts[g] = genre_counts.get(g, 0) + 1
+        derived = {
+            "categories": [{"category": k, "count": v} for k, v in sorted(counts.items())],
+            "genres": [{"genre": k, "count": v} for k, v in sorted(genre_counts.items())],
+        }
+        _local_set(derived_key, derived)
+        # A fresh item list invalidates any cached unfiltered body.
+        _local_cache.pop(body_key, None)
+
+    # Unfiltered catalogue is by far the most-requested shape and is identical for
+    # every client within a cache window — serialize + gzip it once and reuse the
+    # bytes (orjson encode + level-6 gzip of the full list was the real per-request
+    # cost). Filtered views (category/genre) are smaller and computed on demand.
+    if not category and not genre:
+        bodies = _local_get(body_key)
+        if bodies is None:
+            bodies = _json_gzip_bodies({
+                "success": True,
+                "count": len(items),
+                "total": len(items),
+                "categories": derived["categories"],
+                "genres": derived["genres"],
+                "animes": items,
+            })
+            _local_set(body_key, bodies)
+        return _gzip_response(request, bodies)
 
     animes = items
     if category:
@@ -2156,8 +2210,8 @@ async def get_catalogue(
         "success": True,
         "count": len(animes),
         "total": len(items),
-        "categories": categories,
-        "genres": genres,
+        "categories": derived["categories"],
+        "genres": derived["genres"],
         "animes": animes,
     })
 
