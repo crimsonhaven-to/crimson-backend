@@ -35,6 +35,7 @@ COPY local_engine ./local_engine
 COPY cache_engine ./cache_engine
 COPY changelog_engine ./changelog_engine
 COPY recommend_engine ./recommend_engine
+COPY apikey_engine ./apikey_engine
 
 # Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
 # container is stateless and needs no writable data volume.
