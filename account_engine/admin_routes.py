@@ -42,6 +42,7 @@ from local_engine.fs import inspect_path, discover_mountpoints
 from cache_engine.db import CacheStore
 from cache_engine import fs as cache_fs
 from cache_engine import downloader as cache_dl
+from apikey_engine import store as apikey_store
 from .db import AccountStore
 from .routes import require_user
 
@@ -318,6 +319,47 @@ async def revoke_invite(code: str, user: dict = Depends(require_admin)):
     if not ok:
         raise HTTPException(status_code=404, detail="Unknown or already-used invite code")
     return {"success": True, "revoked": code}
+
+
+# --- movie-web bridge API keys ---------------------------------------------
+# Admin-minted machine credentials handed to the modified movie-web fork. The
+# fork's proxy injects the key server-side on calls to the /mw bridge endpoints
+# (the key never reaches the browser); the login wall accepts it ONLY for /mw
+# paths, so it can drive the bridge and nothing else. See apikey_engine/.
+class ApiKeyCreate(BaseModel):
+    label: Optional[str] = Field(None, max_length=100, description="A note to identify this key, e.g. 'movie-web prod'")
+
+
+@router.get("/api-keys")
+async def list_api_keys(
+    user: dict = Depends(require_admin),
+    include_revoked: bool = Query(True),
+):
+    """List minted bridge keys (never the raw secret — that's shown once, at
+    creation). ``id`` is each key's handle for revocation."""
+    items = await run_in_threadpool(apikey_store.list_keys, include_revoked)
+    return {"success": True, "count": len(items), "keys": items}
+
+
+@router.post("/api-keys")
+@limiter.limit("30/minute")
+async def create_api_key(request: Request, body: ApiKeyCreate, user: dict = Depends(require_admin)):
+    """Mint a movie-web bridge key. The raw key is returned exactly ONCE in this
+    response (only its hash is stored) — copy it into the fork's proxy secret now;
+    it can't be retrieved later, only revoked + replaced."""
+    created_by = f"admin:{user.get('email') or user['user_id']}"
+    raw, info = await run_in_threadpool(apikey_store.create_key, (body.label or None), created_by)
+    return {"success": True, "key": raw, "info": info}
+
+
+@router.delete("/api-keys/{key_id}")
+async def revoke_api_key(key_id: str, user: dict = Depends(require_admin)):
+    """Revoke a bridge key by its id. Takes effect within the login wall's
+    validation-cache TTL (~60s)."""
+    ok = await run_in_threadpool(apikey_store.revoke_key, key_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Unknown or already-revoked API key")
+    return {"success": True, "revoked": key_id}
 
 
 # --- metadata resync -------------------------------------------------------
