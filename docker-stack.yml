@@ -86,6 +86,7 @@ services:
       - SMTP_FROM=${SMTP_FROM:-}
       - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - CRIMSON_PROXY_BASE=${CRIMSON_PROXY_BASE:-}
       # --- Server-side video cache (optional) ----------------------------------
       # The serving replicas mint cache tickets and claim pending rows, but they do
       # NOT run the ffmpeg download loop — that lives in the dedicated cache-worker
