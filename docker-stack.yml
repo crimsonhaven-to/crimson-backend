@@ -65,6 +65,10 @@ services:
       # surfaces). Supplied via crimson.env on the manager. Optional region cookie.
       - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
       - FEBBOX_REGION=${FEBBOX_REGION:-}
+      # OpenSubtitles player subtitles. Disables itself when unset (no API key =>
+      # /subtitles returns 503). Supplied via crimson.env on the manager.
+      - OPENSUBTITLES_API_KEY=${OPENSUBTITLES_API_KEY:-}
+      - OPENSUBTITLES_APP_NAME=${OPENSUBTITLES_APP_NAME:-CrimsonHaven v1.0}
       # Login wall (email+password) — lives on the serving service. Supplied via
       # crimson.env on the manager. An empty SIGNUP_INVITE_CODE closes signups
       # (every register 403s), so set it. SMTP powers verification/reset email.
