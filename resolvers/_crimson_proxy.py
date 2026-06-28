@@ -36,8 +36,15 @@ logger = logging.getLogger(__name__)
 
 # Display labels of the sources wired to prefer the external proxy when enabled.
 # Used by the admin dashboard to show what's being offloaded; kept in sync with
-# the resolvers that call ``proxy_url`` (voe / cinemabz / playimdb).
-ROUTED_SOURCES = ["Voe", "cinema.bz", "PlayIMDb"]
+# the resolvers that call ``proxy_url``.
+#
+# NOTE: VOE is deliberately NOT here. Its CDN token is bound to the IP/ASN that
+# resolved the embed (the ``asn=`` query param), so only the backend — the ASN
+# the token was minted for — can fetch its segments. An external proxy on any
+# other network (e.g. a Cloudflare Worker) gets a 403, exactly as the viewer's
+# browser would. VOE therefore MUST stay on its same-origin /voe_proxy. The
+# offloadable sources are the purely Referer/Origin-gated ones below.
+ROUTED_SOURCES = ["cinema.bz", "PlayIMDb"]
 
 
 def proxy_bases() -> list[str]:
@@ -49,60 +56,128 @@ def proxy_bases() -> list[str]:
     ]
 
 
+def _source_allowlist() -> list[str]:
+    """Optional per-source A/B allowlist (``CRIMSON_PROXY_SOURCES``). Empty/unset
+    means *all* wired sources offload; set it to a comma-separated subset (e.g.
+    ``cinema.bz,PlayIMDb``) to offload only those and keep the rest same-origin."""
+    return [s.strip() for s in os.getenv("CRIMSON_PROXY_SOURCES", "").split(",") if s.strip()]
+
+
 def _secret() -> bytes:
     """The shared signing secret — specifically ``PROXY_SECRET`` (the value the
     edge proxy carries as ``NITRO_PROXY_SECRET``), never a per-source secret."""
     return (os.getenv("PROXY_SECRET") or "").encode("utf-8")
 
 
-def is_enabled() -> bool:
-    """True only when we have at least one proxy host AND a secret to sign with."""
-    return bool(proxy_bases()) and bool(os.getenv("PROXY_SECRET"))
+def is_enabled(source: str | None = None) -> bool:
+    """True only when we have at least one proxy host AND a secret to sign with.
+
+    When ``source`` is given, also honour the optional ``CRIMSON_PROXY_SOURCES``
+    allowlist so individual sources can be A/B'd on/off without code changes
+    (unset allowlist = every wired source offloads). Call with no ``source`` for
+    the global "is the proxy configured at all" check (used by the dashboard)."""
+    if not (proxy_bases() and os.getenv("PROXY_SECRET")):
+        return False
+    if source is not None:
+        allow = _source_allowlist()
+        if allow and source not in allow:
+            return False
+    return True
 
 
-def proxy_url(url: str, *, referer: str = "", origin: str = "", user_agent: str = "") -> str:
-    """Build a signed link to the external proxy for ``url`` with the upstream
-    headers the gated CDN requires. Picks one configured host at random (all
-    share the secret, so the link is valid on any of them)."""
+def _signed_query(url: str, referer: str, origin: str, user_agent: str) -> str:
+    """The ``u=…&r=…&o=…&ua=…&s=…`` query string, signed per the crimson-proxy
+    contract (HMAC over ``url\\nreferer\\norigin\\nuser-agent``, hex[:32])."""
     payload = "\n".join([url, referer, origin, user_agent])
     sig = hmac.new(_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
-    q = (
+    return (
         f"u={quote(url, safe='')}"
         f"&r={quote(referer, safe='')}"
         f"&o={quote(origin, safe='')}"
         f"&ua={quote(user_agent, safe='')}"
         f"&s={sig}"
     )
-    return f"{random.choice(proxy_bases())}/?{q}"
 
 
-async def probe_bases(timeout: float = 4.0) -> list[dict]:
-    """Health-ping each configured proxy host's ``GET /`` (the proxy's own
-    health check) so the admin dashboard can show which CORS proxies are live.
-    Returns one ``{base, status, ok, detail}`` dict per host."""
+def proxy_url(url: str, *, referer: str = "", origin: str = "", user_agent: str = "") -> str:
+    """Build a signed link to the external proxy for ``url`` with the upstream
+    headers the gated CDN requires. Picks one configured host at random (all
+    share the secret, so the link is valid on any of them)."""
+    return f"{random.choice(proxy_bases())}/?{_signed_query(url, referer, origin, user_agent)}"
+
+
+# A harmless URL the secret-match canary points at. The proxy verifies the
+# signature BEFORE fetching, so what matters is 401 (bad secret) vs anything
+# else (secret OK) — the URL itself never needs to resolve to a real stream.
+_CANARY_URL = "https://example.com/crimson-proxy-probe.m3u8"
+
+
+async def probe_bases(timeout: float = 5.0) -> list[dict]:
+    """Probe each configured proxy host for the admin dashboard. Per host:
+
+      * ``GET /``  — liveness + whether it enforces signing (``signed`` flag).
+      * a signed **canary** request — the proxy verifies the signature before
+        fetching, so a 401 means its secret does NOT match ours (the classic
+        "all streams 401 / stuck at 00:00" cause); anything else means the
+        secret matches (or the host is in open mode).
+
+    Returns one ``{base, status, code, signed, secret_ok, detail}`` per host.
+    ``secret_ok`` is True/False, or None when it couldn't be determined."""
     bases = proxy_bases()
     if not bases:
         return []
 
+    have_secret = bool(os.getenv("PROXY_SECRET"))
+    canary_q = _signed_query(_CANARY_URL, "", "", "") if have_secret else ""
+
     results: list[dict] = []
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for base in bases:
-            entry = {"base": base, "status": "error", "code": None, "detail": ""}
+            entry = {
+                "base": base,
+                "status": "error",
+                "code": None,
+                "signed": None,
+                "secret_ok": None,
+                "detail": "",
+            }
             try:
                 resp = await client.get(f"{base}/")
                 entry["code"] = resp.status_code
                 if resp.status_code == 200:
                     entry["status"] = "active"
-                    # The proxy answers its health check with a small JSON body;
-                    # surface a hint of it if present, else just note it's up.
+                    entry["detail"] = "up"
                     try:
-                        body = resp.json()
-                        entry["detail"] = body.get("name") or body.get("status") or "up"
+                        entry["signed"] = bool(resp.json().get("signed"))
                     except Exception:
-                        entry["detail"] = "up"
+                        pass
                 else:
                     entry["detail"] = f"HTTP {resp.status_code}"
             except Exception as exc:  # network/DNS/timeout -> host is down
                 entry["detail"] = type(exc).__name__
+                results.append(entry)
+                continue
+
+            # Secret-match canary (only meaningful when WE have a secret to sign
+            # with and the host is enforcing signing).
+            if have_secret and entry["status"] == "active":
+                try:
+                    cresp = await client.get(f"{base}/?{canary_q}")
+                    if cresp.status_code == 401:
+                        entry["secret_ok"] = False
+                        entry["status"] = "error"
+                        entry["detail"] = "secret mismatch (401)"
+                    elif entry["signed"] is False:
+                        # Host accepted us but isn't enforcing signing at all —
+                        # it has no secret set (open mode). Flag it: signed links
+                        # work, but the proxy is abusable as an open relay.
+                        entry["secret_ok"] = None
+                        entry["status"] = "idle"
+                        entry["detail"] = "open mode — NITRO_PROXY_SECRET unset"
+                    else:
+                        entry["secret_ok"] = True
+                        entry["detail"] = "signed OK"
+                except Exception as exc:
+                    entry["detail"] = f"canary: {type(exc).__name__}"
             results.append(entry)
     return results
