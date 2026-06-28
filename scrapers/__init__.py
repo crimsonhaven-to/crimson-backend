@@ -7,6 +7,7 @@ from .aniworld_scraper import AniworldScraper
 from .sto_scraper import StoScraper
 from .stomirror_scraper import StoMirrorScraper
 from .cinemabz_scraper import CinemabzScraper
+from .screenscape_scraper import ScreenscapeScraper
 from .showbox_scraper import ShowBoxScraper
 from .aniwatch_scraper import AniwatchScraper
 from .local_scraper import LocalScraper
@@ -24,5 +25,6 @@ ALL_SCRAPERS = [
     LocalScraper,     # Admin-registered local directories / NAS mounts (direct play only).
     AnimeSugeScraper,
     CinemabzScraper,  # TMDB-keyed HLS aggregator; 3 providers -> 3 tiles
+    ScreenscapeScraper,  # TMDB-keyed multi-server aggregator; ~15 servers, signed/encrypted API
     ShowBoxScraper,   # ShowBox/Febbox direct-file source; env-gated on FEBBOX_UI_TOKEN
 ]

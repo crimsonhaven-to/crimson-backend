@@ -37,6 +37,7 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
     query ($id: Int) {
       Media (id: $id, type: ANIME) {
         id
+        idMal
         status
         episodes
         bannerImage
@@ -114,6 +115,9 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
         
         result = {
             "anilist_id": media.get("id"),
+            # MyAnimeList id (AniList's idMal). Surfaced so the skip-intro feature
+            # can key AniSkip off it (see skiptimes_engine); additive field.
+            "mal_id": media.get("idMal"),
             "title": media.get("title", {}).get("english") or media.get("title", {}).get("romaji"),
             "title_romaji": media.get("title", {}).get("romaji"),
             "title_english": media.get("title", {}).get("english"),
