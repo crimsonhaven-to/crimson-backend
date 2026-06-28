@@ -35,6 +35,7 @@ from resolvers.cinemabz import proxy_fetch as cinemabz_proxy_fetch
 from resolvers.screenscape import proxy_fetch as screenscape_proxy_fetch
 from resolvers.febbox import proxy_fetch as febbox_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
+from resolvers import _crimson_proxy
 from local_engine.db import LocalSourceStore
 from local_engine.fs import (
     safe_resolve as local_safe_resolve,
@@ -2140,6 +2141,9 @@ async def _admin_system_info() -> Dict:
     cache_targets = await run_in_threadpool(cache_store.enabled_targets)
     local_sources = await run_in_threadpool(local_source_store.list_sources)
     local_enabled = sum(1 for s in local_sources if s.get("enabled"))
+    # Live-ping the external CORS proxies (if any) so the dashboard shows which
+    # are up. Cheap GET / health check per host; off entirely when unconfigured.
+    proxy_hosts = await _crimson_proxy.probe_bases()
 
     now = time.time()
     return {
@@ -2164,6 +2168,13 @@ async def _admin_system_info() -> Dict:
             "tmdb_key_set": bool(getattr(Config, "TMDB_API_KEY", None)),
             "rate_limit_storage": os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
             "github_token_set": bool(os.getenv("GITHUB_TOKEN")),
+            "crimson_proxy_enabled": _crimson_proxy.is_enabled(),
+        },
+        "proxies": {
+            "enabled": _crimson_proxy.is_enabled(),
+            "secret_set": bool(os.getenv("PROXY_SECRET")),
+            "routed_sources": _crimson_proxy.ROUTED_SOURCES,
+            "hosts": proxy_hosts,
         },
         "db_pool": pool,
         "cache": {
