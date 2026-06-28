@@ -10,6 +10,7 @@ from .cinemabz import (
     CinemabzIpcloudResolver,
     CinemabzNgcloudResolver,
 )
+from .screenscape import SCREENSCAPE_RESOLVERS
 from .vidsrc import VidSrcResolver
 from .febbox import FebboxResolver
 from .cache import CacheResolver
@@ -31,6 +32,9 @@ ALL_RESOLVERS = [
     CinemabzTcloudResolver,
     CinemabzIpcloudResolver,
     CinemabzNgcloudResolver,
+    # ScreenScape: TMDB-keyed multi-server aggregator; one resolver per server,
+    # each may return several quality/language tiles (signed/encrypted API).
+    *SCREENSCAPE_RESOLVERS,
     VidSrcResolver,  # aniwatch.co.at "VidSrc" server -> megaplay HLS
     FebboxResolver,  # ShowBox/Febbox direct-file source (env-gated on FEBBOX_UI_TOKEN)
 ]

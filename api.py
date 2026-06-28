@@ -32,6 +32,7 @@ from resolvers.vidmoly import proxy_fetch as vidmoly_proxy_fetch
 from resolvers.vidsrc import proxy_fetch as vidsrc_proxy_fetch
 from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.cinemabz import proxy_fetch as cinemabz_proxy_fetch
+from resolvers.screenscape import proxy_fetch as screenscape_proxy_fetch
 from resolvers.febbox import proxy_fetch as febbox_proxy_fetch
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from local_engine.db import LocalSourceStore
@@ -61,6 +62,7 @@ from supporters_engine import router as supporters_router, store as supporters_s
 from changelog_engine import router as changelog_router, service as changelog_service
 from recommend_engine import router as recommend_router
 from subtitles_engine import router as subtitles_router, service as subtitles_service
+from skiptimes_engine import router as skiptimes_router
 from core.db_pool import get_pool, close_pool, pool_stats
 from core import lumi
 from core import source_health
@@ -108,7 +110,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "13.6.0"
+VERSION = "14.0.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -398,6 +400,7 @@ _PUBLIC_PREFIXES = (
     "/vidmoly_proxy",
     "/vidsrc_proxy",
     "/cinemabz_proxy",
+    "/screenscape_proxy",
     "/febbox_proxy",
     "/animesuge_proxy",
     "/jellyfin_proxy",
@@ -600,6 +603,11 @@ app.include_router(recommend_router)
 # authed (search, no quota spent); /subtitles_proxy is public + signed (the
 # <track> can't carry auth) — see subtitles_engine + the _PUBLIC_PREFIXES entry.
 app.include_router(subtitles_router)
+
+# AniSkip-backed intro/outro skip timestamps for the anime player. /skiptimes is
+# authed (behind the login wall); anime-only (resolves anilist_id -> mal_id) and
+# best-effort — see skiptimes_engine.
+app.include_router(skiptimes_router)
 
 # --- DATABASE HELPER FUNCTIONS ---
 def get_db_connection():
@@ -995,6 +1003,38 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
         if matched_resolver:
             try:
                 resolved = await matched_resolver.resolve(embed_url)
+                # A resolver may return a LIST of already-formed stream dicts
+                # ({"url", "source", "type", optional "language"/"subtitles"}) when
+                # one marker fans out to many variants (ScreenScape: a server's
+                # qualities/languages). Absolutize any same-origin proxy paths and
+                # append each as its own tile.
+                if isinstance(resolved, list):
+                    for item in resolved:
+                        if not isinstance(item, dict) or not item.get("url"):
+                            continue
+                        item_url = item["url"]
+                        if item_url.startswith("/") and base_url:
+                            item_url = base_url.rstrip("/") + item_url
+                        item_subs = item.get("subtitles") or None
+                        if item_subs and base_url:
+                            item_subs = [
+                                {**s, "url": base_url.rstrip("/") + s["url"]}
+                                if isinstance(s.get("url"), str) and s["url"].startswith("/")
+                                else s
+                                for s in item_subs
+                            ]
+                        stream_obj = {
+                            "source": item.get("source") or matched_resolver.source_name,
+                            "type": item.get("type")
+                            or ("hls" if "m3u8" in item_url.lower() else "mp4"),
+                            "url": item_url,
+                        }
+                        if item_subs:
+                            stream_obj["subtitles"] = item_subs
+                        if item.get("language"):
+                            stream_obj["language"] = item["language"]
+                        resolved_streams.append(stream_obj)
+                    continue
                 # A resolver may return a bare URL string (the common case) or a
                 # dict {"url", "subtitles"} when it also has external subtitle
                 # tracks (ShowBox/Febbox). Normalise to (url, subtitles).
@@ -2599,6 +2639,40 @@ async def cinemabz_proxy(request: Request):
         raise HTTPException(status_code=403, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"Cinema.bz proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(content=payload, status_code=status, media_type=content_type)
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
+# --- SCREENSCAPE STREAM PROXY ("ScreenScape · …" sources) ---
+@app.get("/screenscape_proxy")
+async def screenscape_proxy(request: Request):
+    """Signed, same-origin proxy for the ScreenScape sources. ScreenScape's
+    per-server upstreams are either bare CDN links gated on a specific
+    Origin/Referer (e.g. ShowBox's hls.shegu.net) or already wrapped in
+    ScreenScape's own Cloudflare Workers; either way this fetches them server-side
+    with the per-stream Origin/Referer injected, rewrites HLS playlists so
+    sub-resources flow back through here, and streams media with Range passthrough.
+
+    The upstream host varies per stream, so instead of a host allow-list this proxy
+    verifies an HMAC over (url, origin, referer) (see resolvers.screenscape) and
+    refuses anything unsigned — closing the open-proxy / SSRF hole."""
+    try:
+        status, content_type, headers, payload = await screenscape_proxy_fetch(
+            url=request.query_params.get("u"),
+            origin=request.query_params.get("o"),
+            referer=request.query_params.get("r"),
+            sig=request.query_params.get("s"),
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"ScreenScape proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
 
     if isinstance(payload, (bytes, bytearray)):
