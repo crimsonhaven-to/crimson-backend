@@ -334,23 +334,23 @@ class AccountStore:
     ) -> List[Dict]:
         """Accounts (newest first) with per-user favorite / progress / active-session
         counts, for the admin user table. Never returns password_hash. Optional
-        case-insensitive search over email / label / numeric id."""
+        case-insensitive search over email / label / display name / numeric id."""
         params: list = []
         where = ""
         if search and search.strip():
             term = search.strip()
             like = f"%{term}%"
             where = (
-                "WHERE a.email ILIKE %s OR a.label ILIKE %s"
+                "WHERE a.email ILIKE %s OR a.label ILIKE %s OR a.username ILIKE %s"
                 " OR CAST(a.user_id AS TEXT) = %s"
             )
-            params += [like, like, term]
+            params += [like, like, like, term]
         now = _iso(_now())
         params += [now, limit, offset]
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT a.user_id, a.email, a.label, a.email_verified, a.is_admin,
+                SELECT a.user_id, a.email, a.label, a.username, a.email_verified, a.is_admin,
                        (a.public_key IS NOT NULL) AS has_mnemonic,
                        a.created_at, a.last_login_at,
                        (SELECT COUNT(*) FROM favorites f WHERE f.user_id = a.user_id) AS favorites_count,

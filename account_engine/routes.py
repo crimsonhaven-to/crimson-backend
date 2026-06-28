@@ -631,7 +631,7 @@ async def put_preferences(request: Request, user: dict = Depends(require_user)):
 # you, {username}". Deliberately separate from auth (email / public_key) and from
 # the free-form preferences blob: it's a single first-class field the frontend can
 # read off /account/me. Non-unique by design.
-MAX_USERNAME_LENGTH = 32
+MAX_USERNAME_LENGTH = 20
 
 
 class UsernameIn(BaseModel):
