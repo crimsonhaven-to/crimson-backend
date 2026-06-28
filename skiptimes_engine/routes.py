@@ -17,7 +17,7 @@ from fastapi import APIRouter, Query
 from core.http_client import http_client
 from metadata_engine.anilist import fetch_anilist_metadata
 
-from .service import service
+from .service import resolve_mal_id, service
 
 router = APIRouter(tags=["skiptimes"])
 
@@ -40,7 +40,12 @@ async def get_skip_times(
 
     async with http_client() as client:
         meta = await fetch_anilist_metadata(client, anilist_id) or {}
-    mal_id = meta.get("mal_id")
+        mal_id = meta.get("mal_id")
+        # The shared metadata cache can hold entries written before idMal existed,
+        # so a missing mal_id here isn't authoritative — resolve it directly (fresh,
+        # small-cached) before giving up. Skipped when the cache already carries it.
+        if not mal_id:
+            mal_id = await resolve_mal_id(client, anilist_id)
     if not mal_id:
         return empty
 

@@ -25,6 +25,51 @@ import httpx
 logger = logging.getLogger(__name__)
 
 ANISKIP_BASE = "https://api.aniskip.com/v2"
+ANILIST_GQL = "https://graphql.anilist.co"
+# Minimal idMal-only query — see resolve_mal_id for why this doesn't reuse the
+# full metadata fetcher.
+_MAL_QUERY = "query($id:Int){Media(id:$id,type:ANIME){idMal}}"
+
+# anilist_id -> (expires_at_monotonic, mal_id|None). A tiny, independent cache so
+# the idMal lookup never leans on the shared 24h api_cache (see resolve_mal_id).
+_mal_cache: Dict[int, Tuple[float, Optional[int]]] = {}
+_MAL_TTL = 6 * 3600.0
+
+
+async def resolve_mal_id(client: httpx.AsyncClient, anilist_id: int) -> Optional[int]:
+    """Resolve an AniList id to its MyAnimeList id (``idMal``) for AniSkip.
+
+    Deliberately a direct, minimal GraphQL call (with its own small cache) rather
+    than reusing ``fetch_anilist_metadata``: that fetcher persists its result in
+    the shared 24h ``api_cache``, and entries written *before* the ``idMal`` field
+    was added carry no ``mal_id`` — so a title cached in that window silently
+    resolves to ``None`` and the skip buttons never appear. Querying ``idMal``
+    fresh sidesteps the stale-cache shape. Returns ``None`` on any error or a
+    genuinely MAL-less title (cached so we don't re-query)."""
+    now = time.monotonic()
+    cached = _mal_cache.get(anilist_id)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    try:
+        resp = await client.post(
+            ANILIST_GQL,
+            json={"query": _MAL_QUERY, "variables": {"id": anilist_id}},
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            logger.info("[aniskip] idMal lookup %s for anilist=%s", resp.status_code, anilist_id)
+            return None
+        media = ((resp.json() or {}).get("data") or {}).get("Media") or {}
+    except (httpx.RequestError, ValueError) as e:
+        logger.warning("[aniskip] idMal lookup failed for anilist=%s: %s - %s",
+                       anilist_id, type(e).__name__, e)
+        return None
+
+    raw = media.get("idMal")
+    mal_id = int(raw) if raw else None
+    _mal_cache[anilist_id] = (now + _MAL_TTL, mal_id)
+    return mal_id
 
 
 class AniSkipService:
