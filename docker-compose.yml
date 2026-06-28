@@ -64,6 +64,10 @@ services:
       # listed here to reach the container — disables itself when unset.
       # - FEBBOX_UI_TOKEN=
       # - FEBBOX_REGION=
+      # Optional OpenSubtitles player subtitles (see .env.example). Must be listed
+      # here to reach the container; unset => /subtitles returns 503.
+      # - OPENSUBTITLES_API_KEY=
+      # - OPENSUBTITLES_APP_NAME=CrimsonHaven v1.0
 
     # Container-level health is also defined in the Dockerfile; declared here too
     # so `docker compose` reports it without relying on the image default.

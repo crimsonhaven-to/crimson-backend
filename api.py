@@ -60,6 +60,7 @@ from apikey_engine import store as apikey_store
 from supporters_engine import router as supporters_router, store as supporters_store
 from changelog_engine import router as changelog_router, service as changelog_service
 from recommend_engine import router as recommend_router
+from subtitles_engine import router as subtitles_router, service as subtitles_service
 from core.db_pool import get_pool, close_pool, pool_stats
 from core import lumi
 from core import source_health
@@ -107,7 +108,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "13.1.0"
+VERSION = "13.5.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -220,6 +221,11 @@ async def lifespan(app: FastAPI):
         )
     else:
         logger.info("GITHUB_TOKEN not set — /changelog will return 503 until configured")
+
+    if subtitles_service.configured():
+        logger.info("OpenSubtitles configured — /subtitles is enabled")
+    else:
+        logger.info("OPENSUBTITLES_API_KEY not set — /subtitles will return 503 until configured")
 
     # The Fribb resync rebuilds the mapping tables wholesale. In a multi-replica
     # Swarm deploy only ONE replica should own it (RUN_DB_SYNC), otherwise every
@@ -396,6 +402,8 @@ _PUBLIC_PREFIXES = (
     "/animesuge_proxy",
     "/jellyfin_proxy",
     "/cache_proxy",
+    # The subtitle <track> loads cross-origin with no auth header (signed instead).
+    "/subtitles_proxy",
     "/docs",
 )
 
@@ -587,6 +595,11 @@ app.include_router(changelog_router)
 # "What to watch next" — genre-based recommendations derived from the viewer's
 # favorites + watch history (read-only, additive; see recommend_engine).
 app.include_router(recommend_router)
+
+# OpenSubtitles-backed external subtitle tracks for the player. /subtitles is
+# authed (search, no quota spent); /subtitles_proxy is public + signed (the
+# <track> can't carry auth) — see subtitles_engine + the _PUBLIC_PREFIXES entry.
+app.include_router(subtitles_router)
 
 # --- DATABASE HELPER FUNCTIONS ---
 def get_db_connection():

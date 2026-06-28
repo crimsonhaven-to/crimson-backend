@@ -91,6 +91,10 @@ services:
       # and the source disables itself (is_configured() False => never surfaces).
       - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
       - FEBBOX_REGION=${FEBBOX_REGION:-}
+      # OpenSubtitles player subtitles. MUST be listed here (Compose does NOT
+      # auto-inject .env) or /subtitles returns 503. Unset => feature disabled.
+      - OPENSUBTITLES_API_KEY=${OPENSUBTITLES_API_KEY:-}
+      - OPENSUBTITLES_APP_NAME=${OPENSUBTITLES_APP_NAME:-CrimsonHaven v1.0}
       # Login wall (email+password). These come from your host env / .env via
       # substitution — Compose does NOT auto-inject the .env into the container,
       # so they MUST be listed here or the app sees them as unset (an empty
