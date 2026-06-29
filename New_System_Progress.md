@@ -35,7 +35,7 @@
     - Expand current CI/CD pipeline for crimson-backend & crimson-client:
       - deploy a "crimson-client-dev"-Service on crimsonswarm
       - deploy a "crimson-backend-dev" Service on crimsonswarm
-      - automated re-deployments ***on push*** into the dev-branch
+      - automated re-deployments ***on push*** into the dev-branch (ONLY when an actual CODE-file has been changed- there's no need for a redeploy on a pure markdown push)
       - keep automated re-deployments ***on tagged release*** in the main-branch
       Important: the dev-branch will not be as HA-Oriented as the prod version.
       Instead, it will use the docker-compose-dev.yml file, and one replica per container. (Meaning: One singular API-container, one singular PostgreSQL container. no cache-worker, no patroni / etcd HA cluster.)
