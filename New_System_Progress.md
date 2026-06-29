@@ -192,7 +192,15 @@ Subtitles (OpenSubtitles quota key). Documented in `registry.ts`.
    ScreenScape/AnimeSuge resolve locally and the HLS/MP4 plays (segments CDN→viewer).
    This is the last DoD criterion and needs a real browser; everything up to it is done.
 
-### 🔧 Phase 1.5 — Live shakeout troubleshooting (OPEN, 2026-06-29)
+### 🔧 Phase 1.5 — Live shakeout troubleshooting (RESOLVED, 2026-06-29)
+
+> **✅ RESOLVED — see "Phase 1.5 — RESOLVED + live end-to-end pass" below.** The
+> MAIN-world fix here (Problem 1) was *necessary but not the whole story*: the
+> extension did inject (`window.CrimsonExtension.available === true`), yet the engine
+> still never ran **on anime titles** — because the anime watch hook never called the
+> client engine at all (see the resolution section). Problem 2 (cache_proxy CORS) is
+> moot for client-resolved playback: VOE now streams straight from the CDN, no proxy
+> in the path. The investigation below is kept as the historical trail.
 
 The Phase 1.5 code is complete and **everything is pushed** (commits below), but the
 **live end-to-end test still fails**: with the companion installed and toggled ON,
@@ -295,9 +303,102 @@ Fix depends on which: a guaranteed-CORS `FileResponse` for `cache_proxy` (explic
 header on the handler) if it's the middleware/range case; an env correction if it's the
 config; or a cache-revalidation if it's the 404.
 
+### ✅ Phase 1.5 — RESOLVED + live end-to-end pass (2026-06-29)
+
+**The Phase 1.5 Definition of Done is met.** A real browser, with the companion
+installed and toggled on, resolved VOE **client-side** for an anime episode (*The
+Eminence in Shadow* S2E3, German Sub **and** Dub) and played the HLS stream straight
+from the hoster CDN — the ASN-bound VOE token (C4) minted from the *viewer's own*
+residential IP (`asn=…` in the playlist URL), exactly the flagship win the migration
+was designed for. ScreenScape (~45 variants) and PlayIMDb also resolved locally in
+the same run.
+
+#### Dev environment on the swarm (the safe place to shake this out)
+
+A real dev environment was stood up on `crimsonswarm` so this could be tested without
+touching prod:
+- **Stacks** (manager-resident compose, *not* in the repos): `crimson-dev` (single
+  `api` + a **bundled** `postgres:17` — physically isolated from prod data) on `:8001`,
+  and `crimson-client-dev` on `:8801`. Folders `~/dev-crimson-deploy/` and
+  `~/dev-crimson-client-deploy/` hold the stack file + `deploy.sh` + placeholder
+  `crimson.env`. Cloudflare tunnel public hostnames route `dev-backend.crimsonhaven.to`
+  → `:8001` and the dev client (`dev.crimsonhaven.to`) → `:8801`.
+- **CI/CD** (`build-image.yml`, both repos): a push to `dev` now builds + pushes
+  `:dev` **and** an immutable `:dev-<sha>`, then a new `deploy-dev` job (gated
+  `if: github.event_name == 'push'`, `paths-ignore: ['**.md']`) SSHes the manager and
+  rolls `:dev-<sha>` onto the dev stack. Release-tag deploys to prod are unchanged.
+  The client build bakes `VITE_API_BASE_URL=https://dev-backend.crimsonhaven.to`.
+
+#### Root cause of the failed shakeout — the anime watch path was never wired
+
+The earlier MAIN-world CSP fix was real but insufficient. The decisive bug:
+`src/hooks.js` has **three** watch hooks, and only two called the engine —
+`useShowStreamer` (TMDB-keyed TV) and `useMovieStreamer`. **`useAnimeStreamer`
+(AniList-keyed) never called `streamLocalSources` at all.** Since VOE / AniWorld /
+S.to are *anime* sources, every title the engine could actually help with went through
+the one hook with no integration → zero `[clientSources]`/`[crimson-sources]` logs,
+zero extension fetches, clean fallback to E0. Not a VOE bug; a wiring gap.
+
+**Fix (crimson-client `dev`):** wired `useAnimeStreamer`'s NDJSON effect to run the
+local engine alongside the backend, mirroring `useShowStreamer` exactly — dedup-aware
+`handleLine(line, origin)` (local supersedes a backend duplicate by `(source, language)`),
+and a `mediaCtx` built from the current season's `tmdb_id`/`tmdb_season` +
+`animeMetadata.title` + the anilist id (so `/scrape-meta` enrichment + title matching
+work just like the backend scrapers).
+
+#### Playback fix — CSP `connect-src`
+
+Once VOE resolved, the in-app hls.js player was CSP-blocked from loading the CDN:
+the extension does the *scraping* fetches in its service worker (CSP-exempt) and
+installs DNR header rules, but **playback** is the page's own XHR, which obeys the page
+CSP. DNR rewrites headers; it doesn't bypass `connect-src`. Hoster CDNs rotate
+(`cloudwindow-route.com`, `*.workers.dev`, `shegu.net`, …) and can't be enumerated, so
+`security-headers.conf` `connect-src` was widened from `'self' https://*.crimsonhaven.to`
+to **`'self' https:`**. `script-src 'self'` (the real XSS floor) is untouched — this
+only widens where the page may *connect*, not what code may *run*. (Applies to prod on
+the next release too — intentional; client-side playback can't work without it.)
+
+#### Known non-issues observed in the trace
+
+- `aniworld`/`sto` searches threw `crimson-extension fetch failed: Failed to fetch`
+  while `stomirror` (a raw-IP mirror) succeeded → the *test network blocks those
+  domains by name*, not a code bug. The engine logged it (never silent) and degraded
+  gracefully to the mirror.
+- Backend `/sign` (E2 proxy) is **not implemented and not needed** for this: the
+  crimson-proxy is a datacenter IP, and VOE's `needsResidentialIP` flag means E2 can
+  *never* mint a working VOE token (`ProxiedFetcher.supports` excludes it). VOE is
+  strictly E3 (extension) or E0 (backend). `/sign` would only help non-extension
+  viewers on header-only sources — deferred to Phase 2.
+
+#### Companion distribution — download page + packed into the client build
+
+Because the `crimson-extension` repo is private (no public Release assets), the
+companion is now shipped **from the client itself**, exactly like the rpc-helper:
+- **Submodule**: `crimson-extension` vendored at `vendor/crimson-extension`
+  (`.gitmodules` url `../crimson-extension`, branch `main`), pinned `610ed27`.
+- **Build** (`Dockerfile`): a new `extpack` stage zips the submodule into
+  `/extension/crimson-extension.zip` (+ `manifest.json` for the live version);
+  `nginx.conf` serves `^~ /extension/` (zip downloads via its mime type, manifest stays
+  readable; 1h cache).
+- **Client UX**: a new themed `/extension` page (`src/DownloadExtension.jsx`) — Luminas'
+  voice, a download button (live version from the manifest), the side-load ritual
+  (unzip → `chrome://extensions` → Developer mode → Load unpacked → the one red button),
+  and an "already bound" success state when `window.CrimsonExtension` is present. A
+  self-effacing home banner (`ExtensionBanner` in `App.jsx`) nudges viewers who don't
+  have it yet — auto-hidden once the companion is detected (`crimson-extension-ready`)
+  or dismissed (localStorage). Plus a permanent footer "Companion" link.
+
+`npm run build` green (the page is its own lazy chunk).
+
 ### ⏭️ Next — Phase 2 candidates
-1. **Backend `/sign` grant** (New_System §8a) → wire `signProxyUrl` so the E2
-   (no-extension, web-only) path works; then non-extension viewers benefit too.
+1. **Backend `/sign` grant** (New_System §8a) → wire `signProxyUrl` for the E2
+   (no-extension, web-only) path. **Deliberately deferred:** E2 can't serve the
+   high-value sources anyway (the proxy is a datacenter IP, so VOE's
+   `needsResidentialIP` and any JA3-gated source exclude it). It would only help
+   non-extension viewers on header-only sources — a pure bandwidth optimization, not a
+   capability gap. Build it only if backend relay cost becomes a concern.
 2. **Rotating segment-host media rules**: parse the master playlist, widen the DNR
    rule to cover cross-host segments (today `extraDomains` covers the known cases).
-3. Dev/Prod environment split + CI/CD (the actual Phase 2 in `New_System.md`).
+3. Dev/Prod environment split + CI/CD — **substantially done** (see the dev-environment
+   subsection above): dev stacks on the swarm, push-to-`dev` auto-deploy, release-tag
+   prod deploy. Remaining: a `crimson-sources` `dev` branch (it still tracks `main`).
