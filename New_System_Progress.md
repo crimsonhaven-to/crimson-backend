@@ -645,3 +645,65 @@ ScreenScape / AnimeSuge offload via the signed proxy. `npm run build` green.
 Then set `CRIMSON_PROXY_BASE` in the dev/prod env and deploy crimson-proxy with a
 matching `NITRO_PROXY_SECRET` — until then `/sign` 503s and clients cleanly stay on
 E3/E0 (no regression).
+
+### 🔀 Phase 2 (cont.) — proxy failover, Netlify deploy fix, cache exclusion (2026-06-29)
+
+Deployed both proxy edges (Cloudflare + Netlify) and shook the E2 path out live;
+several real-world gaps surfaced and were fixed.
+
+#### Automatic proxy failover (health-aware host selection) — committed `f1c15e8`
+
+The signed proxy query is host-independent (it signs `url\nreferer\norigin\nua`,
+not the host), so one signature is valid on every base sharing the secret — which
+makes failover pure *host selection*. `resolvers/_crimson_proxy.py` gained a small
+in-process health cache: `proxy_url()` now routes only to hosts last probed healthy
+(`active`/`idle`), falling back to ALL bases when the cache is cold/stale/all-down
+(never worse than the old `random.choice`). `refresh_health()` reuses the existing
+`probe_bases()` and is called at startup, every 2 min on the scheduler, AND by the
+admin dashboard probe (so opening the overview also steers routing). Each replica
+keeps its own cache. **Why it mattered:** with both edges in `CRIMSON_PROXY_BASE`
+and Netlify 404ing, the old random pick made each source's playability a coin-flip
+(the "PlayIMDb sometimes never loads, then works on refresh" symptom — a fresh
+resolve re-rolled onto Cloudflare). Failover makes it deterministic.
+
+#### Netlify deploy — root-caused after three attempts (crimson-proxy, deploy.yml)
+
+Cloudflare deployed first try; Netlify kept shipping "only netlify.toml / every
+route 404s". Isolated step by step:
+1. Removed a bogus `[functions] directory = ".netlify/functions"` (Nitro's edge
+   preset writes `.netlify/edge-functions/`) — real hygiene, but not the cause.
+2. Added a post-deploy **smoke test** (curl the deployed `/` for the proxy JSON, fail
+   the job loudly) — turned green-but-dead into red-and-legible. This is what made
+   the next two diagnoses possible.
+3. `deploy --build --json` → **no build logs at all** (the `--json`+`--build` combo
+   skipped the build); split into `netlify build` + `deploy --no-build` → build
+   bundled the edge function fine ("Packaging Edge Functions - server") but it STILL
+   404'd. That isolated it: **`--no-build` drops Nitro's *framework-internal* edge
+   function** — Netlify only wires those in via an IN-PROCESS build→deploy handoff.
+4. **Fix:** one plain `netlify deploy --prod` (integrated build+bundle+deploy in a
+   single process), URL grepped from the human output. *(Result of this run pending
+   at write time; if it still 404s, fall back to a user edge function in
+   `netlify/edge-functions/` re-exporting Nitro's bundle.)*
+
+#### Cache engine — exclude edge-offloaded / locally-resolved streams (`cache_engine/downloader.py`)
+
+Live caching threw `ffmpeg failed` rows for episodes watched via the E2/local path.
+Cause: a crimson-proxy URL (`https://<edge>/?u=…`) is a valid-looking `hls` stream,
+so `_cacheable` stamped a ticket / the warmup picked it, and ffmpeg then tried to
+remux it through the (possibly-down) edge — which both errors and, when it works,
+pulls every segment back THROUGH the backend, defeating the entire offload. Added
+`_is_external_proxy_url()` (URL host ∈ `CRIMSON_PROXY_BASE` hosts) and excluded it
+in `_cacheable` — the single gate shared by `mint_ticket` (watch), `maybe_enqueue`
+(confirm), and the warmup filter, so all three agree. Same-origin `/{x}_proxy`
+paths and raw CDN URLs stay cacheable; only the deliberately-offloaded ones are
+skipped. This is the "don't cache a local/offloaded resolve" guard the cache engine
+was missing. Unit-tested the host matcher; `py_compile` clean.
+
+#### State (uncommitted unless noted)
+
+| Repo | What | Status |
+| --- | --- | --- |
+| crimson-backend | proxy failover (`_crimson_proxy.py` + scheduler) | committed `f1c15e8` |
+| crimson-backend | cache exclusion (`cache_engine/downloader.py`) | uncommitted |
+| crimson-proxy | single-step integrated `deploy --prod` + smoke test (`deploy.yml`), netlify.toml comment fix | uncommitted |
+| crimson-extension | v1.0.3 (on-by-default, smaller button, client favicon) | per earlier entry |

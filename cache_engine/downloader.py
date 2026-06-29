@@ -36,6 +36,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .db import CacheStore
 from . import fs, ticket
+from resolvers import _crimson_proxy
 
 logger = logging.getLogger("cache_engine.downloader")
 
@@ -88,6 +89,33 @@ def _media_url_for_stream(stream: dict) -> Optional[str]:
                 # src is a same-origin path; resolve it against the same origin.
                 return f"{parsed.scheme}://{parsed.netloc}{src}"
     return None
+
+
+def _is_external_proxy_url(url: str) -> bool:
+    """True if ``url`` points at an external crimson-proxy edge (a host listed in
+    ``CRIMSON_PROXY_BASE``).
+
+    Such a stream was deliberately offloaded off the backend — the no-extension E2
+    path, or a proxy-routed source (see [[crimson-proxy-phase1]]). Caching it would
+    be self-defeating and fragile: ffmpeg would pull every segment back THROUGH the
+    edge proxy to the backend (re-importing the exact bandwidth we offloaded), and
+    the free edge may be down / rate-limited — that's the source of the
+    "ffmpeg failed" cache rows. These are also precisely the streams the client
+    resolves locally, so excluding them is the "don't cache a local/offloaded
+    resolve" guard the cache engine was missing."""
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    for base in _crimson_proxy.proxy_bases():
+        try:
+            if urlparse(base).netloc.lower() == host:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _to_internal(url: str) -> str:
@@ -175,6 +203,8 @@ class DownloadManager:
         url = (stream.get("url") or "")
         if any(frag in url for frag in _SKIP_URL_FRAGMENTS):
             return False  # our own cache output / the on-disk Local source
+        if _is_external_proxy_url(url):
+            return False  # offloaded to the edge — never pull it back through us
         if not _media_url_for_stream(stream):
             return False
         if not ffmpeg_available():
