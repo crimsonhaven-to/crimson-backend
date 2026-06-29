@@ -1718,6 +1718,69 @@ async def get_movie_watch_links(request: Request, tmdb_id: int):
     )
 
 
+@app.get("/scrape-meta/{tmdb_id}/{season_number}")
+@limiter.limit("60/minute")
+async def get_scrape_meta(request: Request, tmdb_id: int, season_number: int):
+    """The title bundle the *client-side* discovery sources need to search the
+    target sites (New System, Phase 1.5).
+
+    The TS engine running in the viewer's browser (crimson-sources) resolves
+    TMDB-keyed sources off the id alone, but the title-matching discovery sources
+    (aniworld / s.to / stomirror / aniwatch / AnimeSuge) search by title — and the
+    German broadcast synonyms come from TMDB /translations, which needs the
+    server-held TMDB key (a C5 secret that must never ship to the browser). So the
+    client fetches this grant and merges it into its MediaCtx, keeping title
+    matching byte-identical to the backend scrapers without leaking the key.
+
+    Returns exactly the fields the backend's own ``media_ctx`` carries (see
+    ``stream_watch_response``): primary title, the AniList title variants, and the
+    synonym list (AniList synonyms + German titles). Login-gated like ``/watch``,
+    so anonymous users can't use it as a free metadata service."""
+    anilist_id = get_anilist_id(tmdb_id, season_number)
+
+    if anilist_id:
+        async with http_client() as client:
+            anilist_data = await fetch_anilist_metadata(client, anilist_id) or {}
+        title = anilist_data.get("title")
+        synonyms = list(anilist_data.get("synonyms") or [])
+        return {
+            "success": True,
+            "anilist_id": anilist_id,
+            "title": title,
+            "title_english": anilist_data.get("title_english"),
+            "title_romaji": anilist_data.get("title_romaji"),
+            "title_native": anilist_data.get("title_native"),
+            "synonyms": synonyms,
+        }
+
+    # No-AniList path (TMDB-only seasons of long shows): the primary title is the
+    # TMDB show title, enriched with the German broadcast title(s) the s.to-family
+    # sites list non-anime shows under — exactly the enrichment the watch stream
+    # does for the no-AniList case.
+    info = get_show_info(tmdb_id)
+    title = info.get("title") if info else None
+    synonyms: List[str] = []
+    try:
+        async with http_client() as client:
+            if not title:
+                show = await fetch_tmdb_show(client, tmdb_id)
+                title = show.get("title")
+            german_titles = await fetch_tmdb_localized_titles(client, tmdb_id)
+        synonyms = [t for t in (german_titles or []) if t]
+    except Exception as e:
+        logger.warning(f"scrape-meta enrichment failed for {tmdb_id}: {e}")
+
+    return {
+        "success": True,
+        "anilist_id": None,
+        "title": title,
+        "title_english": title,
+        "title_romaji": None,
+        "title_native": None,
+        "synonyms": synonyms,
+    }
+
+
 # --- movie-web bridge (/mw) -------------------------------------------------
 # A thin compatibility surface that re-shapes the existing scrape+resolve
 # pipeline into @movie-web/providers' native `Stream` JSON, so a modified
