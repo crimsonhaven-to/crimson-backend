@@ -29,6 +29,21 @@
     - Everything needs to be wired into the client (and, if necessary, the backend) so that local scraping / resolving client-side works (of course, with help of the crimson-extension)
     - On re-deploy, everything must work as it should. This is the last criteria: An end-to-end test which uses client-side (+ extension) scraping & resolving to resolve sources and then play the HLS / MP4 stream (depending on the source)
 
+4. Phase 2:
+    Cleanly separate the Dev and Prod environment. This will be achieved with the following means.
+    - crimson-client as well as crimson-backend already have separated dev and main branches. dev is the Dev Environment, main is the Production environment. Implement the same branches into crimson-sources.
+    - Expand current CI/CD pipeline for crimson-backend & crimson-client:
+      - deploy a "crimson-client-dev"-Service on crimsonswarm
+      - deploy a "crimson-backend-dev" Service on crimsonswarm
+      - automated re-deployments ***on push*** into the dev-branch
+      - keep automated re-deployments ***on tagged release*** in the main-branch
+      Important: the dev-branch will not be as HA-Oriented as the prod version.
+      Instead, it will use the docker-compose-dev.yml file, and one replica per container. (Meaning: One singular API-container, one singular PostgreSQL container. no cache-worker, no patroni / etcd HA cluster.)
+    - Add the following URLs for Dev branches:
+      - backend-dev.crimsonhaven.to
+      - client-dev.crimsonhaven.to
+    - All changes following completion of Phase 2 will be tested in the dev-environment before releasing them into Prod.
+
 ---
 
 ## Progress Log
