@@ -39,7 +39,12 @@ from resolvers.febbox import (
     is_configured as febbox_is_configured,
 )
 from scrapers.showbox_scraper import ShowBoxScraper
-from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
+from resolvers.jellyfin import (
+    proxy_fetch as jellyfin_proxy_fetch,
+    is_configured as jellyfin_is_configured,
+    JellyfinResolver,
+)
+from scrapers.jellyfin_scraper import JellyfinScraper
 from resolvers import _crimson_proxy
 from local_engine.db import LocalSourceStore
 from local_engine.fs import (
@@ -1934,11 +1939,60 @@ async def _grant_febbox(
     return out
 
 
+def _jellyfin_edge_inject_enabled() -> bool:
+    """Opt-in switch for delivering Jellyfin off-backend via crimson-proxy edge
+    token injection. OFF by default → Jellyfin stays fully on the backend /watch
+    proxy (today's behaviour, no regression). Flip it on ONLY after the proxy is
+    deployed with NITRO_JELLYFIN_HOSTS + NITRO_JELLYFIN_TOKEN, since the edge — not
+    the browser — holds the token and the client path is E2-only."""
+    return (os.getenv("JELLYFIN_EDGE_INJECT", "").strip().lower() in ("1", "true", "yes", "on"))
+
+
+def _jellyfin_grant_configured() -> bool:
+    return jellyfin_is_configured() and _jellyfin_edge_inject_enabled()
+
+
+async def _grant_jellyfin(
+    tmdb_id: int, season_num: int, episode_num: int,
+    anilist_data: Dict, media_type: str, base_url: str,
+) -> List[Dict]:
+    """Resolve the Jellyfin item to its RAW, token-less absolute URL. The client
+    delivers it E2-only through the crimson-proxy, which injects the access token at
+    the edge — so the heavy bytes go Jellyfin → edge → viewer and the token never
+    reaches the browser. ``base_url`` is unused (no same-origin proxy path here)."""
+    embeds = await run_single_scraper(
+        JellyfinScraper, tmdb_id, season_num, episode_num, anilist_data, media_type
+    )
+    if not embeds:
+        return []
+    resolver = JellyfinResolver()
+    out: List[Dict] = []
+    for embed in embeds:
+        try:
+            res = await resolver.resolve_direct(embed)
+        except Exception as e:
+            logger.warning(f"[resolve] jellyfin resolve_direct failed: {type(e).__name__} - {e}")
+            continue
+        if not res or not res.get("url"):
+            continue
+        out.append({
+            "label": resolver.source_name,  # "Jellyfin" -> dedups with the /watch tile
+            "streamType": res.get("streamType") or "hls",
+            "url": res["url"],
+            # No upstream headers: the edge supplies the token + Authorization itself.
+            "headers": {},
+            "subtitles": [],
+            "language": None,
+        })
+    return out
+
+
 # Per-source grant registry: source key -> (is_configured probe, runner). Add a
 # cookie/secret source here and it gains a client-delivery path for free.
 _RESOLVE_GRANTS = {
     "febbox": (febbox_is_configured, _grant_febbox),
     "showbox": (febbox_is_configured, _grant_febbox),  # alias (the display label is "ShowBox")
+    "jellyfin": (_jellyfin_grant_configured, _grant_jellyfin),
 }
 
 
