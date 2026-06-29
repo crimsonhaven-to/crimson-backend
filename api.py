@@ -111,7 +111,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "15.3.0"
+VERSION = "15.4.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -1779,6 +1779,69 @@ async def get_scrape_meta(request: Request, tmdb_id: int, season_number: int):
         "title_native": None,
         "synonyms": synonyms,
     }
+
+
+# --- crimson-proxy sign grant (New System §8a) -----------------------------
+# The E2 (web-only, no-extension) path: the client resolves a stream in the
+# browser and needs a *signed* crimson-proxy link to relay the segment bytes off
+# the backend — but PROXY_SECRET must never ship to the browser. So the client
+# sends the upstream URL(s) + the headers the CDN wants injected here, and we hand
+# back the signed proxy link(s). This is the only thing that keeps PROXY_SECRET
+# server-side while letting the client drive what gets fetched.
+#
+# Login-gated (NOT in _PUBLIC_PREFIXES) + rate-limited, so it can't be used as an
+# anonymous free signing/relay oracle. We only sign http(s) upstreams; the proxy
+# itself still runs its own isSafeUpstream SSRF check before fetching.
+_SIGN_MAX_ITEMS = 24
+
+
+def _sign_one(item: Dict) -> Optional[str]:
+    """Sign a single ``{url, referer?, origin?, userAgent?}`` into a proxy link, or
+    None if the url is missing / not http(s)."""
+    if not isinstance(item, dict):
+        return None
+    url = (item.get("url") or "").strip()
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return None
+    return _crimson_proxy.proxy_url(
+        url,
+        referer=(item.get("referer") or ""),
+        origin=(item.get("origin") or ""),
+        user_agent=(item.get("userAgent") or item.get("user_agent") or ""),
+    )
+
+
+@app.post("/sign")
+@limiter.limit("240/minute")
+async def sign_proxy_links(request: Request):
+    """Mint signed crimson-proxy link(s) for client-resolved streams (New System
+    §8a). Accepts either a single ``{url, referer, origin, userAgent}`` object or
+    ``{"items": [ … ]}`` for batch signing, and always returns a parallel
+    ``signed`` array (null for any item we refuse to sign).
+
+    Returns 503 when the external proxy isn't configured (no ``CRIMSON_PROXY_BASE``
+    / ``PROXY_SECRET``) — the client then stays on E3 (extension) or E0 (backend),
+    exactly as today, so an unconfigured proxy never breaks playback."""
+    if not _crimson_proxy.is_enabled():
+        return JSONResponse({"ok": False, "error": "proxy_unconfigured"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
+
+    items = body.get("items")
+    if items is None:
+        items = [body]  # single-object form
+    if not isinstance(items, list) or not items:
+        return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
+    if len(items) > _SIGN_MAX_ITEMS:
+        items = items[:_SIGN_MAX_ITEMS]
+
+    signed = [_sign_one(it) for it in items]
+    return {"ok": True, "signed": signed}
 
 
 # --- movie-web bridge (/mw) -------------------------------------------------

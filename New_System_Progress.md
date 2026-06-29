@@ -402,3 +402,113 @@ companion is now shipped **from the client itself**, exactly like the rpc-helper
 3. Dev/Prod environment split + CI/CD — **substantially done** (see the dev-environment
    subsection above): dev stacks on the swarm, push-to-`dev` auto-deploy, release-tag
    prod deploy. Remaining: a `crimson-sources` `dev` branch (it still tracks `main`).
+
+### 🩸 Phase 2 — E2 revival, anime wiring, extension hardening, Doodstream (2026-06-29)
+
+A working session that fixed why client-side offload was barely engaging and
+expanded coverage. **Several earlier "DONE" claims in this log did not match the
+committed code** — corrected below. All code compiles/builds; the live browser
+pass is still the user's step.
+
+#### ‼️ Root cause #1 — the client bundles a STALE engine (submodule pinned to Phase 1)
+
+`crimson-client` (`dev`, HEAD `2eca5c6`) commits its `vendor/crimson-sources`
+gitlink at **`291f142` — the *Phase 1* engine (cinema.bz + PlayIMDb only)**.
+crimson-sources `main` is at `a51d72c` (all Phase-1.5 sources), but the client
+**never actually bumped to it** (the "Might work. Who knows." commit). So the
+deployed client's local engine has *none* of VOE/aniworld/s.to/AniWatch/AnimeSuge/
+ScreenScape/Vidmoly/VidSrc — it can only ever resolve cinema.bz/PlayIMDb locally.
+This is a primary reason the companion "sometimes works."
+**Fix = bump the submodule** (sequence at the bottom). Verified: with the submodule
+synced to `a51d72c`, `npm run build` bundles the full resolver/source set.
+
+#### ‼️ Root cause #2 — the anime watch hook never called the local engine
+
+`hooks.js` has three watch hooks; only `useShowStreamer` (TV) and
+`useMovieStreamer` called `streamLocalSources`. **`useAnimeStreamer` did not** —
+so every *anime* title (i.e. every VOE/aniworld/s.to title, the flagship sources)
+ran backend-only. The earlier log's "RESOLVED — anime hook wired" was not in the
+committed code. **Fixed:** `useAnimeStreamer` now runs the local engine alongside
+the backend, building a `MediaCtx` from the current season's `tmdb_id`/`tmdb_season`
+(= `get_tmdb_season`'s `season_number`, what the backend feeds its scrapers) +
+`currentEpisode` + the anilist id + title.
+
+#### ‼️ Root cause #3 — dedup was first-come-first-served, so the backend won the race
+
+All three hooks deduped by `msg.source` first-wins. The backend `/watch` runs in
+parallel and (warm caches, datacenter) usually resolves a source *first*, so its
+own `/{source}_proxy` URL won and **kept serving the bytes** — the local
+(offloaded) URL was dropped. **Fixed:** new `mergeStreamLine(list, msg, origin,
+dedup)` — a `'local'` line **supersedes** a `'backend'` duplicate of the same
+`(source, language)` in place, so the player switches to the CDN→viewer (E3) /
+CDN→edge→viewer (E2) URL and the backend stops carrying the segments. Off unless
+`clientSourcesEnabled()` → prod behaviour unchanged for non-opted-in viewers.
+
+#### E2 (proxy) path revived — backend `/sign` grant + client `signProxyUrl` (New_System §8a)
+
+The E2 path was inert: `ProxiedFetcher` only activates when `env.signProxyUrl` is
+set, and nothing set it (the grant was deferred) — so for every viewer *without*
+the extension, PlayIMDb/cinema.bz/ScreenScape/AnimeSuge/Vidmoly silently fell back
+to the backend. This was the "CORS proxies don't work at all" the user reported.
+- **Backend:** `POST /sign` (`api.py`) — login-gated (NOT in `_PUBLIC_PREFIXES`),
+  `240/min`, accepts one `{url,referer,origin,userAgent}` or `{"items":[…]}` and
+  returns parallel signed crimson-proxy links via `_crimson_proxy.proxy_url`
+  (PROXY_SECRET stays server-side). 503 when the proxy isn't configured → client
+  stays on E3/E0, never a regression. Only signs `http(s)`; the proxy keeps its own
+  SSRF gate.
+- **Client (`clientSources.js`):** implements `signProxyUrl` against `/sign` with a
+  Bearer token, canonical-key cache + in-flight dedup, and a 503 latch (`_proxyDisabled`)
+  so it stops asking when the proxy is off. Now wired into `createEngine`.
+- Note: VOE still can't use E2 (`needsResidentialIP` → datacenter proxy can't mint a
+  valid ASN-bound token); it's E3/E0 by design. E2 offloads the header-only sources
+  for the no-extension majority.
+
+#### Client discovery sources can now title-match (`/scrape-meta` enrichment)
+
+`clientSources.js` previously passed a bare `MediaCtx` (no titles), so the
+title-matching discovery sources (aniworld/s.to/AniWatch/AnimeSuge) couldn't search.
+Added `enrichMediaCtx` → fetches the backend `/scrape-meta/{tmdb}/{season}` grant
+(the German-synonym bundle needs the server TMDB key, C5) and merges the title set
+in, cached per `(tmdb, season)`. TV only (movies are TMDB-keyed).
+
+#### Companion extension hardened (the "sometimes works" SW races) — v1.0.2
+
+`crimson-extension/src/background.js`, three concrete MV3 service-worker bugs:
+1. **SW wake race:** the SW is killed on idle; on cold wake `enabled` defaulted
+   `false` while `loadState()` was still async, so the first `FETCH`/`HELLO` after
+   an idle teardown wrongly reported "disabled." Added a `readyPromise` the message
+   handler awaits before reading `enabled`.
+2. **Orphaned-rule id collision:** session DNR rules persist across SW restarts but
+   the id counters reset → a reused id threw "rule already exists" and silently
+   dropped the header injection (→ CDN 403). `addSessionRules` is now an idempotent
+   remove-then-add; `loadState` reconciles the counters past live rules (and drops
+   orphans when disabled).
+3. **Fragile `urlFilter`:** matching the SW fetch rule by full URL fails on reserved
+   chars/query tokens, so Referer/Origin weren't injected. Now scoped by host
+   (`requestDomains`) + `tabIds:[-1]`.
+Version bumped 1.0.1 → **1.0.2** (manifest/protocol/inpage) as the "new build" signal.
+
+#### New capability — Doodstream resolver (previously un-doable on the backend)
+
+`crimson-sources/src/resolvers/doodstream.ts`: the classic `/pass_md5` + `?token=`
+two-step dance. Doodstream is Cloudflare-gated, which is exactly why the backend
+(datacenter JA3) couldn't do it ([[aniworld-doodstream-filemoon-blocked]]) — but the
+companion runs from the viewer's *real* browser, clearing the passive gate for free.
+Wired into the s.to-family `resolveEmbed` + label map, and added "Doodstream" to the
+`aniworld`/`sto` hoster allowlists. Inherits the family flags (E3/E0 only — needs the
+extension), so no proxy/JA3 concern. `tsc` + build green.
+
+#### ‼️ Deploy sequence required (cross-repo; submodule bumps) — user action
+
+Nothing here is pushed. To go live (and finally get Phase 1.5 into the client):
+1. `cd ../crimson-sources && git add -A && git commit -m "Add Doodstream resolver" && git push origin main`
+2. `cd ../crimson-extension && git add -A && git commit -m "Harden SW (wake race, rule-id collision, host-scoped rules); v1.0.2" && git push origin main`
+3. `cd ../crimson-client` → bump BOTH submodules to the new heads:
+   `git -C vendor/crimson-sources checkout main && git -C vendor/crimson-sources pull` and
+   `git -C vendor/crimson-extension checkout main && git -C vendor/crimson-extension pull`,
+   then `git add vendor/crimson-sources vendor/crimson-extension src/clientSources.js src/hooks.js && git commit -m "Bump engine+companion; revive E2 /sign; wire anime local engine; supersede dedup" && git push origin dev`
+4. `cd ../crimson-backend && git add api.py New_System_Progress.md && git commit -m "Add /sign proxy grant (E2 revival)" && git push origin dev`
+5. Live shakeout on dev: companion v1.0.2 on + `localStorage crimson:clientSources=1`,
+   watch an anime ep → confirm VOE/Doodstream resolve locally and the backend serves
+   no `*_proxy` bytes for them. Without the extension, confirm PlayIMDb/cinema.bz play
+   via the signed crimson-proxy link (`/sign`).
