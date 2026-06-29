@@ -438,11 +438,14 @@ the backend, building a `MediaCtx` from the current season's `tmdb_id`/`tmdb_sea
 All three hooks deduped by `msg.source` first-wins. The backend `/watch` runs in
 parallel and (warm caches, datacenter) usually resolves a source *first*, so its
 own `/{source}_proxy` URL won and **kept serving the bytes** — the local
-(offloaded) URL was dropped. **Fixed:** new `mergeStreamLine(list, msg, origin,
-dedup)` — a `'local'` line **supersedes** a `'backend'` duplicate of the same
-`(source, language)` in place, so the player switches to the CDN→viewer (E3) /
-CDN→edge→viewer (E2) URL and the backend stops carrying the segments. Off unless
-`clientSourcesEnabled()` → prod behaviour unchanged for non-opted-in viewers.
+(offloaded) URL was dropped. **Fixed:** origin-aware dedup — a `'local'` line
+**supersedes** a `'backend'` duplicate of the same `(source, language)` in place,
+so the player switches to the CDN→viewer (E3) / CDN→edge→viewer (E2) URL and the
+backend stops carrying the segments. Off unless `clientSourcesEnabled()` → prod
+behaviour unchanged for non-opted-in viewers. *(Implementation note: I first wrote
+this as a `mergeStreamLine` helper, but the `origin/dev` merge below shipped an
+equivalent inline `dedup` Map + `reselect()` in each hook — that is what's in the
+tree now; `mergeStreamLine` was dropped.)*
 
 #### E2 (proxy) path revived — backend `/sign` grant + client `signProxyUrl` (New_System §8a)
 
@@ -498,17 +501,91 @@ Wired into the s.to-family `resolveEmbed` + label map, and added "Doodstream" to
 `aniworld`/`sto` hoster allowlists. Inherits the family flags (E3/E0 only — needs the
 extension), so no proxy/JA3 concern. `tsc` + build green.
 
-#### ‼️ Deploy sequence required (cross-repo; submodule bumps) — user action
+### 🔀 Phase 2 (cont.) — merge with `origin/dev`, AdGuard diagnosis, VOE playback fix (2026-06-29)
 
-Nothing here is pushed. To go live (and finally get Phase 1.5 into the client):
-1. `cd ../crimson-sources && git add -A && git commit -m "Add Doodstream resolver" && git push origin main`
-2. `cd ../crimson-extension && git add -A && git commit -m "Harden SW (wake race, rule-id collision, host-scoped rules); v1.0.2" && git push origin main`
-3. `cd ../crimson-client` → bump BOTH submodules to the new heads:
-   `git -C vendor/crimson-sources checkout main && git -C vendor/crimson-sources pull` and
-   `git -C vendor/crimson-extension checkout main && git -C vendor/crimson-extension pull`,
-   then `git add vendor/crimson-sources vendor/crimson-extension src/clientSources.js src/hooks.js && git commit -m "Bump engine+companion; revive E2 /sign; wire anime local engine; supersede dedup" && git push origin dev`
-4. `cd ../crimson-backend && git add api.py New_System_Progress.md && git commit -m "Add /sign proxy grant (E2 revival)" && git push origin dev`
-5. Live shakeout on dev: companion v1.0.2 on + `localStorage crimson:clientSources=1`,
-   watch an anime ep → confirm VOE/Doodstream resolve locally and the backend serves
-   no `*_proxy` bytes for them. Without the extension, confirm PlayIMDb/cinema.bz play
-   via the signed crimson-proxy link (`/sign`).
+While the above was still local, a **parallel session** had already pushed a more
+polished version of the same feature to `origin/dev`: an **auto-handshake** client
+engine (`waitForExtensionBridge` + `flagOverride`/`extensionPresent` instead of the
+manual `getExtensionBridge`), a **debug logger** wired through the engine + VOE
+discovery (`crimson-sources` `9f755b7`), and the **companion-distribution** work
+(`/extension` download page, `vendor/crimson-extension` submodule, Dockerfile
+`extpack`, CSP `connect-src https:`). A `git pull` merged it on top, colliding on
+`clientSources.js`, `hooks.js`, and the `vendor/crimson-sources` pin.
+
+**Merge resolution (kept both sides):**
+- `clientSources.js` — kept their auto-handshake design; swapped their placeholder
+  `signProxyUrl = undefined` for the **real `/sign` signer** (now routed through
+  `apiFetch`). E2 revival preserved.
+- `hooks.js` — took the incoming version wholesale: it already has the same
+  origin-aware "local supersedes backend" dedup (inline `dedup` Map + `reselect()`)
+  *and* the anime-hook wiring, more completely than my parallel `mergeStreamLine`
+  (which was dropped). No functionality lost.
+- `vendor/crimson-sources` — re-homed the **Doodstream** resolver onto their
+  `9f755b7` via a 3-way patch (only `stoFamily.ts` overlapped, with the new debug
+  logger — merged cleanly), committed as **`df6a79a`** on a new `crimson-sources`
+  **`dev`** branch (satisfies the Phase-2 "sources needs a dev branch" item).
+- `vendor/crimson-extension` — the merge pinned the *old* `610ed27`; bumped to
+  **`061a6e5`** (the v1.0.2 SW hardening) so a deploy ships the hardened companion.
+
+**VOE web-only debugging (the live end-to-end on `dev.crimsonhaven.to`):** with the
+companion on, the anime path engaged and VOE resolved **locally** — then two issues
+surfaced, diagnosed via `window.CrimsonExtension.fetch(...)` straight from the page
+console:
+
+1. **24-byte VOE embed = the user's AdGuard, not a bug.** `voe.sx/e/<id>` →
+   "Redirecting…" bounce → rotating mirror (`jennifereconomicgive.com/e/<id>`) →
+   AdGuard substitutes a 24-byte `/* Blocked by AdGuard */` stub. The resolver was
+   correct (followed the bounce, extracted the right mirror). A Sec-Fetch/`Origin`
+   "iframe navigation" theory was tried and **disproved** (both header sets returned
+   identical bodies) and **reverted**; what was kept is a sharper resolver
+   diagnostic that now prints *"intercepted by a content blocker … whitelist the
+   streaming hosts"* instead of a cryptic byte count (`crimson-sources` `3ab7f3c`).
+   Note: a per-site allowlist in the blocker does **not** help — the companion
+   fetches from its **service worker** (no tab context), so the blocker's
+   tab-scoped allowlist misses it; the user must pause it / disable the specific
+   rule. (Open product question: ship best-effort high-priority DNR `allow` rules in
+   the companion to override a co-installed blocker — works only if the companion is
+   installed *after* it, per Chrome's install-order cross-extension precedence.)
+
+2. **VOE segments 403 a few seconds in = media rules torn down mid-playback.** First
+   segments returned **200** (proving the `voe.sx` Referer/UA DNR rule *was* injected),
+   then 403 once resolution finished. Cause: `streamLocalSources` called
+   `engine.dispose()` on resolve-completion, and `dispose()` **clears the DNR media
+   rules** — but the player keeps fetching gated segments for the whole episode.
+   **Fixed (`crimson-client` `e6ae921`):** no `dispose()` on normal completion; the
+   rules persist through playback and are cleared+reinstalled at the *next* episode's
+   `streamEpisode()` start (doing it on abort would race that install). Confirmed:
+   **VOE now plays start-to-finish from the CDN, no dev-backend proxy.** ✅
+
+> **Known follow-up (not yet hit):** the media rule is scoped to the *master* `.m3u8`
+> host. If VOE ever serves segments from a **sibling subdomain**, they'd 403 from the
+> *first* segment (distinct from the above). Fix when it bites: widen the rule to the
+> registrable parent domain (the "rotating segment-host media rules" Phase-2 item).
+
+#### ✅ Final state (all committed locally; nothing pushed)
+
+| Repo | Branch | Head | Contains |
+| --- | --- | --- | --- |
+| crimson-backend | dev | `e943321` | `POST /sign` proxy grant |
+| crimson-sources | dev | `3ab7f3c` | `9f755b7` debug engine + Doodstream + VOE diagnostic |
+| crimson-extension | main | `061a6e5` | SW hardening, v1.0.2 |
+| crimson-client | dev | `e6ae921` | merge (auto-handshake + distribution) + E2 `signProxyUrl` + submodule bumps + media-rule lifetime fix |
+
+#### Push sequence (submodule targets before the client that pins them)
+
+1. `cd ../crimson-sources  && git push origin dev`   (`3ab7f3c`)
+2. `cd ../crimson-extension && git push origin main`  (`061a6e5`)
+3. `cd ../crimson-backend  && git push origin dev`    (`e943321`)
+4. `cd ../crimson-client   && git push origin dev`    (merge + bumps + VOE fix)
+
+Push 1 & 2 **before** 4 or CI can't resolve the client's submodule pins. The
+`dev`-branch pushes auto-deploy to the dev stack (`dev.crimsonhaven.to` /
+`dev-backend.crimsonhaven.to`).
+
+#### Status: **Phase 2 web-only + extension paths verified end-to-end on dev** ✅
+
+With the companion (v1.0.2) on, anime resolves locally and VOE plays start-to-finish
+straight from the CDN — the backend carries **zero** segment bytes for it. Doodstream
+is wired (Cloudflare-gated, companion-only). E2 `/sign` is live for the no-extension
+header-only sources. Remaining Phase-2 polish: the sibling-subdomain media-rule
+widening (above), and the optional blocker-override `allow` rules.
