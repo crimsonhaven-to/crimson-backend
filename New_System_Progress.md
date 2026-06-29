@@ -707,3 +707,62 @@ was missing. Unit-tested the host matcher; `py_compile` clean.
 | crimson-backend | cache exclusion (`cache_engine/downloader.py`) | uncommitted |
 | crimson-proxy | single-step integrated `deploy --prod` + smoke test (`deploy.yml`), netlify.toml comment fix | uncommitted |
 | crimson-extension | v1.0.3 (on-by-default, smaller button, client favicon) | per earlier entry |
+
+### 🍪 Phase 2 (cont.) — cookie sources resolve on backend, deliver client-side (2026-06-29)
+
+The remaining "bytes still flow through the backend" case after VOE/cinema.bz/etc.
+went client-side was the **cookie/secret-bound** source: ShowBox/Febbox, whose
+final `/file/player` hop needs the `ui` cookie (FEBBOX_UI_TOKEN, a C5 secret that
+can't ship to the browser). Previously the backend resolved it AND re-streamed the
+rotating-OSS mp4 through `/febbox_proxy` — the last big byte path on the backend.
+
+**Insight:** only the *resolve* needs the cookie; the URL it yields is a direct CDN
+file the viewer can fetch themselves. So split it: **backend resolves (keeps the
+secret), client delivers the bytes (E3/E2).** New general "resolve grant" — the
+cookie-source twin of `/sign` — so MovieBox/other cookie sources slot in.
+
+**crimson-backend (committed `0031118`, dev, NOT pushed):**
+- `resolvers/febbox.py` — extracted `_parse_marker` + a shared `_unlock()` (the
+  token-gated player lookup) behind both `resolve()` (unchanged proxy path) and the
+  new `resolve_direct()`, which returns the **raw** OSS URL + `{headers:{userAgent}}`
+  (Febbox has no Referer gate) + subtitles (still relative `/febbox_proxy` srt→VTT
+  paths — tiny, fine to relay). `streamType` from the URL.
+- `api.py` — `POST /resolve`: login-gated (NOT in `_PUBLIC_PREFIXES`) + `120/min`,
+  source-dispatched via `_RESOLVE_GRANTS` (febbox/showbox today). Takes the client's
+  MediaCtx, runs `run_single_scraper(ShowBoxScraper, …)` → `resolve_direct` per
+  embed, absolutizes subtitle URLs, returns `{ok, streams:[{label,streamType,url,
+  headers,subtitles,language}]}`. 503 when the source isn't configured (token unset)
+  → client cleanly stays on the backend /watch line.
+
+**crimson-sources (committed `12a7007`, dev, NOT pushed):**
+- `types.ts` — `GrantStream`/`GrantRequest`; `resolveGrant` on `EngineEnv` +
+  `ResolvedEnv` (host-supplied like `signProxyUrl`, since only the host has the
+  session token + API base). Threaded through `createEngine`.
+- `sources/febbox.ts` — a **backend-resolved** source: `resolve()` calls
+  `env.resolveGrant({source:"febbox", ctx})` then `preparePlayback` per stream for
+  E3/E2 delivery. Label "ShowBox" so it supersedes the backend tile; `needsCORSBypass`
+  (subtitles force `crossOrigin` and the OSS CDN won't ACAO our origin) → routes E3/E2,
+  falls back to E0 when neither exists. Registered in `registry.ts`.
+
+**crimson-client (committed `e42dc18`, dev, NOT pushed):**
+- `clientSources.js` — `resolveGrant` against `POST /resolve` (apiFetch bearer,
+  cached per `(source,tmdb,season,episode)`, 503/404 latches the source off for the
+  session), threaded into `createEngine`. Submodule bumped to `12a7007`.
+
+**Verified:** backend `ast` + live import of `FebboxResolver.resolve_direct` /
+`ShowBoxScraper` + marker parser; crimson-sources `tsc --noEmit` + build green;
+crimson-client `npm run build` green with the submodule bumped — `febbox`/`/resolve`
+confirmed present in the bundle. **NOT yet done:** a live browser pass (needs a real
+FEBBOX_UI_TOKEN on the dev stack + companion/proxy) — the byte-path win is verified
+by construction (raw URL + E3/E2 delivery), but the end-to-end play is the user's step.
+
+**Push sequence (submodule targets before the client that pins them):**
+1. `cd ../crimson-sources  && git push origin dev`  (`12a7007`)
+2. `cd ../crimson-backend  && git push origin dev`  (`0031118`)
+3. `cd ../crimson-client   && git push origin dev`  (`e42dc18` — submodule bump + wiring)
+
+**Note on Movish/Jellyfin/Cache/Local:** still E0 by nature. Movish is an
+HTML-rewriting iframe player-proxy (no direct stream URL); Jellyfin needs its token
+in *every* segment request (not just resolve), so a grant would have to embed the
+token in the URL — deferred; Cache/Local are server-resident files by definition
+(deliberate exceptions — their whole point is to serve the server's own NAS).
