@@ -47,6 +47,14 @@ services:
       # MUST be set (and identical on every replica) or proxied playback 403s
       # across restarts/replicas. Generate one: `openssl rand -hex 32`.
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET (e.g. openssl rand -hex 32)}
+      # External crimson-proxy edge relay(s) — the E2 (no-extension) client offload
+      # path behind POST /sign. Must be listed here to reach the container; unset =>
+      # _crimson_proxy.is_enabled() is False and /sign returns 503 (clients fall back
+      # to the extension/backend). Comma-separate hosts for failover; each proxy's
+      # NITRO_PROXY_SECRET must equal PROXY_SECRET above.
+      # - CRIMSON_PROXY_BASE=https://<site>.netlify.app,https://crimson-proxy.<acct>.workers.dev
+      # Optional per-source A/B allowlist (unset => all wired E2 sources offload).
+      # - CRIMSON_PROXY_SOURCES=cinema.bz,PlayIMDb
       # Only one replica should own the periodic Fribb resync.
       - RUN_DB_SYNC=true
       # Optional: comma-separated CORS origins (defaults to the built-in list).

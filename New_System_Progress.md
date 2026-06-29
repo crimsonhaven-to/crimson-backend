@@ -589,3 +589,59 @@ straight from the CDN — the backend carries **zero** segment bytes for it. Doo
 is wired (Cloudflare-gated, companion-only). E2 `/sign` is live for the no-extension
 header-only sources. Remaining Phase-2 polish: the sibling-subdomain media-rule
 widening (above), and the optional blocker-override `allow` rules.
+
+### 🩸 Phase 2 (cont.) — E2 auto-engage + compose passthrough + companion defaults (2026-06-29)
+
+Audited the whole E2 (`/sign` → crimson-proxy) chain end-to-end and closed the two
+gaps that kept it from actually doing anything for real visitors, plus three
+companion-UX asks.
+
+#### ‼️ Root cause — the proxy was never reachable from the container
+
+The code chain was complete and byte-consistent (backend `_sign_one`/`_crimson_proxy.proxy_url`
+↔ proxy `signing.ts verify` ↔ sources `ProxiedFetcher`/`preparePlayback` ↔ client
+`signProxyUrl`), but **`CRIMSON_PROXY_BASE` was missing from both compose files'
+`environment:` blocks**. Compose does NOT auto-inject `.env`, so the running
+container saw it unset → `_crimson_proxy.is_enabled()` False → `POST /sign` returned
+503 → the entire E2 path was dead regardless of the client wiring. **Fixed:** added
+`CRIMSON_PROXY_BASE` + `CRIMSON_PROXY_SOURCES` passthrough to `docker-compose-dev.yml`
+(active) and `docker-compose.yml` (commented template), with the standard "must be
+listed or the container can't see it" note. *Runtime value still has to be set in the
+swarm `crimson.env`, and the proxy deployed with `NITRO_PROXY_SECRET == PROXY_SECRET`.*
+
+#### E2 now auto-engages for no-extension viewers (user decision: on for everyone)
+
+Previously the client engine only ran when the companion was present or a tester set
+`localStorage crimson:clientSources=1`, so the proxy bought the no-extension majority
+nothing. Per the New_System §6 "web-only" intent, `clientSources.js` now engages the
+E2 path for every viewer without the companion: the gate drops to "bail only when
+there's no companion AND the proxy is known-unconfigured" (a `/sign` 503 latches
+`_proxyDisabled`, which both halts further asks and flips `clientSourcesEnabled()`
+off so dedup stays correct). The engine self-routes VOE/VidSrc/aniworld → backend
+(their `needsResidentialIP`/`needsJA3` flags exclude E2); only cinema.bz / PlayIMDb /
+ScreenScape / AnimeSuge offload via the signed proxy. `npm run build` green.
+
+#### Companion UX — on by default, smaller button, client favicon (v1.0.3)
+
+- **On by default:** `background.js loadState` treats an absent stored flag as
+  ENABLED (fresh install works out of the box); an explicit toggle-off still persists
+  and wins on every later load. README "off by default" line corrected.
+- **Smaller button:** popup `.power` 132→104px (core inset 14→11, label 14→12px,
+  body min-height 360→320) — same one-button design, less bulk.
+- **Favicon:** `scripts/make_icons.py` rewritten to derive the toolbar/popup icons
+  from crimson-client's own favicon (`public/icons/android-chrome-512x512.png`,
+  LANCZOS-downscaled to 16/32/48/128 + greyscale `-off`), so the companion reads as
+  the same brand. Regenerated all 8 PNGs.
+- Version bumped 1.0.2 → **1.0.3** (manifest/protocol/inpage). All JS `node --check`
+  clean; manifest valid JSON.
+
+#### Push sequence (unchanged ordering — submodule targets before the client)
+
+1. `cd ../crimson-extension && git push origin main`  (v1.0.3 + client favicon)
+2. `cd ../crimson-backend  && git push origin dev`     (compose passthrough)
+3. `cd ../crimson-client   && git push origin dev`     (E2 auto-engage)
+   *(crimson-sources unchanged this session.)*
+
+Then set `CRIMSON_PROXY_BASE` in the dev/prod env and deploy crimson-proxy with a
+matching `NITRO_PROXY_SECRET` — until then `/sign` 503s and clients cleanly stay on
+E3/E0 (no regression).
