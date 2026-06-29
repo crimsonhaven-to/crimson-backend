@@ -19,9 +19,12 @@ name: Build and Deploy
 # which has Docker + buildx and passwordless SSH to the swarm managers.
 
 on:
-#  push:
-#    branches:
-#      - dev
+  push:
+    branches:
+      - dev
+    # Doc-only commits shouldn't rebuild + redeploy the dev image.
+    paths-ignore:
+      - '**.md'
   release:
     types: [published]
 
@@ -45,6 +48,8 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       deploy: ${{ steps.meta.outputs.deploy }}
+      # The exact, immutable tag to deploy (vX.Y.Z on release, dev-<sha> on dev).
+      image_tag: ${{ steps.meta.outputs.image_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -57,11 +62,15 @@ jobs:
             echo "version=${VER}"  >> "$GITHUB_OUTPUT"
             echo "deploy=true"      >> "$GITHUB_OUTPUT"
             echo "tags=${IMAGE}:${VER},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+            echo "image_tag=${VER}" >> "$GITHUB_OUTPUT"
           else
             SHORT_SHA="$(git rev-parse --short HEAD)"
             echo "version="         >> "$GITHUB_OUTPUT"
             echo "deploy=false"     >> "$GITHUB_OUTPUT"
             echo "tags=${IMAGE}:dev,${IMAGE}:dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            # Deploy the immutable per-commit tag, not the rolling :dev, so the
+            # dev stack always rolls to exactly this build.
+            echo "image_tag=dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Log in to GHCR
@@ -102,3 +111,17 @@ jobs:
         run: |
           ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" \
             "/home/raymond/crimson-deploy/deploy.sh '${{ needs.build.outputs.version }}'"
+
+  # Dev auto-deploy: a push to `dev` rolls the just-built dev-<sha> image onto the
+  # crimson-dev stack. Unlike the prod deploy this ships NO stack file — the dev
+  # docker-stack.yml lives only on the manager (~/dev-crimson-deploy/), bundling
+  # its own Postgres; CI just triggers its deploy.sh.
+  deploy-dev:
+    needs: build
+    if: ${{ github.event_name == 'push' }}
+    runs-on: [self-hosted]
+    steps:
+      - name: Deploy to the dev swarm stack
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" \
+            "/home/raymond/dev-crimson-deploy/deploy.sh '${{ needs.build.outputs.image_tag }}'"
