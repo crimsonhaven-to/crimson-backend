@@ -18,7 +18,16 @@
 
 2. Phase 1: Implement most important scrapers + resolvers within ../crimson-sources. 
     I deliberately decided against re-using my fork of movie-web/providers. I want something from the ground up, custom-tailored to crimsonhaven, nothing else.
-    In this first phase, all the scrapers + some important resolvers (Voe / PlayIMDB / Screenscape) need to be implemented in the client. These changes might also require changes to the CORS-Proxy. That can be found at ../crimson-proxy
+    In this first phase, all the scrapers + some important resolvers (Voe / PlayIMDB / Screenscape) need to be implemented in the client. These changes might also require 
+    changes to the CORS-Proxy. That can be found at ../crimson-proxy
+
+3. Phase 1.5:
+    Implement all the sources client-side. Ensure complete support and compatibility with the browser extension first.
+    Definition of Done of Phase 1.5 is reached when the following criteria are met:
+    - All sources need to be wired into the crimson-sources repository.
+    - For now, compatibility only has to be ensured via the crimson-extension. 
+    - Everything needs to be wired into the client (and, if necessary, the backend) so that local scraping / resolving client-side works (of course, with help of the crimson-extension)
+    - On re-deploy, everything must work as it should. This is the last criteria: An end-to-end test which uses client-side (+ extension) scraping & resolving to resolve sources and then play the HLS / MP4 stream (depending on the source)
 
 ---
 
