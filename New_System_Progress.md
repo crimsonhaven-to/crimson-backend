@@ -766,3 +766,68 @@ HTML-rewriting iframe player-proxy (no direct stream URL); Jellyfin needs its to
 in *every* segment request (not just resolve), so a grant would have to embed the
 token in the URL — deferred; Cache/Local are server-resident files by definition
 (deliberate exceptions — their whole point is to serve the server's own NAS).
+
+### 🌙 Phase 2 (cont.) — Filemoon (new hoster) + Jellyfin edge token injection (2026-06-29)
+
+Pushing more sources fully client-side. Two wins: a hoster the pure-backend
+approach **could never do**, and the Jellyfin token moved to the proxy edge so its
+bytes leave the backend too. Routing stays **extension-first, proxy-fallback** (the
+`selectFetcher`/`preparePlayback` order already does this) — Jellyfin is the one
+deliberate exception (E2-only), because its secret lives on the edge, not the browser.
+
+#### Filemoon — previously-impossible hoster, now client-only (crimson-sources `443a070`)
+
+`resolvers/filemoon.ts` + `util/unpack.ts` (a Dean-Edwards `p,a,c,k,e,d` unpacker,
+base>36 via the canonical charcode encoder — unit-checked against base-2 and base-62
+samples). Filemoon is Cloudflare-gated AND packs its JWPlayer config, which is why
+the backend's datacenter JA3 couldn't touch it ([[aniworld-doodstream-filemoon-blocked]]).
+Run from the viewer's real browser via the companion (E3), the gate clears for free
+and the only work is unpacking — no headless browser. Wired into the s.to-family
+`resolveEmbed` + `hosterLabel` and the `aniworld`/`sto` (→`stomirror`) hoster
+allowlists. Pure addition (the backend never had a "Filemoon" tile to dedup against).
+
+#### Jellyfin — edge token injection (user's idea), E2-only, OFF by default
+
+The user's call on "how to handle Jellyfin" was: **let the crimson-proxy inject the
+token**. Implemented as the New System edge-held-secret pattern across 4 repos:
+- **crimson-proxy (`ce76c52`, main):** `utils/inject.ts` — when a signed request
+  targets the configured Jellyfin host (`NITRO_JELLYFIN_HOSTS`), the edge adds the
+  token (`api_key` + `Authorization`) to the *upstream* fetch from `NITRO_JELLYFIN_TOKEN`,
+  and `rewritePlaylist` (now takes a child-url transform) **strips** the api_key
+  Jellyfin bakes into playlist children so it's never in a browser-visible link. Token
+  lives only on the edge; bytes go Jellyfin → edge → viewer.
+- **crimson-backend (`1fa0a66`, dev):** `JellyfinResolver.resolve_direct` returns the
+  raw, token-LESS absolute Jellyfin URL; `_grant_jellyfin` wires it into `/resolve`,
+  gated on a new **`JELLYFIN_EDGE_INJECT`** env flag (default OFF = today's
+  backend-proxied behaviour, **no regression**).
+- **crimson-sources (`443a070`, dev):** new **`needsEdgeSecret`** flag (extension/direct
+  fetchers can't hold an edge secret → routes **E2-only**; the proxied fetcher is the
+  only one that supports it), `preparePlayback` `forceProxy` option, `sources/jellyfin.ts`.
+- **crimson-client (`27fcb7f`, dev):** submodule bump only — the `/resolve` grant
+  wiring is generic, so no client code change.
+
+**Requirements to turn Jellyfin on** (until then it stays fully on the backend):
+1. Jellyfin must be **internet-reachable** (the edge fetches it; the SSRF guard
+   rejects LAN/private IPs — use a public hostname).
+2. Deploy crimson-proxy with `NITRO_JELLYFIN_HOSTS=<jellyfin host>` +
+   `NITRO_JELLYFIN_TOKEN=<access token>` (on **both** edges).
+3. Set `JELLYFIN_EDGE_INJECT=on` in the backend env.
+Trade-off accepted: an authed member can make the edge proxy *fetch* Jellyfin paths
+with the token injected (library browsing), but can never **read** the token itself —
+strictly better than baking it into a URL. (Optional later hardening: restrict edge
+injection to `/Videos/`/`/Items/.../stream` paths.)
+
+**Verified:** crimson-proxy `tsc --noEmit`; backend `ast` + live import of
+`JellyfinResolver.resolve_direct`/`JellyfinScraper`; crimson-sources `tsc` + build;
+crimson-client `npm run build` with the submodule bumped — `filemoon`/`jellyfin` both
+confirmed in the bundle. **NOT done:** live browser pass (needs the env above on dev).
+
+**Push sequence:**
+1. `cd ../crimson-proxy   && git push origin main` (`ce76c52`) + deploy both edges with the new env
+2. `cd ../crimson-sources && git push origin dev`  (`443a070`)
+3. `cd ../crimson-backend && git push origin dev`  (`1fa0a66`)
+4. `cd ../crimson-client  && git push origin dev`  (`27fcb7f`)
+
+**Still E0:** Movish (iframe player-proxy — porting it means reverse-engineering its
+`/embed/api` JSON live, which the backend never parses; deferred), Cache/Local
+(server-resident files by definition), Subtitles (quota key; tiny tracks, not video).
