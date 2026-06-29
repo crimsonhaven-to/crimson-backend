@@ -831,3 +831,66 @@ confirmed in the bundle. **NOT done:** live browser pass (needs the env above on
 **Still E0:** Movish (iframe player-proxy — porting it means reverse-engineering its
 `/embed/api` JSON live, which the backend never parses; deferred), Cache/Local
 (server-resident files by definition), Subtitles (quota key; tiny tracks, not video).
+
+### 🕳️ Phase 2 (cont.) — Jellyfin user/pass edge auth + hidden-tab resolver (resolveInPage) (2026-06-29)
+
+Three asks: (1) Jellyfin edge auth via username/password (the user has no static
+token), (2) Movish, (3) Filemoon SPA+PoW.
+
+#### Jellyfin: edge auths with username/password (crimson-proxy `a37705f`, main — pushed by user)
+
+The user runs Jellyfin with username+password, not a token. So the **edge now logs
+in itself** (`utils/jellyfin-auth.ts`: `POST /Users/AuthenticateByName`, cached token,
+re-auth once on 401) — same env-var style as the backend. Config is now
+`NITRO_JELLYFIN_URL` + `NITRO_JELLYFIN_USERNAME` + `NITRO_JELLYFIN_PASSWORD`
+(inject host derived from the URL); `NITRO_JELLYFIN_TOKEN` kept as an optional
+pre-minted-token shortcut. **This replaces the earlier `NITRO_JELLYFIN_HOSTS` +
+`NITRO_JELLYFIN_TOKEN`** docs. Backend grant + the E2-only `sources/jellyfin.ts`
+unchanged. typecheck green. *(crimson-proxy is on `main`/prod — committed locally,
+the user pushes+deploys it.)*
+
+#### Movish: DEAD upstream — parked (not done)
+
+`api.movish.net` (the host BOTH the backend scraper and resolver are pinned to) is
+**NXDOMAIN** → the backend Movish source has been silently failing already. The live
+site is now `movish.net` with an `rtcore.min.js` anti-devtools trap (console.table /
+timing detection → redirects to `about:blank`). Can't reverse-engineer a non-resolving
+host. Gave the user a capture recipe (mitmproxy / block `rtcore.min.js` / clean profile)
+to grab the real `/v1/play`-style endpoint. **Once we have the current embed-URL pattern,
+the new resolveInPage capability below resolves it for free** (the hidden tab never opens
+DevTools, so rtcore never trips). Pending the user's network capture.
+
+#### Filemoon SPA + the general win: `resolveInPage` (companion hidden-tab capture)
+
+Filemoon's canonical hosts (`filemoon.sx`/`.to`) are now the **"Byse" SPA**
+(per-request fingerprint + proof-of-work + AES-GCM decrypt). Reversing that in pure TS
+is a losing maintenance battle. Instead — the user's pick — the **companion runs the
+embed in a hidden tab and we watch the network**:
+- **crimson-extension `c543d8d` (main, v1.0.4, protocol 2 — committed local, NOT pushed):**
+  new `RESOLVE_IN_PAGE` RPC → `chrome.tabs.create({active:false})` on the embed,
+  `chrome.webRequest.onSendHeaders` (extraHeaders) captures the first `.m3u8`/`.mp4`
+  request **+ its Referer/Origin/UA**, then closes the tab. Added `webRequest`
+  permission; content-relay timeout 30s→60s. The page does its OWN PoW/decrypt; we
+  reverse nothing, and webRequest never trips DevTools detection (so it beats Movish too).
+- **crimson-sources `55ef014` (dev — pushed):** `ExtensionBridge.resolveInPage?` (optional,
+  feature-detected); the s.to-family discovery falls back to it when a static resolver
+  returns null (Filemoon Byse), bounded to 2 hidden-tab attempts/episode. Captured
+  stream → `preparePlayback` (E3 DNR rules with the captured headers) → bytes CDN→viewer.
+- **crimson-client `2ab7858` (dev — pushed):** submodule bump to `55ef014`; no code change.
+
+⚠️ **resolveInPage ships only once the companion is at v1.0.4.** The client still vendors
+the OLD extension (`vendor/crimson-extension` @ `061a6e5`), so the downloadable zip lacks
+it until: push `crimson-extension` (main, `c543d8d`) → bump `vendor/crimson-extension` in
+crimson-client → redeploy. Until then the wiring is inert + degrades cleanly (older
+companions lack the method → fallback skipped). *Caveats for live testing:* a background
+tab is `document.hidden` (some players may refuse — revisit with a visibility shim if so);
+ad/pre-roll media could be captured first (use `mustInclude` to pin the real CDN); popups
+from the hidden embed aren't yet neutered.
+
+**Verified:** crimson-proxy `tsc`; extension all `node --check` + manifest valid;
+crimson-sources `tsc`+build; client build (resolveInPage in the bundle). **NOT done:**
+live browser pass (needs the v1.0.4 companion loaded).
+
+**Pushed this session:** crimson-sources `dev` (`55ef014`), crimson-client `dev`
+(`2ab7858`), crimson-backend `dev` (already up-to-date, `cad53e6`). **Local-only
+(main, user pushes):** crimson-proxy `a37705f`, crimson-extension `c543d8d`.
