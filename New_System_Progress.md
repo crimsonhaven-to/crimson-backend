@@ -141,11 +141,60 @@ pre-existing `set-state-in-effect` pattern). **NOT tested:** a live browser run 
 the extension actually resolving cinema.bz/PlayIMDb (needs the extension loaded +
 the flag on — the first real end-to-end shakeout).
 
-### ⏭️ Next — Step 3 candidates
-1. **Live shakeout:** load crimson-extension, set `crimson:clientSources=1`, watch a
-   show/movie, confirm cinema.bz/PlayIMDb resolve locally + segments go CDN→viewer.
-2. **Backend `/sign` grant** (New_System §8a) → wire `signProxyUrl` so the E2
-   (no-extension) path works; then web-only viewers benefit too.
-3. **Rotating segment-host media rules** (playback.ts note): parse the master, widen
-   the DNR rule to cover cross-host segments.
-4. Then the heavier sources: VOE (E3, the ASN flagship), ScreenScape (WebCrypto), Vidmoly.
+### ✅ Phase 1.5 — All sources wired into the client engine (E3) — DONE (2026-06-29)
+
+Every non-secret backend source now has a from-scratch TS port in `crimson-sources`,
+runnable in the viewer's browser via the crimson-extension (E3). The backend (E0)
+stays the floor for everything secret/server-bound, served by the `/watch` stream
+that runs alongside the local engine — so nothing regresses.
+
+**crimson-sources (`../crimson-sources`, committed `8cad476`, NOT yet pushed):**
+- `src/resolvers/` — `voe.ts` (the flagship: full obfuscated-blob decode chain →
+  raw m3u8 + DNR media rules; the ASN-bound token C4 is solved for free by resolving
+  in the viewer's browser), `vidmoly.ts`, `vidsrc.ts` (megaplay; E3-only, JA3-gated).
+- `src/crypto/` — `md5.ts` (vendored; CryptoJS `EVP_BytesToKey` needs MD5, absent
+  from WebCrypto), `aes.ts` (OpenSSL-salted AES-256-CBC via `crypto.subtle`),
+  `screenscape.ts` (the per-session HMAC signing + AES-envelope decrypt, ported from
+  `_screenscape_crypto.py`). **All validated byte-for-byte against the Python ports**
+  (MD5 vectors, AES round-trip, the six signing primitives, VOE deobfuscation).
+- `src/sources/` — `aniworld.ts` / `sto.ts` / `stomirror.ts` (shared `stoFamily.ts`
+  discovery skeleton → VOE/Vidmoly), `aniwatch.ts` (→ VidSrc), `animesuge.ts`
+  (ad-free direct files), `screenscape.ts` (~15-server TMDB aggregator). `util/`
+  (`text` normalize/slugify/keyword matching, `dom` via DOMParser, `base64`).
+- `MediaCtx` gains the AniList title set + synonyms; `preparePlayback` gains
+  `extraHeaders`/`extraDomains`; the engine installs media rules with `replace:false`
+  so host-scoped rules from multiple sources coexist.
+- `registry.ts` now lists 8 sources. `tsc` + `npm run build` green; routing verified
+  (E3 → all 8 for TV / 3 TMDB-keyed for movies; no extension → 0, backend handles all).
+
+**crimson-backend (committed `0c0bc45`, NOT pushed):** `GET /scrape-meta/{tmdb}/{season}`
+returns the `media_ctx` title bundle (primary title + AniList variants + German
+synonyms) the title-matching discovery sources need. German titles come from the
+TMDB key (C5), so the client can't derive them — it asks this grant. Login-gated
+like `/watch`. Mirrors `stream_watch_response`'s media_ctx construction exactly.
+
+**crimson-client (committed `feb1754`, NOT pushed):** submodule bumped to `8cad476`;
+`clientSources.js` enriches `MediaCtx` from `/scrape-meta`; `hooks.js` dedups
+local↔backend by `(source, language)` so VOE/Vidmoly dub/sub variants stay distinct
+tiles. Still OFF by default (`crimson:clientSources` flag + extension required).
+
+**Stays E0 by nature** (the DoD keeps E0 as fallback): Movish (HTML-rewriting iframe
+player-proxy), ShowBox/Febbox + Jellyfin (C5 secret), Cache + Local (server NAS),
+Subtitles (OpenSubtitles quota key). Documented in `registry.ts`.
+
+**⚠️ Action needed from you before CI/prod (the live end-to-end test):**
+1. `cd ../crimson-sources && git push origin main` (the client submodule pins
+   `8cad476`, which is local-only — CI clone fails until it's on the remote).
+2. `cd ../crimson-client && git push` (the submodule bump + wiring, on `dev`).
+3. `cd ../crimson-backend && git push` (the `/scrape-meta` endpoint, on `dev`).
+4. **Live shakeout (Phase 1.5 DoD):** load crimson-extension + toggle it on, set
+   `localStorage crimson:clientSources=1`, watch a show — confirm VOE/Vidmoly/VidSrc/
+   ScreenScape/AnimeSuge resolve locally and the HLS/MP4 plays (segments CDN→viewer).
+   This is the last DoD criterion and needs a real browser; everything up to it is done.
+
+### ⏭️ Next — Phase 2 candidates
+1. **Backend `/sign` grant** (New_System §8a) → wire `signProxyUrl` so the E2
+   (no-extension, web-only) path works; then non-extension viewers benefit too.
+2. **Rotating segment-host media rules**: parse the master playlist, widen the DNR
+   rule to cover cross-host segments (today `extraDomains` covers the known cases).
+3. Dev/Prod environment split + CI/CD (the actual Phase 2 in `New_System.md`).
