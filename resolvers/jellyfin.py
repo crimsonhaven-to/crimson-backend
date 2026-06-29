@@ -425,3 +425,63 @@ class JellyfinResolver(BaseResolver):
 
         print(f"[JellyfinResolver] SUCCESS (hls): {proxy_path}")
         return proxy_path
+
+    async def resolve_direct(self, embed_url: str) -> Optional[dict]:
+        """Resolve to the **raw, token-less** absolute Jellyfin URL so the bytes are
+        delivered off-backend via the crimson-proxy edge, which injects the token
+        itself (New System edge-token-injection — see crimson-proxy/utils/inject.ts).
+
+        Unlike the other client-delivered sources this is **E2-only**: the access
+        token is an edge secret, so the companion extension (which can't hold it)
+        can't play the raw URL — only the edge can. The URL therefore carries NO
+        api_key; the edge appends it. Returns
+        ``{"url","streamType"}`` (mp4 direct-play / hls transcode) or None."""
+        if not is_configured():
+            return None
+
+        item_id = embed_url.split(":", 1)[1] if ":" in embed_url else embed_url
+        item_id = item_id.strip().strip("/")
+        if not item_id:
+            return None
+
+        try:
+            info = await playback_info(item_id)
+        except Exception as e:
+            print(f"[JellyfinResolver] direct PlaybackInfo failed: {type(e).__name__} - {e}")
+            return None
+
+        sources = info.get("MediaSources") or []
+        if not sources:
+            return None
+        ms = sources[0]
+        ms_id = ms.get("Id") or item_id
+        play_session = info.get("PlaySessionId") or ""
+        jf_url, _, _ = get_config()
+
+        if _is_web_playable(ms):
+            params = {"static": "true", "mediaSourceId": ms_id}
+            if play_session:
+                params["playSessionId"] = play_session
+            url = f"{jf_url}/Videos/{item_id}/stream?{urlencode(params)}"
+            return {"url": url, "streamType": "mp4"}
+
+        # HLS transcode: prefer Jellyfin's ready-made TranscodingUrl (absolutized +
+        # token-stripped), else hand-build the master.m3u8 request.
+        transcode_url = ms.get("TranscodingUrl")
+        if transcode_url:
+            abs_url = (jf_url + transcode_url) if transcode_url.startswith("/") else transcode_url
+            url = _strip_api_key(abs_url)
+        else:
+            params = {
+                "mediaSourceId": ms_id,
+                "videoCodec": "h264",
+                "audioCodec": "aac,mp3",
+                "container": "ts",
+                "transcodingProtocol": "hls",
+                "transcodingContainer": "ts",
+                "maxAudioChannels": "2",
+            }
+            if play_session:
+                params["playSessionId"] = play_session
+            url = f"{jf_url}/Videos/{item_id}/master.m3u8?{urlencode(params)}"
+        return {"url": url, "streamType": "hls"}

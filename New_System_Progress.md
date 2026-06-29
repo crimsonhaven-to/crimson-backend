@@ -707,3 +707,190 @@ was missing. Unit-tested the host matcher; `py_compile` clean.
 | crimson-backend | cache exclusion (`cache_engine/downloader.py`) | uncommitted |
 | crimson-proxy | single-step integrated `deploy --prod` + smoke test (`deploy.yml`), netlify.toml comment fix | uncommitted |
 | crimson-extension | v1.0.3 (on-by-default, smaller button, client favicon) | per earlier entry |
+
+### 🍪 Phase 2 (cont.) — cookie sources resolve on backend, deliver client-side (2026-06-29)
+
+The remaining "bytes still flow through the backend" case after VOE/cinema.bz/etc.
+went client-side was the **cookie/secret-bound** source: ShowBox/Febbox, whose
+final `/file/player` hop needs the `ui` cookie (FEBBOX_UI_TOKEN, a C5 secret that
+can't ship to the browser). Previously the backend resolved it AND re-streamed the
+rotating-OSS mp4 through `/febbox_proxy` — the last big byte path on the backend.
+
+**Insight:** only the *resolve* needs the cookie; the URL it yields is a direct CDN
+file the viewer can fetch themselves. So split it: **backend resolves (keeps the
+secret), client delivers the bytes (E3/E2).** New general "resolve grant" — the
+cookie-source twin of `/sign` — so MovieBox/other cookie sources slot in.
+
+**crimson-backend (committed `0031118`, dev, NOT pushed):**
+- `resolvers/febbox.py` — extracted `_parse_marker` + a shared `_unlock()` (the
+  token-gated player lookup) behind both `resolve()` (unchanged proxy path) and the
+  new `resolve_direct()`, which returns the **raw** OSS URL + `{headers:{userAgent}}`
+  (Febbox has no Referer gate) + subtitles (still relative `/febbox_proxy` srt→VTT
+  paths — tiny, fine to relay). `streamType` from the URL.
+- `api.py` — `POST /resolve`: login-gated (NOT in `_PUBLIC_PREFIXES`) + `120/min`,
+  source-dispatched via `_RESOLVE_GRANTS` (febbox/showbox today). Takes the client's
+  MediaCtx, runs `run_single_scraper(ShowBoxScraper, …)` → `resolve_direct` per
+  embed, absolutizes subtitle URLs, returns `{ok, streams:[{label,streamType,url,
+  headers,subtitles,language}]}`. 503 when the source isn't configured (token unset)
+  → client cleanly stays on the backend /watch line.
+
+**crimson-sources (committed `12a7007`, dev, NOT pushed):**
+- `types.ts` — `GrantStream`/`GrantRequest`; `resolveGrant` on `EngineEnv` +
+  `ResolvedEnv` (host-supplied like `signProxyUrl`, since only the host has the
+  session token + API base). Threaded through `createEngine`.
+- `sources/febbox.ts` — a **backend-resolved** source: `resolve()` calls
+  `env.resolveGrant({source:"febbox", ctx})` then `preparePlayback` per stream for
+  E3/E2 delivery. Label "ShowBox" so it supersedes the backend tile; `needsCORSBypass`
+  (subtitles force `crossOrigin` and the OSS CDN won't ACAO our origin) → routes E3/E2,
+  falls back to E0 when neither exists. Registered in `registry.ts`.
+
+**crimson-client (committed `e42dc18`, dev, NOT pushed):**
+- `clientSources.js` — `resolveGrant` against `POST /resolve` (apiFetch bearer,
+  cached per `(source,tmdb,season,episode)`, 503/404 latches the source off for the
+  session), threaded into `createEngine`. Submodule bumped to `12a7007`.
+
+**Verified:** backend `ast` + live import of `FebboxResolver.resolve_direct` /
+`ShowBoxScraper` + marker parser; crimson-sources `tsc --noEmit` + build green;
+crimson-client `npm run build` green with the submodule bumped — `febbox`/`/resolve`
+confirmed present in the bundle. **NOT yet done:** a live browser pass (needs a real
+FEBBOX_UI_TOKEN on the dev stack + companion/proxy) — the byte-path win is verified
+by construction (raw URL + E3/E2 delivery), but the end-to-end play is the user's step.
+
+**Push sequence (submodule targets before the client that pins them):**
+1. `cd ../crimson-sources  && git push origin dev`  (`12a7007`)
+2. `cd ../crimson-backend  && git push origin dev`  (`0031118`)
+3. `cd ../crimson-client   && git push origin dev`  (`e42dc18` — submodule bump + wiring)
+
+**Note on Movish/Jellyfin/Cache/Local:** still E0 by nature. Movish is an
+HTML-rewriting iframe player-proxy (no direct stream URL); Jellyfin needs its token
+in *every* segment request (not just resolve), so a grant would have to embed the
+token in the URL — deferred; Cache/Local are server-resident files by definition
+(deliberate exceptions — their whole point is to serve the server's own NAS).
+
+### 🌙 Phase 2 (cont.) — Filemoon (new hoster) + Jellyfin edge token injection (2026-06-29)
+
+Pushing more sources fully client-side. Two wins: a hoster the pure-backend
+approach **could never do**, and the Jellyfin token moved to the proxy edge so its
+bytes leave the backend too. Routing stays **extension-first, proxy-fallback** (the
+`selectFetcher`/`preparePlayback` order already does this) — Jellyfin is the one
+deliberate exception (E2-only), because its secret lives on the edge, not the browser.
+
+#### Filemoon — previously-impossible hoster, now client-only (crimson-sources `443a070`)
+
+`resolvers/filemoon.ts` + `util/unpack.ts` (a Dean-Edwards `p,a,c,k,e,d` unpacker,
+base>36 via the canonical charcode encoder — unit-checked against base-2 and base-62
+samples). Filemoon is Cloudflare-gated AND packs its JWPlayer config, which is why
+the backend's datacenter JA3 couldn't touch it ([[aniworld-doodstream-filemoon-blocked]]).
+Run from the viewer's real browser via the companion (E3), the gate clears for free
+and the only work is unpacking — no headless browser. Wired into the s.to-family
+`resolveEmbed` + `hosterLabel` and the `aniworld`/`sto` (→`stomirror`) hoster
+allowlists. Pure addition (the backend never had a "Filemoon" tile to dedup against).
+
+#### Jellyfin — edge token injection (user's idea), E2-only, OFF by default
+
+The user's call on "how to handle Jellyfin" was: **let the crimson-proxy inject the
+token**. Implemented as the New System edge-held-secret pattern across 4 repos:
+- **crimson-proxy (`ce76c52`, main):** `utils/inject.ts` — when a signed request
+  targets the configured Jellyfin host (`NITRO_JELLYFIN_HOSTS`), the edge adds the
+  token (`api_key` + `Authorization`) to the *upstream* fetch from `NITRO_JELLYFIN_TOKEN`,
+  and `rewritePlaylist` (now takes a child-url transform) **strips** the api_key
+  Jellyfin bakes into playlist children so it's never in a browser-visible link. Token
+  lives only on the edge; bytes go Jellyfin → edge → viewer.
+- **crimson-backend (`1fa0a66`, dev):** `JellyfinResolver.resolve_direct` returns the
+  raw, token-LESS absolute Jellyfin URL; `_grant_jellyfin` wires it into `/resolve`,
+  gated on a new **`JELLYFIN_EDGE_INJECT`** env flag (default OFF = today's
+  backend-proxied behaviour, **no regression**).
+- **crimson-sources (`443a070`, dev):** new **`needsEdgeSecret`** flag (extension/direct
+  fetchers can't hold an edge secret → routes **E2-only**; the proxied fetcher is the
+  only one that supports it), `preparePlayback` `forceProxy` option, `sources/jellyfin.ts`.
+- **crimson-client (`27fcb7f`, dev):** submodule bump only — the `/resolve` grant
+  wiring is generic, so no client code change.
+
+**Requirements to turn Jellyfin on** (until then it stays fully on the backend):
+1. Jellyfin must be **internet-reachable** (the edge fetches it; the SSRF guard
+   rejects LAN/private IPs — use a public hostname).
+2. Deploy crimson-proxy with `NITRO_JELLYFIN_HOSTS=<jellyfin host>` +
+   `NITRO_JELLYFIN_TOKEN=<access token>` (on **both** edges).
+3. Set `JELLYFIN_EDGE_INJECT=on` in the backend env.
+Trade-off accepted: an authed member can make the edge proxy *fetch* Jellyfin paths
+with the token injected (library browsing), but can never **read** the token itself —
+strictly better than baking it into a URL. (Optional later hardening: restrict edge
+injection to `/Videos/`/`/Items/.../stream` paths.)
+
+**Verified:** crimson-proxy `tsc --noEmit`; backend `ast` + live import of
+`JellyfinResolver.resolve_direct`/`JellyfinScraper`; crimson-sources `tsc` + build;
+crimson-client `npm run build` with the submodule bumped — `filemoon`/`jellyfin` both
+confirmed in the bundle. **NOT done:** live browser pass (needs the env above on dev).
+
+**Push sequence:**
+1. `cd ../crimson-proxy   && git push origin main` (`ce76c52`) + deploy both edges with the new env
+2. `cd ../crimson-sources && git push origin dev`  (`443a070`)
+3. `cd ../crimson-backend && git push origin dev`  (`1fa0a66`)
+4. `cd ../crimson-client  && git push origin dev`  (`27fcb7f`)
+
+**Still E0:** Movish (iframe player-proxy — porting it means reverse-engineering its
+`/embed/api` JSON live, which the backend never parses; deferred), Cache/Local
+(server-resident files by definition), Subtitles (quota key; tiny tracks, not video).
+
+### 🕳️ Phase 2 (cont.) — Jellyfin user/pass edge auth + hidden-tab resolver (resolveInPage) (2026-06-29)
+
+Three asks: (1) Jellyfin edge auth via username/password (the user has no static
+token), (2) Movish, (3) Filemoon SPA+PoW.
+
+#### Jellyfin: edge auths with username/password (crimson-proxy `a37705f`, main — pushed by user)
+
+The user runs Jellyfin with username+password, not a token. So the **edge now logs
+in itself** (`utils/jellyfin-auth.ts`: `POST /Users/AuthenticateByName`, cached token,
+re-auth once on 401) — same env-var style as the backend. Config is now
+`NITRO_JELLYFIN_URL` + `NITRO_JELLYFIN_USERNAME` + `NITRO_JELLYFIN_PASSWORD`
+(inject host derived from the URL); `NITRO_JELLYFIN_TOKEN` kept as an optional
+pre-minted-token shortcut. **This replaces the earlier `NITRO_JELLYFIN_HOSTS` +
+`NITRO_JELLYFIN_TOKEN`** docs. Backend grant + the E2-only `sources/jellyfin.ts`
+unchanged. typecheck green. *(crimson-proxy is on `main`/prod — committed locally,
+the user pushes+deploys it.)*
+
+#### Movish: DEAD upstream — parked (not done)
+
+`api.movish.net` (the host BOTH the backend scraper and resolver are pinned to) is
+**NXDOMAIN** → the backend Movish source has been silently failing already. The live
+site is now `movish.net` with an `rtcore.min.js` anti-devtools trap (console.table /
+timing detection → redirects to `about:blank`). Can't reverse-engineer a non-resolving
+host. Gave the user a capture recipe (mitmproxy / block `rtcore.min.js` / clean profile)
+to grab the real `/v1/play`-style endpoint. **Once we have the current embed-URL pattern,
+the new resolveInPage capability below resolves it for free** (the hidden tab never opens
+DevTools, so rtcore never trips). Pending the user's network capture.
+
+#### Filemoon SPA + the general win: `resolveInPage` (companion hidden-tab capture)
+
+Filemoon's canonical hosts (`filemoon.sx`/`.to`) are now the **"Byse" SPA**
+(per-request fingerprint + proof-of-work + AES-GCM decrypt). Reversing that in pure TS
+is a losing maintenance battle. Instead — the user's pick — the **companion runs the
+embed in a hidden tab and we watch the network**:
+- **crimson-extension `c543d8d` (main, v1.0.4, protocol 2 — committed local, NOT pushed):**
+  new `RESOLVE_IN_PAGE` RPC → `chrome.tabs.create({active:false})` on the embed,
+  `chrome.webRequest.onSendHeaders` (extraHeaders) captures the first `.m3u8`/`.mp4`
+  request **+ its Referer/Origin/UA**, then closes the tab. Added `webRequest`
+  permission; content-relay timeout 30s→60s. The page does its OWN PoW/decrypt; we
+  reverse nothing, and webRequest never trips DevTools detection (so it beats Movish too).
+- **crimson-sources `55ef014` (dev — pushed):** `ExtensionBridge.resolveInPage?` (optional,
+  feature-detected); the s.to-family discovery falls back to it when a static resolver
+  returns null (Filemoon Byse), bounded to 2 hidden-tab attempts/episode. Captured
+  stream → `preparePlayback` (E3 DNR rules with the captured headers) → bytes CDN→viewer.
+- **crimson-client `2ab7858` (dev — pushed):** submodule bump to `55ef014`; no code change.
+
+⚠️ **resolveInPage ships only once the companion is at v1.0.4.** The client still vendors
+the OLD extension (`vendor/crimson-extension` @ `061a6e5`), so the downloadable zip lacks
+it until: push `crimson-extension` (main, `c543d8d`) → bump `vendor/crimson-extension` in
+crimson-client → redeploy. Until then the wiring is inert + degrades cleanly (older
+companions lack the method → fallback skipped). *Caveats for live testing:* a background
+tab is `document.hidden` (some players may refuse — revisit with a visibility shim if so);
+ad/pre-roll media could be captured first (use `mustInclude` to pin the real CDN); popups
+from the hidden embed aren't yet neutered.
+
+**Verified:** crimson-proxy `tsc`; extension all `node --check` + manifest valid;
+crimson-sources `tsc`+build; client build (resolveInPage in the bundle). **NOT done:**
+live browser pass (needs the v1.0.4 companion loaded).
+
+**Pushed this session:** crimson-sources `dev` (`55ef014`), crimson-client `dev`
+(`2ab7858`), crimson-backend `dev` (already up-to-date, `cad53e6`). **Local-only
+(main, user pushes):** crimson-proxy `a37705f`, crimson-extension `c543d8d`.

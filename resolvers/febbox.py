@@ -238,6 +238,22 @@ async def proxy_fetch(
 
 
 # --- Febbox player lookup --------------------------------------------------
+def _parse_marker(embed_url: str) -> Optional[Tuple[str, str, Optional[int], Optional[int]]]:
+    """Parse a ``crimson-febbox:{share_key}:{fid}[:{season}:{episode}]`` marker
+    into ``(share_key, fid, season, episode)``, or None if it isn't ours.
+
+    share_key keeps its original case (resolve_streams only lowercases for the
+    keyword *match*); season/episode are optional (absent for movies)."""
+    parts = embed_url.split(":")
+    if len(parts) < 3 or parts[0] != EMBED_MARKER:
+        logger.warning(f"[febbox] unrecognised marker: {embed_url}")
+        return None
+    share_key, fid = parts[1], parts[2]
+    season = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
+    episode = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None
+    return share_key, fid, season, episode
+
+
 def _quality_rank(label: str) -> int:
     """Rank a febbox source label; lower = better (earlier in _QUALITY_ORDER)."""
     low = (label or "").lower()
@@ -392,19 +408,18 @@ class FebboxResolver(BaseResolver):
     domain_keyword: str = EMBED_MARKER
     source_name: str = "ShowBox"
 
-    async def resolve(self, embed_url: str):
+    async def _unlock(self, embed_url: str) -> Optional[Tuple[str, List[dict]]]:
+        """Shared token-gated lookup behind both resolve paths: marker -> Febbox
+        player HTML -> ``(best_direct_url, subtitle_tracks)``. The ``ui`` cookie
+        (FEBBOX_UI_TOKEN, a C5 secret) is used HERE and nowhere downstream, so the
+        secret never has to reach the client. Subtitle ``url`` is the RAW .srt link
+        (callers wrap it in the signed proxy). Returns None when locked/unfound."""
         if not is_configured():
             return None
-
-        # Marker: crimson-febbox:{share_key}:{fid}:{season}:{episode}  (share_key
-        # keeps its case; resolve_streams only lowercases for the keyword *match*).
-        parts = embed_url.split(":")
-        if len(parts) < 3 or parts[0] != EMBED_MARKER:
-            logger.warning(f"[febbox] unrecognised marker: {embed_url}")
+        parsed = _parse_marker(embed_url)
+        if not parsed:
             return None
-        share_key, fid = parts[1], parts[2]
-        season = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
-        episode = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None
+        share_key, fid, season, episode = parsed
 
         try:
             html = await fetch_player_html(share_key, fid)
@@ -421,11 +436,51 @@ class FebboxResolver(BaseResolver):
         best = _best_source(html, fid)
         if not best:
             return None
+        return best, _parse_subtitles(html, season, episode)
 
+    async def resolve(self, embed_url: str):
+        unlocked = await self._unlock(embed_url)
+        if not unlocked:
+            return None
+        best, subs = unlocked
         subtitles = [
             {"label": t["label"], "lang": t["lang"], "url": _proxy_path_for(t["url"])}
-            for t in _parse_subtitles(html, season, episode)
+            for t in subs
         ]
-        logger.info(f"[febbox] resolved fid {fid} -> proxied stream ({best[:60]}…), "
+        logger.info(f"[febbox] resolved -> proxied stream ({best[:60]}…), "
                     f"{len(subtitles)} subtitle track(s)")
         return {"url": _proxy_path_for(best), "subtitles": subtitles}
+
+    async def resolve_direct(self, embed_url: str) -> Optional[dict]:
+        """Resolve to the **raw** direct file URL (NOT the same-origin /febbox_proxy
+        path) so the client engine delivers the bytes itself — extension (E3) or the
+        signed crimson-proxy edge (E2) — and the heavy mp4/HLS never travels through
+        this backend (New System: take the backend out of the byte path).
+
+        The token-gated player lookup still runs here (FEBBOX_UI_TOKEN is a C5
+        secret), but only the *control* bytes touch us. Febbox's OSS download links
+        carry no Referer gate (the proxy fetches them with a UA alone), so the sole
+        header hint is the desktop ``userAgent``. Subtitles stay on the signed
+        /febbox_proxy — they're tiny .srt files we convert to WebVTT on the way out,
+        which is fine (and necessary) to relay.
+
+        Returns ``{"url", "streamType", "headers": {"userAgent"}, "subtitles"}`` (the
+        subtitle URLs are relative signed proxy paths; the /resolve grant absolutizes
+        them against the backend base) or None when the file can't be unlocked."""
+        unlocked = await self._unlock(embed_url)
+        if not unlocked:
+            return None
+        best, subs = unlocked
+        subtitles = [
+            {"label": t["label"], "lang": t["lang"], "url": _proxy_path_for(t["url"])}
+            for t in subs
+        ]
+        stream_type = "hls" if _is_playlist_url(best) else "mp4"
+        logger.info(f"[febbox] resolved -> DIRECT {stream_type} ({best[:60]}…), "
+                    f"{len(subtitles)} subtitle track(s) [bytes off-backend]")
+        return {
+            "url": best,
+            "streamType": stream_type,
+            "headers": {"userAgent": UA},
+            "subtitles": subtitles,
+        }
