@@ -71,6 +71,16 @@ services:
       # could omit it (a random per-process secret is then used), but setting it
       # mirrors production and survives a container restart. openssl rand -hex 32
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET (e.g. openssl rand -hex 32)}
+      # External crimson-proxy edge relay(s) — the E2 (no-extension) offload path.
+      # MUST be listed here (Compose does NOT auto-inject .env into the container)
+      # or the app sees CRIMSON_PROXY_BASE unset, _crimson_proxy.is_enabled() is
+      # False, and POST /sign returns 503 → the whole client-side proxy path goes
+      # dark (clients silently fall back to E0/extension). Comma-separate hosts for
+      # free failover; the proxy's NITRO_PROXY_SECRET must equal PROXY_SECRET above.
+      - CRIMSON_PROXY_BASE=${CRIMSON_PROXY_BASE:-}
+      # Optional per-source A/B allowlist (e.g. cinema.bz,PlayIMDb). Unset => every
+      # wired E2 source offloads.
+      - CRIMSON_PROXY_SOURCES=${CRIMSON_PROXY_SOURCES:-}
       # This lone replica owns the Fribb resync (in prod that's api-sync's job).
       - RUN_DB_SYNC=true
       # Dev CORS: defaults to the built-in dev + crimsonhaven list when unset.

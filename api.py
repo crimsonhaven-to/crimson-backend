@@ -111,7 +111,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "15.4.0"
+VERSION = "15.5.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -224,6 +224,35 @@ async def lifespan(app: FastAPI):
         )
     else:
         logger.info("GITHUB_TOKEN not set — /changelog will return 503 until configured")
+
+    # CORS-proxy health cache (every replica keeps its own, since each routes
+    # independently). Periodically probes every CRIMSON_PROXY_BASE host so proxy_url
+    # routes only to the ones that are up — automatic failover between the Cloudflare
+    # and Netlify deploys. Cheap (1–2 GETs per host); only runs when configured.
+    if _crimson_proxy.is_enabled():
+        async def _warm_proxy_health():
+            try:
+                await _crimson_proxy.refresh_health()
+                logger.info("CORS proxy health cache warmed")
+            except Exception as e:
+                logger.error(f"Initial proxy health probe failed (will retry on schedule): {e}")
+
+        asyncio.create_task(_warm_proxy_health())  # fire-and-forget; don't delay startup
+
+        def _refresh_proxy_health():
+            try:
+                asyncio.run(_crimson_proxy.refresh_health())
+            except Exception as e:
+                logger.error(f"Proxy health refresh failed: {e}")
+
+        scheduler.add_job(
+            _refresh_proxy_health,
+            trigger=IntervalTrigger(minutes=2),
+            id="proxy_health_job",
+            replace_existing=True,
+        )
+    else:
+        logger.info("CRIMSON_PROXY_BASE not set — external CORS proxy disabled, /sign returns 503")
 
     if subtitles_service.configured():
         logger.info("OpenSubtitles configured — /subtitles is enabled")
@@ -2269,7 +2298,9 @@ async def _admin_system_info() -> Dict:
     local_enabled = sum(1 for s in local_sources if s.get("enabled"))
     # Live-ping the external CORS proxies (if any) so the dashboard shows which
     # are up. Cheap GET / health check per host; off entirely when unconfigured.
-    proxy_hosts = await _crimson_proxy.probe_bases()
+    # Uses refresh_health (not bare probe_bases) so opening the dashboard also
+    # updates the routing health cache that drives automatic failover in proxy_url.
+    proxy_hosts = await _crimson_proxy.refresh_health()
 
     now = time.time()
     return {

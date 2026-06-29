@@ -438,11 +438,14 @@ the backend, building a `MediaCtx` from the current season's `tmdb_id`/`tmdb_sea
 All three hooks deduped by `msg.source` first-wins. The backend `/watch` runs in
 parallel and (warm caches, datacenter) usually resolves a source *first*, so its
 own `/{source}_proxy` URL won and **kept serving the bytes** — the local
-(offloaded) URL was dropped. **Fixed:** new `mergeStreamLine(list, msg, origin,
-dedup)` — a `'local'` line **supersedes** a `'backend'` duplicate of the same
-`(source, language)` in place, so the player switches to the CDN→viewer (E3) /
-CDN→edge→viewer (E2) URL and the backend stops carrying the segments. Off unless
-`clientSourcesEnabled()` → prod behaviour unchanged for non-opted-in viewers.
+(offloaded) URL was dropped. **Fixed:** origin-aware dedup — a `'local'` line
+**supersedes** a `'backend'` duplicate of the same `(source, language)` in place,
+so the player switches to the CDN→viewer (E3) / CDN→edge→viewer (E2) URL and the
+backend stops carrying the segments. Off unless `clientSourcesEnabled()` → prod
+behaviour unchanged for non-opted-in viewers. *(Implementation note: I first wrote
+this as a `mergeStreamLine` helper, but the `origin/dev` merge below shipped an
+equivalent inline `dedup` Map + `reselect()` in each hook — that is what's in the
+tree now; `mergeStreamLine` was dropped.)*
 
 #### E2 (proxy) path revived — backend `/sign` grant + client `signProxyUrl` (New_System §8a)
 
@@ -498,17 +501,209 @@ Wired into the s.to-family `resolveEmbed` + label map, and added "Doodstream" to
 `aniworld`/`sto` hoster allowlists. Inherits the family flags (E3/E0 only — needs the
 extension), so no proxy/JA3 concern. `tsc` + build green.
 
-#### ‼️ Deploy sequence required (cross-repo; submodule bumps) — user action
+### 🔀 Phase 2 (cont.) — merge with `origin/dev`, AdGuard diagnosis, VOE playback fix (2026-06-29)
 
-Nothing here is pushed. To go live (and finally get Phase 1.5 into the client):
-1. `cd ../crimson-sources && git add -A && git commit -m "Add Doodstream resolver" && git push origin main`
-2. `cd ../crimson-extension && git add -A && git commit -m "Harden SW (wake race, rule-id collision, host-scoped rules); v1.0.2" && git push origin main`
-3. `cd ../crimson-client` → bump BOTH submodules to the new heads:
-   `git -C vendor/crimson-sources checkout main && git -C vendor/crimson-sources pull` and
-   `git -C vendor/crimson-extension checkout main && git -C vendor/crimson-extension pull`,
-   then `git add vendor/crimson-sources vendor/crimson-extension src/clientSources.js src/hooks.js && git commit -m "Bump engine+companion; revive E2 /sign; wire anime local engine; supersede dedup" && git push origin dev`
-4. `cd ../crimson-backend && git add api.py New_System_Progress.md && git commit -m "Add /sign proxy grant (E2 revival)" && git push origin dev`
-5. Live shakeout on dev: companion v1.0.2 on + `localStorage crimson:clientSources=1`,
-   watch an anime ep → confirm VOE/Doodstream resolve locally and the backend serves
-   no `*_proxy` bytes for them. Without the extension, confirm PlayIMDb/cinema.bz play
-   via the signed crimson-proxy link (`/sign`).
+While the above was still local, a **parallel session** had already pushed a more
+polished version of the same feature to `origin/dev`: an **auto-handshake** client
+engine (`waitForExtensionBridge` + `flagOverride`/`extensionPresent` instead of the
+manual `getExtensionBridge`), a **debug logger** wired through the engine + VOE
+discovery (`crimson-sources` `9f755b7`), and the **companion-distribution** work
+(`/extension` download page, `vendor/crimson-extension` submodule, Dockerfile
+`extpack`, CSP `connect-src https:`). A `git pull` merged it on top, colliding on
+`clientSources.js`, `hooks.js`, and the `vendor/crimson-sources` pin.
+
+**Merge resolution (kept both sides):**
+- `clientSources.js` — kept their auto-handshake design; swapped their placeholder
+  `signProxyUrl = undefined` for the **real `/sign` signer** (now routed through
+  `apiFetch`). E2 revival preserved.
+- `hooks.js` — took the incoming version wholesale: it already has the same
+  origin-aware "local supersedes backend" dedup (inline `dedup` Map + `reselect()`)
+  *and* the anime-hook wiring, more completely than my parallel `mergeStreamLine`
+  (which was dropped). No functionality lost.
+- `vendor/crimson-sources` — re-homed the **Doodstream** resolver onto their
+  `9f755b7` via a 3-way patch (only `stoFamily.ts` overlapped, with the new debug
+  logger — merged cleanly), committed as **`df6a79a`** on a new `crimson-sources`
+  **`dev`** branch (satisfies the Phase-2 "sources needs a dev branch" item).
+- `vendor/crimson-extension` — the merge pinned the *old* `610ed27`; bumped to
+  **`061a6e5`** (the v1.0.2 SW hardening) so a deploy ships the hardened companion.
+
+**VOE web-only debugging (the live end-to-end on `dev.crimsonhaven.to`):** with the
+companion on, the anime path engaged and VOE resolved **locally** — then two issues
+surfaced, diagnosed via `window.CrimsonExtension.fetch(...)` straight from the page
+console:
+
+1. **24-byte VOE embed = the user's AdGuard, not a bug.** `voe.sx/e/<id>` →
+   "Redirecting…" bounce → rotating mirror (`jennifereconomicgive.com/e/<id>`) →
+   AdGuard substitutes a 24-byte `/* Blocked by AdGuard */` stub. The resolver was
+   correct (followed the bounce, extracted the right mirror). A Sec-Fetch/`Origin`
+   "iframe navigation" theory was tried and **disproved** (both header sets returned
+   identical bodies) and **reverted**; what was kept is a sharper resolver
+   diagnostic that now prints *"intercepted by a content blocker … whitelist the
+   streaming hosts"* instead of a cryptic byte count (`crimson-sources` `3ab7f3c`).
+   Note: a per-site allowlist in the blocker does **not** help — the companion
+   fetches from its **service worker** (no tab context), so the blocker's
+   tab-scoped allowlist misses it; the user must pause it / disable the specific
+   rule. (Open product question: ship best-effort high-priority DNR `allow` rules in
+   the companion to override a co-installed blocker — works only if the companion is
+   installed *after* it, per Chrome's install-order cross-extension precedence.)
+
+2. **VOE segments 403 a few seconds in = media rules torn down mid-playback.** First
+   segments returned **200** (proving the `voe.sx` Referer/UA DNR rule *was* injected),
+   then 403 once resolution finished. Cause: `streamLocalSources` called
+   `engine.dispose()` on resolve-completion, and `dispose()` **clears the DNR media
+   rules** — but the player keeps fetching gated segments for the whole episode.
+   **Fixed (`crimson-client` `e6ae921`):** no `dispose()` on normal completion; the
+   rules persist through playback and are cleared+reinstalled at the *next* episode's
+   `streamEpisode()` start (doing it on abort would race that install). Confirmed:
+   **VOE now plays start-to-finish from the CDN, no dev-backend proxy.** ✅
+
+> **Known follow-up (not yet hit):** the media rule is scoped to the *master* `.m3u8`
+> host. If VOE ever serves segments from a **sibling subdomain**, they'd 403 from the
+> *first* segment (distinct from the above). Fix when it bites: widen the rule to the
+> registrable parent domain (the "rotating segment-host media rules" Phase-2 item).
+
+#### ✅ Final state (all committed locally; nothing pushed)
+
+| Repo | Branch | Head | Contains |
+| --- | --- | --- | --- |
+| crimson-backend | dev | `e943321` | `POST /sign` proxy grant |
+| crimson-sources | dev | `3ab7f3c` | `9f755b7` debug engine + Doodstream + VOE diagnostic |
+| crimson-extension | main | `061a6e5` | SW hardening, v1.0.2 |
+| crimson-client | dev | `e6ae921` | merge (auto-handshake + distribution) + E2 `signProxyUrl` + submodule bumps + media-rule lifetime fix |
+
+#### Push sequence (submodule targets before the client that pins them)
+
+1. `cd ../crimson-sources  && git push origin dev`   (`3ab7f3c`)
+2. `cd ../crimson-extension && git push origin main`  (`061a6e5`)
+3. `cd ../crimson-backend  && git push origin dev`    (`e943321`)
+4. `cd ../crimson-client   && git push origin dev`    (merge + bumps + VOE fix)
+
+Push 1 & 2 **before** 4 or CI can't resolve the client's submodule pins. The
+`dev`-branch pushes auto-deploy to the dev stack (`dev.crimsonhaven.to` /
+`dev-backend.crimsonhaven.to`).
+
+#### Status: **Phase 2 web-only + extension paths verified end-to-end on dev** ✅
+
+With the companion (v1.0.2) on, anime resolves locally and VOE plays start-to-finish
+straight from the CDN — the backend carries **zero** segment bytes for it. Doodstream
+is wired (Cloudflare-gated, companion-only). E2 `/sign` is live for the no-extension
+header-only sources. Remaining Phase-2 polish: the sibling-subdomain media-rule
+widening (above), and the optional blocker-override `allow` rules.
+
+### 🩸 Phase 2 (cont.) — E2 auto-engage + compose passthrough + companion defaults (2026-06-29)
+
+Audited the whole E2 (`/sign` → crimson-proxy) chain end-to-end and closed the two
+gaps that kept it from actually doing anything for real visitors, plus three
+companion-UX asks.
+
+#### ‼️ Root cause — the proxy was never reachable from the container
+
+The code chain was complete and byte-consistent (backend `_sign_one`/`_crimson_proxy.proxy_url`
+↔ proxy `signing.ts verify` ↔ sources `ProxiedFetcher`/`preparePlayback` ↔ client
+`signProxyUrl`), but **`CRIMSON_PROXY_BASE` was missing from both compose files'
+`environment:` blocks**. Compose does NOT auto-inject `.env`, so the running
+container saw it unset → `_crimson_proxy.is_enabled()` False → `POST /sign` returned
+503 → the entire E2 path was dead regardless of the client wiring. **Fixed:** added
+`CRIMSON_PROXY_BASE` + `CRIMSON_PROXY_SOURCES` passthrough to `docker-compose-dev.yml`
+(active) and `docker-compose.yml` (commented template), with the standard "must be
+listed or the container can't see it" note. *Runtime value still has to be set in the
+swarm `crimson.env`, and the proxy deployed with `NITRO_PROXY_SECRET == PROXY_SECRET`.*
+
+#### E2 now auto-engages for no-extension viewers (user decision: on for everyone)
+
+Previously the client engine only ran when the companion was present or a tester set
+`localStorage crimson:clientSources=1`, so the proxy bought the no-extension majority
+nothing. Per the New_System §6 "web-only" intent, `clientSources.js` now engages the
+E2 path for every viewer without the companion: the gate drops to "bail only when
+there's no companion AND the proxy is known-unconfigured" (a `/sign` 503 latches
+`_proxyDisabled`, which both halts further asks and flips `clientSourcesEnabled()`
+off so dedup stays correct). The engine self-routes VOE/VidSrc/aniworld → backend
+(their `needsResidentialIP`/`needsJA3` flags exclude E2); only cinema.bz / PlayIMDb /
+ScreenScape / AnimeSuge offload via the signed proxy. `npm run build` green.
+
+#### Companion UX — on by default, smaller button, client favicon (v1.0.3)
+
+- **On by default:** `background.js loadState` treats an absent stored flag as
+  ENABLED (fresh install works out of the box); an explicit toggle-off still persists
+  and wins on every later load. README "off by default" line corrected.
+- **Smaller button:** popup `.power` 132→104px (core inset 14→11, label 14→12px,
+  body min-height 360→320) — same one-button design, less bulk.
+- **Favicon:** `scripts/make_icons.py` rewritten to derive the toolbar/popup icons
+  from crimson-client's own favicon (`public/icons/android-chrome-512x512.png`,
+  LANCZOS-downscaled to 16/32/48/128 + greyscale `-off`), so the companion reads as
+  the same brand. Regenerated all 8 PNGs.
+- Version bumped 1.0.2 → **1.0.3** (manifest/protocol/inpage). All JS `node --check`
+  clean; manifest valid JSON.
+
+#### Push sequence (unchanged ordering — submodule targets before the client)
+
+1. `cd ../crimson-extension && git push origin main`  (v1.0.3 + client favicon)
+2. `cd ../crimson-backend  && git push origin dev`     (compose passthrough)
+3. `cd ../crimson-client   && git push origin dev`     (E2 auto-engage)
+   *(crimson-sources unchanged this session.)*
+
+Then set `CRIMSON_PROXY_BASE` in the dev/prod env and deploy crimson-proxy with a
+matching `NITRO_PROXY_SECRET` — until then `/sign` 503s and clients cleanly stay on
+E3/E0 (no regression).
+
+### 🔀 Phase 2 (cont.) — proxy failover, Netlify deploy fix, cache exclusion (2026-06-29)
+
+Deployed both proxy edges (Cloudflare + Netlify) and shook the E2 path out live;
+several real-world gaps surfaced and were fixed.
+
+#### Automatic proxy failover (health-aware host selection) — committed `f1c15e8`
+
+The signed proxy query is host-independent (it signs `url\nreferer\norigin\nua`,
+not the host), so one signature is valid on every base sharing the secret — which
+makes failover pure *host selection*. `resolvers/_crimson_proxy.py` gained a small
+in-process health cache: `proxy_url()` now routes only to hosts last probed healthy
+(`active`/`idle`), falling back to ALL bases when the cache is cold/stale/all-down
+(never worse than the old `random.choice`). `refresh_health()` reuses the existing
+`probe_bases()` and is called at startup, every 2 min on the scheduler, AND by the
+admin dashboard probe (so opening the overview also steers routing). Each replica
+keeps its own cache. **Why it mattered:** with both edges in `CRIMSON_PROXY_BASE`
+and Netlify 404ing, the old random pick made each source's playability a coin-flip
+(the "PlayIMDb sometimes never loads, then works on refresh" symptom — a fresh
+resolve re-rolled onto Cloudflare). Failover makes it deterministic.
+
+#### Netlify deploy — root-caused after three attempts (crimson-proxy, deploy.yml)
+
+Cloudflare deployed first try; Netlify kept shipping "only netlify.toml / every
+route 404s". Isolated step by step:
+1. Removed a bogus `[functions] directory = ".netlify/functions"` (Nitro's edge
+   preset writes `.netlify/edge-functions/`) — real hygiene, but not the cause.
+2. Added a post-deploy **smoke test** (curl the deployed `/` for the proxy JSON, fail
+   the job loudly) — turned green-but-dead into red-and-legible. This is what made
+   the next two diagnoses possible.
+3. `deploy --build --json` → **no build logs at all** (the `--json`+`--build` combo
+   skipped the build); split into `netlify build` + `deploy --no-build` → build
+   bundled the edge function fine ("Packaging Edge Functions - server") but it STILL
+   404'd. That isolated it: **`--no-build` drops Nitro's *framework-internal* edge
+   function** — Netlify only wires those in via an IN-PROCESS build→deploy handoff.
+4. **Fix:** one plain `netlify deploy --prod` (integrated build+bundle+deploy in a
+   single process), URL grepped from the human output. *(Result of this run pending
+   at write time; if it still 404s, fall back to a user edge function in
+   `netlify/edge-functions/` re-exporting Nitro's bundle.)*
+
+#### Cache engine — exclude edge-offloaded / locally-resolved streams (`cache_engine/downloader.py`)
+
+Live caching threw `ffmpeg failed` rows for episodes watched via the E2/local path.
+Cause: a crimson-proxy URL (`https://<edge>/?u=…`) is a valid-looking `hls` stream,
+so `_cacheable` stamped a ticket / the warmup picked it, and ffmpeg then tried to
+remux it through the (possibly-down) edge — which both errors and, when it works,
+pulls every segment back THROUGH the backend, defeating the entire offload. Added
+`_is_external_proxy_url()` (URL host ∈ `CRIMSON_PROXY_BASE` hosts) and excluded it
+in `_cacheable` — the single gate shared by `mint_ticket` (watch), `maybe_enqueue`
+(confirm), and the warmup filter, so all three agree. Same-origin `/{x}_proxy`
+paths and raw CDN URLs stay cacheable; only the deliberately-offloaded ones are
+skipped. This is the "don't cache a local/offloaded resolve" guard the cache engine
+was missing. Unit-tested the host matcher; `py_compile` clean.
+
+#### State (uncommitted unless noted)
+
+| Repo | What | Status |
+| --- | --- | --- |
+| crimson-backend | proxy failover (`_crimson_proxy.py` + scheduler) | committed `f1c15e8` |
+| crimson-backend | cache exclusion (`cache_engine/downloader.py`) | uncommitted |
+| crimson-proxy | single-step integrated `deploy --prod` + smoke test (`deploy.yml`), netlify.toml comment fix | uncommitted |
+| crimson-extension | v1.0.3 (on-by-default, smaller button, client favicon) | per earlier entry |
