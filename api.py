@@ -33,7 +33,12 @@ from resolvers.vidsrc import proxy_fetch as vidsrc_proxy_fetch
 from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
 from resolvers.cinemabz import proxy_fetch as cinemabz_proxy_fetch
 from resolvers.screenscape import proxy_fetch as screenscape_proxy_fetch
-from resolvers.febbox import proxy_fetch as febbox_proxy_fetch
+from resolvers.febbox import (
+    proxy_fetch as febbox_proxy_fetch,
+    FebboxResolver,
+    is_configured as febbox_is_configured,
+)
+from scrapers.showbox_scraper import ShowBoxScraper
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch, is_configured as jellyfin_is_configured
 from resolvers import _crimson_proxy
 from local_engine.db import LocalSourceStore
@@ -1871,6 +1876,133 @@ async def sign_proxy_links(request: Request):
 
     signed = [_sign_one(it) for it in items]
     return {"ok": True, "signed": signed}
+
+
+# --- client-side resolve grants (New System: take the backend out of the byte path) ---
+# Some sources can't run in the viewer's browser because the final hop needs a
+# server-held secret (C5) — Febbox's ``ui`` cookie today, MovieBox/others later. But
+# only the *resolve* needs the secret; the URL it yields is a direct CDN file the
+# viewer can fetch themselves. So /resolve does the token-gated lookup server-side and
+# returns the **raw** stream URL + the headers the CDN wants — and the client engine
+# delivers the bytes (extension E3 / signed crimson-proxy E2). The heavy mp4/HLS never
+# travels through this backend; only a few hundred bytes of control traffic do.
+#
+# This is the cookie-source twin of /sign: login-gated (NOT in _PUBLIC_PREFIXES) +
+# rate-limited, so it can't be used as an anonymous scraping oracle. A source that
+# isn't configured returns 503 and the client cleanly stays on the backend /watch
+# line (same-origin proxy) for it — never a regression.
+
+
+async def _grant_febbox(
+    tmdb_id: int, season_num: int, episode_num: int,
+    anilist_data: Dict, media_type: str, base_url: str,
+) -> List[Dict]:
+    """Run the ShowBox discovery + the token-gated Febbox player lookup, returning
+    RAW direct-file streams (not /febbox_proxy paths). Subtitle URLs stay on the
+    signed proxy (tiny .srt -> WebVTT) and are absolutized here against the backend
+    base, exactly like resolve_streams does."""
+    embeds = await run_single_scraper(
+        ShowBoxScraper, tmdb_id, season_num, episode_num, anilist_data, media_type
+    )
+    if not embeds:
+        return []
+    resolver = FebboxResolver()
+    out: List[Dict] = []
+    for embed in embeds:
+        try:
+            res = await resolver.resolve_direct(embed)
+        except Exception as e:
+            logger.warning(f"[resolve] febbox resolve_direct failed: {type(e).__name__} - {e}")
+            continue
+        if not res or not res.get("url"):
+            continue
+        subs = res.get("subtitles") or []
+        if base_url:
+            subs = [
+                {**s, "url": base_url.rstrip("/") + s["url"]}
+                if isinstance(s.get("url"), str) and s["url"].startswith("/") else s
+                for s in subs
+            ]
+        out.append({
+            "label": resolver.source_name,  # "ShowBox" -> dedups with the /watch tile
+            "streamType": res.get("streamType") or "mp4",
+            "url": res["url"],
+            "headers": res.get("headers") or {},
+            "subtitles": subs,
+            "language": None,
+        })
+    return out
+
+
+# Per-source grant registry: source key -> (is_configured probe, runner). Add a
+# cookie/secret source here and it gains a client-delivery path for free.
+_RESOLVE_GRANTS = {
+    "febbox": (febbox_is_configured, _grant_febbox),
+    "showbox": (febbox_is_configured, _grant_febbox),  # alias (the display label is "ShowBox")
+}
+
+
+@app.post("/resolve")
+@limiter.limit("120/minute")
+async def resolve_grant(request: Request):
+    """Server-side resolve grant for cookie/secret-bound sources (New System).
+
+    Body is the client's MediaCtx + a ``source`` key:
+    ``{source, tmdbId, mediaType, season, episode, title, titleEnglish,
+    titleRomaji, titleNative, synonyms}``. Returns
+    ``{ok, streams:[{label, streamType, url, headers, subtitles, language}]}`` with
+    **raw** CDN URLs — the client engine handles the actual byte delivery.
+
+    503 when the requested source isn't configured (e.g. FEBBOX_UI_TOKEN unset);
+    the client then keeps using the backend /watch line for it."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
+
+    source = (body.get("source") or "").strip().lower()
+    grant = _RESOLVE_GRANTS.get(source)
+    if not grant:
+        return JSONResponse({"ok": False, "error": "unknown_source"}, status_code=404)
+    is_conf, runner = grant
+    if not is_conf():
+        return JSONResponse({"ok": False, "error": "source_unconfigured"}, status_code=503)
+
+    try:
+        tmdb_id = int(body.get("tmdbId") or body.get("tmdb_id"))
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
+
+    media_type = "movie" if (body.get("mediaType") or "tv") == "movie" else "tv"
+    try:
+        season_num = int(body.get("season") or 1)
+        episode_num = int(body.get("episode") or 1)
+    except (TypeError, ValueError):
+        season_num, episode_num = 1, 1
+
+    # The title bundle the discovery scraper matches on — the same fields the client
+    # already carries (and enriched via /scrape-meta). None values are simply skipped
+    # by the scraper's candidate-title builder.
+    anilist_data = {
+        "title": body.get("title"),
+        "title_english": body.get("titleEnglish"),
+        "title_romaji": body.get("titleRomaji"),
+        "title_native": body.get("titleNative"),
+        "synonyms": body.get("synonyms") or [],
+    }
+
+    base_url = _public_base_url(request)
+    try:
+        streams = await runner(
+            tmdb_id, season_num, episode_num, anilist_data, media_type, base_url
+        )
+    except Exception as e:
+        logger.error(f"[resolve] grant for {source!r} failed: {type(e).__name__} - {e}")
+        return JSONResponse({"ok": False, "error": "resolve_failed"}, status_code=502)
+
+    return {"ok": True, "streams": streams}
 
 
 # --- movie-web bridge (/mw) -------------------------------------------------
