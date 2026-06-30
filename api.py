@@ -58,6 +58,7 @@ from cache_engine.fs import (
     media_type_for as cache_media_type,
 )
 from cache_engine.downloader import manager as cache_manager, ffmpeg_available
+from telemetry_engine import TelemetryStore
 from core.player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
@@ -145,6 +146,10 @@ local_source_store = LocalSourceStore()
 # the scraper/resolver/proxy read enabled targets via their own CacheStore.
 cache_store = CacheStore()
 
+# Anonymous per-source resolve telemetry (client beacons -> daily aggregates).
+# Restores the source-success visibility lost when resolving moved client-side.
+telemetry_store = TelemetryStore()
+
 
 # Load environment variables
 load_dotenv()
@@ -175,6 +180,7 @@ async def lifespan(app: FastAPI):
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
     local_source_store.init_db()  # admin-managed local media sources (resync-safe)
     cache_store.init_db()  # server-side video cache tables (resync-safe)
+    telemetry_store.init_db()  # anonymous resolve telemetry (resync-safe)
 
     # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
     # that already exist). Lets the operator reach the /admin dashboard without
@@ -2300,6 +2306,30 @@ async def confirm_cache(request: Request):
         ticket = ""
     accepted = await cache_manager.confirm_ticket(ticket) if ticket else False
     return {"ok": bool(accepted)}
+
+
+@app.post("/telemetry/resolve")
+@limiter.limit("60/minute")
+async def telemetry_resolve(request: Request):
+    """Ingest an anonymous per-source resolve beacon from the client engine.
+
+    Body: ``{"events": [{"source": "Cinema.bz (tcloud)", "ok": true, "env": "extension"}, …]}``.
+    Strictly aggregate + anonymous — no title, no user, no IP is stored (see
+    telemetry_engine). Restores the source-success visibility lost when resolving
+    moved client-side. Behind the login wall + rate-limited; always 200 so a
+    beacon can be fire-and-forget."""
+    try:
+        body = await request.json()
+        events = (body or {}).get("events") or []
+    except Exception:
+        events = []
+    rows = 0
+    if isinstance(events, list) and events:
+        try:
+            rows = await run_in_threadpool(telemetry_store.record_batch, events)
+        except Exception as e:
+            logger.warning(f"telemetry ingest failed: {e}")
+    return {"ok": True, "recorded": rows}
 
 
 # --- CONTINUE-WATCHING WARMUP ----------------------------------------------

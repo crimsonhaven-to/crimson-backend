@@ -1568,6 +1568,68 @@
         }
       }
     },
+    "/admin/source-stats": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Admin Source Stats",
+        "description": "Real per-source resolve success rates from anonymous client beacons over the\nlast ``days`` days. Complements /source-health (which probes from the backend):\nthis reflects what actually resolved for viewers on the client+extension path —\nthe visibility that was lost when resolving moved client-side.",
+        "operationId": "admin_source_stats_admin_source_stats_get",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 365,
+              "minimum": 1,
+              "description": "Window to aggregate over",
+              "default": 14,
+              "title": "Days"
+            },
+            "description": "Window to aggregate over"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/admin/users": {
       "get": {
         "tags": [
@@ -4400,6 +4462,23 @@
         "summary": "Confirm Cache",
         "description": "Player calls this once the viewer has actually watched a source for a few\nseconds, passing back the ``cacheTicket`` that source carried. Only then is\nthat exact stream enqueued for server-side caching — so we cache the source\nthe viewer *chose* (its quality + language), not whichever resolved fastest.\n\nThe ticket is HMAC-signed by ``/watch``, so no arbitrary URL can be injected\ninto the downloader. Behind the login wall; always 200 so it never leaks\nwhether caching is on or whether the episode was already cached.",
         "operationId": "confirm_cache_cache_confirm_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/telemetry/resolve": {
+      "post": {
+        "summary": "Telemetry Resolve",
+        "description": "Ingest an anonymous per-source resolve beacon from the client engine.\n\nBody: ``{\"events\": [{\"source\": \"Cinema.bz (tcloud)\", \"ok\": true, \"env\": \"extension\"}, …]}``.\nStrictly aggregate + anonymous — no title, no user, no IP is stored (see\ntelemetry_engine). Restores the source-success visibility lost when resolving\nmoved client-side. Behind the login wall + rate-limited; always 200 so a\nbeacon can be fire-and-forget.",
+        "operationId": "telemetry_resolve_telemetry_resolve_post",
         "responses": {
           "200": {
             "description": "Successful Response",

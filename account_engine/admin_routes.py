@@ -42,6 +42,7 @@ from local_engine.fs import inspect_path, discover_mountpoints
 from cache_engine.db import CacheStore
 from cache_engine import fs as cache_fs
 from cache_engine import downloader as cache_dl
+from telemetry_engine import TelemetryStore
 from apikey_engine import store as apikey_store
 from .db import AccountStore
 from .routes import require_user
@@ -50,6 +51,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 store = AccountStore()
 local_store = LocalSourceStore()
 cache_store = CacheStore()
+telemetry_store = TelemetryStore()
 
 
 def _now_iso() -> str:
@@ -217,6 +219,19 @@ async def admin_source_health(
         raise HTTPException(status_code=503, detail="Source health is not available on this node")
     data = await _source_health_handler(force)
     return {"success": True, "generated_at": _now_iso(), **data}
+
+
+@router.get("/source-stats")
+async def admin_source_stats(
+    user: dict = Depends(require_admin),
+    days: int = Query(14, ge=1, le=365, description="Window to aggregate over"),
+):
+    """Real per-source resolve success rates from anonymous client beacons over the
+    last ``days`` days. Complements /source-health (which probes from the backend):
+    this reflects what actually resolved for viewers on the client+extension path —
+    the visibility that was lost when resolving moved client-side."""
+    rows = await run_in_threadpool(telemetry_store.top_stats, days)
+    return {"success": True, "generated_at": _now_iso(), "days": days, "sources": rows}
 
 
 # --- users -----------------------------------------------------------------
