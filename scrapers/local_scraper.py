@@ -16,8 +16,10 @@ Matching, MVP-pragmatic and layout-tolerant:
     and returns the file matching the requested S/E. A single-file folder is
     treated as S1E1 so a movie still resolves.
 
-Only browser-playable containers (mp4/m4v/mov/webm) are considered — direct play
-only, no transcoding (see local_engine.fs.WEB_EXTENSIONS).
+Browser-playable containers (mp4/m4v/mov/webm) are always considered; non-web
+containers (mkv/avi/ts/…) are only surfaced for sources that have **encoding**
+enabled, in which case they play through the on-the-fly HLS transcode route. The
+``is_playable_path`` choke point owns that policy (see local_engine.fs).
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import re
 from typing import List, Optional
 
 from local_engine.db import LocalSourceStore
-from local_engine.fs import EMBED_MARKER, WEB_EXTENSIONS, encode_token, is_configured
+from local_engine.fs import EMBED_MARKER, encode_token, is_configured, is_playable_path
 
 from .base_scraper import BaseAnimeScraper
 
@@ -220,9 +222,11 @@ class LocalScraper(BaseAnimeScraper):
                     parent = os.path.basename(root)
                     dir_season = _season_from_dir(parent)
                     for f in files:
-                        if os.path.splitext(f)[1].lower() not in WEB_EXTENSIONS:
-                            continue
                         full = os.path.join(root, f)
+                        # Web-native always; non-web only when its source has encoding
+                        # on (then it plays via the /local_hls transcode route).
+                        if not is_playable_path(full):
+                            continue
                         all_videos.append(full)
                         s, e = _parse_se(f)
                         if e is None:

@@ -26,14 +26,28 @@ from typing import List, Optional
 from .db import LocalSourceStore
 
 # The scraper emits ``crimson-local:{token}``; the resolver matches on this
-# keyword and the ``/local_proxy`` route serves it.
+# keyword and serves it via one of two routes depending on the file + the source's
+# per-root ``encoding`` flag:
+#   * ``/local_proxy``  — direct play (Range-served bytes) for browser-native files.
+#   * ``/local_hls``    — on-the-fly HLS transcode for everything else, but ONLY
+#                         when the file's source has encoding enabled.
 EMBED_MARKER = "crimson-local"
 PROXY_PREFIX = "/local_proxy"
+HLS_PREFIX = "/local_hls"
 
-# MVP — direct play only: a browser ``<video>`` element can play these as-is, so
-# the backend just range-serves the bytes. MKV / HEVC / AC3 etc. would need an
-# ffmpeg transcode pipeline (deliberately out of scope) and are simply skipped.
+# A browser ``<video>`` element can play these as-is, so the backend just
+# range-serves the bytes (the ``/local_proxy`` direct-play path).
 WEB_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
+
+# Containers a browser can't play directly but ffmpeg can read — surfaced only
+# when the source has ``encoding`` enabled, and streamed through the ``/local_hls``
+# transcode route (remuxed/re-encoded to HLS on the fly). Note ``.mp4``/``.m4v``/
+# ``.mov``/``.webm`` are deliberately NOT here: a web-native container always takes
+# the cheaper direct-play path even on an encoding-enabled source.
+TRANSCODE_EXTENSIONS = {
+    ".mkv", ".avi", ".ts", ".m2ts", ".mts", ".wmv", ".flv",
+    ".mpg", ".mpeg", ".m2v", ".vob", ".ogv", ".ogm", ".3gp", ".divx", ".mxf", ".rmvb",
+}
 
 _MEDIA_TYPES = {
     ".mp4": "video/mp4",
@@ -69,8 +83,37 @@ def is_web_playable_path(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in WEB_EXTENSIONS
 
 
+def is_transcodable_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in TRANSCODE_EXTENSIONS
+
+
 def media_type_for(path: str) -> str:
     return _MEDIA_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+def _encoding_root_for(real_path: str) -> Optional[dict]:
+    """The enabled source root that contains ``real_path`` (already fully resolved),
+    or None. Returns the whole config entry so callers can read its ``encoding`` flag
+    without a second lookup."""
+    for root in _store.enabled_roots_config():
+        if _within(real_path, root["path"]):
+            return root
+    return None
+
+
+def encoding_enabled_for(real_path: str) -> bool:
+    """True when ``real_path`` lives in an enabled source root that has encoding on."""
+    root = _encoding_root_for(real_path)
+    return bool(root and root["encoding"])
+
+
+def is_playable_path(path: str) -> bool:
+    """Whether the Local source should surface ``path`` at all: a web-native file
+    (always), or a transcodable container whose source has encoding enabled. Used by
+    the scraper so a disabled-encoding root never lists files it can't actually play."""
+    if is_web_playable_path(path):
+        return True
+    return is_transcodable_path(path) and encoding_enabled_for(os.path.realpath(path))
 
 
 # --- the security choke point -----------------------------------------------
@@ -105,6 +148,23 @@ def safe_resolve(token: str) -> Optional[str]:
     return None
 
 
+def safe_resolve_transcode(token: str) -> Optional[str]:
+    """The ``/local_hls`` counterpart of :func:`safe_resolve`.
+
+    Maps a token back to a real file ONLY when, after resolving symlinks, it is a
+    regular *transcodable* file living inside a *currently enabled* source root that
+    has **encoding turned on**. So flipping a source's encoding off (or disabling the
+    source) instantly 404s its transcode streams, re-checked on every segment
+    request — the same per-request safety model as the direct-play path."""
+    raw = decode_token(token)
+    if not raw:
+        return None
+    real = os.path.realpath(raw)
+    if not os.path.isfile(real) or not is_transcodable_path(real):
+        return None
+    return real if encoding_enabled_for(real) else None
+
+
 # --- admin dashboard helpers (read-only) ------------------------------------
 def inspect_path(path: str, *, count_cap: int = 2000) -> dict:
     """Quick, bounded health probe of a path for the Add-Source form.
@@ -117,7 +177,8 @@ def inspect_path(path: str, *, count_cap: int = 2000) -> dict:
         "exists": False,
         "is_dir": False,
         "readable": False,
-        "video_count": 0,
+        "video_count": 0,            # direct-playable (web-native) files
+        "transcodable_count": 0,     # files that need encoding on to play
         "video_count_capped": False,
     }
     try:
@@ -127,18 +188,23 @@ def inspect_path(path: str, *, count_cap: int = 2000) -> dict:
         info["is_dir"] = os.path.isdir(path)
         info["readable"] = os.access(path, os.R_OK)
         if info["is_dir"] and info["readable"]:
-            n = 0
+            n = 0          # web-native
+            t = 0          # transcodable
             capped = False
             for _root, _dirs, files in os.walk(path):
                 for f in files:
-                    if os.path.splitext(f)[1].lower() in WEB_EXTENSIONS:
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in WEB_EXTENSIONS:
                         n += 1
-                        if n >= count_cap:
-                            capped = True
-                            break
+                    elif ext in TRANSCODE_EXTENSIONS:
+                        t += 1
+                    if (n + t) >= count_cap:
+                        capped = True
+                        break
                 if capped:
                     break
             info["video_count"] = n
+            info["transcodable_count"] = t
             info["video_count_capped"] = capped
     except Exception:
         pass

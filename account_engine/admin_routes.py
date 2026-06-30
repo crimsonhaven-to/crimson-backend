@@ -39,6 +39,7 @@ from core.rate_limit import limiter
 from metadata_engine import maintenance as metadata_maintenance
 from local_engine.db import LocalSourceStore
 from local_engine.fs import inspect_path, discover_mountpoints
+from local_engine.transcode import tools_available as encoding_tools_available
 from cache_engine.db import CacheStore
 from cache_engine import fs as cache_fs
 from cache_engine import downloader as cache_dl
@@ -443,17 +444,22 @@ async def trigger_backfill(body: Optional[BackfillTrigger] = None, user: dict = 
 class LocalSourceCreate(BaseModel):
     label: str = Field(..., min_length=1, max_length=100)
     path: str = Field(..., min_length=1, max_length=1000)
+    # On-the-fly HLS transcoding for non-web containers (mkv/avi/…). Off by default
+    # so a new source is direct-play-only until the operator opts in.
+    encoding: bool = False
 
 
 class LocalSourceUpdate(BaseModel):
     label: Optional[str] = Field(None, min_length=1, max_length=100)
     enabled: Optional[bool] = None
+    encoding: Optional[bool] = None
 
 
 def _local_with_status(row: dict) -> dict:
     """Merge a stored source row with a live filesystem probe for the dashboard."""
     out = dict(row)
     out["enabled"] = bool(out.get("enabled"))
+    out["encoding"] = bool(out.get("encoding"))
     out["status"] = inspect_path(row["path"])
     return out
 
@@ -463,7 +469,15 @@ async def list_local_sources(user: dict = Depends(require_admin)):
     rows = await run_in_threadpool(local_store.list_sources)
     # inspect_path walks the tree (bounded) — do the whole list in one threadpool hop.
     items = await run_in_threadpool(lambda: [_local_with_status(r) for r in rows])
-    return {"success": True, "count": len(items), "sources": items}
+    # encoding_supported tells the dashboard whether to offer the per-source encoding
+    # toggle at all: the on-the-fly HLS transcode needs ffmpeg AND ffprobe in the
+    # image, so grey the switch out when they're missing rather than failing playback.
+    return {
+        "success": True,
+        "count": len(items),
+        "sources": items,
+        "encoding_supported": encoding_tools_available(),
+    }
 
 
 @router.get("/local-sources/discover")
@@ -504,18 +518,23 @@ async def add_local_source(body: LocalSourceCreate, user: dict = Depends(require
     if any(os.path.normpath(r["path"]) == path for r in existing):
         raise HTTPException(status_code=409, detail="That path is already registered")
 
-    row = await run_in_threadpool(local_store.add_source, body.label.strip(), path)
+    row = await run_in_threadpool(
+        local_store.add_source, body.label.strip(), path, body.encoding
+    )
     return {"success": True, "source": await run_in_threadpool(_local_with_status, row)}
 
 
 @router.patch("/local-sources/{source_id}")
 async def update_local_source(source_id: int, body: LocalSourceUpdate, user: dict = Depends(require_admin)):
-    """Toggle a source on/off or rename it (the path is immutable — delete + re-add)."""
+    """Toggle a source on/off, flip its encoding (transcoding) switch, or rename it
+    (the path is immutable — delete + re-add)."""
     target = await run_in_threadpool(local_store.get_source, source_id)
     if not target:
         raise HTTPException(status_code=404, detail="Source not found")
     label = body.label.strip() if body.label is not None else None
-    row = await run_in_threadpool(local_store.update_source, source_id, label, body.enabled)
+    row = await run_in_threadpool(
+        local_store.update_source, source_id, label, body.enabled, body.encoding
+    )
     return {"success": True, "source": await run_in_threadpool(_local_with_status, row)}
 
 

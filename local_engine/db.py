@@ -21,7 +21,7 @@ from typing import List, Optional
 
 from core.db_pool import get_connection, lock_schema_init
 
-_COLS = "id, label, path, enabled, created_at"
+_COLS = "id, label, path, enabled, encoding, created_at"
 
 
 def _now_iso() -> str:
@@ -31,11 +31,13 @@ def _now_iso() -> str:
 class LocalSourceStore:
     """Thin data layer for the ``local_media_sources`` table."""
 
-    # The enabled-roots list is read on every scrape AND every /local_proxy
-    # request, so it's cached process-wide for a few seconds. Kept at class level
-    # so the cache is shared no matter which instance (scraper/resolver/route/
-    # admin) reads it; any write invalidates it via _bump().
-    _roots_cache: Optional[List[str]] = None
+    # The enabled-roots config is read on every scrape AND every /local_proxy /
+    # /local_hls request, so it's cached process-wide for a few seconds. Each cached
+    # entry is ``{"path", "encoding"}`` so callers can tell direct-play roots from
+    # transcode-enabled ones without a second query. Kept at class level so the cache
+    # is shared no matter which instance (scraper/resolver/route/admin) reads it; any
+    # write invalidates it via _bump().
+    _roots_cache: Optional[List[dict]] = None
     _roots_cache_at: float = 0.0
     _ROOTS_TTL = 5.0
 
@@ -51,9 +53,18 @@ class LocalSourceStore:
                     label      TEXT NOT NULL,
                     path       TEXT NOT NULL UNIQUE,
                     enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+                    encoding   BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TEXT NOT NULL
                 );
                 """
+            )
+            # Per-source on-the-fly transcoding switch. OFF by default so existing
+            # rows (and a fresh deploy) keep today's direct-play-only behaviour;
+            # when ON, the Local scraper also surfaces non-web containers (mkv/avi/…)
+            # and they play via the /local_hls transcode route. Added via ALTER for
+            # DBs created before encoding support existed.
+            conn.execute(
+                "ALTER TABLE local_media_sources ADD COLUMN IF NOT EXISTS encoding BOOLEAN NOT NULL DEFAULT FALSE"
             )
 
     # -- reads ----------------------------------------------------------------
@@ -69,8 +80,10 @@ class LocalSourceStore:
                 f"SELECT {_COLS} FROM local_media_sources WHERE id = %s", (source_id,)
             ).fetchone()
 
-    def enabled_roots(self) -> List[str]:
-        """Paths of all enabled sources (cached briefly; see class docstring)."""
+    def enabled_roots_config(self) -> List[dict]:
+        """``{"path", "encoding"}`` for every enabled source (cached briefly; see
+        class docstring). The single source of truth the lighter ``enabled_roots``
+        derives from, so a scrape/proxy request hits the DB at most once per TTL."""
         now = time.monotonic()
         cached = LocalSourceStore._roots_cache
         if cached is not None and (now - LocalSourceStore._roots_cache_at) < LocalSourceStore._ROOTS_TTL:
@@ -78,32 +91,40 @@ class LocalSourceStore:
         try:
             with get_connection() as conn:
                 rows = conn.execute(
-                    "SELECT path FROM local_media_sources WHERE enabled = TRUE"
+                    "SELECT path, encoding FROM local_media_sources WHERE enabled = TRUE"
                 ).fetchall()
-            roots = [r["path"] for r in rows]
+            config = [{"path": r["path"], "encoding": bool(r["encoding"])} for r in rows]
         except Exception:
-            # DB hiccup: serve the last known roots rather than 500 a playback.
-            roots = cached or []
-        LocalSourceStore._roots_cache = roots
+            # DB hiccup: serve the last known config rather than 500 a playback.
+            config = cached or []
+        LocalSourceStore._roots_cache = config
         LocalSourceStore._roots_cache_at = now
-        return roots
+        return config
+
+    def enabled_roots(self) -> List[str]:
+        """Paths of all enabled sources (cached briefly; see class docstring)."""
+        return [r["path"] for r in self.enabled_roots_config()]
 
     # -- writes ---------------------------------------------------------------
-    def add_source(self, label: str, path: str) -> dict:
+    def add_source(self, label: str, path: str, encoding: bool = False) -> dict:
         with get_connection() as conn:
             row = conn.execute(
                 f"""
-                INSERT INTO local_media_sources (label, path, enabled, created_at)
-                VALUES (%s, %s, TRUE, %s)
+                INSERT INTO local_media_sources (label, path, enabled, encoding, created_at)
+                VALUES (%s, %s, TRUE, %s, %s)
                 RETURNING {_COLS}
                 """,
-                (label, path, _now_iso()),
+                (label, path, encoding, _now_iso()),
             ).fetchone()
         self._bump()
         return row
 
     def update_source(
-        self, source_id: int, label: Optional[str] = None, enabled: Optional[bool] = None
+        self,
+        source_id: int,
+        label: Optional[str] = None,
+        enabled: Optional[bool] = None,
+        encoding: Optional[bool] = None,
     ) -> Optional[dict]:
         sets, vals = [], []
         if label is not None:
@@ -112,6 +133,9 @@ class LocalSourceStore:
         if enabled is not None:
             sets.append("enabled = %s")
             vals.append(enabled)
+        if encoding is not None:
+            sets.append("encoding = %s")
+            vals.append(encoding)
         if not sets:
             return self.get_source(source_id)
         vals.append(source_id)

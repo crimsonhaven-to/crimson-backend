@@ -56,8 +56,9 @@ POLL_INTERVAL = max(2, int(os.getenv("CACHE_POLL_INTERVAL", "10")))  # seconds
 MIN_FREE_BYTES = int(os.getenv("CACHE_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024)))  # 2 GiB
 
 # Stream URL fragments that mean "don't cache this": our own cache output and the
-# on-disk Local source (already a file) — re-caching either is pointless/looping.
-_SKIP_URL_FRAGMENTS = (fs.PROXY_PREFIX, "/local_proxy")
+# on-disk Local source — direct play (/local_proxy) AND its on-the-fly transcode
+# (/local_hls) are both already a local file, so re-caching either is pointless/looping.
+_SKIP_URL_FRAGMENTS = (fs.PROXY_PREFIX, "/local_proxy", "/local_hls")
 
 
 def ffmpeg_available() -> bool:

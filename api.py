@@ -50,9 +50,11 @@ from resolvers import _crimson_proxy
 from local_engine.db import LocalSourceStore
 from local_engine.fs import (
     safe_resolve as local_safe_resolve,
+    safe_resolve_transcode as local_safe_resolve_transcode,
     media_type_for as local_media_type,
     is_configured as local_is_configured,
 )
+from local_engine import transcode as local_transcode
 from cache_engine.db import CacheStore
 from cache_engine.fs import (
     safe_resolve as cache_safe_resolve,
@@ -131,7 +133,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "16.1.0"
+VERSION = "16.2.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -3094,6 +3096,46 @@ async def local_proxy(token: str):
     if not real_path:
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(real_path, media_type=local_media_type(real_path))
+
+
+@app.get("/local_hls/{token}/{resource}")
+async def local_hls(token: str, resource: str):
+    """On-the-fly HLS for a transcodable Local file (mkv/avi/ts/…) whose source has
+    encoding enabled — the non-direct-play counterpart of /local_proxy.
+
+    ``resource`` is either the VOD playlist (``master.m3u8``/``media.m3u8``) or a
+    segment (``seg{n}.ts``). ``safe_resolve_transcode`` re-validates on EVERY request
+    that the token maps to a transcodable file inside a *currently enabled* source
+    root with **encoding on** — so disabling the source (or just its encoding) instantly
+    404s its transcode streams, exactly like /local_proxy for direct play. Gated by the
+    login wall (NOT a public prefix), so the player must carry the session token; the
+    bytes never leave this host's library unauthenticated."""
+    real_path = await run_in_threadpool(local_safe_resolve_transcode, token)
+    if not real_path:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    duration = await run_in_threadpool(local_transcode.probe_duration, real_path)
+    if not duration:
+        raise HTTPException(status_code=422, detail="Could not probe media")
+
+    if resource in ("master.m3u8", "media.m3u8", "index.m3u8"):
+        playlist = local_transcode.build_media_playlist(duration)
+        return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
+
+    if resource.startswith("seg") and resource.endswith(".ts"):
+        try:
+            index = int(resource[3:-3])
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Not found")
+        if index < 0 or index >= local_transcode.segment_count(duration):
+            raise HTTPException(status_code=404, detail="Not found")
+        data, err = await local_transcode.transcode_segment(real_path, index)
+        if data is None:
+            logger.warning(f"[local_hls] segment {index} failed for {real_path!r}: {err}")
+            raise HTTPException(status_code=502, detail="Transcode failed")
+        return Response(content=data, media_type="video/mp2t")
+
+    raise HTTPException(status_code=404, detail="Not found")
 
 
 @app.get("/cache_proxy/{token}")
