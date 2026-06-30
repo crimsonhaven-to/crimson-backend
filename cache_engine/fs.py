@@ -24,7 +24,7 @@ import base64
 import os
 import re
 import shutil
-from typing import List, Optional
+from typing import Optional
 
 from .db import CacheStore
 

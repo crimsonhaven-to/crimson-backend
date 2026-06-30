@@ -1,0 +1,17 @@
+# Dev/CI-only tooling. Installed on top of requirements.txt in the CI quality
+# gate (lint + typecheck + tests) — NOT baked into the production image.
+-r requirements.txt
+
+pytest==9.1.1
+# Must be >=1.1 to allow pytest 9 (1.0.0 caps pytest <9). 1.4.0 is the version
+# the suite is validated against.
+pytest-asyncio==1.4.0
+# Linter + formatter (Rust, fast). Replaces flake8/isort/black in one tool.
+ruff==0.14.4
+# Static type-checker. Run in --ignore-missing-imports mode in CI (we don't
+# vendor stubs for every third-party lib); it still catches real type errors in
+# our own code.
+mypy==1.18.2
+# Validates the /watch NDJSON builders against the canonical JSON Schema
+# (core/contracts.py) in the contract test.
+jsonschema==4.25.1

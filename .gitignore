@@ -2,6 +2,13 @@
 *pycache*
 /.claude
 
+# test/lint tooling caches + the throwaway local test venv (CI uses its own)
+.venv-test/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # secrets
 .env
 

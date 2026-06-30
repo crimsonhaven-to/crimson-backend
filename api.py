@@ -58,6 +58,7 @@ from cache_engine.fs import (
     media_type_for as cache_media_type,
 )
 from cache_engine.downloader import manager as cache_manager, ffmpeg_available
+from telemetry_engine import TelemetryStore
 from core.player import render_player, is_safe_src
 from metadata_engine.db_handler import MappingDatabaseEngine
 from account_engine import router as account_router, store as account_store
@@ -77,6 +78,13 @@ from skiptimes_engine import router as skiptimes_router
 from core.db_pool import get_pool, close_pool, pool_stats
 from core import lumi
 from core import source_health
+from core import config_report
+from core.contracts import (
+    build_done_line,
+    build_meta_line,
+    build_stream_line,
+    build_unaired_line,
+)
 from core.rate_limit import limiter
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -122,7 +130,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "15.8.0"
+VERSION = "15.9.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -137,6 +145,10 @@ local_source_store = LocalSourceStore()
 # them as a named source). Schema-init'd + download manager started in lifespan;
 # the scraper/resolver/proxy read enabled targets via their own CacheStore.
 cache_store = CacheStore()
+
+# Anonymous per-source resolve telemetry (client beacons -> daily aggregates).
+# Restores the source-success visibility lost when resolving moved client-side.
+telemetry_store = TelemetryStore()
 
 
 # Load environment variables
@@ -154,6 +166,10 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up FastAPI application...")
 
+    # Log which optional, env-gated features are on/off (presence only, no secret
+    # values) so a "dark" source is diagnosable at a glance from the boot log.
+    config_report.log_report(logger)
+
     # Open the shared HTTP client (kept warm for the whole process lifetime).
     open_http_client()
 
@@ -164,6 +180,7 @@ async def lifespan(app: FastAPI):
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
     local_source_store.init_db()  # admin-managed local media sources (resync-safe)
     cache_store.init_db()  # server-side video cache tables (resync-safe)
+    telemetry_store.init_db()  # anonymous resolve telemetry (resync-safe)
 
     # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
     # that already exist). Lets the operator reach the /admin dashboard without
@@ -1560,15 +1577,13 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
     title = anilist_data.get("title") or fallback_title
     media_ctx = {**anilist_data, "title": title}
 
-    yield _ndjson({
-        "type": "meta",
-        "success": True,
-        "tmdb_id": tmdb_id,
-        "season_number": season_number,
-        "episode_number": episode_number,
-        "anilist_id": anilist_id,
-        "title": title,
-    })
+    yield _ndjson(build_meta_line(
+        tmdb_id=tmdb_id,
+        season_number=season_number,
+        episode_number=episode_number,
+        anilist_id=anilist_id,
+        title=title,
+    ))
 
     # Don't waste scraper work on an episode that hasn't aired yet. TMDB carries a
     # per-episode air_date; when the requested episode is dated in the future, tell
@@ -1580,14 +1595,13 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
         ep_info = await _season_episode_info(tmdb_id, season_number)
         air_date = (ep_info.get("air_dates") or {}).get(episode_number)
         if _is_future_air_date(air_date):
-            yield _ndjson({
-                "type": "unaired",
-                "air_date": air_date,
-                "title": title,
-                "season_number": season_number,
-                "episode_number": episode_number,
-            })
-            yield _ndjson({"type": "done", "count": 0})
+            yield _ndjson(build_unaired_line(
+                air_date=air_date,
+                title=title,
+                season_number=season_number,
+                episode_number=episode_number,
+            ))
+            yield _ndjson(build_done_line(0))
             return
 
     # German streaming scrapers (s.to, aniworld) list many non-anime shows under
@@ -1679,20 +1693,10 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
             if stream is None:  # sentinel: all scrapers finished
                 break
             count += 1
-            line = {
-                "type": "stream",
-                "source": stream["source"],
-                "streamType": stream["type"],
-                "url": stream["url"],
-                "language": stream.get("language"),
-                "subtitles": stream.get("subtitles"),
-            }
-            # Only present on cacheable streams (when caching is enabled); the
-            # player echoes it back to /cache/confirm after a few seconds of play.
-            if stream.get("cacheTicket"):
-                line["cacheTicket"] = stream["cacheTicket"]
-            yield _ndjson(line)
-        yield _ndjson({"type": "done", "count": count})
+            # Shape (incl. the cacheTicket-only-when-present rule) lives in
+            # core.contracts so it can't drift from the client/crimson-sources.
+            yield _ndjson(build_stream_line(stream))
+        yield _ndjson(build_done_line(count))
     finally:
         # If the client disconnects mid-stream the generator is closed here —
         # cancel the still-running tasks so they don't leak (no-op if done).
@@ -2304,6 +2308,30 @@ async def confirm_cache(request: Request):
     return {"ok": bool(accepted)}
 
 
+@app.post("/telemetry/resolve")
+@limiter.limit("60/minute")
+async def telemetry_resolve(request: Request):
+    """Ingest an anonymous per-source resolve beacon from the client engine.
+
+    Body: ``{"events": [{"source": "Cinema.bz (tcloud)", "ok": true, "env": "extension"}, …]}``.
+    Strictly aggregate + anonymous — no title, no user, no IP is stored (see
+    telemetry_engine). Restores the source-success visibility lost when resolving
+    moved client-side. Behind the login wall + rate-limited; always 200 so a
+    beacon can be fire-and-forget."""
+    try:
+        body = await request.json()
+        events = (body or {}).get("events") or []
+    except Exception:
+        events = []
+    rows = 0
+    if isinstance(events, list) and events:
+        try:
+            rows = await run_in_threadpool(telemetry_store.record_batch, events)
+        except Exception as e:
+            logger.warning(f"telemetry ingest failed: {e}")
+    return {"ok": True, "recorded": rows}
+
+
 # --- CONTINUE-WATCHING WARMUP ----------------------------------------------
 # When a viewer saves progress on an episode, we look ahead to the NEXT one,
 # scrape+resolve it in the background, and hand the source closest to their
@@ -2859,6 +2887,32 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
         headers=_STREAM_HEADERS,
     )
 
+# --- SAME-ORIGIN STREAM PROXIES ------------------------------------------
+# Several sources hand the player a same-origin proxy path instead of a raw CDN
+# URL, because the CDN gates segments on a Referer/Origin/UA/ASN the viewer's
+# browser can't satisfy (or serves no usable CORS). Every proxy ends the same
+# way: turn the resolver proxy_fetch result (status, content_type, headers,
+# payload) into the right response — buffered bytes for a rewritten HLS playlist,
+# a streamed body (Range/length headers forwarded) for a media segment. That tail
+# lived copy-pasted in ~10 routes; it lives here once now.
+def _proxy_response(status, content_type, headers, payload, *, forward_bytes_headers=False):
+    """Shape a resolver ``proxy_fetch`` result into a Response/StreamingResponse.
+
+    ``payload`` is either rewritten ``bytes`` (an HLS playlist) or an async byte
+    iterator (a streamed media segment). Bytes responses don't forward upstream
+    headers unless ``forward_bytes_headers`` is set (Jellyfin needs them)."""
+    if isinstance(payload, (bytes, bytearray)):
+        return Response(
+            content=payload,
+            status_code=status,
+            media_type=content_type,
+            headers=headers if forward_bytes_headers else None,
+        )
+    return StreamingResponse(
+        payload, status_code=status, media_type=content_type, headers=headers
+    )
+
+
 # --- MOVISH AD-FREE PROXY ("movish" source) ---
 @app.api_route("/movish_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
 async def movish_proxy(request: Request, host: str, path: str):
@@ -2873,7 +2927,7 @@ async def movish_proxy(request: Request, host: str, path: str):
     to avoid an open proxy)."""
     body = await request.body() if request.method == "POST" else None
     try:
-        status, content_type, headers, payload = await movish_proxy_fetch(
+        result = await movish_proxy_fetch(
             host=host,
             path=path,
             query_string=request.url.query,
@@ -2886,184 +2940,52 @@ async def movish_proxy(request: Request, host: str, path: str):
     except httpx.RequestError as e:
         logger.error(f"Movish proxy upstream error for {host}/{path}: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    # Streaming media (video/binary) — forward Range/length headers.
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
+    return _proxy_response(*result)
 
 
-# --- PLAYIMDB AD-FREE HLS PROXY ("playimdb" source) ---
-@app.get("/playimdb_proxy")
-async def playimdb_proxy(request: Request):
-    """Signed, same-origin HLS proxy for the PlayIMDb source. Fetches a signed
-    upstream playlist/segment with the Referer the PlayIMDb CDNs require
-    (injected server-side), rewrites playlists so sub-resources flow back
-    through this proxy, and streams segments through with Range passthrough.
-
-    The upstream CDN host rotates per request, so instead of a host allow-list
-    this proxy verifies an HMAC on the ``u`` URL (see resolvers.playimdb) and
-    refuses anything unsigned — closing the open-proxy / SSRF hole. No PlayIMDb
-    player or ad code is ever involved; the resolver extracts the raw stream and
-    wraps it in /player."""
-    url = request.query_params.get("u")
-    sig = request.query_params.get("s")
-    try:
-        status, content_type, headers, payload = await playimdb_proxy_fetch(
-            url=url,
-            sig=sig,
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"PlayIMDb proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
+# --- SIGNED SAME-ORIGIN STREAM PROXIES (table-driven) ---
+# These seven are byte-identical: verify the HMAC on the ``u`` query param, fetch
+# the rotating CDN host server-side with the headers it gates on (all inside the
+# resolver's ``proxy_fetch``), rewrite HLS playlists so sub-resources flow back
+# here, and stream segments with Range passthrough. They differ ONLY by which
+# resolver fetches and the log label, so they're registered from a table instead
+# of as N copy-pasted routes. The path stays ``/{name}_proxy`` — the resolvers
+# mint exactly those signed URLs and the player loads them verbatim.
+_SIGNED_STREAM_PROXIES = {
+    "playimdb": (playimdb_proxy_fetch, "PlayIMDb"),
+    "voe": (voe_proxy_fetch, "VOE"),
+    "vidmoly": (vidmoly_proxy_fetch, "Vidmoly"),
+    "vidsrc": (vidsrc_proxy_fetch, "VidSrc"),
+    "cinemabz": (cinemabz_proxy_fetch, "Cinema.bz"),
+    "febbox": (febbox_proxy_fetch, "Febbox"),
+    "animesuge": (animesuge_proxy_fetch, "AnimeSuge"),
+}
 
 
-# --- VOE STREAM PROXY ("Voe" source) ---
-@app.get("/voe_proxy")
-async def voe_proxy(request: Request):
-    """Signed, same-origin HLS proxy for the VOE source. VOE's delivery CDN binds
-    its stream token to the IP/ASN that resolved the embed (note the ``asn=``
-    query param), so the raw playlist/segment URLs 403 from the viewer's browser
-    even though they play for the backend. This fetches the signed upstream
-    playlist/segment server-side, rewrites playlists so sub-resources flow back
-    through this proxy, and streams segments through with Range passthrough.
+def _make_signed_stream_proxy(fetch_fn, label):
+    async def _signed_stream_proxy(request: Request):
+        try:
+            result = await fetch_fn(
+                url=request.query_params.get("u"),
+                sig=request.query_params.get("s"),
+                range_header=request.headers.get("range"),
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=403, detail=str(e))
+        except httpx.RequestError as e:
+            logger.error(f"{label} proxy upstream error: {e}")
+            raise HTTPException(status_code=502, detail="Upstream fetch failed")
+        return _proxy_response(*result)
 
-    The CDN host rotates, so instead of a host allow-list this proxy verifies an
-    HMAC on the ``u`` URL (see resolvers.voe) and refuses anything unsigned —
-    closing the open-proxy / SSRF hole."""
-    url = request.query_params.get("u")
-    sig = request.query_params.get("s")
-    try:
-        status, content_type, headers, payload = await voe_proxy_fetch(
-            url=url,
-            sig=sig,
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"VOE proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
+    return _signed_stream_proxy
 
 
-# --- VIDMOLY STREAM PROXY ("Vidmoly" source) ---
-@app.get("/vidmoly_proxy")
-async def vidmoly_proxy(request: Request):
-    """Signed, same-origin HLS proxy for the Vidmoly source. Fetches the signed
-    upstream playlist/segment server-side (with the vidmoly Referer), rewrites
-    playlists so sub-resources flow back through this proxy, and streams segments
-    through with Range passthrough.
-
-    This exists so the Vidmoly stream can be played in the same-origin Crimson
-    ``/player`` (which gives a real, fullscreen-capable player) instead of being
-    handed to the frontend as a bare cross-origin URL. The CDN host rotates, so
-    instead of a host allow-list the proxy verifies an HMAC on the ``u`` URL (see
-    resolvers.vidmoly) and refuses anything unsigned — closing the open-proxy /
-    SSRF hole."""
-    url = request.query_params.get("u")
-    sig = request.query_params.get("s")
-    try:
-        status, content_type, headers, payload = await vidmoly_proxy_fetch(
-            url=url,
-            sig=sig,
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"Vidmoly proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
-
-
-# --- VIDSRC STREAM PROXY ("VidSrc" / aniwatch megaplay source) ---
-@app.get("/vidsrc_proxy")
-async def vidsrc_proxy(request: Request):
-    """Signed, same-origin HLS proxy for aniwatch's "VidSrc" (megaplay) source.
-    The megaplay delivery CDN is Referer-gated (403s without
-    ``Referer: https://megaplay.buzz/``), which the viewer's browser can't set on
-    its media fetches, so the playlist/segments are fetched server-side here (with
-    that Referer), playlists rewritten so sub-resources flow back through this
-    proxy, and segments streamed through with Range passthrough.
-
-    The CDN host rotates, so instead of a host allow-list this proxy verifies an
-    HMAC on the ``u`` URL (see resolvers.vidsrc) and refuses anything unsigned —
-    closing the open-proxy / SSRF hole."""
-    url = request.query_params.get("u")
-    sig = request.query_params.get("s")
-    try:
-        status, content_type, headers, payload = await vidsrc_proxy_fetch(
-            url=url,
-            sig=sig,
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"VidSrc proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
-
-
-# --- CINEMA.BZ STREAM PROXY ("Cinema.bz (…)" sources) ---
-@app.get("/cinemabz_proxy")
-async def cinemabz_proxy(request: Request):
-    """Signed, same-origin HLS proxy for the cinema.bz sources. cinema.bz's
-    upstream HLS CDN is Referer-gated (403s without ``Referer: https://cinema.bz/``)
-    and the 1shows CDN serves CORS scoped to cinema.bz's own origin (not ``*``), so
-    the raw playlist/segments can't be fetched by the viewer's browser. This fetches
-    the signed upstream playlist/segment server-side (with the cinema.bz Referer),
-    rewrites playlists so sub-resources flow back through this proxy, and streams
-    segments through with Range passthrough.
-
-    The upstream CDN host rotates, so instead of a host allow-list this proxy
-    verifies an HMAC on the ``u`` URL (see resolvers.cinemabz) and refuses anything
-    unsigned — closing the open-proxy / SSRF hole."""
-    url = request.query_params.get("u")
-    sig = request.query_params.get("s")
-    try:
-        status, content_type, headers, payload = await cinemabz_proxy_fetch(
-            url=url,
-            sig=sig,
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"Cinema.bz proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
+for _proxy_name, (_proxy_fn, _proxy_label) in _SIGNED_STREAM_PROXIES.items():
+    app.add_api_route(
+        f"/{_proxy_name}_proxy",
+        _make_signed_stream_proxy(_proxy_fn, _proxy_label),
+        methods=["GET"],
+        name=f"{_proxy_name}_proxy",
     )
 
 
@@ -3081,7 +3003,7 @@ async def screenscape_proxy(request: Request):
     verifies an HMAC over (url, origin, referer) (see resolvers.screenscape) and
     refuses anything unsigned — closing the open-proxy / SSRF hole."""
     try:
-        status, content_type, headers, payload = await screenscape_proxy_fetch(
+        result = await screenscape_proxy_fetch(
             url=request.query_params.get("u"),
             origin=request.query_params.get("o"),
             referer=request.query_params.get("r"),
@@ -3093,80 +3015,7 @@ async def screenscape_proxy(request: Request):
     except httpx.RequestError as e:
         logger.error(f"ScreenScape proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
-
-
-# --- SHOWBOX/FEBBOX DIRECT-FILE PROXY ("showbox" source) ---
-@app.get("/febbox_proxy")
-async def febbox_proxy(request: Request):
-    """Signed, same-origin proxy for the ShowBox/Febbox source. Febbox's player
-    hands back direct mp4 links on a rotating OSS CDN; proxying keeps playback
-    same-origin (no CORS surprises), survives host rotation and gives Range
-    passthrough for seeking. Some qualities come back as HLS, which is rewritten
-    so sub-resources flow back through here.
-
-    The OSS host rotates, so instead of a host allow-list this proxy verifies an
-    HMAC on the ``u`` URL (see resolvers.febbox) and refuses anything unsigned —
-    closing the open-proxy / SSRF hole. The febbox ``ui`` token never reaches the
-    browser: it's only used server-side to mint the direct link in the resolver."""
-    url = request.query_params.get("u")
-    sig = request.query_params.get("s")
-    try:
-        status, content_type, headers, payload = await febbox_proxy_fetch(
-            url=url,
-            sig=sig,
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"Febbox proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
-
-
-# --- ANIMESUGE AD-FREE STREAM PROXY ("animesuge" source) ---
-@app.get("/animesuge_proxy")
-async def animesuge_proxy(request: Request):
-    """Signed, same-origin proxy for the AnimeSuge source. Fetches a signed
-    upstream direct file (mp4/m3u8) server-side, rewrites HLS playlists so
-    sub-resources flow back through this proxy, and streams media through with
-    Range passthrough.
-
-    The direct-file CDN host can rotate, so instead of a host allow-list this
-    proxy verifies an HMAC on the ``u`` URL (see resolvers.animesuge) and refuses
-    anything unsigned — closing the open-proxy / SSRF hole. No AnimeSuge or
-    third-party player/ad code is ever involved; the scraper extracts the raw
-    direct file and the resolver wraps it in /player."""
-    url = request.query_params.get("u")
-    sig = request.query_params.get("s")
-    try:
-        status, content_type, headers, payload = await animesuge_proxy_fetch(
-            url=url,
-            sig=sig,
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"AnimeSuge proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
+    return _proxy_response(*result)
 
 
 # --- JELLYFIN PROXY ("jellyfin" source) ---
@@ -3179,7 +3028,7 @@ async def jellyfin_proxy(request: Request, path: str):
     JELLYFIN_* env vars (see resolvers.jellyfin)."""
     body = await request.body() if request.method == "POST" else None
     try:
-        status, content_type, headers, payload = await jellyfin_proxy_fetch(
+        result = await jellyfin_proxy_fetch(
             path=path,
             query_string=request.url.query,
             method=request.method,
@@ -3191,12 +3040,8 @@ async def jellyfin_proxy(request: Request, path: str):
     except httpx.RequestError as e:
         logger.error(f"Jellyfin proxy upstream error for {path}: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
-
-    if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type, headers=headers)
-    return StreamingResponse(
-        payload, status_code=status, media_type=content_type, headers=headers
-    )
+    # Jellyfin forwards upstream headers on buffered (playlist) responses too.
+    return _proxy_response(*result, forward_bytes_headers=True)
 
 
 # --- LOCAL SOURCE PROXY ("Local" source: admin-registered dirs / NAS) ---
