@@ -470,6 +470,14 @@ async def email_register(request: Request, body: EmailRegisterRequest):
     pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
     account = store.create_email_account(email, pw_hash, body.label)
 
+    # Demo deployments run with no SMTP and want frictionless signup, so skip the
+    # verify-by-email step: mark the account verified and sign the user straight in.
+    # (The nightly DEMO_MODE reset wipes these accounts anyway.)
+    if Config.DEMO_MODE:
+        store.set_email_verified(account["user_id"], True)
+        account = store.get_account(account["user_id"])
+        return {**_session_payload(account, created=True), "requires_verification": False}
+
     token = store.create_email_token(account["user_id"], "verify", VERIFY_TOKEN_TTL)
     await run_in_threadpool(mailer.send_verification_email, email, token)
 

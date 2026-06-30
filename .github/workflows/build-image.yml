@@ -7,7 +7,10 @@ name: Build and Deploy
 #                              (and :dev-<sha>). No deploy.
 #   * a published Release   -> build + push :<tag> and :latest, then deploy that
 #                              immutable :<tag> to the swarm with a health-gated,
-#                              auto-rolling update.
+#                              auto-rolling update. ALSO builds a separate, CLEAN
+#                              demo image (:demo / :demo-<tag>) — NO private source
+#                              overlay baked in — and rolls it onto the crimson-demo
+#                              stack (DEMO_MODE=1, sourceless). See build-demo below.
 #
 # The image is PRIVATE. Pull auth reaches the swarm nodes two ways:
 #   - CI push uses the ephemeral GITHUB_TOKEN (packages: write).
@@ -171,3 +174,67 @@ jobs:
         run: |
           ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" \
             "/home/raymond/dev-crimson-deploy/deploy.sh '${{ needs.build.outputs.image_tag }}'"
+
+  # --- Demo image: a CLEAN build with NO private source overlay -----------------
+  # Built only on a release, alongside the prod `build`. It deliberately OMITS the
+  # sources_pat/sources_repo BuildKit secrets, so the Dockerfile's private-sources
+  # stage is a no-op and NONE of secret-backend-sources is baked into the image. A
+  # SEPARATE buildcache ref (:democache) guarantees the clean build can never restore
+  # a source-bearing layer from the prod cache. The crimson-demo stack runs this with
+  # DEMO_MODE=1 + PRIVATE_SOURCES_ENABLED=0, so the demo resolves nothing.
+  build-demo:
+    needs: gate
+    if: ${{ github.event_name == 'release' }}
+    runs-on: [self-hosted]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Compute demo image tags
+        id: meta
+        run: |
+          VER="${{ github.event.release.tag_name }}"
+          echo "tags=${IMAGE}:demo,${IMAGE}:demo-${VER}" >> "$GITHUB_OUTPUT"
+          # Deploy the immutable per-release demo tag, not the rolling :demo.
+          echo "image_tag=demo-${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (CLEAN — no source overlay)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # NOTE: no `secrets:` block on purpose — without sources_pat/sources_repo the
+          # Dockerfile skips the overlay clone, so the demo image carries none of the
+          # private backend sources. Its own buildcache ref keeps it source-free.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:democache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:democache,mode=max
+
+  # Demo auto-deploy on release: roll the just-built demo-<tag> image onto the
+  # crimson-demo stack. Like the dev deploy it ships NO stack file — the demo
+  # docker-stack.yml lives only on the manager (~/demo-crimson-deploy/), bundling its
+  # own Postgres and the DEMO_MODE env; CI just triggers its deploy.sh.
+  deploy-demo:
+    needs: build-demo
+    if: ${{ github.event_name == 'release' }}
+    runs-on: [self-hosted]
+    steps:
+      - name: Deploy to the demo swarm stack
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" \
+            "/home/raymond/demo-crimson-deploy/deploy.sh '${{ needs.build-demo.outputs.image_tag }}'"
