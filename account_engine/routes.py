@@ -45,6 +45,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import ed25519, mailer, passwords
 from .db import AccountStore, QuotaExceeded, VERIFY_TOKEN_TTL, RESET_TOKEN_TTL
+from core.config import Config
 from core.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,12 @@ def _check_invite_code(code: str) -> bool:
     consume a single-use token — burn that with _consume_invite_code only once
     you're committed to creating the account, so a later 409/validation failure
     doesn't waste it."""
+    # Demo deployments accept any (or no) invite code so anyone can try the haven;
+    # runaway growth is bounded by the nightly DEMO_MODE reset, not the invite gate.
+    # Returning True marks it "static" so _consume_invite_code is a no-op (nothing to
+    # burn).
+    if Config.DEMO_MODE:
+        return True
     code = (code or "").strip()
     static_codes = _allowed_invite_codes()
     is_static = bool(static_codes) and code in static_codes
@@ -462,6 +469,14 @@ async def email_register(request: Request, body: EmailRegisterRequest):
 
     pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
     account = store.create_email_account(email, pw_hash, body.label)
+
+    # Demo deployments run with no SMTP and want frictionless signup, so skip the
+    # verify-by-email step: mark the account verified and sign the user straight in.
+    # (The nightly DEMO_MODE reset wipes these accounts anyway.)
+    if Config.DEMO_MODE:
+        store.set_email_verified(account["user_id"], True)
+        account = store.get_account(account["user_id"])
+        return {**_session_payload(account, created=True), "requires_verification": False}
 
     token = store.create_email_token(account["user_id"], "verify", VERIFY_TOKEN_TTL)
     await run_in_threadpool(mailer.send_verification_email, email, token)

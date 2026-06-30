@@ -50,9 +50,11 @@ from resolvers import _crimson_proxy
 from local_engine.db import LocalSourceStore
 from local_engine.fs import (
     safe_resolve as local_safe_resolve,
+    safe_resolve_transcode as local_safe_resolve_transcode,
     media_type_for as local_media_type,
     is_configured as local_is_configured,
 )
+from local_engine import transcode as local_transcode
 from cache_engine.db import CacheStore
 from cache_engine.fs import (
     safe_resolve as cache_safe_resolve,
@@ -131,7 +133,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "16.1.0"
+VERSION = "16.2.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -287,6 +289,33 @@ async def lifespan(app: FastAPI):
         logger.info("OpenSubtitles configured — /subtitles is enabled")
     else:
         logger.info("OPENSUBTITLES_API_KEY not set — /subtitles will return 503 until configured")
+
+    # DEMO_MODE nightly reset (demo.crimsonhaven.to). Signup is open (invite gate
+    # bypassed in account_engine.routes), so all non-admin account data is wiped each
+    # night to bound growth. Pinned to the single RUN_DB_SYNC replica so multiple
+    # replicas don't race the same DELETE; a demo normally runs one replica with
+    # RUN_DB_SYNC=true (the compose default).
+    if Config.DEMO_MODE:
+        logger.warning(
+            "DEMO_MODE is ON — signup invite gate is bypassed; non-admin data resets "
+            f"nightly at {Config.DEMO_RESET_HOUR:02d}:00 (server time)"
+        )
+        if Config.RUN_DB_SYNC:
+            def _demo_reset():
+                try:
+                    res = account_store.wipe_demo_data()
+                    logger.info(f"DEMO_MODE nightly reset done: {res}")
+                except Exception as e:
+                    logger.error(f"DEMO_MODE nightly reset failed: {e}")
+
+            scheduler.add_job(
+                _demo_reset,
+                trigger=CronTrigger(hour=Config.DEMO_RESET_HOUR, minute=0),
+                id="demo_reset_job",
+                replace_existing=True,
+            )
+        else:
+            logger.info("DEMO_MODE: this replica is not RUN_DB_SYNC — the nightly reset runs on the sync replica")
 
     # The Fribb resync rebuilds the mapping tables wholesale. In a multi-replica
     # Swarm deploy only ONE replica should own it (RUN_DB_SYNC), otherwise every
@@ -447,7 +476,7 @@ app.add_exception_handler(RateLimitExceeded, _voiced_rate_limit_handler)
 # Defined BEFORE the CORS middleware below so CORS remains the outermost layer and
 # its headers are attached even to the 401 we return here (browsers need that to
 # surface the error instead of an opaque CORS failure).
-_PUBLIC_EXACT = {"/", "/lumi", "/health", "/openapi.json", "/docs", "/redoc"}
+_PUBLIC_EXACT = {"/", "/lumi", "/health", "/config", "/openapi.json", "/docs", "/redoc"}
 _PUBLIC_PREFIXES = (
     "/auth/",
     "/kofi/webhook",
@@ -3096,6 +3125,46 @@ async def local_proxy(token: str):
     return FileResponse(real_path, media_type=local_media_type(real_path))
 
 
+@app.get("/local_hls/{token}/{resource}")
+async def local_hls(token: str, resource: str):
+    """On-the-fly HLS for a transcodable Local file (mkv/avi/ts/…) whose source has
+    encoding enabled — the non-direct-play counterpart of /local_proxy.
+
+    ``resource`` is either the VOD playlist (``master.m3u8``/``media.m3u8``) or a
+    segment (``seg{n}.ts``). ``safe_resolve_transcode`` re-validates on EVERY request
+    that the token maps to a transcodable file inside a *currently enabled* source
+    root with **encoding on** — so disabling the source (or just its encoding) instantly
+    404s its transcode streams, exactly like /local_proxy for direct play. Gated by the
+    login wall (NOT a public prefix), so the player must carry the session token; the
+    bytes never leave this host's library unauthenticated."""
+    real_path = await run_in_threadpool(local_safe_resolve_transcode, token)
+    if not real_path:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    duration = await run_in_threadpool(local_transcode.probe_duration, real_path)
+    if not duration:
+        raise HTTPException(status_code=422, detail="Could not probe media")
+
+    if resource in ("master.m3u8", "media.m3u8", "index.m3u8"):
+        playlist = local_transcode.build_media_playlist(duration)
+        return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
+
+    if resource.startswith("seg") and resource.endswith(".ts"):
+        try:
+            index = int(resource[3:-3])
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Not found")
+        if index < 0 or index >= local_transcode.segment_count(duration):
+            raise HTTPException(status_code=404, detail="Not found")
+        data, err = await local_transcode.transcode_segment(real_path, index)
+        if data is None:
+            logger.warning(f"[local_hls] segment {index} failed for {real_path!r}: {err}")
+            raise HTTPException(status_code=502, detail="Transcode failed")
+        return Response(content=data, media_type="video/mp2t")
+
+    raise HTTPException(status_code=404, detail="Not found")
+
+
 @app.get("/cache_proxy/{token}")
 async def cache_proxy(token: str):
     """Stream a server-side-cached episode straight off the NAS.
@@ -3385,6 +3454,20 @@ async def get_movie_overview(tmdb_id: int):
     }
 
 # --- HEALTH CHECK ENDPOINT ---
+@app.get("/config")
+async def public_config():
+    """Public, unauthenticated feature flags the frontend needs *before* login.
+
+    Notably ``demo_mode``: on a demo deployment the login page drops the invite-code
+    requirement (signup is open) and can show a "data resets nightly" hint. Booleans
+    only — no secrets, counts, or paths leak through this (it's reachable without a
+    session, whitelisted in _PUBLIC_EXACT)."""
+    return {
+        "demo_mode": Config.DEMO_MODE,
+        "require_login": Config.REQUIRE_LOGIN,
+    }
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""

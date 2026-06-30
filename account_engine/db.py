@@ -329,6 +329,25 @@ class AccountStore:
             cur = conn.execute("DELETE FROM accounts WHERE user_id = %s", (user_id,))
             return cur.rowcount > 0
 
+    def wipe_demo_data(self) -> Dict[str, int]:
+        """DEMO_MODE nightly reset: delete every NON-admin account — cascading its
+        sessions, favorites, watch progress and email tokens via ON DELETE CASCADE —
+        plus all challenges and invite tokens. Admin accounts (seeded from
+        ADMIN_EMAILS) are preserved so the operator keeps dashboard access without a
+        restart (is_admin is only re-seeded at startup). Returns row counts, for
+        logging. Bounds the growth of an open-signup demo to a single day."""
+        with self._connect() as conn:
+            accounts = conn.execute(
+                "DELETE FROM accounts WHERE is_admin = FALSE"
+            ).rowcount
+            challenges = conn.execute("DELETE FROM challenges").rowcount
+            invites = conn.execute("DELETE FROM invite_tokens").rowcount
+        return {
+            "accounts_deleted": accounts,
+            "challenges_deleted": challenges,
+            "invites_deleted": invites,
+        }
+
     def list_accounts(
         self, search: Optional[str] = None, limit: int = 50, offset: int = 0
     ) -> List[Dict]:
