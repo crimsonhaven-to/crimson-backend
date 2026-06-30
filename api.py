@@ -121,7 +121,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "15.6.0"
+VERSION = "15.7.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -1915,27 +1915,30 @@ async def _grant_febbox(
     out: List[Dict] = []
     for embed in embeds:
         try:
-            res = await resolver.resolve_direct(embed)
+            streams = await resolver.resolve_direct(embed)
         except Exception as e:
             logger.warning(f"[resolve] febbox resolve_direct failed: {type(e).__name__} - {e}")
             continue
-        if not res or not res.get("url"):
-            continue
-        subs = res.get("subtitles") or []
-        if base_url:
-            subs = [
-                {**s, "url": base_url.rstrip("/") + s["url"]}
-                if isinstance(s.get("url"), str) and s["url"].startswith("/") else s
-                for s in subs
-            ]
-        out.append({
-            "label": resolver.source_name,  # "ShowBox" -> dedups with the /watch tile
-            "streamType": res.get("streamType") or "mp4",
-            "url": res["url"],
-            "headers": res.get("headers") or {},
-            "subtitles": subs,
-            "language": None,
-        })
+        # resolve_direct returns one stream per quality variant (best-first).
+        for res in streams or []:
+            if not res.get("url"):
+                continue
+            subs = res.get("subtitles") or []
+            if base_url:
+                subs = [
+                    {**s, "url": base_url.rstrip("/") + s["url"]}
+                    if isinstance(s.get("url"), str) and s["url"].startswith("/") else s
+                    for s in subs
+                ]
+            out.append({
+                # per-quality "ShowBox (1080p)" -> dedups with the matching /watch tile
+                "label": res.get("label") or resolver.source_name,
+                "streamType": res.get("streamType") or "mp4",
+                "url": res["url"],
+                "headers": res.get("headers") or {},
+                "subtitles": subs,
+                "language": res.get("language"),
+            })
     return out
 
 
