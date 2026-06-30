@@ -108,6 +108,7 @@ from metadata_engine.tmdb import (
     fetch_tmdb_movie_search_results,
     fetch_trending_movies,
     fetch_tmdb_localized_titles,
+    fetch_tmdb_imdb_id,
 )
 from metadata_engine.anilist import fetch_anilist_metadata, _empty
 from metadata_engine import maintenance as metadata_maintenance
@@ -121,7 +122,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "15.7.0"
+VERSION = "15.8.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -1777,6 +1778,10 @@ async def get_scrape_meta(request: Request, tmdb_id: int, season_number: int):
     so anonymous users can't use it as a free metadata service."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
 
+    # Release year + IMDb id — for the year-disambiguated (hdrezka/lookmovie) and
+    # IMDb-keyed (insertunit) client sources. Both cached + best-effort.
+    release_year, imdb_id = await _show_year_imdb(tmdb_id)
+
     if anilist_id:
         async with http_client() as client:
             anilist_data = await fetch_anilist_metadata(client, anilist_id) or {}
@@ -1790,6 +1795,8 @@ async def get_scrape_meta(request: Request, tmdb_id: int, season_number: int):
             "title_romaji": anilist_data.get("title_romaji"),
             "title_native": anilist_data.get("title_native"),
             "synonyms": synonyms,
+            "release_year": release_year,
+            "imdb_id": imdb_id,
         }
 
     # No-AniList path (TMDB-only seasons of long shows): the primary title is the
@@ -1817,6 +1824,61 @@ async def get_scrape_meta(request: Request, tmdb_id: int, season_number: int):
         "title_romaji": None,
         "title_native": None,
         "synonyms": synonyms,
+        "release_year": release_year,
+        "imdb_id": imdb_id,
+    }
+
+
+def _year_from_date(date_str: Optional[str]) -> Optional[int]:
+    """Pull the 4-digit year off a TMDB date ("2023-07-21" -> 2023)."""
+    if not date_str or len(date_str) < 4 or not date_str[:4].isdigit():
+        return None
+    return int(date_str[:4])
+
+
+async def _show_year_imdb(tmdb_id: int) -> Tuple[Optional[int], Optional[str]]:
+    """(release_year, imdb_id) for a TMDB show; best-effort, both cached."""
+    try:
+        async with http_client() as client:
+            show = await fetch_tmdb_show(client, tmdb_id)
+            imdb = await fetch_tmdb_imdb_id(client, tmdb_id, "tv")
+        return _year_from_date((show or {}).get("first_air_date")), imdb
+    except Exception as e:
+        logger.warning(f"scrape-meta year/imdb failed for show {tmdb_id}: {e}")
+        return None, None
+
+
+@app.get("/scrape-meta/movie/{tmdb_id}")
+@limiter.limit("60/minute")
+async def get_scrape_meta_movie(request: Request, tmdb_id: int):
+    """Movie twin of /scrape-meta — the title + release year + IMDb id the
+    title/IMDb-keyed client sources (hdrezka/lookmovie/insertunit) need to match a
+    movie. The TMDB key stays server-side (C5). Login-gated like /watch."""
+    title = None
+    release_year = None
+    imdb_id = None
+    try:
+        info = get_movie_info(tmdb_id)
+        title = info.get("title") if info else None
+        async with http_client() as client:
+            movie = await fetch_tmdb_movie(client, tmdb_id)
+            if not title:
+                title = (movie or {}).get("title")
+            release_year = _year_from_date((movie or {}).get("release_date"))
+            imdb_id = await fetch_tmdb_imdb_id(client, tmdb_id, "movie")
+    except Exception as e:
+        logger.warning(f"scrape-meta(movie) enrichment failed for {tmdb_id}: {e}")
+
+    return {
+        "success": True,
+        "anilist_id": None,
+        "title": title,
+        "title_english": title,
+        "title_romaji": None,
+        "title_native": None,
+        "synonyms": [],
+        "release_year": release_year,
+        "imdb_id": imdb_id,
     }
 
 
