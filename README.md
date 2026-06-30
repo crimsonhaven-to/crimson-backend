@@ -7,24 +7,34 @@ This is the **brain** of our streaming sanctuary: TMDB↔AniList metadata, accou
 and the orchestration that ties it all together — served fast over a progressive
 NDJSON `/watch` stream.
 
-> ## 🩸 Important: this backend does **not** scrape third-party streaming sites
+> ## 🩸 A word from Lumi — the disclaimer, made crimson
 >
-> For legal reasons — and because this repository is **public** — the backend no
-> longer scrapes or resolves any third-party source. All of that logic was moved
-> into the **private** [`crimson-sources`](../crimson-sources) package, which runs
-> **client-side** in the viewer's own browser (with the
+> Let me be perfectly clear, little mortal: this is — at its heart — an **expansive,
+> performance-oriented streaming *framework*** with a metadata brain that natively
+> maps **TMDB ↔ AniList** (per-season, with graceful TMDB fallback), runs accounts
+> and a members-only login wall, recommendations, supporters and an admin dashboard,
+> and orchestrates it all over a progressive NDJSON `/watch` stream. That is what it
+> *is*, and it does it beautifully.
+>
+> What it is **not** is a pirate ship. Crimson Backend does **not host, store, embed,
+> or ship any sources** — there are no third-party scrapers, no resolvers, no
+> playlists and no pre-loaded streams anywhere in this repository, and I do **not**
+> condone piracy. It is a neutral, hollow vessel; what (lawfully) fills it is entirely
+> yours to decide.
+>
+> The only media the backend ever serves is **operator-owned** — things *you*, the
+> operator, already control: **Local** (your own NAS / bind-mounted directories),
+> **Cache** (episodes this server already remuxed onto your own NAS), and **Jellyfin**
+> (your own self-hosted media server). Plus one inert, documented **template** source
+> that shows the contract for wiring in another operator-owned source. Should you ever
+> add your own third-party providers, they live in a **private** repository of your
+> own and resolve **client-side**, in the viewer's browser — helped by the optional
 > [companion extension](../crimson-extension) and/or the
-> [`crimson-proxy`](../crimson-proxy) edge relay).
+> [`crimson-proxy`](../crimson-proxy) edge relay. Albeit sources can be added into the
+> backend, it is not advisable to do so since the streams usually require to be proxied
+> through this very backend, and bandwidth is both hard to scale and quite expensive~
 >
-> What the backend *does* still serve are **operator-owned sources** — media the
-> server operator controls, which is not third-party scraping:
-> **Local** (your own NAS / bind-mounted directories), **Cache** (episodes this
-> server already remuxed onto your NAS), and **Jellyfin** (your own self-hosted
-> media server). Plus an inert, documented **template** source that shows the
-> contract for adding another operator-owned source.
->
-> See [`New_System.md`](New_System.md) for the full architecture and
-> [`New_System_Progress.md`](New_System_Progress.md) for the build log.
+> See [`New_System.md`](New_System.md) for the full architecture
 
 ## 🩸 Core Features
 
