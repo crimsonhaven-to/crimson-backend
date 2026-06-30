@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crimsonhaven.to/contracts/watch_ndjson/v1",
+  "title": "Crimson /watch NDJSON line",
+  "description": "One line of the /watch line-delimited JSON stream. Discriminated on `type`. Generated from core/contracts.py — do not edit by hand.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "type",
+        "success",
+        "tmdb_id",
+        "season_number",
+        "episode_number",
+        "anilist_id",
+        "title"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "meta"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "tmdb_id": {
+          "type": "integer"
+        },
+        "season_number": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "episode_number": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "anilist_id": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "type",
+        "air_date",
+        "title",
+        "season_number",
+        "episode_number"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "unaired"
+        },
+        "air_date": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "season_number": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "episode_number": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "type",
+        "source",
+        "streamType",
+        "url",
+        "language",
+        "subtitles"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "stream"
+        },
+        "source": {
+          "type": "string"
+        },
+        "streamType": {
+          "enum": [
+            "hls",
+            "mp4",
+            "iframe"
+          ]
+        },
+        "url": {
+          "type": "string"
+        },
+        "language": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subtitles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "required": [
+              "url",
+              "lang"
+            ],
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "lang": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "cacheTicket": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "type",
+        "count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "done"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  ]
+}

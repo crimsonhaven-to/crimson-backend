@@ -1,0 +1,5888 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Anime Streaming API",
+    "description": "API for streaming anime with multi-season support",
+    "version": "15.8.0"
+  },
+  "paths": {
+    "/auth/challenge": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Auth Challenge",
+        "description": "Issue a one-time challenge for a public key. The client signs the\nreturned ``challenge`` string with its Ed25519 private key, then calls\n/auth/register or /auth/login.",
+        "operationId": "auth_challenge_auth_challenge_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChallengeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/register": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Auth Register",
+        "description": "Create the account for a public key (proving key possession via the\nsigned challenge) and return a session. 409 if the key is already\nregistered — use /auth/login instead.\n\nCreating a NEW mnemonic account is invite-gated (``invite_code``) exactly like\nemail signup, so a freshly minted client-side keypair can't bypass the\ninvite-only site. Existing mnemonic accounts are unaffected — they sign in via\n/auth/login and need no code.\n\nOrdering is deliberate so nothing one-time is wasted on a doomed attempt:\nthe account-exists check (409) and invite-code validity check (403) both run\nBEFORE the (one-time) challenge is consumed — so a 409 leaves the challenge\nintact for a /auth/login retry with the same challenge (the frontend tries\nregister then falls back to login on a single challenge) — and the single-use\ninvite token is only burned once the signed challenge has verified.",
+        "operationId": "auth_register_auth_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Auth Login",
+        "description": "Log in to an existing account by signing the challenge. 404 if the public\nkey isn't registered yet — use /auth/register.\n\nThe account-exists check runs BEFORE the (one-time) challenge is consumed,\nso a 404 leaves the challenge intact for a /auth/register fallback with the\nsame challenge (the common 'link identity' frontend flow: try login, then\nregister the new key).",
+        "operationId": "auth_login_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Auth Logout",
+        "description": "Revoke the current session token.",
+        "operationId": "auth_logout_auth_logout_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/email/register": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Email Register",
+        "description": "Create an email+password account (invite-gated, unverified) and email a\nverification link. Returns 403 on a bad invite code, 409 if the email is\ntaken. No session is issued until the email is verified.",
+        "operationId": "email_register_auth_email_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailRegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/email/login": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Email Login",
+        "description": "Log in with email + password. Returns a session on success. 401 on bad\ncredentials (deliberately generic, no account-existence oracle); 403 if the\nemail isn't verified yet.",
+        "operationId": "email_login_auth_email_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/email/verify": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Email Verify",
+        "description": "Consume a verification token, mark the email verified, and sign the user\nin (returns a session) so verifying lands them straight in the app.",
+        "operationId": "email_verify_auth_email_verify_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/email/resend": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Email Resend",
+        "description": "Resend the verification email. Always returns success (no account-exists\noracle); only actually sends for an existing, still-unverified account.",
+        "operationId": "email_resend_auth_email_resend_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailOnlyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/email/forgot": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Email Forgot",
+        "description": "Start a password reset. Always returns success (no account-exists oracle);\nonly sends for an existing email+password account.",
+        "operationId": "email_forgot_auth_email_forgot_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailOnlyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/email/reset": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Email Reset",
+        "description": "Complete a password reset: consume the token, set the new password, revoke\nall existing sessions, and (since controlling the inbox proves ownership)\nmark the email verified.",
+        "operationId": "email_reset_auth_email_reset_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetPasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/me": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Account Me",
+        "operationId": "account_me_account_me_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/preferences": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Get Preferences",
+        "description": "The account's stored client preferences (``{}`` when none set yet).",
+        "operationId": "get_preferences_account_preferences_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Put Preferences",
+        "description": "Replace the account's client preferences with the JSON object in the body.\n\nThe body is a small JSON object (sent raw, mirroring the import endpoint to\nkeep the slim image multipart-free). Purely additive: it never affects auth,\nfavorites or progress, and a client that never calls this is unchanged.",
+        "operationId": "put_preferences_account_preferences_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/username": {
+      "put": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Set Username",
+        "description": "Set or clear the account's cosmetic display name. Trimmed; an empty value\nclears it. Purely additive — never affects auth, favorites or progress.",
+        "operationId": "set_username_account_username_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UsernameIn"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/favorites": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Get Favorites",
+        "operationId": "get_favorites_account_favorites_get",
+        "parameters": [
+          {
+            "name": "list_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to one list; omit for all lists",
+              "title": "List Name"
+            },
+            "description": "Filter to one list; omit for all lists"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Add Favorite",
+        "operationId": "add_favorite_account_favorites_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FavoriteIn"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Remove Favorite",
+        "description": "Remove a favorite by item_key, or by tmdb_id / anilist_id.\n\nWith ``list_name`` the show is removed from that list only; without it the\nshow is removed from every list it belongs to.",
+        "operationId": "remove_favorite_account_favorites_delete",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "anilist_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Anilist Id"
+            }
+          },
+          {
+            "name": "item_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Item Key"
+            }
+          },
+          {
+            "name": "media_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "'movie' to target the movie namespace",
+              "title": "Media Type"
+            },
+            "description": "'movie' to target the movie namespace"
+          },
+          {
+            "name": "list_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Remove from one list; omit for all lists",
+              "title": "List Name"
+            },
+            "description": "Remove from one list; omit for all lists"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/watchlists": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Get Watchlists",
+        "description": "The user's distinct list names, each with its item count.",
+        "operationId": "get_watchlists_account_watchlists_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/favorites/export": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Export Favorites",
+        "description": "Download every watchlist (all lists at once) as a single file.\n\n``csv`` is the spreadsheet-friendly default; ``json`` is a round-trippable\nbackup that preserves types/nulls. Either way it's one row/object per show,\nnewest-first, carrying the list it belongs to in ``list_name`` so all lists\ncoexist in one file. Served as an attachment so the browser saves it.",
+        "operationId": "export_favorites_account_favorites_export_get",
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(csv|json)$",
+              "description": "csv (default) or json",
+              "default": "csv",
+              "title": "Format"
+            },
+            "description": "csv (default) or json"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/favorites/import": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Import Favorites",
+        "description": "Restore watchlists from a previously-exported CSV or JSON file.\n\nThe file is sent as the raw request body (no multipart — keeps the slim image\ndependency-free); its format is sniffed from the content. Round-trips the\n/export output: each row is upserted into the list named in its ``list_name``\ncolumn (defaulting to 'favorites'), keyed by AniList id when present else TMDB\nid, so re-importing is idempotent. ``mode=replace`` wipes every existing list\nfirst (a clean restore); the default ``merge`` keeps what's there and\nadds/updates. Rows without any id are skipped; rows past the account cap are\nreported in ``skipped``.",
+        "operationId": "import_favorites_account_favorites_import_post",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(merge|replace)$",
+              "description": "merge (default) adds to your existing lists; replace clears all your lists first",
+              "default": "merge",
+              "title": "Mode"
+            },
+            "description": "merge (default) adds to your existing lists; replace clears all your lists first"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/progress": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Get Progress",
+        "operationId": "get_progress_account_progress_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter: in_progress | completed",
+              "title": "Status"
+            },
+            "description": "Filter: in_progress | completed"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Upsert Progress",
+        "operationId": "upsert_progress_account_progress_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProgressIn"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Remove Progress",
+        "operationId": "remove_progress_account_progress_delete",
+        "parameters": [
+          {
+            "name": "item_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Item Key"
+            }
+          },
+          {
+            "name": "tmdb_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "anilist_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Anilist Id"
+            }
+          },
+          {
+            "name": "season_number",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Season Number"
+            }
+          },
+          {
+            "name": "episode_number",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Episode Number"
+            }
+          },
+          {
+            "name": "media_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "'movie' to target the movie namespace",
+              "title": "Media Type"
+            },
+            "description": "'movie' to target the movie namespace"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/continue-watching": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Continue Watching",
+        "description": "In-progress shows, most-recently-watched first — for a 'Continue Watching'\nrow on the frontend.\n\nCollapsed to one entry per show (latest in-progress episode), so a series\nyou're partway through several episodes of appears once.",
+        "operationId": "continue_watching_account_continue_watching_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account/recent": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "summary": "Recent",
+        "description": "Recently-watched shows of *any* status (in_progress + completed),\nmost-recently-watched first — for a 'Recent' / 'History' row on the frontend.\n\nCollapsed to one entry per show: a viewer who watched several episodes of the\nsame series shows up once, carrying that show's most recent episode (and its\nprogress). Rows are newest-first, so the first time we see a show is its\nlatest episode. Unlike /account/continue-watching (which is in_progress only),\nthis keeps finished episodes so the history stays populated after completion.",
+        "operationId": "recent_account_recent_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "Max items to return",
+              "default": 20,
+              "title": "Limit"
+            },
+            "description": "Max items to return"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/stats": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Admin Stats",
+        "description": "Account-system + content aggregates for the dashboard. (System info —\nscrapers/resolvers/jellyfin — is on the public /health endpoint the frontend\nalso reads.)",
+        "operationId": "admin_stats_admin_stats_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/system": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Admin System",
+        "description": "Rich runtime snapshot for the dashboard: version + uptime, the scraper/\nresolver registry sizes, capability flags, DB-pool utilisation and the\nserver-side cache aggregate. Provided by api.py (it owns the registries).",
+        "operationId": "admin_system_admin_system_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/source-health": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Admin Source Health",
+        "description": "Per-source health: probe every external scrape source against a known canary\ntitle (green = embeds resolved, yellow = reachable but empty, red = error) and\nreport the operator-provided library sources' configuration. Results are cached\nserver-side for a few minutes; pass ``force=true`` to re-probe immediately.\n\nThe probe runs the real search→embeds pipeline, so a green source is one that\nwould actually play right now. Provided by api.py (it owns the pipeline).",
+        "operationId": "admin_source_health_admin_source_health_get",
+        "parameters": [
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Bypass the short result cache and re-probe now",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "Bypass the short result cache and re-probe now"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/users": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Users",
+        "operationId": "list_users_admin_users_get",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Match email / label / id",
+              "title": "Search"
+            },
+            "description": "Match email / label / id"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/users/{user_id}": {
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Update User",
+        "description": "Toggle a user's admin / verified flags. You can't revoke your OWN admin\nflag (locking yourself out), nor demote the last remaining admin.",
+        "operationId": "update_user_admin_users__user_id__patch",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Delete User",
+        "description": "Delete an account and (via ON DELETE CASCADE) its favorites / progress /\nsessions. You cannot delete your own account here.",
+        "operationId": "delete_user_admin_users__user_id__delete",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/users/{user_id}/revoke-sessions": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Revoke User Sessions",
+        "description": "Force-log-out a user by dropping all their active sessions.",
+        "operationId": "revoke_user_sessions_admin_users__user_id__revoke_sessions_post",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/invites": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Invites",
+        "operationId": "list_invites_admin_invites_get",
+        "parameters": [
+          {
+            "name": "include_used",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Include Used"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Create Invites",
+        "description": "Mint ``count`` single-use invite codes (optionally expiring after\n``ttl_hours``). Same table/contract the Discord bot uses, so the codes drop\nstraight into the signup form's invite field.",
+        "operationId": "create_invites_admin_invites_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/invites/{code}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Revoke Invite",
+        "operationId": "revoke_invite_admin_invites__code__delete",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Code"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api-keys": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Api Keys",
+        "description": "List minted bridge keys (never the raw secret — that's shown once, at\ncreation). ``id`` is each key's handle for revocation.",
+        "operationId": "list_api_keys_admin_api_keys_get",
+        "parameters": [
+          {
+            "name": "include_revoked",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Include Revoked"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Create Api Key",
+        "description": "Mint a movie-web bridge key. The raw key is returned exactly ONCE in this\nresponse (only its hash is stored) — copy it into the fork's proxy secret now;\nit can't be retrieved later, only revoked + replaced.",
+        "operationId": "create_api_key_admin_api_keys_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiKeyCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api-keys/{key_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Revoke Api Key",
+        "description": "Revoke a bridge key by its id. Takes effect within the login wall's\nvalidation-cache TTL (~60s).",
+        "operationId": "revoke_api_key_admin_api_keys__key_id__delete",
+        "parameters": [
+          {
+            "name": "key_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Key Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/resync/status": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Resync Status",
+        "operationId": "resync_status_admin_resync_status_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/resync": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Trigger Resync",
+        "description": "Kick off a forced AniList<->TMDB mapping resync in the background (the same\nwholesale rebuild metadata_engine.resync runs). Returns immediately; poll\n/admin/resync/status for progress. A no-op if one is already running.",
+        "operationId": "trigger_resync_admin_resync_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/backfill/status": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Backfill Status",
+        "operationId": "backfill_status_admin_backfill_status_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/backfill": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Trigger Backfill",
+        "description": "Queue a non-anime catalogue backfill — page TMDB discover and lazily cache\neach (non-anime, postered) show/movie into tmdb_shows / tmdb_movies. The job is\nwritten to the DB and picked up within ~a minute by the api-sync container (so\nonly that one container churns the metadata); poll /admin/backfill/status for\nprogress. A no-op if one is already queued or running.",
+        "operationId": "trigger_backfill_admin_backfill_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/BackfillTrigger"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/local-sources": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Local Sources",
+        "operationId": "list_local_sources_admin_local_sources_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Add Local Source",
+        "description": "Register a directory. Validated up front (must be an absolute, existing,\nreadable directory *inside the backend container*) so a wrong path / missing\nbind-mount fails loudly here instead of silently resolving nothing later.",
+        "operationId": "add_local_source_admin_local_sources_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalSourceCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/local-sources/discover": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Discover Local Sources",
+        "description": "Best-effort candidate directories (Docker bind-mounts / NAS mounts visible\ninside the container) the admin can add with one click. Advisory only.",
+        "operationId": "discover_local_sources_admin_local_sources_discover_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/local-sources/{source_id}": {
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Update Local Source",
+        "description": "Toggle a source on/off or rename it (the path is immutable — delete + re-add).",
+        "operationId": "update_local_source_admin_local_sources__source_id__patch",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Source Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalSourceUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Delete Local Source",
+        "operationId": "delete_local_source_admin_local_sources__source_id__delete",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Source Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/cache": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Cache Overview",
+        "description": "Global cache status for the dashboard: master switch, ffmpeg availability,\ndownload config, and aggregate counts/bytes.",
+        "operationId": "cache_overview_admin_cache_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/cache/settings": {
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Update Cache Settings",
+        "description": "Flip the global cache master switch. With it off, no new downloads start;\nalready-cached episodes keep playing as long as their target stays enabled.",
+        "operationId": "update_cache_settings_admin_cache_settings_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CacheSettingsUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/cache-targets": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Cache Targets",
+        "operationId": "list_cache_targets_admin_cache_targets_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Add Cache Target",
+        "description": "Register a NAS directory as a cache target. Must be an absolute, existing,\nWRITABLE directory inside the backend container (bind-mount it first).",
+        "operationId": "add_cache_target_admin_cache_targets_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CacheTargetCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/cache-targets/discover": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Discover Cache Targets",
+        "description": "Candidate NAS/bind-mount directories (probed for writability + free space)\nthe admin can register with one click. Advisory only.",
+        "operationId": "discover_cache_targets_admin_cache_targets_discover_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/cache-targets/{target_id}": {
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Update Cache Target",
+        "description": "Rename a target (its name is what viewers see as the source) or toggle it\non/off. The path is immutable — delete + re-add to move it.",
+        "operationId": "update_cache_target_admin_cache_targets__target_id__patch",
+        "parameters": [
+          {
+            "name": "target_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Target Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CacheTargetUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Delete Cache Target",
+        "description": "Remove a target. Its cached_episodes rows cascade-delete; the files on the\nNAS are left in place (delete them on the share if you want the space back).",
+        "operationId": "delete_cache_target_admin_cache_targets__target_id__delete",
+        "parameters": [
+          {
+            "name": "target_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Target Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/cached-episodes": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Cached Episodes",
+        "operationId": "list_cached_episodes_admin_cached_episodes_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ready / pending / downloading / failed",
+              "title": "Status"
+            },
+            "description": "ready / pending / downloading / failed"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/cached-episodes/{entry_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Delete Cached Episode",
+        "description": "Drop a cache entry and delete its file from the NAS. Deleting a 'failed'\nentry also lets the episode be re-cached on its next play.",
+        "operationId": "delete_cached_episode_admin_cached_episodes__entry_id__delete",
+        "parameters": [
+          {
+            "name": "entry_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Entry Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/kofi/webhook": {
+      "post": {
+        "tags": [
+          "supporters"
+        ],
+        "summary": "Kofi Webhook",
+        "description": "Receive a Ko-fi payment webhook and append it to the ledger.\n\nKo-fi sends ``application/x-www-form-urlencoded`` with one ``data`` field\nwhose value is the event JSON (including a ``verification_token`` we match\nagainst ``KOFI_VERIFICATION_TOKEN``). Always answers 200 on a duplicate so\nKo-fi stops retrying; rejects a bad/absent token with 401.",
+        "operationId": "kofi_webhook_kofi_webhook_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/supporters": {
+      "get": {
+        "tags": [
+          "supporters"
+        ],
+        "summary": "List Supporters",
+        "description": "Public list for the 'Lumi's Loved Mortals' page. No auth. Most-recent\npayment first. Lapsed subscribers are hidden unless ``include_lapsed=true``.",
+        "operationId": "list_supporters_supporters_get",
+        "parameters": [
+          {
+            "name": "include_lapsed",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Include subscribers whose membership has lapsed.",
+              "default": false,
+              "title": "Include Lapsed"
+            },
+            "description": "Include subscribers whose membership has lapsed."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 1000,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cap the number of supporters returned.",
+              "title": "Limit"
+            },
+            "description": "Cap the number of supporters returned."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/supporters/stats": {
+      "get": {
+        "tags": [
+          "supporters"
+        ],
+        "summary": "Supporters Stats",
+        "description": "Aggregate totals for a page header (e.g. 'N loved mortals • X brewed').\n\nSums over *active* supporters (same rule as /supporters). ``total_raised`` is\na naive cross-currency sum; ``currency`` is the most common one seen.",
+        "operationId": "supporters_stats_supporters_stats_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/changelog": {
+      "get": {
+        "tags": [
+          "changelog"
+        ],
+        "summary": "Get Changelog",
+        "description": "Release notes for the haven, newest first.\n\nReturns 503 until a ``GITHUB_TOKEN`` is configured (see the service module).\nEach entry carries ``{tag, name, body (Markdown), published_at, url,\nprerelease, author}``. ``stale: true`` means GitHub was unreachable on the last\nrefresh and these are the last-known notes (served rather than failing).",
+        "operationId": "get_changelog_changelog_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/recommendations": {
+      "get": {
+        "tags": [
+          "recommendations"
+        ],
+        "summary": "Get Recommendations",
+        "description": "Personalized \"watch next\" feed across anime, shows and movies, ranked by the\ngenres of the titles you've saved and watched.\n\nReturns an empty list (with ``based_on.seed_count == 0``) when there's nothing\nto learn from yet — a brand-new account, or one whose history has no genres on\nrecord. The frontend can fall back to /trending in that case.",
+        "operationId": "get_recommendations_recommendations_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "description": "Max recommendations to return",
+              "default": 24,
+              "title": "Limit"
+            },
+            "description": "Max recommendations to return"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/recommendations/similar/{anilist_id}": {
+      "get": {
+        "tags": [
+          "recommendations"
+        ],
+        "summary": "Get Similar",
+        "description": "\"More like this\": anime that share genres with one given title. Public (no\nauth) so it can power a 'Recommended' row on the overview page. 404 if the\nanilist id has no genres on record.",
+        "operationId": "get_similar_recommendations_similar__anilist_id__get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Anilist Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "description": "Max recommendations to return",
+              "default": 20,
+              "title": "Limit"
+            },
+            "description": "Max recommendations to return"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subtitles": {
+      "get": {
+        "tags": [
+          "subtitles"
+        ],
+        "summary": "List Subtitles",
+        "description": "External subtitle tracks for a title from OpenSubtitles.\n\nReturns ``{success, subtitles: [{url, lang, label}]}``; ``url`` is a signed,\nsame-origin ``/subtitles_proxy`` path the player can hand straight to a\n``<track>``. Returns 503 when ``OPENSUBTITLES_API_KEY`` isn't configured.\nNever raises on upstream trouble — an empty list just means \"no tracks found\".",
+        "operationId": "list_subtitles_subtitles_get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "description": "TMDB id (show id for episodes, movie id for movies)",
+              "title": "Tmdb Id"
+            },
+            "description": "TMDB id (show id for episodes, movie id for movies)"
+          },
+          {
+            "name": "languages",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Comma-separated 2-letter language codes, e.g. en,de",
+              "default": "en",
+              "title": "Languages"
+            },
+            "description": "Comma-separated 2-letter language codes, e.g. en,de"
+          },
+          {
+            "name": "season",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Season"
+            }
+          },
+          {
+            "name": "episode",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Episode"
+            }
+          },
+          {
+            "name": "is_movie",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Is Movie"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subtitles_proxy": {
+      "get": {
+        "tags": [
+          "subtitles"
+        ],
+        "summary": "Subtitles Proxy",
+        "description": "Download + convert one subtitle file to WebVTT and serve it same-origin.\n\nPublic (the ``<track>`` can't send auth) but the ``f`` file_id is HMAC-signed —\nan unsigned/forged id is rejected so the proxy can't be driven to drain our\nOpenSubtitles download quota. The converted VTT is cached by file_id, so a\nre-selected track / second viewer doesn't spend quota again.",
+        "operationId": "subtitles_proxy_subtitles_proxy_get",
+        "parameters": [
+          {
+            "name": "f",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "OpenSubtitles file_id (HMAC-signed)",
+              "title": "F"
+            },
+            "description": "OpenSubtitles file_id (HMAC-signed)"
+          },
+          {
+            "name": "s",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "signature",
+              "title": "S"
+            },
+            "description": "signature"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/skiptimes": {
+      "get": {
+        "tags": [
+          "skiptimes"
+        ],
+        "summary": "Get Skip Times",
+        "description": "Intro/outro skip intervals for an anime episode.\n\nReturns ``{success, found, mal_id, op, ed, episode_length}`` where ``op``/``ed``\nare ``{start, end}`` (seconds) or ``null``. Never errors on missing data — an\nanime with no AniList ``idMal`` or no AniSkip submissions just yields\n``found: false``.",
+        "operationId": "get_skip_times_skiptimes_get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "description": "AniList id of the anime (anime-only)",
+              "title": "Anilist Id"
+            },
+            "description": "AniList id of the anime (anime-only)"
+          },
+          {
+            "name": "episode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Absolute episode number for the season",
+              "title": "Episode"
+            },
+            "description": "Absolute episode number for the season"
+          },
+          {
+            "name": "episode_length",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Player-known episode length in seconds (improves accuracy; 0 = unknown)",
+              "default": 0,
+              "title": "Episode Length"
+            },
+            "description": "Player-known episode length in seconds (improves accuracy; 0 = unknown)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "summary": "Root",
+        "description": "API root endpoint",
+        "operationId": "root__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/lumi": {
+      "get": {
+        "summary": "Lumi Blessing",
+        "description": "A little shrine to the empress. Returns a random royal blessing — used by\nthe frontend's Konami-code secret page and anyone curious enough to find it.\nPublic (whitelisted on the login wall) so Lumi greets even the uninvited.",
+        "operationId": "lumi_blessing_lumi_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/search/anime": {
+      "get": {
+        "summary": "Search Anime By Name",
+        "description": "Search for anime by name",
+        "operationId": "search_anime_by_name_search_anime_get",
+        "parameters": [
+          {
+            "name": "query_name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Anime name to search",
+              "title": "Query Name"
+            },
+            "description": "Anime name to search"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trending": {
+      "get": {
+        "summary": "Get Trending Anime",
+        "description": "Get trending anime",
+        "operationId": "get_trending_anime_trending_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "description": "Number of results to return",
+              "default": 10,
+              "title": "Limit"
+            },
+            "description": "Number of results to return"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/search/shows": {
+      "get": {
+        "summary": "Search Shows By Name",
+        "description": "Search for non-anime TV shows by name (kind='show', keyed by tmdb_id).",
+        "operationId": "search_shows_by_name_search_shows_get",
+        "parameters": [
+          {
+            "name": "query_name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "TV show name to search",
+              "title": "Query Name"
+            },
+            "description": "TV show name to search"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trending/shows": {
+      "get": {
+        "summary": "Get Trending Shows",
+        "description": "Get trending non-anime TV shows.",
+        "operationId": "get_trending_shows_trending_shows_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "description": "Number of results to return",
+              "default": 10,
+              "title": "Limit"
+            },
+            "description": "Number of results to return"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/search/movies": {
+      "get": {
+        "summary": "Search Movies By Name",
+        "description": "Search for general movies by name (kind='movie', keyed by tmdb_id).",
+        "operationId": "search_movies_by_name_search_movies_get",
+        "parameters": [
+          {
+            "name": "query_name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Movie name to search",
+              "title": "Query Name"
+            },
+            "description": "Movie name to search"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trending/movies": {
+      "get": {
+        "summary": "Get Trending Movies",
+        "description": "Get trending general movies.",
+        "operationId": "get_trending_movies_trending_movies_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "description": "Number of results to return",
+              "default": 10,
+              "title": "Limit"
+            },
+            "description": "Number of results to return"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/catalogue": {
+      "get": {
+        "summary": "Get Catalogue",
+        "description": "Full anime catalogue for a 'browse by category' page.\n\nLists every anime in our local DB (name + format + genres + navigation ids)\nwith no external API calls. ``categories`` and ``genres`` always reflect the\nwhole catalogue (so the frontend can render all tabs/chips); ``animes`` is\nfiltered when a ``category`` (format) and/or ``genre`` query param is given.\n\nThe (large) response is gzip-compressed when the client accepts it.",
+        "operationId": "get_catalogue_catalogue_get",
+        "parameters": [
+          {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional format filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL",
+              "title": "Category"
+            },
+            "description": "Optional format filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL"
+          },
+          {
+            "name": "genre",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional genre filter, e.g. Action, Romance, Comedy",
+              "title": "Genre"
+            },
+            "description": "Optional genre filter, e.g. Action, Romance, Comedy"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/show/{tmdb_id}": {
+      "get": {
+        "summary": "Get Show Details",
+        "description": "Returns show info + every TMDB season (playable via the TMDB-keyed sources), AniList-mapped where known.",
+        "operationId": "get_show_details_show__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/season/{tmdb_id}/{season_number}": {
+      "get": {
+        "summary": "Get Season Details",
+        "description": "Combined TMDB season metadata + AniList metadata (AniList optional).",
+        "operationId": "get_season_details_season__tmdb_id___season_number__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "season_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Season Number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/watch/{tmdb_id}/{season_number}/{episode_number}": {
+      "get": {
+        "summary": "Get Watch Links",
+        "description": "Get streaming links as a progressive NDJSON stream (one line per source,\nemitted as soon as that source resolves). Works even for TMDB seasons with no\nAniList mapping (long shows like Naruto) — the proxy sources play off the TMDB id.",
+        "operationId": "get_watch_links_watch__tmdb_id___season_number___episode_number__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "season_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Season Number"
+            }
+          },
+          {
+            "name": "episode_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Episode Number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/watch/movie/{tmdb_id}": {
+      "get": {
+        "summary": "Get Movie Watch Links",
+        "description": "Streaming links for a standalone MOVIE (TMDB *movie* id), as the same\nprogressive NDJSON the TV watch route emits — one line per source. Movies have\nno season/episode and no AniList mapping; only the movie-capable TMDB-keyed\nsources run. Declared before /watch/{anilist_id}/{episode_number} so the literal\n'movie' segment is matched here rather than failing that route's int parse.\n\nThe meta line carries null season_number/episode_number; the player ignores\nthem for movies.",
+        "operationId": "get_movie_watch_links_watch_movie__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scrape-meta/{tmdb_id}/{season_number}": {
+      "get": {
+        "summary": "Get Scrape Meta",
+        "description": "The title bundle the *client-side* discovery sources need to search the\ntarget sites (New System, Phase 1.5).\n\nThe TS engine running in the viewer's browser (crimson-sources) resolves\nTMDB-keyed sources off the id alone, but the title-matching discovery sources\n(aniworld / s.to / stomirror / aniwatch / AnimeSuge) search by title — and the\nGerman broadcast synonyms come from TMDB /translations, which needs the\nserver-held TMDB key (a C5 secret that must never ship to the browser). So the\nclient fetches this grant and merges it into its MediaCtx, keeping title\nmatching byte-identical to the backend scrapers without leaking the key.\n\nReturns exactly the fields the backend's own ``media_ctx`` carries (see\n``stream_watch_response``): primary title, the AniList title variants, and the\nsynonym list (AniList synonyms + German titles). Login-gated like ``/watch``,\nso anonymous users can't use it as a free metadata service.",
+        "operationId": "get_scrape_meta_scrape_meta__tmdb_id___season_number__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "season_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Season Number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scrape-meta/movie/{tmdb_id}": {
+      "get": {
+        "summary": "Get Scrape Meta Movie",
+        "description": "Movie twin of /scrape-meta — the title + release year + IMDb id the\ntitle/IMDb-keyed client sources (hdrezka/lookmovie/insertunit) need to match a\nmovie. The TMDB key stays server-side (C5). Login-gated like /watch.",
+        "operationId": "get_scrape_meta_movie_scrape_meta_movie__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sign": {
+      "post": {
+        "summary": "Sign Proxy Links",
+        "description": "Mint signed crimson-proxy link(s) for client-resolved streams (New System\n§8a). Accepts either a single ``{url, referer, origin, userAgent}`` object or\n``{\"items\": [ … ]}`` for batch signing, and always returns a parallel\n``signed`` array (null for any item we refuse to sign).\n\nReturns 503 when the external proxy isn't configured (no ``CRIMSON_PROXY_BASE``\n/ ``PROXY_SECRET``) — the client then stays on E3 (extension) or E0 (backend),\nexactly as today, so an unconfigured proxy never breaks playback.",
+        "operationId": "sign_proxy_links_sign_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/resolve": {
+      "post": {
+        "summary": "Resolve Grant",
+        "description": "Server-side resolve grant for cookie/secret-bound sources (New System).\n\nBody is the client's MediaCtx + a ``source`` key:\n``{source, tmdbId, mediaType, season, episode, title, titleEnglish,\ntitleRomaji, titleNative, synonyms}``. Returns\n``{ok, streams:[{label, streamType, url, headers, subtitles, language}]}`` with\n**raw** CDN URLs — the client engine handles the actual byte delivery.\n\n503 when the requested source isn't configured (e.g. FEBBOX_UI_TOKEN unset);\nthe client then keeps using the backend /watch line for it.",
+        "operationId": "resolve_grant_resolve_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mw/watch/movie/{tmdb_id}": {
+      "get": {
+        "summary": "Mw Watch Movie",
+        "description": "movie-web bridge — streams for a standalone MOVIE (TMDB movie id), as a\nsingle JSON document of native movie-web `Stream`s. Declared before the TV\nroute so the literal 'movie' segment matches here. Requires a valid\nX-API-Key (or an admin/user session).",
+        "operationId": "mw_watch_movie_mw_watch_movie__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mw/watch/{tmdb_id}/{season_number}/{episode_number}": {
+      "get": {
+        "summary": "Mw Watch Tv",
+        "description": "movie-web bridge — streams for a TV episode (TMDB show id + season +\nepisode), as a single JSON document of native movie-web `Stream`s. Mirrors\nthe frontend /watch route's id/title resolution, then reshapes the output.\nRequires a valid X-API-Key (or an admin/user session).",
+        "operationId": "mw_watch_tv_mw_watch__tmdb_id___season_number___episode_number__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "season_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Season Number"
+            }
+          },
+          {
+            "name": "episode_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Episode Number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cache/confirm": {
+      "post": {
+        "summary": "Confirm Cache",
+        "description": "Player calls this once the viewer has actually watched a source for a few\nseconds, passing back the ``cacheTicket`` that source carried. Only then is\nthat exact stream enqueued for server-side caching — so we cache the source\nthe viewer *chose* (its quality + language), not whichever resolved fastest.\n\nThe ticket is HMAC-signed by ``/watch``, so no arbitrary URL can be injected\ninto the downloader. Behind the login wall; always 200 so it never leaks\nwhether caching is on or whether the episode was already cached.",
+        "operationId": "confirm_cache_cache_confirm_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/anilist/{anilist_id}": {
+      "get": {
+        "summary": "Get Anilist Mapping",
+        "description": "Returns { tmdb_id, season_number } for an anilist_id.",
+        "operationId": "get_anilist_mapping_anilist__anilist_id__get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Anilist Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/info/{tmdb_id}": {
+      "get": {
+        "summary": "Get Anime Info",
+        "description": "Merged TMDB + AniList metadata for a (tmdb_id, season). Flat legacy shape.\n\nAniList is optional: seasons of long shows with no AniList entry still return\nTMDB metadata + a TMDB-derived episode list, and the description always falls\nback (AniList -> TMDB season -> TMDB show overview).",
+        "operationId": "get_anime_info_info__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "season",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "TMDB season number",
+              "default": 1,
+              "title": "Season"
+            },
+            "description": "TMDB season number"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/watch/{anilist_id}/{episode_number}": {
+      "get": {
+        "summary": "Deprecated Watch",
+        "description": "Watch by anilist_id. TV seasons redirect to the canonical /watch route;\nextras (specials/OVAs/movies) have no TMDB season number, so they are served\ndirectly here.",
+        "operationId": "deprecated_watch_watch__anilist_id___episode_number__get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Anilist Id"
+            }
+          },
+          {
+            "name": "episode_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Episode Number"
+            }
+          },
+          {
+            "name": "season_part",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "title": "Season Part"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/movish_proxy/h/{host}/{path}": {
+      "post": {
+        "summary": "Movish Proxy",
+        "description": "Same-origin reverse proxy for the Movish player. Downloads the page/asset,\nsandboxes any embed-provider iframe + neutralises pop-ups, rewrites\nsub-resource URLs back through this proxy, and serves it.\n\nText resources (HTML/JS/CSS, and the CORS-less /embed/api JSON) are buffered,\ncleaned and rewritten; /v1/play media is streamed straight through with Range\npassthrough so seeking works and large files aren't held in memory. Scoped to\nthe api.movish.net host allow-list in resolvers.movish (rejects anything else\nto avoid an open proxy).",
+        "operationId": "movish_proxy_movish_proxy_h__host___path__post",
+        "parameters": [
+          {
+            "name": "host",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Host"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "Movish Proxy",
+        "description": "Same-origin reverse proxy for the Movish player. Downloads the page/asset,\nsandboxes any embed-provider iframe + neutralises pop-ups, rewrites\nsub-resource URLs back through this proxy, and serves it.\n\nText resources (HTML/JS/CSS, and the CORS-less /embed/api JSON) are buffered,\ncleaned and rewritten; /v1/play media is streamed straight through with Range\npassthrough so seeking works and large files aren't held in memory. Scoped to\nthe api.movish.net host allow-list in resolvers.movish (rejects anything else\nto avoid an open proxy).",
+        "operationId": "movish_proxy_movish_proxy_h__host___path__post",
+        "parameters": [
+          {
+            "name": "host",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Host"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/playimdb_proxy": {
+      "get": {
+        "summary": "Playimdb Proxy",
+        "description": "Signed, same-origin HLS proxy for the PlayIMDb source. Fetches a signed\nupstream playlist/segment with the Referer the PlayIMDb CDNs require\n(injected server-side), rewrites playlists so sub-resources flow back\nthrough this proxy, and streams segments through with Range passthrough.\n\nThe upstream CDN host rotates per request, so instead of a host allow-list\nthis proxy verifies an HMAC on the ``u`` URL (see resolvers.playimdb) and\nrefuses anything unsigned — closing the open-proxy / SSRF hole. No PlayIMDb\nplayer or ad code is ever involved; the resolver extracts the raw stream and\nwraps it in /player.",
+        "operationId": "playimdb_proxy_playimdb_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/voe_proxy": {
+      "get": {
+        "summary": "Voe Proxy",
+        "description": "Signed, same-origin HLS proxy for the VOE source. VOE's delivery CDN binds\nits stream token to the IP/ASN that resolved the embed (note the ``asn=``\nquery param), so the raw playlist/segment URLs 403 from the viewer's browser\neven though they play for the backend. This fetches the signed upstream\nplaylist/segment server-side, rewrites playlists so sub-resources flow back\nthrough this proxy, and streams segments through with Range passthrough.\n\nThe CDN host rotates, so instead of a host allow-list this proxy verifies an\nHMAC on the ``u`` URL (see resolvers.voe) and refuses anything unsigned —\nclosing the open-proxy / SSRF hole.",
+        "operationId": "voe_proxy_voe_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vidmoly_proxy": {
+      "get": {
+        "summary": "Vidmoly Proxy",
+        "description": "Signed, same-origin HLS proxy for the Vidmoly source. Fetches the signed\nupstream playlist/segment server-side (with the vidmoly Referer), rewrites\nplaylists so sub-resources flow back through this proxy, and streams segments\nthrough with Range passthrough.\n\nThis exists so the Vidmoly stream can be played in the same-origin Crimson\n``/player`` (which gives a real, fullscreen-capable player) instead of being\nhanded to the frontend as a bare cross-origin URL. The CDN host rotates, so\ninstead of a host allow-list the proxy verifies an HMAC on the ``u`` URL (see\nresolvers.vidmoly) and refuses anything unsigned — closing the open-proxy /\nSSRF hole.",
+        "operationId": "vidmoly_proxy_vidmoly_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vidsrc_proxy": {
+      "get": {
+        "summary": "Vidsrc Proxy",
+        "description": "Signed, same-origin HLS proxy for aniwatch's \"VidSrc\" (megaplay) source.\nThe megaplay delivery CDN is Referer-gated (403s without\n``Referer: https://megaplay.buzz/``), which the viewer's browser can't set on\nits media fetches, so the playlist/segments are fetched server-side here (with\nthat Referer), playlists rewritten so sub-resources flow back through this\nproxy, and segments streamed through with Range passthrough.\n\nThe CDN host rotates, so instead of a host allow-list this proxy verifies an\nHMAC on the ``u`` URL (see resolvers.vidsrc) and refuses anything unsigned —\nclosing the open-proxy / SSRF hole.",
+        "operationId": "vidsrc_proxy_vidsrc_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cinemabz_proxy": {
+      "get": {
+        "summary": "Cinemabz Proxy",
+        "description": "Signed, same-origin HLS proxy for the cinema.bz sources. cinema.bz's\nupstream HLS CDN is Referer-gated (403s without ``Referer: https://cinema.bz/``)\nand the 1shows CDN serves CORS scoped to cinema.bz's own origin (not ``*``), so\nthe raw playlist/segments can't be fetched by the viewer's browser. This fetches\nthe signed upstream playlist/segment server-side (with the cinema.bz Referer),\nrewrites playlists so sub-resources flow back through this proxy, and streams\nsegments through with Range passthrough.\n\nThe upstream CDN host rotates, so instead of a host allow-list this proxy\nverifies an HMAC on the ``u`` URL (see resolvers.cinemabz) and refuses anything\nunsigned — closing the open-proxy / SSRF hole.",
+        "operationId": "cinemabz_proxy_cinemabz_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/screenscape_proxy": {
+      "get": {
+        "summary": "Screenscape Proxy",
+        "description": "Signed, same-origin proxy for the ScreenScape sources. ScreenScape's\nper-server upstreams are either bare CDN links gated on a specific\nOrigin/Referer (e.g. ShowBox's hls.shegu.net) or already wrapped in\nScreenScape's own Cloudflare Workers; either way this fetches them server-side\nwith the per-stream Origin/Referer injected, rewrites HLS playlists so\nsub-resources flow back through here, and streams media with Range passthrough.\n\nThe upstream host varies per stream, so instead of a host allow-list this proxy\nverifies an HMAC over (url, origin, referer) (see resolvers.screenscape) and\nrefuses anything unsigned — closing the open-proxy / SSRF hole.",
+        "operationId": "screenscape_proxy_screenscape_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/febbox_proxy": {
+      "get": {
+        "summary": "Febbox Proxy",
+        "description": "Signed, same-origin proxy for the ShowBox/Febbox source. Febbox's player\nhands back direct mp4 links on a rotating OSS CDN; proxying keeps playback\nsame-origin (no CORS surprises), survives host rotation and gives Range\npassthrough for seeking. Some qualities come back as HLS, which is rewritten\nso sub-resources flow back through here.\n\nThe OSS host rotates, so instead of a host allow-list this proxy verifies an\nHMAC on the ``u`` URL (see resolvers.febbox) and refuses anything unsigned —\nclosing the open-proxy / SSRF hole. The febbox ``ui`` token never reaches the\nbrowser: it's only used server-side to mint the direct link in the resolver.",
+        "operationId": "febbox_proxy_febbox_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/animesuge_proxy": {
+      "get": {
+        "summary": "Animesuge Proxy",
+        "description": "Signed, same-origin proxy for the AnimeSuge source. Fetches a signed\nupstream direct file (mp4/m3u8) server-side, rewrites HLS playlists so\nsub-resources flow back through this proxy, and streams media through with\nRange passthrough.\n\nThe direct-file CDN host can rotate, so instead of a host allow-list this\nproxy verifies an HMAC on the ``u`` URL (see resolvers.animesuge) and refuses\nanything unsigned — closing the open-proxy / SSRF hole. No AnimeSuge or\nthird-party player/ad code is ever involved; the scraper extracts the raw\ndirect file and the resolver wraps it in /player.",
+        "operationId": "animesuge_proxy_animesuge_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jellyfin_proxy/{path}": {
+      "post": {
+        "summary": "Jellyfin Proxy",
+        "description": "Authenticated reverse proxy to the user's Jellyfin server. Injects the\naccess token server-side (so it never reaches the browser) and rewrites HLS\nplaylists to flow back through this proxy; media segments / direct files are\nstreamed straight through with Range passthrough. Configured via the\nJELLYFIN_* env vars (see resolvers.jellyfin).",
+        "operationId": "jellyfin_proxy_jellyfin_proxy__path__post",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "Jellyfin Proxy",
+        "description": "Authenticated reverse proxy to the user's Jellyfin server. Injects the\naccess token server-side (so it never reaches the browser) and rewrites HLS\nplaylists to flow back through this proxy; media segments / direct files are\nstreamed straight through with Range passthrough. Configured via the\nJELLYFIN_* env vars (see resolvers.jellyfin).",
+        "operationId": "jellyfin_proxy_jellyfin_proxy__path__post",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/local_proxy/{token}": {
+      "get": {
+        "summary": "Local Proxy",
+        "description": "Stream a browser-playable file from an admin-registered local source.\n\n``token`` is an opaque base64url of the absolute path the LocalScraper found.\n``safe_resolve`` maps it back to a real file ONLY when it currently lives\ninside an *enabled* source root (path traversal / symlink escapes / disabled\nsources all resolve to None → 404), re-checked on every request. Starlette's\nFileResponse handles HTTP Range requests, so the player can seek.",
+        "operationId": "local_proxy_local_proxy__token__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cache_proxy/{token}": {
+      "get": {
+        "summary": "Cache Proxy",
+        "description": "Stream a server-side-cached episode straight off the NAS.\n\n``token`` is an opaque base64url of the cached file's absolute path.\n``cache_safe_resolve`` maps it back to a real file ONLY when it currently\nlives inside an *enabled* cache target (traversal/symlink escapes / disabled\ntargets all 404), re-checked per request. FileResponse handles Range so the\nplayer can seek. Mirrors /local_proxy.",
+        "operationId": "cache_proxy_cache_proxy__token__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/player": {
+      "get": {
+        "summary": "Player",
+        "description": "Serve a Crimson-themed player for a same-origin proxied stream. Resolvers\nthat return a raw hls/mp4 stream (e.g. Jellyfin) wrap it in this page so the\nfrontend can iframe it like any other source. ``src`` is restricted to\nsame-origin relative paths to prevent embedding arbitrary external content.",
+        "operationId": "player_player_get",
+        "parameters": [
+          {
+            "name": "src",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Same-origin stream path to play",
+              "title": "Src"
+            },
+            "description": "Same-origin stream path to play"
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "hls or mp4 (inferred if omitted)",
+              "default": "",
+              "title": "Type"
+            },
+            "description": "hls or mp4 (inferred if omitted)"
+          },
+          {
+            "name": "title",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Optional title",
+              "default": "",
+              "title": "Title"
+            },
+            "description": "Optional title"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/seasons/{anilist_id}": {
+      "get": {
+        "summary": "Get Anime Seasons",
+        "description": "All seasons of the show this anilist_id belongs to (legacy shape).\n\nEach season carries its own tmdb_id + tmdb_season so the frontend can drill\ninto /info/{tmdb_id}?season={tmdb_season} and /watch/{anilist_id}/{episode}.",
+        "operationId": "get_anime_seasons_seasons__anilist_id__get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Anilist Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/overview/{anilist_id}": {
+      "get": {
+        "summary": "Get Anime Overview",
+        "description": "Aggregated show overview for the per-anime landing/overview page.\n\nReturns show-level metadata (title, poster, backdrop, synopsis, status, year)\nplus the full season list + extras in a single round-trip, so the frontend can\npaint the season/episode browser shell without a /seasons -> /info waterfall.\n\nPer-season episode lists (with the stored per-episode titles/thumbnails) are\nstill fetched lazily by the frontend via /info/{tmdb_id}?season=, so /overview\nnever fans out into one TMDB season call per season.",
+        "operationId": "get_anime_overview_overview__anilist_id__get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Anilist Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/show-overview/{tmdb_id}": {
+      "get": {
+        "summary": "Get Show Overview",
+        "description": "Aggregated overview for a NON-ANIME TV show, keyed by tmdb_id.\n\nThe TMDB-keyed twin of /overview/{anilist_id}: same response shape (so the\nfrontend can render it with the shared overview UI), but built purely from\nTMDB — there is no AniList entry for a general show. Seasons come from TMDB's\nreal season list via _build_season_list (any anilist_id fields are simply\nnull), and per-season episodes are still fetched lazily by the frontend via\n/info/{tmdb_id}?season=. Playback uses /watch/{tmdb_id}/{season}/{episode}.",
+        "operationId": "get_show_overview_show_overview__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/movie-overview/{tmdb_id}": {
+      "get": {
+        "summary": "Get Movie Overview",
+        "description": "Aggregated overview for a standalone MOVIE, keyed by its TMDB *movie* id.\n\nThe movie twin of /show-overview: same overall response shape so the frontend\nreuses the shared overview UI, but with no seasons (movies have none) — instead\na single ``play`` descriptor the page links to /watch-movie. Built purely from\nTMDB (movies have no AniList entry); falls back to the locally-stored\ntmdb_movies row when the live TMDB fetch fails, exactly like /show-overview.",
+        "operationId": "get_movie_overview_movie_overview__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health Check",
+        "description": "Health check endpoint",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiKeyCreate": {
+        "properties": {
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label",
+            "description": "A note to identify this key, e.g. 'movie-web prod'"
+          }
+        },
+        "type": "object",
+        "title": "ApiKeyCreate"
+      },
+      "AuthResponse": {
+        "properties": {
+          "public_key": {
+            "type": "string",
+            "title": "Public Key"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "session_token": {
+            "type": "string",
+            "title": "Session Token"
+          },
+          "expires_at": {
+            "type": "string",
+            "title": "Expires At"
+          },
+          "created": {
+            "type": "boolean",
+            "title": "Created"
+          }
+        },
+        "type": "object",
+        "required": [
+          "public_key",
+          "label",
+          "session_token",
+          "expires_at",
+          "created"
+        ],
+        "title": "AuthResponse"
+      },
+      "BackfillTrigger": {
+        "properties": {
+          "pages": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 500.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pages"
+          }
+        },
+        "type": "object",
+        "title": "BackfillTrigger"
+      },
+      "CacheSettingsUpdate": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          }
+        },
+        "type": "object",
+        "required": [
+          "enabled"
+        ],
+        "title": "CacheSettingsUpdate"
+      },
+      "CacheTargetCreate": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "path"
+        ],
+        "title": "CacheTargetCreate"
+      },
+      "CacheTargetUpdate": {
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          }
+        },
+        "type": "object",
+        "title": "CacheTargetUpdate"
+      },
+      "ChallengeRequest": {
+        "properties": {
+          "public_key": {
+            "type": "string",
+            "title": "Public Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "public_key"
+        ],
+        "title": "ChallengeRequest"
+      },
+      "ChallengeResponse": {
+        "properties": {
+          "public_key": {
+            "type": "string",
+            "title": "Public Key"
+          },
+          "challenge": {
+            "type": "string",
+            "title": "Challenge"
+          },
+          "expires_at": {
+            "type": "string",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "public_key",
+          "challenge",
+          "expires_at"
+        ],
+        "title": "ChallengeResponse"
+      },
+      "EmailLoginRequest": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          }
+        },
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "EmailLoginRequest"
+      },
+      "EmailOnlyRequest": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "title": "Email"
+          }
+        },
+        "type": "object",
+        "required": [
+          "email"
+        ],
+        "title": "EmailOnlyRequest"
+      },
+      "EmailRegisterRequest": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          },
+          "invite_code": {
+            "type": "string",
+            "title": "Invite Code"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          }
+        },
+        "type": "object",
+        "required": [
+          "email",
+          "password",
+          "invite_code"
+        ],
+        "title": "EmailRegisterRequest"
+      },
+      "EmailTokenRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "EmailTokenRequest"
+      },
+      "FavoriteIn": {
+        "properties": {
+          "tmdb_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tmdb Id"
+          },
+          "anilist_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anilist Id"
+          },
+          "season_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season Number"
+          },
+          "media_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Type"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "poster": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Poster"
+          },
+          "list_name": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "List Name",
+            "default": "favorites"
+          }
+        },
+        "type": "object",
+        "title": "FavoriteIn"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "InviteCreate": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Count",
+            "default": 1
+          },
+          "ttl_hours": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 8760.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl Hours"
+          }
+        },
+        "type": "object",
+        "title": "InviteCreate"
+      },
+      "LocalSourceCreate": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Label"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "path"
+        ],
+        "title": "LocalSourceCreate"
+      },
+      "LocalSourceUpdate": {
+        "properties": {
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          }
+        },
+        "type": "object",
+        "title": "LocalSourceUpdate"
+      },
+      "LoginRequest": {
+        "properties": {
+          "public_key": {
+            "type": "string",
+            "title": "Public Key"
+          },
+          "challenge": {
+            "type": "string",
+            "title": "Challenge"
+          },
+          "signature": {
+            "type": "string",
+            "title": "Signature"
+          }
+        },
+        "type": "object",
+        "required": [
+          "public_key",
+          "challenge",
+          "signature"
+        ],
+        "title": "LoginRequest"
+      },
+      "ProgressIn": {
+        "properties": {
+          "tmdb_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tmdb Id"
+          },
+          "anilist_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anilist Id"
+          },
+          "season_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season Number"
+          },
+          "episode_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Episode Number"
+          },
+          "position_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Position Seconds"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "poster": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Poster"
+          },
+          "media_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Type"
+          }
+        },
+        "type": "object",
+        "title": "ProgressIn"
+      },
+      "RegisterRequest": {
+        "properties": {
+          "public_key": {
+            "type": "string",
+            "title": "Public Key"
+          },
+          "challenge": {
+            "type": "string",
+            "title": "Challenge"
+          },
+          "signature": {
+            "type": "string",
+            "title": "Signature"
+          },
+          "invite_code": {
+            "type": "string",
+            "title": "Invite Code"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          }
+        },
+        "type": "object",
+        "required": [
+          "public_key",
+          "challenge",
+          "signature",
+          "invite_code"
+        ],
+        "title": "RegisterRequest"
+      },
+      "ResetPasswordRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token",
+          "password"
+        ],
+        "title": "ResetPasswordRequest"
+      },
+      "UserUpdate": {
+        "properties": {
+          "is_admin": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Admin"
+          },
+          "email_verified": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email Verified"
+          }
+        },
+        "type": "object",
+        "title": "UserUpdate"
+      },
+      "UsernameIn": {
+        "properties": {
+          "username": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 20
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          }
+        },
+        "type": "object",
+        "title": "UsernameIn"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

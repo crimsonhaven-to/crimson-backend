@@ -31,6 +31,9 @@ tests/
 .venv-test/
 requirements-dev.txt
 pyproject.toml
+# Generated API contract artifacts (used by the frontend + tests, not at runtime).
+openapi.json
+contracts/
 
 # Docs / misc not needed at runtime
 README.md

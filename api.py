@@ -77,6 +77,12 @@ from skiptimes_engine import router as skiptimes_router
 from core.db_pool import get_pool, close_pool, pool_stats
 from core import lumi
 from core import source_health
+from core.contracts import (
+    build_done_line,
+    build_meta_line,
+    build_stream_line,
+    build_unaired_line,
+)
 from core.rate_limit import limiter
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -1560,15 +1566,13 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
     title = anilist_data.get("title") or fallback_title
     media_ctx = {**anilist_data, "title": title}
 
-    yield _ndjson({
-        "type": "meta",
-        "success": True,
-        "tmdb_id": tmdb_id,
-        "season_number": season_number,
-        "episode_number": episode_number,
-        "anilist_id": anilist_id,
-        "title": title,
-    })
+    yield _ndjson(build_meta_line(
+        tmdb_id=tmdb_id,
+        season_number=season_number,
+        episode_number=episode_number,
+        anilist_id=anilist_id,
+        title=title,
+    ))
 
     # Don't waste scraper work on an episode that hasn't aired yet. TMDB carries a
     # per-episode air_date; when the requested episode is dated in the future, tell
@@ -1580,14 +1584,13 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
         ep_info = await _season_episode_info(tmdb_id, season_number)
         air_date = (ep_info.get("air_dates") or {}).get(episode_number)
         if _is_future_air_date(air_date):
-            yield _ndjson({
-                "type": "unaired",
-                "air_date": air_date,
-                "title": title,
-                "season_number": season_number,
-                "episode_number": episode_number,
-            })
-            yield _ndjson({"type": "done", "count": 0})
+            yield _ndjson(build_unaired_line(
+                air_date=air_date,
+                title=title,
+                season_number=season_number,
+                episode_number=episode_number,
+            ))
+            yield _ndjson(build_done_line(0))
             return
 
     # German streaming scrapers (s.to, aniworld) list many non-anime shows under
@@ -1679,20 +1682,10 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
             if stream is None:  # sentinel: all scrapers finished
                 break
             count += 1
-            line = {
-                "type": "stream",
-                "source": stream["source"],
-                "streamType": stream["type"],
-                "url": stream["url"],
-                "language": stream.get("language"),
-                "subtitles": stream.get("subtitles"),
-            }
-            # Only present on cacheable streams (when caching is enabled); the
-            # player echoes it back to /cache/confirm after a few seconds of play.
-            if stream.get("cacheTicket"):
-                line["cacheTicket"] = stream["cacheTicket"]
-            yield _ndjson(line)
-        yield _ndjson({"type": "done", "count": count})
+            # Shape (incl. the cacheTicket-only-when-present rule) lives in
+            # core.contracts so it can't drift from the client/crimson-sources.
+            yield _ndjson(build_stream_line(stream))
+        yield _ndjson(build_done_line(count))
     finally:
         # If the client disconnects mid-stream the generator is closed here —
         # cancel the still-running tasks so they don't leak (no-op if done).
