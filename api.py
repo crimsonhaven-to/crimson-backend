@@ -22,29 +22,30 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
-# Import all scrapers & resolvers + metadata engine
+# Import the scraper/resolver registries + metadata engine.
+#
+# The public backend no longer scrapes third-party sites (that moved to the
+# private ``crimson-sources`` package, running client/extension/proxy-side — see
+# New_System.md). What's left are the operator-owned sources: the server cache,
+# local NAS dirs, and the operator's own Jellyfin server, plus an inert template.
 from scrapers import ALL_SCRAPERS
 from resolvers import ALL_RESOLVERS
-from resolvers.movish import proxy_fetch as movish_proxy_fetch
-from resolvers.playimdb import proxy_fetch as playimdb_proxy_fetch
-from resolvers.voe import proxy_fetch as voe_proxy_fetch
-from resolvers.vidmoly import proxy_fetch as vidmoly_proxy_fetch
-from resolvers.vidsrc import proxy_fetch as vidsrc_proxy_fetch
-from resolvers.animesuge import proxy_fetch as animesuge_proxy_fetch
-from resolvers.cinemabz import proxy_fetch as cinemabz_proxy_fetch
-from resolvers.screenscape import proxy_fetch as screenscape_proxy_fetch
-from resolvers.febbox import (
-    proxy_fetch as febbox_proxy_fetch,
-    FebboxResolver,
-    is_configured as febbox_is_configured,
-)
-from scrapers.showbox_scraper import ShowBoxScraper
 from resolvers.jellyfin import (
     proxy_fetch as jellyfin_proxy_fetch,
     is_configured as jellyfin_is_configured,
     JellyfinResolver,
 )
 from scrapers.jellyfin_scraper import JellyfinScraper
+# Febbox is wired ONLY into the secret-bound `/resolve` grant (not ALL_SCRAPERS /
+# ALL_RESOLVERS, so it never appears in the public `/watch` pipeline). It self-
+# disables unless FEBBOX_UI_TOKEN is set, so a stock public deployment runs nothing
+# here; an operator who has the token gets the resolve grant the client engine uses.
+from resolvers.febbox import (
+    proxy_fetch as febbox_proxy_fetch,
+    FebboxResolver,
+    is_configured as febbox_is_configured,
+)
+from scrapers.showbox_scraper import ShowBoxScraper
 from resolvers import _crimson_proxy
 from local_engine.db import LocalSourceStore
 from local_engine.fs import (
@@ -452,17 +453,13 @@ _PUBLIC_PREFIXES = (
     "/kofi/webhook",
     "/changelog",
     "/player",
-    "/movish_proxy",
-    "/playimdb_proxy",
-    "/voe_proxy",
-    "/vidmoly_proxy",
-    "/vidsrc_proxy",
-    "/cinemabz_proxy",
-    "/screenscape_proxy",
-    "/febbox_proxy",
-    "/animesuge_proxy",
+    # Operator-owned source proxies (the only stream proxies the backend still
+    # serves). Third-party source proxies were removed with their scrapers.
     "/jellyfin_proxy",
     "/cache_proxy",
+    # Signed Febbox subtitle relay (srt->VTT) for the operator-only /resolve grant;
+    # loaded cross-origin by the player's <track> with no auth header (HMAC-signed).
+    "/febbox_proxy",
     # The subtitle <track> loads cross-origin with no auth header (signed instead).
     "/subtitles_proxy",
     "/docs",
@@ -1019,8 +1016,8 @@ def _public_base_url(request: Request) -> str:
 
     Behind a TLS-terminating reverse proxy (our Docker deploy), uvicorn sees a
     plain HTTP request, so ``request.base_url`` reports ``http://`` — which makes
-    the absolute iframe URLs we emit for the ad-free proxy sources (Movish,
-    PlayIMDb, AnimeSuge) get blocked as mixed content on the HTTPS frontend. Trust
+    the absolute proxy/stream URLs we emit for the operator-owned sources (Jellyfin,
+    local, cache) get blocked as mixed content on the HTTPS frontend. Trust
     ``X-Forwarded-Proto``/``X-Forwarded-Host`` (set by the proxy) so the URL is
     HTTPS, regardless of uvicorn's --proxy-headers/--forwarded-allow-ips config.
     """
@@ -1036,13 +1033,13 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
     """Resolve embed URLs to direct stream URLs.
 
     ``base_url`` is the public base of this backend (e.g. https://host/). It is
-    used to turn a resolver's relative proxy/player path (Movish, PlayIMDb,
-    AnimeSuge, Jellyfin) into an absolute iframe src the frontend can load.
+    used to turn a resolver's relative proxy/player path (Jellyfin, local, cache)
+    into an absolute stream URL the frontend can load.
 
-    ``language`` is an optional human-readable audio/subtitle label (e.g.
-    "German Dub") for these embeds, known by some scrapers (aniworld) and not
-    others. When set, it is stamped onto every resolved stream so the frontend
-    can show it; otherwise the streams carry no language and it stays blank.
+    ``language`` is an optional human-readable audio/subtitle label (e.g. the NAS
+    target's dub language), known by some sources (the cache) and not others. When
+    set, it is stamped onto every resolved stream so the frontend can show it;
+    otherwise the streams carry no language and it stays blank.
     """
     if not embed_urls:
         return []
@@ -1950,18 +1947,17 @@ async def sign_proxy_links(request: Request):
 
 
 # --- client-side resolve grants (New System: take the backend out of the byte path) ---
-# Some sources can't run in the viewer's browser because the final hop needs a
-# server-held secret (C5) — Febbox's ``ui`` cookie today, MovieBox/others later. But
-# only the *resolve* needs the secret; the URL it yields is a direct CDN file the
-# viewer can fetch themselves. So /resolve does the token-gated lookup server-side and
-# returns the **raw** stream URL + the headers the CDN wants — and the client engine
-# delivers the bytes (extension E3 / signed crimson-proxy E2). The heavy mp4/HLS never
-# travels through this backend; only a few hundred bytes of control traffic do.
+# Some operator-owned sources can't run wholly in the viewer's browser because the
+# final hop needs a server-held secret — e.g. the Jellyfin access token. But only
+# the *resolve* needs the secret; the URL it yields is a stream the viewer (or the
+# crimson-proxy edge) can fetch. So /resolve does the token lookup server-side and
+# returns the **raw** stream URL + the headers the upstream wants — and the client
+# engine delivers the bytes (extension E3 / signed crimson-proxy E2). The heavy
+# mp4/HLS never travels through this backend; only a little control traffic does.
 #
-# This is the cookie-source twin of /sign: login-gated (NOT in _PUBLIC_PREFIXES) +
-# rate-limited, so it can't be used as an anonymous scraping oracle. A source that
-# isn't configured returns 503 and the client cleanly stays on the backend /watch
-# line (same-origin proxy) for it — never a regression.
+# It's login-gated (NOT in _PUBLIC_PREFIXES) + rate-limited, so it can't be used as
+# an anonymous oracle. A source that isn't configured returns 503 and the client
+# cleanly stays on the backend /watch line (same-origin proxy) for it.
 
 
 async def _grant_febbox(
@@ -1971,7 +1967,8 @@ async def _grant_febbox(
     """Run the ShowBox discovery + the token-gated Febbox player lookup, returning
     RAW direct-file streams (not /febbox_proxy paths). Subtitle URLs stay on the
     signed proxy (tiny .srt -> WebVTT) and are absolutized here against the backend
-    base, exactly like resolve_streams does."""
+    base. Gated on FEBBOX_UI_TOKEN (an operator-only secret), so this returns
+    nothing on a stock deployment — it's wired only for the private client engine."""
     embeds = await run_single_scraper(
         ShowBoxScraper, tmdb_id, season_num, episode_num, anilist_data, media_type
     )
@@ -1997,7 +1994,7 @@ async def _grant_febbox(
                     for s in subs
                 ]
             out.append({
-                # per-quality "ShowBox (1080p)" -> dedups with the matching /watch tile
+                # per-quality "ShowBox (1080p)" -> dedups with the client tile
                 "label": res.get("label") or resolver.source_name,
                 "streamType": res.get("streamType") or "mp4",
                 "url": res["url"],
@@ -2056,12 +2053,12 @@ async def _grant_jellyfin(
     return out
 
 
-# Per-source grant registry: source key -> (is_configured probe, runner). Add a
-# cookie/secret source here and it gains a client-delivery path for free.
+# Per-source grant registry: source key -> (is_configured probe, runner). Add an
+# operator-owned secret source here and it gains a client-delivery path for free.
 _RESOLVE_GRANTS = {
+    "jellyfin": (_jellyfin_grant_configured, _grant_jellyfin),
     "febbox": (febbox_is_configured, _grant_febbox),
     "showbox": (febbox_is_configured, _grant_febbox),  # alias (the display label is "ShowBox")
-    "jellyfin": (_jellyfin_grant_configured, _grant_jellyfin),
 }
 
 
@@ -2598,7 +2595,6 @@ async def _admin_system_info() -> Dict:
             "require_login": bool(getattr(Config, "REQUIRE_LOGIN", False)),
             "jellyfin_configured": jellyfin_is_configured(),
             "local_configured": local_is_configured(),
-            "showbox_configured": bool(os.getenv("FEBBOX_UI_TOKEN")),
             "cache_enabled": bool(cache_enabled),
             "ffmpeg_available": ffmpeg_available(),
             "tmdb_key_set": bool(getattr(Config, "TMDB_API_KEY", None)),
@@ -2913,109 +2909,13 @@ def _proxy_response(status, content_type, headers, payload, *, forward_bytes_hea
     )
 
 
-# --- MOVISH AD-FREE PROXY ("movish" source) ---
-@app.api_route("/movish_proxy/h/{host}/{path:path}", methods=["GET", "POST"])
-async def movish_proxy(request: Request, host: str, path: str):
-    """Same-origin reverse proxy for the Movish player. Downloads the page/asset,
-    sandboxes any embed-provider iframe + neutralises pop-ups, rewrites
-    sub-resource URLs back through this proxy, and serves it.
-
-    Text resources (HTML/JS/CSS, and the CORS-less /embed/api JSON) are buffered,
-    cleaned and rewritten; /v1/play media is streamed straight through with Range
-    passthrough so seeking works and large files aren't held in memory. Scoped to
-    the api.movish.net host allow-list in resolvers.movish (rejects anything else
-    to avoid an open proxy)."""
-    body = await request.body() if request.method == "POST" else None
-    try:
-        result = await movish_proxy_fetch(
-            host=host,
-            path=path,
-            query_string=request.url.query,
-            method=request.method,
-            body=body,
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"Movish proxy upstream error for {host}/{path}: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-    return _proxy_response(*result)
-
-
-# --- SIGNED SAME-ORIGIN STREAM PROXIES (table-driven) ---
-# These seven are byte-identical: verify the HMAC on the ``u`` query param, fetch
-# the rotating CDN host server-side with the headers it gates on (all inside the
-# resolver's ``proxy_fetch``), rewrite HLS playlists so sub-resources flow back
-# here, and stream segments with Range passthrough. They differ ONLY by which
-# resolver fetches and the log label, so they're registered from a table instead
-# of as N copy-pasted routes. The path stays ``/{name}_proxy`` — the resolvers
-# mint exactly those signed URLs and the player loads them verbatim.
-_SIGNED_STREAM_PROXIES = {
-    "playimdb": (playimdb_proxy_fetch, "PlayIMDb"),
-    "voe": (voe_proxy_fetch, "VOE"),
-    "vidmoly": (vidmoly_proxy_fetch, "Vidmoly"),
-    "vidsrc": (vidsrc_proxy_fetch, "VidSrc"),
-    "cinemabz": (cinemabz_proxy_fetch, "Cinema.bz"),
-    "febbox": (febbox_proxy_fetch, "Febbox"),
-    "animesuge": (animesuge_proxy_fetch, "AnimeSuge"),
-}
-
-
-def _make_signed_stream_proxy(fetch_fn, label):
-    async def _signed_stream_proxy(request: Request):
-        try:
-            result = await fetch_fn(
-                url=request.query_params.get("u"),
-                sig=request.query_params.get("s"),
-                range_header=request.headers.get("range"),
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=403, detail=str(e))
-        except httpx.RequestError as e:
-            logger.error(f"{label} proxy upstream error: {e}")
-            raise HTTPException(status_code=502, detail="Upstream fetch failed")
-        return _proxy_response(*result)
-
-    return _signed_stream_proxy
-
-
-for _proxy_name, (_proxy_fn, _proxy_label) in _SIGNED_STREAM_PROXIES.items():
-    app.add_api_route(
-        f"/{_proxy_name}_proxy",
-        _make_signed_stream_proxy(_proxy_fn, _proxy_label),
-        methods=["GET"],
-        name=f"{_proxy_name}_proxy",
-    )
-
-
-# --- SCREENSCAPE STREAM PROXY ("ScreenScape · …" sources) ---
-@app.get("/screenscape_proxy")
-async def screenscape_proxy(request: Request):
-    """Signed, same-origin proxy for the ScreenScape sources. ScreenScape's
-    per-server upstreams are either bare CDN links gated on a specific
-    Origin/Referer (e.g. ShowBox's hls.shegu.net) or already wrapped in
-    ScreenScape's own Cloudflare Workers; either way this fetches them server-side
-    with the per-stream Origin/Referer injected, rewrites HLS playlists so
-    sub-resources flow back through here, and streams media with Range passthrough.
-
-    The upstream host varies per stream, so instead of a host allow-list this proxy
-    verifies an HMAC over (url, origin, referer) (see resolvers.screenscape) and
-    refuses anything unsigned — closing the open-proxy / SSRF hole."""
-    try:
-        result = await screenscape_proxy_fetch(
-            url=request.query_params.get("u"),
-            origin=request.query_params.get("o"),
-            referer=request.query_params.get("r"),
-            sig=request.query_params.get("s"),
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"ScreenScape proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-    return _proxy_response(*result)
+# NOTE: the third-party stream proxies that used to live here (the Movish ad-free
+# page proxy, the table-driven signed proxies for PlayIMDb/VOE/Vidmoly/VidSrc/
+# Cinema.bz/AnimeSuge, and the ScreenScape signed proxy) were removed along with
+# their scrapers/resolvers. Third-party stream relaying is now handled client-side
+# via the crimson-proxy CORS relay (see /sign + New_System.md). What remains are the
+# operator-owned proxies below (Jellyfin, local, cache) plus the signed Febbox
+# subtitle relay that backs the operator-only /resolve grant.
 
 
 # --- JELLYFIN PROXY ("jellyfin" source) ---
@@ -3042,6 +2942,28 @@ async def jellyfin_proxy(request: Request, path: str):
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
     # Jellyfin forwards upstream headers on buffered (playlist) responses too.
     return _proxy_response(*result, forward_bytes_headers=True)
+
+
+# --- FEBBOX SUBTITLE PROXY (operator-only /resolve grant) ---
+# Not part of the public /watch pipeline. The /resolve grant returns Febbox's video
+# URLs RAW (the client delivers those bytes itself via E3/E2); only the tiny .srt
+# subtitles are minted as signed /febbox_proxy paths, which this route fetches and
+# converts to WebVTT. HMAC-signed (no open relay) and inert unless FEBBOX_UI_TOKEN
+# is configured.
+@app.get("/febbox_proxy", include_in_schema=False)
+async def febbox_proxy(request: Request):
+    try:
+        result = await febbox_proxy_fetch(
+            url=request.query_params.get("u"),
+            sig=request.query_params.get("s"),
+            range_header=request.headers.get("range"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except httpx.RequestError as e:
+        logger.error(f"Febbox proxy upstream error: {e}")
+        raise HTTPException(status_code=502, detail="Upstream fetch failed")
+    return _proxy_response(*result)
 
 
 # --- LOCAL SOURCE PROXY ("Local" source: admin-registered dirs / NAS) ---

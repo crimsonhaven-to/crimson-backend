@@ -1,30 +1,24 @@
 # scrapers/__init__.py
-from .movish_scraper import MovishScraper
-from .playimdb_scraper import PlayimdbScraper
+#
+# The public Crimson backend does NOT scrape third-party streaming sites. That
+# logic was moved into the private ``crimson-sources`` package and now runs in
+# the client / browser extension / crimson-proxy (see ``New_System.md``).
+#
+# What remains here are only operator-owned sources — media the server operator
+# controls, which is not third-party scraping:
+#   * CacheScraper    — episodes this server already remuxed onto your NAS
+#   * LocalScraper    — your own registered directories / NAS bind-mounts
+#   * JellyfinScraper — your own self-hosted Jellyfin server (env-configured)
+# See ``template_scraper.py`` for a documented, inert reference implementation of
+# the scraper contract (kept as a file only; not imported/registered here).
 from .jellyfin_scraper import JellyfinScraper
-from .animesuge_scraper import AnimeSugeScraper
-from .aniworld_scraper import AniworldScraper
-from .sto_scraper import StoScraper
-from .stomirror_scraper import StoMirrorScraper
-from .cinemabz_scraper import CinemabzScraper
-from .screenscape_scraper import ScreenscapeScraper
-from .showbox_scraper import ShowBoxScraper
-from .aniwatch_scraper import AniwatchScraper
 from .local_scraper import LocalScraper
 from .cache_scraper import CacheScraper
+# from .template_scraper import TemplateScraper  # reference only — re-enable with the list entry below.
 
 ALL_SCRAPERS = [
-    CacheScraper,     # Server-side video cache: surfaces already-downloaded episodes first.
-    AniworldScraper,  # German s.to-family site; feeds VOE/Vidmoly embeds.
-    StoScraper,       # s.to: aniworld's general sibling (anime + movies); same VOE/Vidmoly embeds.
-    StoMirrorScraper, # Cloudflare/Turnstile-free IP mirror of s.to; resolves /r?t= where s.to's gate stalls.
-    AniwatchScraper,  # WordPress site; feeds "VidSrc" (megaplay) embeds.
-    MovishScraper,
-    PlayimdbScraper,
-    JellyfinScraper,
-    LocalScraper,     # Admin-registered local directories / NAS mounts (direct play only).
-    AnimeSugeScraper,
-    CinemabzScraper,  # TMDB-keyed HLS aggregator; 3 providers -> 3 tiles
-    ScreenscapeScraper,  # TMDB-keyed multi-server aggregator; ~15 servers, signed/encrypted API
-    ShowBoxScraper,   # ShowBox/Febbox direct-file source; env-gated on FEBBOX_UI_TOKEN
+    CacheScraper,      # Server-side video cache: surfaces already-downloaded episodes first.
+    LocalScraper,      # Admin-registered local directories / NAS mounts (direct play only).
+    JellyfinScraper,   # Your own self-hosted Jellyfin server (env-gated on JELLYFIN_*).
+    # TemplateScraper,   # Inert reference implementation of the scraper contract.
 ]
