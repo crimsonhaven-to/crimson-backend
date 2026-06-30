@@ -22,9 +22,11 @@ def test_coalesce_defaults_and_validates_env():
     folded = TelemetryStore._coalesce([
         {"source": "X", "ok": True, "env": "WEIRD"},   # unknown env -> client
         {"source": "X", "ok": True, "env": "proxied"},
+        {"source": "X", "ok": False, "env": "report"},  # manual broken-report kept distinct
     ])
     assert folded[("X", "client")] == [1, 0]
     assert folded[("X", "proxied")] == [1, 0]
+    assert folded[("X", "report")] == [0, 1]
 
 
 def test_coalesce_skips_junk_and_blank_sources():

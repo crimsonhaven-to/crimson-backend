@@ -16,7 +16,9 @@ from core.db_pool import get_connection, lock_schema_init
 # Guard rails so a hostile/buggy client can't bloat the table or counters.
 MAX_EVENTS_PER_BATCH = 60
 MAX_SOURCE_LEN = 80
-_VALID_ENVS = ("client", "extension", "proxied", "direct", "backend")
+# "report" tags a manual "this source is broken" beacon from the player (vs the
+# automatic per-source resolve outcomes), so the dashboard can tell them apart.
+_VALID_ENVS = ("client", "extension", "proxied", "direct", "backend", "report")
 
 
 def _today() -> date:
