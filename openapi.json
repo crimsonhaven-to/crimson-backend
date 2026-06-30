@@ -4559,10 +4559,10 @@
       }
     },
     "/movish_proxy/h/{host}/{path}": {
-      "post": {
+      "get": {
         "summary": "Movish Proxy",
         "description": "Same-origin reverse proxy for the Movish player. Downloads the page/asset,\nsandboxes any embed-provider iframe + neutralises pop-ups, rewrites\nsub-resource URLs back through this proxy, and serves it.\n\nText resources (HTML/JS/CSS, and the CORS-less /embed/api JSON) are buffered,\ncleaned and rewritten; /v1/play media is streamed straight through with Range\npassthrough so seeking works and large files aren't held in memory. Scoped to\nthe api.movish.net host allow-list in resolvers.movish (rejects anything else\nto avoid an open proxy).",
-        "operationId": "movish_proxy_movish_proxy_h__host___path__post",
+        "operationId": "movish_proxy_movish_proxy_h__host___path__get",
         "parameters": [
           {
             "name": "host",
@@ -4604,10 +4604,10 @@
           }
         }
       },
-      "get": {
+      "post": {
         "summary": "Movish Proxy",
         "description": "Same-origin reverse proxy for the Movish player. Downloads the page/asset,\nsandboxes any embed-provider iframe + neutralises pop-ups, rewrites\nsub-resource URLs back through this proxy, and serves it.\n\nText resources (HTML/JS/CSS, and the CORS-less /embed/api JSON) are buffered,\ncleaned and rewritten; /v1/play media is streamed straight through with Range\npassthrough so seeking works and large files aren't held in memory. Scoped to\nthe api.movish.net host allow-list in resolvers.movish (rejects anything else\nto avoid an open proxy).",
-        "operationId": "movish_proxy_movish_proxy_h__host___path__post",
+        "operationId": "movish_proxy_movish_proxy_h__host___path__get",
         "parameters": [
           {
             "name": "host",
@@ -4653,7 +4653,6 @@
     "/playimdb_proxy": {
       "get": {
         "summary": "Playimdb Proxy",
-        "description": "Signed, same-origin HLS proxy for the PlayIMDb source. Fetches a signed\nupstream playlist/segment with the Referer the PlayIMDb CDNs require\n(injected server-side), rewrites playlists so sub-resources flow back\nthrough this proxy, and streams segments through with Range passthrough.\n\nThe upstream CDN host rotates per request, so instead of a host allow-list\nthis proxy verifies an HMAC on the ``u`` URL (see resolvers.playimdb) and\nrefuses anything unsigned — closing the open-proxy / SSRF hole. No PlayIMDb\nplayer or ad code is ever involved; the resolver extracts the raw stream and\nwraps it in /player.",
         "operationId": "playimdb_proxy_playimdb_proxy_get",
         "responses": {
           "200": {
@@ -4670,7 +4669,6 @@
     "/voe_proxy": {
       "get": {
         "summary": "Voe Proxy",
-        "description": "Signed, same-origin HLS proxy for the VOE source. VOE's delivery CDN binds\nits stream token to the IP/ASN that resolved the embed (note the ``asn=``\nquery param), so the raw playlist/segment URLs 403 from the viewer's browser\neven though they play for the backend. This fetches the signed upstream\nplaylist/segment server-side, rewrites playlists so sub-resources flow back\nthrough this proxy, and streams segments through with Range passthrough.\n\nThe CDN host rotates, so instead of a host allow-list this proxy verifies an\nHMAC on the ``u`` URL (see resolvers.voe) and refuses anything unsigned —\nclosing the open-proxy / SSRF hole.",
         "operationId": "voe_proxy_voe_proxy_get",
         "responses": {
           "200": {
@@ -4687,7 +4685,6 @@
     "/vidmoly_proxy": {
       "get": {
         "summary": "Vidmoly Proxy",
-        "description": "Signed, same-origin HLS proxy for the Vidmoly source. Fetches the signed\nupstream playlist/segment server-side (with the vidmoly Referer), rewrites\nplaylists so sub-resources flow back through this proxy, and streams segments\nthrough with Range passthrough.\n\nThis exists so the Vidmoly stream can be played in the same-origin Crimson\n``/player`` (which gives a real, fullscreen-capable player) instead of being\nhanded to the frontend as a bare cross-origin URL. The CDN host rotates, so\ninstead of a host allow-list the proxy verifies an HMAC on the ``u`` URL (see\nresolvers.vidmoly) and refuses anything unsigned — closing the open-proxy /\nSSRF hole.",
         "operationId": "vidmoly_proxy_vidmoly_proxy_get",
         "responses": {
           "200": {
@@ -4704,7 +4701,6 @@
     "/vidsrc_proxy": {
       "get": {
         "summary": "Vidsrc Proxy",
-        "description": "Signed, same-origin HLS proxy for aniwatch's \"VidSrc\" (megaplay) source.\nThe megaplay delivery CDN is Referer-gated (403s without\n``Referer: https://megaplay.buzz/``), which the viewer's browser can't set on\nits media fetches, so the playlist/segments are fetched server-side here (with\nthat Referer), playlists rewritten so sub-resources flow back through this\nproxy, and segments streamed through with Range passthrough.\n\nThe CDN host rotates, so instead of a host allow-list this proxy verifies an\nHMAC on the ``u`` URL (see resolvers.vidsrc) and refuses anything unsigned —\nclosing the open-proxy / SSRF hole.",
         "operationId": "vidsrc_proxy_vidsrc_proxy_get",
         "responses": {
           "200": {
@@ -4721,8 +4717,39 @@
     "/cinemabz_proxy": {
       "get": {
         "summary": "Cinemabz Proxy",
-        "description": "Signed, same-origin HLS proxy for the cinema.bz sources. cinema.bz's\nupstream HLS CDN is Referer-gated (403s without ``Referer: https://cinema.bz/``)\nand the 1shows CDN serves CORS scoped to cinema.bz's own origin (not ``*``), so\nthe raw playlist/segments can't be fetched by the viewer's browser. This fetches\nthe signed upstream playlist/segment server-side (with the cinema.bz Referer),\nrewrites playlists so sub-resources flow back through this proxy, and streams\nsegments through with Range passthrough.\n\nThe upstream CDN host rotates, so instead of a host allow-list this proxy\nverifies an HMAC on the ``u`` URL (see resolvers.cinemabz) and refuses anything\nunsigned — closing the open-proxy / SSRF hole.",
         "operationId": "cinemabz_proxy_cinemabz_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/febbox_proxy": {
+      "get": {
+        "summary": "Febbox Proxy",
+        "operationId": "febbox_proxy_febbox_proxy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/animesuge_proxy": {
+      "get": {
+        "summary": "Animesuge Proxy",
+        "operationId": "animesuge_proxy_animesuge_proxy_get",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -4752,45 +4779,11 @@
         }
       }
     },
-    "/febbox_proxy": {
-      "get": {
-        "summary": "Febbox Proxy",
-        "description": "Signed, same-origin proxy for the ShowBox/Febbox source. Febbox's player\nhands back direct mp4 links on a rotating OSS CDN; proxying keeps playback\nsame-origin (no CORS surprises), survives host rotation and gives Range\npassthrough for seeking. Some qualities come back as HLS, which is rewritten\nso sub-resources flow back through here.\n\nThe OSS host rotates, so instead of a host allow-list this proxy verifies an\nHMAC on the ``u`` URL (see resolvers.febbox) and refuses anything unsigned —\nclosing the open-proxy / SSRF hole. The febbox ``ui`` token never reaches the\nbrowser: it's only used server-side to mint the direct link in the resolver.",
-        "operationId": "febbox_proxy_febbox_proxy_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/animesuge_proxy": {
-      "get": {
-        "summary": "Animesuge Proxy",
-        "description": "Signed, same-origin proxy for the AnimeSuge source. Fetches a signed\nupstream direct file (mp4/m3u8) server-side, rewrites HLS playlists so\nsub-resources flow back through this proxy, and streams media through with\nRange passthrough.\n\nThe direct-file CDN host can rotate, so instead of a host allow-list this\nproxy verifies an HMAC on the ``u`` URL (see resolvers.animesuge) and refuses\nanything unsigned — closing the open-proxy / SSRF hole. No AnimeSuge or\nthird-party player/ad code is ever involved; the scraper extracts the raw\ndirect file and the resolver wraps it in /player.",
-        "operationId": "animesuge_proxy_animesuge_proxy_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
     "/jellyfin_proxy/{path}": {
-      "post": {
+      "get": {
         "summary": "Jellyfin Proxy",
         "description": "Authenticated reverse proxy to the user's Jellyfin server. Injects the\naccess token server-side (so it never reaches the browser) and rewrites HLS\nplaylists to flow back through this proxy; media segments / direct files are\nstreamed straight through with Range passthrough. Configured via the\nJELLYFIN_* env vars (see resolvers.jellyfin).",
-        "operationId": "jellyfin_proxy_jellyfin_proxy__path__post",
+        "operationId": "jellyfin_proxy_jellyfin_proxy__path__get",
         "parameters": [
           {
             "name": "path",
@@ -4823,10 +4816,10 @@
           }
         }
       },
-      "get": {
+      "post": {
         "summary": "Jellyfin Proxy",
         "description": "Authenticated reverse proxy to the user's Jellyfin server. Injects the\naccess token server-side (so it never reaches the browser) and rewrites HLS\nplaylists to flow back through this proxy; media segments / direct files are\nstreamed straight through with Range passthrough. Configured via the\nJELLYFIN_* env vars (see resolvers.jellyfin).",
-        "operationId": "jellyfin_proxy_jellyfin_proxy__path__post",
+        "operationId": "jellyfin_proxy_jellyfin_proxy__path__get",
         "parameters": [
           {
             "name": "path",
