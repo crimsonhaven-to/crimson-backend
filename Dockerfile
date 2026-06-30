@@ -14,10 +14,10 @@ RUN mkdir -p resolvers scrapers
 RUN --mount=type=secret,id=sources_pat --mount=type=secret,id=sources_repo \
     if [ -s /run/secrets/sources_pat ] && [ -s /run/secrets/sources_repo ]; then \
         git clone --depth 1 \
-          "https://x-access-token:$(cat /run/secrets/sources_pat)@$(cat /run/secrets/sources_repo)" /tmp/src && \
-        cp /tmp/src/resolvers/*.py resolvers/ 2>/dev/null || true; \
-        cp /tmp/src/scrapers/*.py scrapers/ 2>/dev/null || true; \
-        rm -rf /tmp/src; \
+          "https://x-access-token:$(cat /run/secrets/sources_pat)@github.com/$(cat /run/secrets/sources_repo).git" /tmp/src && \
+        cp /tmp/src/resolvers/*.py resolvers/ && \
+        cp /tmp/src/scrapers/*.py scrapers/ && \
+        rm -rf /tmp/src && \
         echo ">> overlay applied: $(ls resolvers | wc -l) resolver / $(ls scrapers | wc -l) scraper file(s)"; \
     else \
         echo ">> no overlay secrets supplied — building base image only"; \
