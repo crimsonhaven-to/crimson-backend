@@ -25,6 +25,15 @@ __pycache__/
 .venv/
 venv/
 
+# Dev/CI-only: the test suite, its tooling config and the throwaway local venv
+# are never needed in the runtime image (the CI `gate` job runs them separately).
+tests/
+.venv-test/
+requirements-dev.txt
+pyproject.toml
+
 # Docs / misc not needed at runtime
 README.md
 metadata_engine/README.md
+New_System.md
+New_System_Progress.md

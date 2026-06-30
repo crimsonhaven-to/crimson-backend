@@ -1,0 +1,12 @@
+# Dev/CI-only tooling. Installed on top of requirements.txt in the CI quality
+# gate (lint + typecheck + tests) — NOT baked into the production image.
+-r requirements.txt
+
+pytest==9.1.1
+pytest-asyncio==1.0.0
+# Linter + formatter (Rust, fast). Replaces flake8/isort/black in one tool.
+ruff==0.14.4
+# Static type-checker. Run in --ignore-missing-imports mode in CI (we don't
+# vendor stubs for every third-party lib); it still catches real type errors in
+# our own code.
+mypy==1.18.2

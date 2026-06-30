@@ -27,7 +27,6 @@ from the shared pool (db_pool), driven from api.py's async handlers via
 
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime, timezone
 from typing import List, Optional

@@ -1,0 +1,43 @@
+# Tooling config for the CI quality gate (see .github/workflows/build-image.yml).
+# This file configures dev tooling only; the app itself is run via uvicorn (see
+# Dockerfile) and has no build step / packaging — there is intentionally no
+# [build-system] table.
+
+[tool.pytest.ini_options]
+# `tests/` holds fixture-based unit tests for the pure parsing/crypto/signing
+# logic — the bits that silently break when an upstream host rotates its markup.
+# They make NO network calls and need NO database, so the suite runs anywhere
+# (locally + CI) in well under a second.
+testpaths = ["tests"]
+# pytest-asyncio in auto mode: `async def test_*` are collected without a
+# per-test @pytest.mark.asyncio decorator.
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+# Match the rest of the codebase's comfortable line width.
+line-length = 100
+target-version = "py314"
+# Vendored third-party crypto + generated/cache dirs aren't ours to lint.
+extend-exclude = ["__pycache__", ".venv-test", "data", "dist"]
+
+[tool.ruff.lint]
+# The ENFORCED gate is pyflakes (F) only: real correctness bugs — undefined
+# names, unused imports, redefinitions, f-strings missing placeholders. This is
+# already clean across the codebase, so the gate is green without a big churn
+# commit. The wider style/modernization families (E/W/I/UP/B) are deliberately
+# left out of the blocking gate for now; `ruff check --select I,UP --fix` is a
+# safe follow-up the maintainer can opt into when ready.
+select = ["F"]
+
+[tool.mypy]
+python_version = "3.14"
+# We don't vendor type stubs for curl_cffi/selectolax/etc., so don't fail on
+# their missing types — we only want type errors in OUR code.
+ignore_missing_imports = true
+# Pragmatic settings: this is a large existing codebase, so run in
+# non-strict mode and only flag concrete mistakes.
+warn_redundant_casts = true
+warn_unused_ignores = false
+no_implicit_optional = true
+exclude = ["tests/", ".venv-test/", "data/"]
