@@ -3,7 +3,9 @@
 -r requirements.txt
 
 pytest==9.1.1
-pytest-asyncio==1.0.0
+# Must be >=1.1 to allow pytest 9 (1.0.0 caps pytest <9). 1.4.0 is the version
+# the suite is validated against.
+pytest-asyncio==1.4.0
 # Linter + formatter (Rust, fast). Replaces flake8/isort/black in one tool.
 ruff==0.14.4
 # Static type-checker. Run in --ignore-missing-imports mode in CI (we don't

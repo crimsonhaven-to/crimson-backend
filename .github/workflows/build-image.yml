@@ -48,14 +48,19 @@ jobs:
   gate:
     runs-on: [self-hosted]
     container: python:3.14-slim
+    # The container runs as root, so its checkout can clean any root-owned files a
+    # prior container run left, and the final step below hands the workspace back
+    # writable so the host-run `build` job can clean it (avoids EACCES on checkout).
+    env:
+      PIP_ROOT_USER_ACTION: ignore
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dev + runtime deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          python -m pip install --upgrade pip --no-cache-dir
+          pip install --no-cache-dir -r requirements-dev.txt
 
       - name: Lint (ruff — correctness rules)
         run: ruff check .
@@ -66,6 +71,13 @@ jobs:
 
       - name: Unit tests (pytest)
         run: pytest
+
+      - name: Hand the workspace back to the host runner
+        if: always()
+        # This job's container writes files as root into the shared self-hosted
+        # workspace; make them world-writable so the next (host-run) job's checkout
+        # can delete them. Without this, `build`'s checkout fails with EACCES.
+        run: chmod -R a+rwX "$GITHUB_WORKSPACE" || true
 
   build:
     needs: gate
