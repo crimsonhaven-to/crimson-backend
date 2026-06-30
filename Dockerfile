@@ -38,6 +38,7 @@ COPY recommend_engine ./recommend_engine
 COPY apikey_engine ./apikey_engine
 COPY subtitles_engine ./subtitles_engine
 COPY skiptimes_engine ./skiptimes_engine
+COPY telemetry_engine ./telemetry_engine
 
 # Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
 # container is stateless and needs no writable data volume.
