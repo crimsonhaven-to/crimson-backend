@@ -15,3 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Deterministic secrets so HMAC signing tests don't depend on the host env.
 os.environ.setdefault("VOE_PROXY_SECRET", "test-voe-secret")
 os.environ.setdefault("PROXY_SECRET", "test-proxy-secret")
+# Importing api.py runs Config.validate(), which requires TMDB_API_KEY to be set.
+# The import-smoke + contract tests never make TMDB calls, so a placeholder is
+# enough (locally this comes from a gitignored .env; CI has none). setdefault so
+# a real key in the environment still wins.
+os.environ.setdefault("TMDB_API_KEY", "test-tmdb-key")
