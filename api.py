@@ -131,7 +131,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "16.0.0"
+VERSION = "16.1.0"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -465,6 +465,13 @@ _PUBLIC_PREFIXES = (
     "/docs",
 )
 
+# Extra public path prefixes contributed at import time by the optional build-time
+# source overlay (empty in a base build). Their stream proxies are loaded cross-origin
+# by the player with no auth header (HMAC-signed instead), so they bypass the login
+# wall the same way the operator proxies above do. Kept separate + derived from the
+# overlaid module names so this committed file names no overlay source.
+_DYNAMIC_PUBLIC_PREFIXES: tuple = ()
+
 # Tiny in-process cache of validated session tokens so the login wall doesn't add
 # a DB round-trip to every content request. A hit (the common case) skips the DB
 # entirely; entries are short-lived so a logout/expiry takes effect within the
@@ -538,6 +545,7 @@ class LoginWallMiddleware:
             scope.get("method") == "OPTIONS"
             or path in _PUBLIC_EXACT
             or path.startswith(_PUBLIC_PREFIXES)
+            or (_DYNAMIC_PUBLIC_PREFIXES and path.startswith(_DYNAMIC_PUBLIC_PREFIXES))
         ):
             return await self.app(scope, receive, send)
 
@@ -2964,6 +2972,112 @@ async def febbox_proxy(request: Request):
         logger.error(f"Febbox proxy upstream error: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
     return _proxy_response(*result)
+
+
+# Optional same-origin stream relays for any overlaid module that ships a
+# ``proxy_fetch`` (present only when the build-time overlay added it). Each mirrors
+# /febbox_proxy: schema-hidden, with the HMAC verification / host allow-list living
+# inside the module's own ``proxy_fetch``. A base build has none, so nothing is added.
+# Routes are derived from the module names + the wiring shape from each fetch
+# signature, so this file names no overlaid source.
+def _register_overlay_stream_proxies():
+    global _DYNAMIC_PUBLIC_PREFIXES
+    import importlib
+    import inspect
+    import pkgutil
+
+    import resolvers as _res_pkg
+
+    already_wired = {"jellyfin", "febbox", "local", "cache"}
+
+    def _signed_stream(fetch_fn):
+        async def _route(request: Request):
+            try:
+                result = await fetch_fn(
+                    url=request.query_params.get("u"),
+                    sig=request.query_params.get("s"),
+                    range_header=request.headers.get("range"),
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=403, detail=str(e))
+            except httpx.RequestError as e:
+                logger.error(f"overlay proxy upstream error: {e}")
+                raise HTTPException(status_code=502, detail="Upstream fetch failed")
+            return _proxy_response(*result)
+        return _route
+
+    def _signed_stream_with_headers(fetch_fn):
+        async def _route(request: Request):
+            try:
+                result = await fetch_fn(
+                    url=request.query_params.get("u"),
+                    origin=request.query_params.get("o"),
+                    referer=request.query_params.get("r"),
+                    sig=request.query_params.get("s"),
+                    range_header=request.headers.get("range"),
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=403, detail=str(e))
+            except httpx.RequestError as e:
+                logger.error(f"overlay proxy upstream error: {e}")
+                raise HTTPException(status_code=502, detail="Upstream fetch failed")
+            return _proxy_response(*result)
+        return _route
+
+    def _reverse_proxy(fetch_fn):
+        async def _route(request: Request, host: str, path: str):
+            body = await request.body() if request.method == "POST" else None
+            try:
+                result = await fetch_fn(
+                    host=host,
+                    path=path,
+                    query_string=request.url.query,
+                    method=request.method,
+                    body=body,
+                    range_header=request.headers.get("range"),
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=403, detail=str(e))
+            except httpx.RequestError as e:
+                logger.error(f"overlay proxy upstream error: {e}")
+                raise HTTPException(status_code=502, detail="Upstream fetch failed")
+            return _proxy_response(*result)
+        return _route
+
+    public_prefixes = []
+    for info in pkgutil.iter_modules(_res_pkg.__path__):
+        name = info.name
+        if name in already_wired or name.startswith("_") or "test" in name:
+            continue
+        try:
+            module = importlib.import_module(f"resolvers.{name}")
+        except Exception:
+            continue
+        fetch_fn = getattr(module, "proxy_fetch", None)
+        if fetch_fn is None:
+            continue
+        params = set(inspect.signature(fetch_fn).parameters)
+        if {"host", "path"} <= params:
+            route, suffix = _reverse_proxy(fetch_fn), "/h/{host}/{path:path}"
+            methods = ["GET", "POST"]
+        elif {"origin", "referer"} <= params:
+            route, suffix, methods = _signed_stream_with_headers(fetch_fn), "", ["GET"]
+        elif {"url", "sig"} <= params:
+            route, suffix, methods = _signed_stream(fetch_fn), "", ["GET"]
+        else:
+            continue
+        app.add_api_route(
+            f"/{name}_proxy{suffix}", route, methods=methods,
+            name=f"{name}_proxy", include_in_schema=False,
+        )
+        public_prefixes.append(f"/{name}_proxy")
+
+    if public_prefixes:
+        _DYNAMIC_PUBLIC_PREFIXES = tuple(public_prefixes)
+        logger.info("registered %d overlay stream prox(y/ies)", len(public_prefixes))
+
+
+_register_overlay_stream_proxies()
 
 
 # --- LOCAL SOURCE PROXY ("Local" source: admin-registered dirs / NAS) ---

@@ -18,3 +18,19 @@ ALL_RESOLVERS = [
     JellyfinResolver,  # your own Jellyfin server -> token-injecting /jellyfin_proxy
     # TemplateResolver,  # inert reference implementation of the resolver contract
 ]
+
+# --- optional build-time source overlay ------------------------------------
+# An operator build may drop extra resolver modules into this package; they're
+# auto-discovered and appended here, so this registry needs no edit. A build without
+# the overlay has none, so nothing is added. ``febbox`` is excluded (operator-only,
+# wired into /resolve, not /watch). Off via PRIVATE_SOURCES_ENABLED=0.
+import sys as _sys
+
+from core.private_sources import discover_private_sources
+
+from .base_resolver import BaseResolver
+
+_PUBLIC_RESOLVER_MODULES = {"base_resolver", "local", "cache", "jellyfin", "template", "febbox"}
+ALL_RESOLVERS += discover_private_sources(
+    _sys.modules[__name__], BaseResolver, _PUBLIC_RESOLVER_MODULES
+)

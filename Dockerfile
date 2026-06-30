@@ -1,3 +1,29 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Optional build-time source overlay. An operator build may inject extra source
+# modules via two BuildKit secrets (a clone URL + a token); absent either, this is
+# a no-op and the image is built as-is. Secrets are mounted only for this RUN and
+# never land in any image layer. See the self-hosting docs.
+# ---------------------------------------------------------------------------
+FROM python:3.14-slim AS private-sources
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /injected
+RUN mkdir -p resolvers scrapers
+RUN --mount=type=secret,id=sources_pat --mount=type=secret,id=sources_repo \
+    if [ -s /run/secrets/sources_pat ] && [ -s /run/secrets/sources_repo ]; then \
+        git clone --depth 1 \
+          "https://x-access-token:$(cat /run/secrets/sources_pat)@github.com/$(cat /run/secrets/sources_repo).git" /tmp/src && \
+        cp /tmp/src/resolvers/*.py resolvers/ && \
+        cp /tmp/src/scrapers/*.py scrapers/ && \
+        rm -rf /tmp/src && \
+        echo ">> overlay applied: $(ls resolvers | wc -l) resolver / $(ls scrapers | wc -l) scraper file(s)"; \
+    else \
+        echo ">> no overlay secrets supplied — building base image only"; \
+    fi
+
+# ---------------------------------------------------------------------------
 FROM python:3.14-slim
 
 # Don't write .pyc files; flush stdout/stderr so container logs are real-time.
@@ -39,6 +65,11 @@ COPY apikey_engine ./apikey_engine
 COPY subtitles_engine ./subtitles_engine
 COPY skiptimes_engine ./skiptimes_engine
 COPY telemetry_engine ./telemetry_engine
+
+# Apply the optional build-time source overlay on top of the base packages. In a
+# build without the overlay secrets these directories are empty, so this is a no-op.
+COPY --from=private-sources /injected/resolvers/ ./resolvers/
+COPY --from=private-sources /injected/scrapers/ ./scrapers/
 
 # Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
 # container is stateless and needs no writable data volume.
