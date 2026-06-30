@@ -86,6 +86,10 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `RATE_LIMIT_STORAGE_URI` | no | `memory://` | Storage backend for rate limiting. Set to `redis://redis:6379` for shared limits across replicas. |
 | `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
 | `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional Jellyfin source. |
+| `JELLYFIN_EDGE_INJECT` | no | `off` | New System: deliver Jellyfin off-backend via crimson-proxy **edge token injection** instead of the backend `/jellyfin_proxy`. Requires the proxy deployed with `NITRO_JELLYFIN_*`. Off ⇒ today's backend-proxied behaviour. |
+| `FEBBOX_UI_TOKEN` / `FEBBOX_REGION` | no | – / `USA7` | The febbox `ui` session cookie that unlocks the ShowBox/Febbox source (the only secret it needs). Unset ⇒ the source self-disables. |
+| `CRIMSON_PROXY_BASE` | no | – | Comma-separated [crimson-proxy](../crimson-proxy) edge origin(s). When set, the New-System offload paths (`/sign`, `/resolve`) hand the client **signed edge links** so segment bytes skip the backend. Unset ⇒ same-origin backend proxies (today's behaviour). |
+| `CRIMSON_PROXY_SOURCES` | no | all | Restrict which sources may be offloaded to the edge (comma-separated source names). |
 | `REQUIRE_LOGIN` | no | `true` | Site-wide login wall — require a valid session on all content endpoints. `false` reopens the API. |
 | `SIGNUP_INVITE_CODE` | no | – | Shared, **reusable** invite code(s) (comma-separated) gating **both** email and mnemonic registration. **Empty ⇒ signups closed** (every register `403`s) — unless a single-use Discord-bot token is used instead. |
 | `DISCORD_BOT_TOKEN` / `DISCORD_OWNER_ID` | no | – | Enable the optional Discord invite bot (`python -m discord_bot`): the one whitelisted `DISCORD_OWNER_ID` can mint **single-use** invite tokens. Empty token ⇒ bot disabled. |
@@ -215,6 +219,26 @@ for extras (specials/OVAs/movies).
 - **`/vidmoly_proxy`**: Signed HLS proxy for the Vidmoly source (the other common aniworld.to host). Same idea as `/voe_proxy` — the stream is proxied server-side and emitted as a direct `hls` source for the in-app player (also future-proofs against the CDN's `asn=` token binding).
 - **`/jellyfin_proxy`**: Proxies Jellyfin HLS segments for same-origin playback.
 - **`/health`**: Check system status and database health.
+
+### Client-side offload grants (New System)
+
+The backend stays the **brain** (metadata, identity, secret custody) but is moving
+out of the **byte path**: the [crimson-sources](../crimson-sources) engine running in
+the viewer's browser (with the [companion extension](../crimson-extension) and/or
+[crimson-proxy](../crimson-proxy)) now scrapes/resolves most sources itself and streams
+`CDN → viewer`. The backend exposes small **grants** that hand the client just what it
+can't derive (server-held secrets stay server-side). All are login-gated like `/watch`.
+
+| Method | Endpoint | Purpose |
+| :--- | :--- | :--- |
+| `GET` | `/scrape-meta/{tmdb}/{season}` | Title bundle for the title-keyed client sources — AniList/TMDB titles + German synonyms, **+ `release_year` + `imdb_id`** (the year/imdb come from the server-held TMDB key, C5). |
+| `GET` | `/scrape-meta/movie/{tmdb}` | Movie twin of the above (title + `release_year` + `imdb_id`) for the Western movie sources (HDRezka/LookMovie/EE3). |
+| `POST` | `/sign` | Mint a **signed crimson-proxy URL** (E2) for a header-only source — `PROXY_SECRET` never reaches the browser. 503 when no proxy is configured. |
+| `POST` | `/resolve` | Cookie/secret-bound **resolve grant**: runs the token-gated lookup server-side (ShowBox/Febbox cookie, Jellyfin token) and returns the **raw** stream for the client to deliver via E3/E2. |
+
+> The execution-environment model (E0 backend → E3 extension) and which source lands
+> where lives in [`New_System.md`](New_System.md); the running status log is
+> [`New_System_Progress.md`](New_System_Progress.md).
 
 ---
 

@@ -894,3 +894,79 @@ live browser pass (needs the v1.0.4 companion loaded).
 **Pushed this session:** crimson-sources `dev` (`55ef014`), crimson-client `dev`
 (`2ab7858`), crimson-backend `dev` (already up-to-date, `cad53e6`). **Local-only
 (main, user pushes):** crimson-proxy `a37705f`, crimson-extension `c543d8d`.
+
+### 🎬 Western/movie source revival + ee3 edge resolution + polish (2026-06-30)
+
+A long session: small fixes, a movie-web/providers fork triage that added real Western
+coverage, the wiring to make title/imdb-keyed sources work, and ee3 brought back as a
+full **edge-resolved** source. All compiles/builds; live browser pass is the user's step.
+
+#### Fixes & polish
+- **`/extension` reload 404 (crimson-client `nginx.conf`):** the Dockerfile copies the
+  packed companion into a physical `extension/` dir, so the SPA fallback's `$uri/` probe
+  301'd `/extension` → `/extension/` → 404. Fixed by dropping `$uri/`
+  (`try_files $uri /index.html`); the download dir still serves via its `^~ /extension/` block.
+- **ShowBox/Febbox multi-quality (`resolvers/febbox.py`):** Febbox's `var sources` carries
+  every transcode (ORG/4K/1080/720/…); the resolver kept only the best. Now `_rank_sources`
+  fans out **one tile per quality** ("ShowBox (1080p)", …) — both `resolve()` (/watch) and
+  `resolve_direct()` (/resolve grant) emit identical labels so local↔backend dedup holds.
+- **PlayIMDb multi-stream (`resolvers/playimdb.py` + `sources/playimdb.ts`):** the API's
+  `stream_urls` are different *releases* (often different muxed audio), unlabeled. We used to
+  play `_first_reachable` → "random dub". Now probe all + surface each reachable release as a
+  "PlayIMDb (Server N)" tile (stable by API index). Deterministic + user-selectable.
+- **VOE tabs (`sources/stoFamily.ts`):** the `resolveInPage` fallback fired for ANY embed a
+  static resolver missed — including VOE, whose opened page spawned ad-popup tabs ("up to 3
+  tabs"). Restricted the hidden-tab fallback to **Filemoon only** (the one hoster with no
+  static path); others skip silently.
+- **Companion popup tidy-up → v1.0.5 (`crimson-extension`):** `resolveInPage` now tracks tabs
+  whose opener chains back to the throwaway embed tab (`chrome.tabs.onCreated`) and closes the
+  ad popunders together with it in `finish()` (success/timeout/error). No stray tabs.
+
+#### movie-web/providers revival → Western movies/TV (see [[movieweb-providers-revival]])
+Triaged the user's Jan-2025 `@movie-web/providers` fork (~32 sources + ~32 embeds). **Key
+lesson:** a homepage 200 ≠ alive — many "alive" hosts are parked/SPA-rebuilt; verify the
+*actual scraping endpoint*. Ported the three that survived real-endpoint checks into
+`crimson-sources` (`dev`):
+- **hdrezka** (`sources/hdrezka.ts`) — Western + RU-dub movies/TV; search→translators→
+  get_cdn_series; **one tile per dub** + subs; E3-only (IP-locked). Verified live.
+- **lookmovie** (`sources/lookmovie.ts`) — lmscript.xyz v1 JSON API; HLS + VTT subs; E3-only.
+- **insertunit** (`sources/insertunit.ts`) — IMDb-keyed HLS (RU/UK/EN); E2/E3; needs `ctx.imdbId`.
+- **Dropped (dead/SPA/parked):** soapertv (domain-for-sale), vidsrc.su (now an SPA), nepu
+  (gutted), flixhq/primewire/autoembed/… (dead). ridomovies (moved to ridomovies.is, CF-walled)
+  + vidsrc.su deferred. `MediaCtx` gained `releaseYear` + `imdbId`.
+
+#### Title/year/imdb wiring (makes the above resolvable)
+- **Backend:** `/scrape-meta/{tmdb}/{season}` now also returns `release_year` + `imdb_id`;
+  new `/scrape-meta/movie/{tmdb}` for movies. New `metadata_engine/tmdb.py::fetch_tmdb_imdb_id`
+  (cached /external_ids) + `_show_year_imdb`/`_year_from_date` in `api.py`. Validated live.
+- **Client:** `clientSources.js enrichMediaCtx` now handles **movies** + folds in
+  `releaseYear`/`imdbId`; the show/movie hooks need no change (they already call it).
+
+#### ee3 — reverse-engineered + revived as an EDGE-resolved source (user decision: E2)
+ee3 was rebuilt as a SvelteKit app; the movie-web port is dead. Fully RE'd (user supplied
+creds + invite): login `POST /login` (form + same-origin headers → `session` cookie) →
+search `/api/movies?title=` (match title+year → slug) → `/movies/{slug}/__data.json`
+(`torrentStreamUrl` = `/api/torrent/proxy/{uuid}`) → stream gated on session + Referer +
+`Sec-Fetch-Site:same-origin` (**not IP-bound**; uuid **session-bound + rotating**; payload is
+the raw ~20GB MKV). Because the uuid is session-bound, the **edge owns the whole flow**:
+- **crimson-proxy (`main`):** `utils/ee3-auth.ts` (login + cached session), `utils/ee3.ts`
+  (detect signed `/__ee3?title=&year=` marker → search → `__data.json` → stream; 2h uuid cache;
+  content-type force-download→`video/x-matroska`), `routes/index.ts` ee3 branch (+re-auth/
+  re-resolve once on 401/403/404/410). New env **`NITRO_EE3_USERNAME`/`_PASSWORD`/`_HOST`**.
+- **crimson-sources (`dev`):** `sources/ee3.ts` movies-only, `needsEdgeSecret` (E2-only),
+  emits the `/__ee3` marker via `preparePlayback({forceProxy})` → the existing `/sign` grant.
+  **No backend code** — the edge owns ee3 end-to-end. Full flow validated live (206 MKV bytes).
+
+#### Docs (this entry)
+Refreshed every README to match the code: crimson-proxy (edge-held secrets: Jellyfin + ee3
++ `NITRO_*` env), crimson-sources (full source table + the Western set + ee3 + layout),
+crimson-extension (the 3rd capability `resolveInPage` + v1.0.5 popup tidy-up + API), backend
+(the `/scrape-meta`·`/scrape-meta/movie`·`/sign`·`/resolve` grants + `JELLYFIN_EDGE_INJECT`/
+`FEBBOX_UI_TOKEN`/`CRIMSON_PROXY_BASE` env), client (the "Client-Side Resolution" section).
+
+**To deploy this session's work:** push crimson-sources `dev` → bump
+`crimson-client/vendor/crimson-sources` + `vendor/crimson-extension` (v1.0.5) → push backend
+`dev` (`/scrape-meta` movie + year/imdb) → push client `dev` → deploy crimson-proxy (both
+edges) with `NITRO_EE3_USERNAME/_PASSWORD` (+ existing `NITRO_JELLYFIN_*` if used). **Live
+test (user):** companion on, watch a Western title (HDRezka dubs / LookMovie) + a movie via
+ee3 — confirm playback (ee3 MKV plays in Chromium-on-Windows).
