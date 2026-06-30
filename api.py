@@ -77,6 +77,7 @@ from skiptimes_engine import router as skiptimes_router
 from core.db_pool import get_pool, close_pool, pool_stats
 from core import lumi
 from core import source_health
+from core import config_report
 from core.contracts import (
     build_done_line,
     build_meta_line,
@@ -159,6 +160,10 @@ async def lifespan(app: FastAPI):
     """Manage application lifecycle"""
     # Startup
     logger.info("Starting up FastAPI application...")
+
+    # Log which optional, env-gated features are on/off (presence only, no secret
+    # values) so a "dark" source is diagnosable at a glance from the boot log.
+    config_report.log_report(logger)
 
     # Open the shared HTTP client (kept warm for the whole process lifetime).
     open_http_client()
