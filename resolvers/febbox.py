@@ -69,8 +69,27 @@ UA = (
 )
 
 # Quality preference, best first. Febbox labels are like "ORG"/"4K"/"1080P"/…;
-# we normalise to these tokens and pick the highest available with a real file.
+# we normalise to these tokens, surface one tile per distinct quality (best file
+# per quality bucket) and order best-first.
 _QUALITY_ORDER = ("org", "4k", "2160", "1440", "1080", "720", "480", "360", "240")
+
+# How many quality variants to surface per episode (best-first; the cap drops the
+# lowest). Febbox typically returns 3-6; this just guards a pathological response.
+_MAX_VARIANTS = 6
+
+# Pretty display per normalised quality token — the suffix in the source label
+# ("ShowBox (1080p)"). Unmatched labels keep their raw text (see _quality_display).
+_QUALITY_DISPLAY = {
+    "org": "Original",
+    "4k": "4K",
+    "2160": "4K",
+    "1440": "1440p",
+    "1080": "1080p",
+    "720": "720p",
+    "480": "480p",
+    "360": "360p",
+    "240": "240p",
+}
 
 
 def _ui_token() -> Optional[str]:
@@ -254,13 +273,36 @@ def _parse_marker(embed_url: str) -> Optional[Tuple[str, str, Optional[int], Opt
     return share_key, fid, season, episode
 
 
+def _quality_token(label: str) -> Optional[str]:
+    """The first _QUALITY_ORDER token present in a febbox source label, or None."""
+    low = (label or "").lower()
+    for tok in _QUALITY_ORDER:
+        if tok in low:
+            return tok
+    return None
+
+
 def _quality_rank(label: str) -> int:
     """Rank a febbox source label; lower = better (earlier in _QUALITY_ORDER)."""
-    low = (label or "").lower()
-    for i, tok in enumerate(_QUALITY_ORDER):
-        if tok in low:
-            return i
-    return len(_QUALITY_ORDER)  # unknown labels sort last
+    tok = _quality_token(label)
+    return _QUALITY_ORDER.index(tok) if tok is not None else len(_QUALITY_ORDER)
+
+
+def _quality_display(label: str) -> str:
+    """Human display for a source label's quality ("1080P" -> "1080p", "ORG" ->
+    "Original"); an unrecognised label is returned cleaned (e.g. "HD"), or "SD"."""
+    tok = _quality_token(label)
+    if tok is not None:
+        return _QUALITY_DISPLAY.get(tok, tok)
+    return (label or "").strip() or "SD"
+
+
+def _source_label(quality: str) -> str:
+    """Per-quality display label. The frontend groups providers by splitting on
+    " · " / " (", so "ShowBox (1080p)" collapses under one "ShowBox" card. Kept
+    identical across resolve() (/watch proxy) and resolve_direct() (/resolve grant)
+    so the two paths dedupe by (source, language)."""
+    return f"ShowBox ({quality})" if quality else "ShowBox"
 
 
 async def fetch_player_html(share_key: str, fid: str) -> Optional[str]:
@@ -296,9 +338,15 @@ async def fetch_player_html(share_key: str, fid: str) -> Optional[str]:
         await session.close()
 
 
-def _best_source(html: str, fid: str) -> Optional[str]:
-    """Pick the best-quality direct file URL from a player response's
-    ``var sources = [...]`` array."""
+def _rank_sources(html: str, fid: str) -> List[Tuple[str, str]]:
+    """Parse a player response's ``var sources = [...]`` array into a best-first list
+    of ``(file_url, quality_display)`` — ONE entry per distinct quality (the best
+    file per quality bucket), capped at ``_MAX_VARIANTS``.
+
+    Febbox returns every transcode of a file (ORG/4K/1080P/720P/…). The resolver
+    used to keep only the single best; surfacing each as its own tile gives a manual
+    quality picker (lower rungs help slow links / save data), matching what other
+    aggregators show per episode."""
     match = re.search(r"var\s+sources\s*=\s*(\[.*?\])\s*;", html, re.S)
     if not match:
         # Surface the login wall / region error explicitly — it's the usual cause.
@@ -307,24 +355,37 @@ def _best_source(html: str, fid: str) -> Optional[str]:
             logger.warning(f"[febbox] no sources for fid {fid}: {msg!r}")
         except (json.JSONDecodeError, AttributeError):
             logger.warning(f"[febbox] no sources for fid {fid} (unparseable response)")
-        return None
+        return []
     try:
         sources = json.loads(match.group(1))
     except json.JSONDecodeError:
         logger.warning(f"[febbox] could not parse sources array for fid {fid}")
-        return None
+        return []
 
     candidates = [
         s for s in sources
         if isinstance(s, dict) and isinstance(s.get("file"), str) and s["file"].startswith("http")
     ]
     if not candidates:
-        return None
+        return []
     candidates.sort(key=lambda s: _quality_rank(s.get("label", "")))
-    best = candidates[0]
-    logger.info(f"[febbox] fid {fid}: picked {best.get('label')!r} of "
-                f"{[c.get('label') for c in candidates]}")
-    return best["file"]
+
+    out: List[Tuple[str, str]] = []
+    seen: set = set()
+    for s in candidates:
+        label = s.get("label", "")
+        # Dedupe by quality bucket: two "1080P" entries collapse, ORG vs 1080P stay
+        # distinct. Unknown labels dedupe on their raw text so they don't all merge.
+        key = _quality_token(label) or label.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((s["file"], _quality_display(label)))
+        if len(out) >= _MAX_VARIANTS:
+            break
+    logger.info(f"[febbox] fid {fid}: surfacing {[q for _, q in out]} "
+                f"of {[c.get('label') for c in candidates]}")
+    return out
 
 
 # Cap on how many subtitle tracks we surface (one per language, ordered).
@@ -408,9 +469,10 @@ class FebboxResolver(BaseResolver):
     domain_keyword: str = EMBED_MARKER
     source_name: str = "ShowBox"
 
-    async def _unlock(self, embed_url: str) -> Optional[Tuple[str, List[dict]]]:
+    async def _unlock(self, embed_url: str) -> Optional[Tuple[List[Tuple[str, str]], List[dict]]]:
         """Shared token-gated lookup behind both resolve paths: marker -> Febbox
-        player HTML -> ``(best_direct_url, subtitle_tracks)``. The ``ui`` cookie
+        player HTML -> ``([(direct_url, quality_display), …], subtitle_tracks)`` —
+        one entry per distinct quality, best-first. The ``ui`` cookie
         (FEBBOX_UI_TOKEN, a C5 secret) is used HERE and nowhere downstream, so the
         secret never has to reach the client. Subtitle ``url`` is the RAW .srt link
         (callers wrap it in the signed proxy). Returns None when locked/unfound."""
@@ -433,54 +495,73 @@ class FebboxResolver(BaseResolver):
         if not html:
             return None
 
-        best = _best_source(html, fid)
-        if not best:
+        streams = _rank_sources(html, fid)
+        if not streams:
             return None
-        return best, _parse_subtitles(html, season, episode)
+        return streams, _parse_subtitles(html, season, episode)
 
     async def resolve(self, embed_url: str):
+        """Resolve to a LIST of per-quality stream tiles (one ``var sources`` entry
+        each), all routed through the signed /febbox_proxy. resolve_streams accepts a
+        list and appends each as its own tile; the frontend groups them under one
+        "ShowBox" card."""
         unlocked = await self._unlock(embed_url)
         if not unlocked:
             return None
-        best, subs = unlocked
+        streams, subs = unlocked
         subtitles = [
             {"label": t["label"], "lang": t["lang"], "url": _proxy_path_for(t["url"])}
             for t in subs
         ]
-        logger.info(f"[febbox] resolved -> proxied stream ({best[:60]}…), "
+        out: List[dict] = []
+        for url, quality in streams:
+            item = {
+                "source": _source_label(quality),
+                "type": "hls" if _is_playlist_url(url) else "mp4",
+                "url": _proxy_path_for(url),
+            }
+            if subtitles:
+                item["subtitles"] = subtitles
+            out.append(item)
+        logger.info(f"[febbox] resolved -> {len(out)} proxied quality tile(s), "
                     f"{len(subtitles)} subtitle track(s)")
-        return {"url": _proxy_path_for(best), "subtitles": subtitles}
+        return out
 
-    async def resolve_direct(self, embed_url: str) -> Optional[dict]:
-        """Resolve to the **raw** direct file URL (NOT the same-origin /febbox_proxy
-        path) so the client engine delivers the bytes itself — extension (E3) or the
-        signed crimson-proxy edge (E2) — and the heavy mp4/HLS never travels through
-        this backend (New System: take the backend out of the byte path).
+    async def resolve_direct(self, embed_url: str) -> Optional[List[dict]]:
+        """Resolve to a LIST of **raw** direct file URLs (NOT same-origin
+        /febbox_proxy paths) — one per quality — so the client engine delivers the
+        bytes itself: extension (E3) or the signed crimson-proxy edge (E2). The heavy
+        mp4/HLS never travels through this backend (New System: take the backend out
+        of the byte path).
 
         The token-gated player lookup still runs here (FEBBOX_UI_TOKEN is a C5
         secret), but only the *control* bytes touch us. Febbox's OSS download links
         carry no Referer gate (the proxy fetches them with a UA alone), so the sole
         header hint is the desktop ``userAgent``. Subtitles stay on the signed
-        /febbox_proxy — they're tiny .srt files we convert to WebVTT on the way out,
-        which is fine (and necessary) to relay.
+        /febbox_proxy — tiny .srt files we convert to WebVTT on the way out, fine
+        (and necessary) to relay.
 
-        Returns ``{"url", "streamType", "headers": {"userAgent"}, "subtitles"}`` (the
-        subtitle URLs are relative signed proxy paths; the /resolve grant absolutizes
-        them against the backend base) or None when the file can't be unlocked."""
+        Each entry is ``{"label", "url", "streamType", "headers": {"userAgent"},
+        "subtitles"}`` (the subtitle URLs are relative signed proxy paths; the
+        /resolve grant absolutizes them against the backend base). Returns None when
+        the file can't be unlocked."""
         unlocked = await self._unlock(embed_url)
         if not unlocked:
             return None
-        best, subs = unlocked
+        streams, subs = unlocked
         subtitles = [
             {"label": t["label"], "lang": t["lang"], "url": _proxy_path_for(t["url"])}
             for t in subs
         ]
-        stream_type = "hls" if _is_playlist_url(best) else "mp4"
-        logger.info(f"[febbox] resolved -> DIRECT {stream_type} ({best[:60]}…), "
+        out: List[dict] = []
+        for url, quality in streams:
+            out.append({
+                "label": _source_label(quality),
+                "url": url,
+                "streamType": "hls" if _is_playlist_url(url) else "mp4",
+                "headers": {"userAgent": UA},
+                "subtitles": subtitles,
+            })
+        logger.info(f"[febbox] resolved -> {len(out)} DIRECT quality stream(s), "
                     f"{len(subtitles)} subtitle track(s) [bytes off-backend]")
-        return {
-            "url": best,
-            "streamType": stream_type,
-            "headers": {"userAgent": UA},
-            "subtitles": subtitles,
-        }
+        return out
