@@ -34,8 +34,7 @@ NDJSON `/watch` stream.
 > backend, it is not advisable to do so since the streams usually require to be proxied
 > through this very backend, and bandwidth is both hard to scale and quite expensive~
 >
-> See [`New_System.md`](New_System.md) for the full architecture and
-> [`New_System_Progress.md`](New_System_Progress.md) for the build log.
+> See [`New_System.md`](New_System.md) for the full architecture
 
 ## 🩸 Core Features
 
