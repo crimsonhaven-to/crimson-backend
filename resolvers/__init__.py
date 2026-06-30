@@ -1,40 +1,20 @@
-from .vidmoly import VidmolyResolver
-from .voe import VoeResolver
-from .movish import MovishResolver
-from .playimdb import PlayimdbResolver
+# resolvers/__init__.py
+#
+# Resolvers turn a scraper's embed marker into a playable stream URL. With the
+# third-party sources removed (their scraping/resolving now lives in the private
+# ``crimson-sources`` package — see ``New_System.md``), only the operator-owned
+# resolvers remain. See ``template.py`` for a documented, inert reference
+# implementation of the resolver contract (kept as a file only; not registered).
 from .jellyfin import JellyfinResolver
 from .local import LocalResolver
-from .animesuge import AnimeSugeResolver, DirectM3U8Resolver, AsbGamesResolver
-from .cinemabz import (
-    CinemabzTcloudResolver,
-    CinemabzIpcloudResolver,
-    CinemabzNgcloudResolver,
-)
-from .screenscape import SCREENSCAPE_RESOLVERS
-from .vidsrc import VidSrcResolver
-from .febbox import FebboxResolver
 from .cache import CacheResolver
+# from .template import TemplateResolver  # reference only — re-enable with the list entry below.
 
-# The unified list of all our resolvers.
-# MovishResolver matches on the distinct "api.movish.net" host.
+# The unified list of all resolvers. ``resolve_streams`` (api.py) matches an
+# embed to the first resolver whose ``domain_keyword`` is a substring of it.
 ALL_RESOLVERS = [
-    CacheResolver,  # server-side cache -> /cache_proxy (direct play); labelled per NAS target
-    VidmolyResolver,
-    VoeResolver,
-    MovishResolver,
-    PlayimdbResolver,
-    JellyfinResolver,
-    LocalResolver,  # admin-registered local dirs / NAS mounts -> /local_proxy (direct play)
-    AnimeSugeResolver,  # ad-free: extracts direct mp4/m3u8, proxies + /player
-    DirectM3U8Resolver,
-    AsbGamesResolver,
-    # cinema.bz: TMDB-keyed HLS, one resolver per provider (three switchable tiles)
-    CinemabzTcloudResolver,
-    CinemabzIpcloudResolver,
-    CinemabzNgcloudResolver,
-    # ScreenScape: TMDB-keyed multi-server aggregator; one resolver per server,
-    # each may return several quality/language tiles (signed/encrypted API).
-    *SCREENSCAPE_RESOLVERS,
-    VidSrcResolver,  # aniwatch.co.at "VidSrc" server -> megaplay HLS
-    FebboxResolver,  # ShowBox/Febbox direct-file source (env-gated on FEBBOX_UI_TOKEN)
+    CacheResolver,     # server-side cache -> /cache_proxy (direct play); labelled per NAS target
+    LocalResolver,     # admin-registered local dirs / NAS mounts -> /local_proxy (direct play)
+    JellyfinResolver,  # your own Jellyfin server -> token-injecting /jellyfin_proxy
+    # TemplateResolver,  # inert reference implementation of the resolver contract
 ]

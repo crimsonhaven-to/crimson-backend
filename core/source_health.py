@@ -34,22 +34,19 @@ CANARY = {
 
 # Per-source descriptors. ``env_gate`` names an env var that must be set for the
 # source to be live (probing it while unset reports "disabled" rather than red).
+#
+# Only operator-provided ``library`` sources remain — the public backend no longer
+# scrapes third-party sites (that moved to the private ``crimson-sources`` package,
+# running client/extension/proxy-side; see ``New_System.md``). The ``scrape``
+# category + the ``CANARY`` probe above are kept for the contract / any future
+# operator-owned source that wants an end-to-end probe.
 SOURCE_META = {
-    # --- external scrape sources -------------------------------------------
-    "AniworldScraper": {"label": "AniWorld",     "category": "scrape", "note": "Anime · German (VOE/Vidmoly)"},
-    "StoScraper":      {"label": "s.to",         "category": "scrape", "note": "TV + anime · German (VOE/Vidmoly)"},
-    "StoMirrorScraper":{"label": "s.to (mirror)","category": "scrape", "note": "Turnstile-free IP mirror of s.to"},
-    "AniwatchScraper": {"label": "AniWatch",     "category": "scrape", "note": "Anime · VidSrc/megaplay"},
-    "MovishScraper":   {"label": "Movish",       "category": "scrape", "note": "TMDB-keyed · ad-free player"},
-    "PlayimdbScraper": {"label": "PlayIMDb",     "category": "scrape", "note": "TMDB-keyed · VidAPI chain"},
-    "AnimeSugeScraper":{"label": "AnimeSuge",    "category": "scrape", "note": "Anime · ad-free Kiranime"},
-    "CinemabzScraper": {"label": "Cinema.bz",    "category": "scrape", "note": "TMDB-keyed · 3-provider HLS"},
-    "ShowBoxScraper":  {"label": "ShowBox",      "category": "scrape", "note": "Direct-file · FebBox",
-                        "env_gate": "FEBBOX_UI_TOKEN"},
     # --- operator-provided library sources ---------------------------------
     "CacheScraper":    {"label": "Server Cache", "category": "library", "note": "Remuxed episodes on your NAS"},
     "LocalScraper":    {"label": "Local Media",  "category": "library", "note": "Registered NAS / bind-mount dirs"},
     "JellyfinScraper": {"label": "Jellyfin",     "category": "library", "note": "Your personal Jellyfin server"},
+    # --- documentation-only template ---------------------------------------
+    "TemplateScraper": {"label": "Template",     "category": "library", "note": "Inert reference source (no-op)"},
 }
 
 

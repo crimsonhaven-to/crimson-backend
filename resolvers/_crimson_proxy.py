@@ -35,17 +35,13 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Display labels of the sources wired to prefer the external proxy when enabled.
-# Used by the admin dashboard to show what's being offloaded; kept in sync with
-# the resolvers that call ``proxy_url``.
-#
-# NOTE: VOE is deliberately NOT here. Its CDN token is bound to the IP/ASN that
-# resolved the embed (the ``asn=`` query param), so only the backend — the ASN
-# the token was minted for — can fetch its segments. An external proxy on any
-# other network (e.g. a Cloudflare Worker) gets a 403, exactly as the viewer's
-# browser would. VOE therefore MUST stay on its same-origin /voe_proxy. The
-# offloadable sources are the purely Referer/Origin-gated ones below.
-ROUTED_SOURCES = ["cinema.bz", "PlayIMDb"]
+# Display labels of backend sources wired to prefer the external proxy when
+# enabled (shown by the admin dashboard). The backend no longer resolves any
+# third-party sources, so this is empty: source resolving + proxy offload now
+# happen client-side (the client mints its own signed links via POST /sign, and
+# the crimson-proxy helper here only powers /sign, the cache downloader, and the
+# dashboard's proxy-health ping).
+ROUTED_SOURCES: list[str] = []
 
 
 def proxy_bases() -> list[str]:

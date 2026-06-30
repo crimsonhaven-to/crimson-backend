@@ -2,62 +2,85 @@
 
 Greetings from the heart of Crimson Haven! I am Luminas Crimsonveil—your curator of all things anime. You may call me Lumi ( ^ . ^ )
 
-This is the robust, high-performance engine powering our streaming sanctuary. It handles multi-season anime mapping, automated metadata aggregation, and multi-source stream resolution with elegance and speed.
+This is the **brain** of our streaming sanctuary: TMDB↔AniList metadata, accounts
+& the members-only login wall, recommendations, supporters, the admin dashboard,
+and the orchestration that ties it all together — served fast over a progressive
+NDJSON `/watch` stream.
+
+> ## 🩸 Important: this backend does **not** scrape third-party streaming sites
+>
+> For legal reasons — and because this repository is **public** — the backend no
+> longer scrapes or resolves any third-party source. All of that logic was moved
+> into the **private** [`crimson-sources`](../crimson-sources) package, which runs
+> **client-side** in the viewer's own browser (with the
+> [companion extension](../crimson-extension) and/or the
+> [`crimson-proxy`](../crimson-proxy) edge relay).
+>
+> What the backend *does* still serve are **operator-owned sources** — media the
+> server operator controls, which is not third-party scraping:
+> **Local** (your own NAS / bind-mounted directories), **Cache** (episodes this
+> server already remuxed onto your NAS), and **Jellyfin** (your own self-hosted
+> media server). Plus an inert, documented **template** source that shows the
+> contract for adding another operator-owned source.
+>
+> See [`New_System.md`](New_System.md) for the full architecture and
+> [`New_System_Progress.md`](New_System_Progress.md) for the build log.
 
 ## 🩸 Core Features
 
-- **Multi-Season Intelligence**: Automatically maps TMDB TV shows and seasons to their corresponding AniList IDs using the Fribb dataset.
-- **Unified Search**: Search across TMDB with automatic suggestions and metadata enrichment.
-- **Smart Metadata**: Aggregates data from TMDB and AniList for complete info (titles, posters, episode summaries).
-- **Advanced Scraping**: Multi-threaded, async scraping from various sources (AniWorld, s.to, AniWatch, AnimeSuge, etc.). Sources like AniWorld even include **language labels** (English Sub, German Dub, etc.).
-- **Stream Resolution**: Resolves third-party embed URLs to direct HLS/MP4 streams or ad-free proxied players.
-- **Progressive Streaming**: `/watch` streams results as **NDJSON** — each source is pushed to the client the instant its scraper + resolver finish, so the fastest source plays first instead of waiting for every source.
-- **Automatic Sync**: Built-in scheduler keeps the local mapping database up-to-date with upstream sources.
-- **Internal Proxies**: Custom reverse proxies for providers like AnimeSuge, Movish, and Jellyfin to bypass ads and CORS.
-- **Crimson Player**: A minimal, ad-free HLS/MP4 player served directly from the backend for a seamless experience.
-- **Accounts & Login Wall**: Two coexisting sign-in methods — Ed25519 mnemonic (P-Stream style) **and** invite-gated email + password with SMTP verification/reset — behind a site-wide, opt-out login wall so the whole API is members-only.
-- **Rate Limiting**: Built-in protection against scraping abuse and brute-force attempts on sensitive endpoints.
+- **Multi-Season Intelligence**: Maps TMDB TV shows/seasons to their AniList IDs using the Fribb dataset.
+- **Unified Search & Metadata**: Searches TMDB and enriches with AniList (titles, posters, episode summaries) for anime, non-anime TV, and movies.
+- **Progressive `/watch`**: streams resolved sources as **NDJSON** — each source is flushed to the client the instant it resolves, so the fastest plays first.
+- **Operator-owned sources**: a generic scrape→resolve pipeline that now drives only **Local**, **Cache**, and **Jellyfin** (all server-operator media), plus a template.
+- **Client-offload grants**: small login-gated endpoints (`/scrape-meta`, `/sign`, `/resolve`) that hand the client engine exactly what it can't derive — without ever leaking a server-held secret.
+- **Crimson Player**: a minimal, ad-free HLS/MP4 player served from the backend for the operator-owned (and any iframe) streams.
+- **Accounts & Login Wall**: two coexisting sign-in methods — Ed25519 mnemonic (P-Stream style) **and** invite-gated email + password with SMTP verify/reset — behind a site-wide, opt-out login wall so the whole API is members-only.
+- **Extras**: recommendations, Ko-fi supporters, a public changelog from GitHub Releases, OpenSubtitles tracks, AniSkip skip-times, an admin dashboard, and a server-side video cache.
+- **Rate Limiting**: built-in protection on sensitive endpoints (`slowapi`).
 
 ## 🛠 Tech Stack
 
-- **Framework**: FastAPI (Python 3.10+)
-- **Database**: PostgreSQL (Metadata Mapping, API Cache & Accounts), pooled via psycopg 3
-- **Networking**: HTTPX (Async)
-- **Parsing**: BeautifulSoup4, Selectolax, lxml
+- **Framework**: FastAPI (Python 3.10+, runs on 3.14-slim in the image)
+- **Database**: PostgreSQL (metadata mapping, API cache & accounts), pooled via psycopg 3
+- **Networking**: HTTPX (async); the operator-owned sources use plain server-to-server fetches (no third-party impersonation)
 - **Scheduling**: APScheduler
-- **Rate Limiting**: slowapi (Token Bucket)
-- **Containerization**: Docker & Docker Compose
+- **Rate Limiting**: slowapi (token bucket)
+- **Containerization**: Docker & Docker Compose / Swarm
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 
 - **Python 3.10+**
-- **PostgreSQL**: A reachable database (run one locally, or use the bundled `postgres` service via `docker compose`).
-- **TMDB API Key**: Required for metadata and search (Legacy API Key / Read Access Token).
+- **PostgreSQL**: a reachable database (run one locally, or use the bundled `postgres` service via `docker compose`).
+- **TMDB API Key**: required for metadata and search (legacy API key / v4 Read Access Token).
 
 ### Installation
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/ramon/crimson-backend.git
+   git clone https://github.com/crimsonhaven-to/crimson-backend.git
    cd crimson-backend
    ```
 
-2. **Install dependencies**:
+2. **Create a virtualenv and install dependencies**:
    ```bash
+   python -m venv .venv
+   . .venv/bin/activate          # Windows: .venv\Scripts\activate
    pip install -r requirements.txt
+   # for tests / linting:  pip install -r requirements-dev.txt
    ```
 
-3. **Configure environment**:
-   Create a `.env` file in the root:
+3. **Configure environment**: copy [`.env.example`](.env.example) to `.env` and fill in at least:
    ```env
    TMDB_API_KEY=your_tmdb_api_key_here
    DATABASE_URL=postgresql://crimson:crimson@localhost:5432/crimson
-   DEBUG=False
+   # For a quick local spin-up you can also disable the login wall:
+   # REQUIRE_LOGIN=false
    ```
-   The database schema is created automatically on startup (idempotent); you
-   only need an empty database and a user that can create tables.
+   The database schema is created automatically on startup (idempotent
+   `CREATE TABLE / ALTER … IF NOT EXISTS` migrations); you only need an empty
+   database and a user that can create tables.
 
 ### Running the API
 
@@ -65,47 +88,60 @@ This is the robust, high-performance engine powering our streaming sanctuary. It
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-The API will be available at `http://localhost:8000`. You can explore the interactive docs at `/docs`.
+The API is at `http://localhost:8000`; interactive docs at `/docs`. The committed
+[`openapi.json`](openapi.json) is the generated schema — regenerate it after route
+changes with `python scripts/export_openapi.py`.
+
+### Running the tests
+
+```bash
+pytest -q
+```
+
+The suite covers the canonical contracts (`tests/test_contracts.py` asserts the
+app imports and its OpenAPI schema generates), the proxy-signing + SSRF guards,
+the config report and telemetry.
 
 ---
 
 ## ⚙️ Configuration
 
-All configuration is via environment variables (see [`.env.example`](.env.example)).
+All configuration is via environment variables (see [`.env.example`](.env.example)
+for the fully-commented list). The most relevant:
 
 | Variable | Required | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `TMDB_API_KEY` | **yes** | – | TMDB Read Access Token (v4) or legacy key. |
-| `PROXY_SECRET` | prod | random | HMAC secret for the signed stream proxies (AnimeSuge/PlayIMDb/VOE/Vidmoly). **Must be stable and shared across replicas** or proxied playback 403s. `openssl rand -hex 32`. |
-| `DATABASE_URL` | prod | – | Full PostgreSQL connection URL, e.g. `postgresql://crimson:crimson@postgres:5432/crimson`. Takes precedence over the discrete `POSTGRES_*` parts below. |
-| `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | no | `localhost` / `5432` / `crimson` / `crimson` / `crimson` | Used to assemble the connection when `DATABASE_URL` is unset. |
+| `DATABASE_URL` | prod | – | Full PostgreSQL URL, e.g. `postgresql://crimson:crimson@postgres:5432/crimson`. Takes precedence over the discrete `POSTGRES_*` parts. |
+| `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | no | `localhost` / `5432` / `crimson` ×3 | Used to assemble the connection when `DATABASE_URL` is unset. |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | no | `1` / `10` | Connection-pool sizing. |
-| `DB_CONNECT_TIMEOUT` | no | `30` | Seconds to wait at startup for the database to accept connections. |
 | `RUN_DB_SYNC` | no | `true` | Whether this instance runs the periodic Fribb resync. Set `false` on all but one replica. |
-| `ALLOWED_ORIGINS` | no | built-in list | Comma-separated CORS origins (e.g. `https://crimsonhaven.to`). |
-| `RATE_LIMIT_STORAGE_URI` | no | `memory://` | Storage backend for rate limiting. Set to `redis://redis:6379` for shared limits across replicas. |
-| `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
-| `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional Jellyfin source. |
-| `JELLYFIN_EDGE_INJECT` | no | `off` | New System: deliver Jellyfin off-backend via crimson-proxy **edge token injection** instead of the backend `/jellyfin_proxy`. Requires the proxy deployed with `NITRO_JELLYFIN_*`. Off ⇒ today's backend-proxied behaviour. |
-| `FEBBOX_UI_TOKEN` / `FEBBOX_REGION` | no | – / `USA7` | The febbox `ui` session cookie that unlocks the ShowBox/Febbox source (the only secret it needs). Unset ⇒ the source self-disables. |
-| `CRIMSON_PROXY_BASE` | no | – | Comma-separated [crimson-proxy](../crimson-proxy) edge origin(s). When set, the New-System offload paths (`/sign`, `/resolve`) hand the client **signed edge links** so segment bytes skip the backend. Unset ⇒ same-origin backend proxies (today's behaviour). |
-| `CRIMSON_PROXY_SOURCES` | no | all | Restrict which sources may be offloaded to the edge (comma-separated source names). |
 | `REQUIRE_LOGIN` | no | `true` | Site-wide login wall — require a valid session on all content endpoints. `false` reopens the API. |
-| `SIGNUP_INVITE_CODE` | no | – | Shared, **reusable** invite code(s) (comma-separated) gating **both** email and mnemonic registration. **Empty ⇒ signups closed** (every register `403`s) — unless a single-use Discord-bot token is used instead. |
-| `DISCORD_BOT_TOKEN` / `DISCORD_OWNER_ID` | no | – | Enable the optional Discord invite bot (`python -m discord_bot`): the one whitelisted `DISCORD_OWNER_ID` can mint **single-use** invite tokens. Empty token ⇒ bot disabled. |
-| `DISCORD_COMMAND_PREFIX` | no | `!` | Chat-command prefix for the Discord invite bot. |
-| `FRONTEND_BASE_URL` | no | `https://crimsonhaven.to` | Origin used to build the emailed verify / reset links. |
-| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURITY` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_FROM_NAME` | no | – / `587` / `starttls` / … | SMTP for verification + reset email. Unset `SMTP_HOST` disables sending (registration still works; mail no-ops). |
+| `SIGNUP_INVITE_CODE` | no | – | Shared, **reusable** invite code(s) gating **both** email and mnemonic registration. **Empty ⇒ signups closed** (every register `403`s) — unless a single-use Discord-bot token is used instead. |
+| `PROXY_SECRET` | for `/sign` | random | HMAC secret shared with [`crimson-proxy`](../crimson-proxy). Signs the `/sign` client links, `/subtitles_proxy`, and cache tickets. **Must be stable + identical across replicas (and equal to each proxy's `NITRO_PROXY_SECRET`)** or signed playback 403s. `openssl rand -hex 32`. |
+| `CRIMSON_PROXY_BASE` | no | – | Comma-separated [`crimson-proxy`](../crimson-proxy) edge origin(s). When set, `POST /sign` mints **signed edge links** for client-resolved streams (segment bytes skip the backend). Unset ⇒ `/sign` returns 503 and the client stays on the extension (E3) or backend (E0). |
+| `JELLYFIN_URL` / `JELLYFIN_USERNAME` / `JELLYFIN_PASSWORD` | no | – | Enable the optional **Jellyfin** source (your own server; reachable from the backend). |
+| `JELLYFIN_EDGE_INJECT` | no | `off` | Deliver Jellyfin off-backend via crimson-proxy **edge token injection** instead of the backend `/jellyfin_proxy`. Requires the proxy deployed with `NITRO_JELLYFIN_*`. Off ⇒ backend-proxied (default, no regression). |
+| `ALLOWED_ORIGINS` | no | built-in list | Comma-separated CORS origins (e.g. `https://crimsonhaven.to`). |
+| `RATE_LIMIT_STORAGE_URI` | no | `memory://` | Rate-limit backend; `redis://…` to share limits across replicas. |
+| `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
 
-> **Containers:** Compose/Swarm only inject env vars **explicitly listed** in a service's `environment:` block — the `.env` file is used for `${...}` substitution, *not* auto-injected. The login-wall + SMTP vars are wired into the `api` services in `docker-compose-dev.yml` and `docker-stack.yml`; recreate the container (`docker compose up -d`) after changing them.
+Other optional integrations (each self-disables when unset): the **Discord invite
+bot** (`DISCORD_BOT_TOKEN` / `DISCORD_OWNER_ID`), **SMTP** for verify/reset email
+(`SMTP_*`, `FRONTEND_BASE_URL`), **Ko-fi supporters** (`KOFI_VERIFICATION_TOKEN`),
+the public **changelog** (`GITHUB_TOKEN` / `GITHUB_REPO`), **OpenSubtitles**
+(`OPENSUBTITLES_API_KEY`), and the **server-side cache** worker (`RUN_CACHE_WORKER`
++ `CACHE_*`). All are documented inline in `.env.example`.
+
+> **Containers:** Compose/Swarm only inject env vars **explicitly listed** in a
+> service's `environment:` block — the `.env` file is used for `${...}`
+> substitution, *not* auto-injected. Recreate the container after changing them.
 
 All state (the TMDB↔AniList mapping, the API cache, and accounts/favorites/
 progress) lives in **one PostgreSQL database**, reached through a process-wide
-psycopg connection pool (`db_pool.py`). A Fribb resync only rebuilds the three
-mapping tables inside a transaction, so it never touches user data — which is
-why mapping and accounts can safely share one database. Because the API holds no
-local state, replicas are interchangeable and can all point at the same
-database.
+psycopg connection pool (`db_pool.py`). A Fribb resync only rebuilds the mapping
+tables inside a transaction, so it never touches user data. Because the API holds
+no local state, replicas are interchangeable and can all point at the same database.
 
 ---
 
@@ -119,173 +155,151 @@ docker build -t crimson-backend:1.0 .
 TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) docker compose up -d
 ```
 
-The Compose file brings up a bundled **`postgres:17-alpine`** service (data on
-the `crimson-pgdata` named volume) and the stateless API container, which runs
-as a non-root user and ships a `HEALTHCHECK` that polls `/health`. The API waits
-for Postgres to report healthy (`depends_on`) before starting.
+The Compose file brings up a bundled **`postgres:17-alpine`** service (data on the
+`crimson-pgdata` named volume) and the stateless API container, which runs as a
+non-root user and ships a `HEALTHCHECK` that polls `/health`. The API waits for
+Postgres to report healthy (`depends_on`) before starting.
 
 > [!NOTE]
 > The bundled `postgres` service is meant for **dev / single-host** use. In
 > production, point `DATABASE_URL` at a managed or externally-operated PostgreSQL
-> instance and drop the bundled service — the API needs no writable volume of its
-> own. Override the database credentials via `POSTGRES_USER` / `POSTGRES_PASSWORD`
-> / `POSTGRES_DB` (or set a full `DATABASE_URL`).
+> instance and drop the bundled service — the API needs no writable volume of its own.
 
-### Deploying to Docker Swarm
+### Docker Swarm
 
-The provided [`docker-compose.yml`](docker-compose.yml) is Swarm-ready
-(`deploy:` block with restart policy, resource limits and `stop-first` updates):
+The provided [`docker-stack.yml`](docker-stack.yml) is Swarm-ready (restart policy,
+resource limits, `stop-first` updates):
 
 ```bash
-docker stack deploy -c docker-compose.yml crimson
+docker stack deploy -c docker-stack.yml crimson
 ```
 
 > [!IMPORTANT]
-> **State now lives in PostgreSQL, so the API is stateless and scales across
-> nodes.** Point every replica at the same database (a managed/external Postgres
-> in production; the bundled `postgres` service is fine for a single host) and
-> scale `anime-api` freely. When running more than one replica:
-> 1. Set `RUN_DB_SYNC=true` on **exactly one** replica, `false` on the rest, so
->    the wholesale mapping rebuild runs once.
-> 2. Set the **same `PROXY_SECRET`** on every replica so signed proxy URLs
->    verify regardless of which replica serves the follow-up request.
->
-> The database access layer is small and isolated in `db_pool.py` (the shared
-> pool), `account_engine/db.py`, `metadata_engine/db_handler.py` and the helpers
-> in `api.py`.
+> **State lives in PostgreSQL, so the API is stateless and scales across nodes.**
+> When running more than one replica:
+> 1. Set `RUN_DB_SYNC=true` on **exactly one** replica, `false` on the rest, so the
+>    wholesale mapping rebuild runs once.
+> 2. Set the **same `PROXY_SECRET`** on every replica so signed links verify
+>    regardless of which replica serves the follow-up request.
+> 3. Run the cache downloader on **one** dedicated worker (`RUN_CACHE_WORKER=true`
+>    there, `false` everywhere else).
 
-The stack must be reachable behind a TLS-terminating reverse proxy that sets
+The stack must sit behind a TLS-terminating reverse proxy that sets
 `X-Forwarded-Proto`/`X-Forwarded-Host` (uvicorn runs with `--proxy-headers`),
-otherwise proxied iframe URLs are emitted as `http://` and blocked as mixed
-content on the HTTPS frontend.
+otherwise the absolute stream URLs the backend emits come out as `http://` and get
+blocked as mixed content on the HTTPS frontend.
+
+`deploy/` holds the production ops notes (Patroni HA Postgres, pgBackRest B2
+backups, PgBouncer pooling); the CI/CD pipeline builds + pushes a private GHCR
+image and auto-deploys to the swarm on a tagged release.
 
 ---
 
 ## 📜 API Reference
 
-### Core Endpoints
+### Core content endpoints
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/search/anime` | Search for anime by name (TMDB-based). |
-| `GET` | `/trending` | Fetch popular shows. |
-| `GET` | `/catalogue` | List all mapped anime in the local DB. |
-| `GET` | `/show/{tmdb_id}` | Get full show details and season list. |
-| `GET` | `/overview/{anilist_id}` | **New**: Aggregated show metadata + season list in one round-trip. |
-| `GET` | `/info/{tmdb_id}?season=` | Flat merged TMDB + AniList metadata + `episodes_list` for a season. |
-| `GET` | `/seasons/{anilist_id}` | All seasons of the show an AniList id belongs to. |
-| `GET` | `/season/{tmdb_id}/{num}` | Get metadata for a specific season. |
-| `GET` | `/watch/{tmdb_id}/{s}/{e}` | **Primary**: stream episode links progressively as **NDJSON** (see below). |
-| `GET` | `/anilist/{id}` | Reverse lookup (AniList ID -> TMDB ID). |
+| `GET` | `/search/anime` · `/search/shows` · `/search/movies` | Search by name (TMDB-based). |
+| `GET` | `/trending` · `/trending/shows` · `/trending/movies` | Popular titles. |
+| `GET` | `/catalogue` | All mapped anime in the local DB. |
+| `GET` | `/show/{tmdb_id}` · `/info/{tmdb_id}?season=` | Show details / flat merged season metadata. |
+| `GET` | `/seasons/{anilist_id}` · `/season/{tmdb_id}/{num}` | Season list / single-season metadata. |
+| `GET` | `/overview/{anilist_id}` · `/show-overview/{tmdb_id}` · `/movie-overview/{tmdb_id}` | Aggregated metadata + seasons in one round-trip. |
+| `GET` | `/watch/{tmdb_id}/{s}/{e}` · `/watch/movie/{tmdb_id}` | **Primary**: stream episode/movie links progressively as **NDJSON**. |
+| `GET` | `/recommendations` · `/recommendations/similar/{anilist_id}` | Genre-based "watch next". |
+| `GET` | `/anilist/{id}` | Reverse lookup (AniList ID → TMDB ID). |
 
 ### Progressive `/watch` (NDJSON streaming)
 
 `GET /watch/{tmdb_id}/{season}/{episode}` does **not** return a single JSON body.
 It responds with `Content-Type: application/x-ndjson` and emits **one JSON object
-per line, flushed as each source resolves** — the client should read the body
-incrementally (line by line) and surface each source the moment it arrives.
-
-Lines, in order:
+per line, flushed as each source resolves** — read the body incrementally and
+surface each source the moment it arrives.
 
 ```jsonc
 {"type":"meta","success":true,"tmdb_id":1234,"season_number":1,"episode_number":1,"anilist_id":567,"title":"..."}
-{"type":"stream","source":"AniWorld","streamType":"hls","url":"https://.../playlist.m3u8","language":"English Sub"}
-{"type":"stream","source":"AnimeSuge","streamType":"hls","url":"https://<backend>/animesuge_proxy?u=...&s=..."}
+{"type":"stream","source":"Jellyfin","streamType":"hls","url":"https://<backend>/jellyfin_proxy/...","language":null}
+{"type":"stream","source":"Crimson Vault","streamType":"mp4","url":"https://<backend>/cache_proxy/<token>","language":"German Dub"}
 {"type":"done","count":2}
 ```
 
 - `meta` — always first (ids + resolved title).
-- `stream` — zero or more; `streamType` is `hls` | `mp4` | `iframe`. Append each to the player's source list as it arrives.
-- `done` — terminal; `count` = number of `stream` lines emitted (`0` → nothing found).
+- `stream` — zero or more; `streamType` is `hls` | `mp4` | `iframe`. The
+  **client-side engine** ([`crimson-sources`](../crimson-sources)) emits the
+  **byte-identical** line shape for the sources it resolves in the browser, and the
+  frontend dedupes the two streams by `(source, language)` — so a backend
+  (operator-owned) source and a client-resolved third-party source coexist in one list.
+- `done` — terminal; `count` = number of `stream` lines emitted.
 
-Each scraper runs as its own task (scrape → resolve → emit); a shared seen-set
-de-dupes embeds/URLs across sources. If the client disconnects mid-stream the
-backend cancels its in-flight scraper tasks. The response carries
-`X-Accel-Buffering: no` so an nginx/reverse proxy flushes lines through instead
-of buffering the whole response. The legacy `GET /watch/{anilist_id}/{episode}`
-301-redirects to the canonical 3-part route for TV seasons, or streams directly
-for extras (specials/OVAs/movies).
+Each operator-owned source runs as its own task (search → embeds → resolve → emit);
+a shared seen-set de-dupes across sources, and disconnecting cancels in-flight tasks.
+The response carries `X-Accel-Buffering: no` so reverse proxies flush lines through.
 
-> The full client-side integration spec (including an Android NDJSON consumer and
-> how to play each `streamType`) lives in [`Mobile.md`](Mobile.md).
+### Operator-owned stream proxies & utilities
 
-### Internal Proxies & Utilities
+These are the **only** stream proxies the backend serves — all for media the
+operator controls:
 
-- **`/player`**: Renders the Crimson Player for direct HLS/MP4 streams.
-- **`/animesuge_proxy`**: Signed, same-origin proxy for AnimeSuge direct streams (handles Referer and HLS rewriting).
-- **`/movish_proxy`**: Proxies Movish streams to handle headers/CORS.
-- **`/playimdb_proxy`**: Signed HLS proxy for the PlayIMDb source (injects the referer the PlayIMDb CDNs require; the raw stream is extracted server-side so no PlayIMDb player/ad code is ever loaded).
-- **`/voe_proxy`**: Signed HLS proxy for the VOE source (most of aniworld.to is hosted on VOE). VOE's CDN binds the stream token to the IP/ASN **and** User-Agent that resolved the embed, so the raw playlist/segment URLs 403 from the viewer's browser; the backend fetches them server-side (matching UA) and rewrites playlists so segments flow back through the proxy. Emitted as a `streamType: hls` source the frontend's in-app player loads directly.
-- **`/vidmoly_proxy`**: Signed HLS proxy for the Vidmoly source (the other common aniworld.to host). Same idea as `/voe_proxy` — the stream is proxied server-side and emitted as a direct `hls` source for the in-app player (also future-proofs against the CDN's `asn=` token binding).
-- **`/jellyfin_proxy`**: Proxies Jellyfin HLS segments for same-origin playback.
-- **`/health`**: Check system status and database health.
+- **`/player`** — renders the Crimson Player for a direct HLS/MP4 (or iframe) stream.
+- **`/jellyfin_proxy/{path}`** — authenticated reverse proxy to your own Jellyfin server. Injects the access token **server-side** (it never reaches the browser) and rewrites HLS playlists to flow back through the proxy.
+- **`/local_proxy/{token}`** — streams a browser-playable file from an admin-registered local directory / NAS mount (direct play, HTTP Range supported).
+- **`/cache_proxy/{token}`** — streams a server-side-cached (remuxed) episode straight off the NAS. Mirrors `/local_proxy`.
+- **`/health`** — system + database status.
 
 ### Client-side offload grants (New System)
 
-The backend stays the **brain** (metadata, identity, secret custody) but is moving
-out of the **byte path**: the [crimson-sources](../crimson-sources) engine running in
-the viewer's browser (with the [companion extension](../crimson-extension) and/or
-[crimson-proxy](../crimson-proxy)) now scrapes/resolves most sources itself and streams
-`CDN → viewer`. The backend exposes small **grants** that hand the client just what it
-can't derive (server-held secrets stay server-side). All are login-gated like `/watch`.
+The backend stays the **brain** (metadata, identity, secret custody) but stays out
+of the **byte path** for third-party sources: the [`crimson-sources`](../crimson-sources)
+engine in the viewer's browser scrapes/resolves them and streams `CDN → viewer`.
+The backend exposes small **grants** that hand the client only what it can't derive.
+All are login-gated like `/watch`.
 
 | Method | Endpoint | Purpose |
 | :--- | :--- | :--- |
-| `GET` | `/scrape-meta/{tmdb}/{season}` | Title bundle for the title-keyed client sources — AniList/TMDB titles + German synonyms, **+ `release_year` + `imdb_id`** (the year/imdb come from the server-held TMDB key, C5). |
-| `GET` | `/scrape-meta/movie/{tmdb}` | Movie twin of the above (title + `release_year` + `imdb_id`) for the Western movie sources (HDRezka/LookMovie/EE3). |
+| `GET` | `/scrape-meta/{tmdb}/{season}` | Title bundle for the title-keyed client sources — AniList/TMDB titles + German synonyms, **+ `release_year` + `imdb_id`** (year/imdb come from the server-held TMDB key). |
+| `GET` | `/scrape-meta/movie/{tmdb}` | Movie twin of the above for the Western movie sources. |
 | `POST` | `/sign` | Mint a **signed crimson-proxy URL** (E2) for a header-only source — `PROXY_SECRET` never reaches the browser. 503 when no proxy is configured. |
-| `POST` | `/resolve` | Cookie/secret-bound **resolve grant**: runs the token-gated lookup server-side (ShowBox/Febbox cookie, Jellyfin token) and returns the **raw** stream for the client to deliver via E3/E2. |
+| `POST` | `/resolve` | Secret-bound **resolve grant**: runs a token-gated lookup server-side (e.g. the Jellyfin token) and returns the **raw** stream for the client to deliver via the edge/extension. |
 
-> The execution-environment model (E0 backend → E3 extension) and which source lands
-> where lives in [`New_System.md`](New_System.md); the running status log is
-> [`New_System_Progress.md`](New_System_Progress.md).
+> The execution-environment model (E0 backend → E3 extension) and which source
+> lands where lives in [`New_System.md`](New_System.md).
 
 ---
 
 ## 🔐 Accounts
 
 Two sign-in methods coexist; an account row carries **either** an Ed25519
-`public_key` **or** an `email`/`password_hash` (`public_key` is nullable). User
-data (favorites + watch progress) lives in its own PostgreSQL tables, untouched
-by mapping resyncs. The schema upgrades itself on boot — `AccountStore.init_db()`
-runs idempotent `ALTER ... IF NOT EXISTS` migrations, so pointing a new build at
-an existing database "just works" with no manual SQL.
+`public_key` **or** an `email`/`password_hash`. User data (favorites + watch
+progress) lives in its own PostgreSQL tables, untouched by mapping resyncs. The
+schema upgrades itself on boot via idempotent migrations.
 
 ### Site-wide login wall
 
 When `REQUIRE_LOGIN=true` (default) the site is **members-only**: a pure-ASGI
-middleware (`LoginWallMiddleware` in `api.py`) rejects any request without a valid
-`Authorization: Bearer <session_token>` with `401`, except a small whitelist —
-the auth endpoints, `/health` + `/`, the Ko-fi webhook, and the signed stream
-proxies + `/player` (loaded by `<iframe>`/`<video>` which can't send headers;
-they're already HMAC-signed and only reachable via an authenticated `/watch`).
-Validated tokens are cached in-process for 60s so the wall adds no DB hit on hot
-paths, and it sits *inside* CORS so 401s still carry CORS headers. Set
-`REQUIRE_LOGIN=false` to reopen the whole API.
+middleware (`LoginWallMiddleware`) rejects any request without a valid
+`Authorization: Bearer <session_token>` with `401`, except a small whitelist — the
+auth endpoints, `/health` + `/`, the Ko-fi webhook, and the operator-owned stream
+proxies + `/player` (loaded by `<iframe>`/`<video>` which can't send headers; only
+reachable via an authenticated `/watch`). Validated tokens are cached in-process
+for 60s so the wall adds no DB hit on hot paths, and it sits *inside* CORS so 401s
+still carry CORS headers. Set `REQUIRE_LOGIN=false` to reopen the API.
 
 ### Mnemonic (Ed25519) sign-in
 
 No usernames, no passwords. An account **is** an Ed25519 public key derived from a
 12-word BIP39 mnemonic that lives entirely on the client (like P-Stream). The
 server stores only the public key and *verifies* signatures over one-time
-challenges — the mnemonic / private key never reach the backend, so a DB leak
-exposes no credential.
-
-> **Registration is invite-gated**, exactly like email signup. `/auth/register`
-> requires a valid `invite_code` (a shared `SIGNUP_INVITE_CODE` **or** a single-use
-> Discord-bot token), so a freshly generated mnemonic can't bypass the invite-only
-> site. Without a valid code `/auth/register` returns `403`. Existing mnemonic
-> accounts sign in via `/auth/login` and need no code — so a user with an invite
-> can choose either a mnemonic or an email+password account.
+challenges — the mnemonic / private key never reach the backend.
 
 ### Email + password sign-in
 
 Registration is **invite-gated** (`SIGNUP_INVITE_CODE`, comma-separated; empty ⇒
 signups closed → `403`) and requires email verification before the first login.
-Passwords are hashed with PBKDF2-HMAC-SHA256 (600k iters, stdlib `hashlib` — no
-native deps); hashing and SMTP both run in a threadpool so the event loop never
-blocks. Verification + password-reset links are emailed (single-use, hashed
-tokens) via SMTP (`SMTP_*`, `FRONTEND_BASE_URL` builds the link).
+Passwords are hashed with PBKDF2-HMAC-SHA256 (600k iters, stdlib `hashlib`);
+hashing and SMTP both run in a threadpool. Verification + reset links are emailed
+(single-use, hashed tokens) via SMTP.
 
 | Method | Endpoint | Auth | Description |
 | :--- | :--- | :--- | :--- |
@@ -293,64 +307,20 @@ tokens) via SMTP (`SMTP_*`, `FRONTEND_BASE_URL` builds the link).
 | `POST` | `/auth/email/login` | – | Email + password → session (`403` until verified). |
 | `POST` | `/auth/email/verify` | – | Consume a verification token → marks verified **and** returns a session. |
 | `POST` | `/auth/email/resend` | – | Resend the verification email (always `200`, no account-exists oracle). |
-| `POST` | `/auth/email/forgot` | – | Start a password reset → sends reset email (always `200`). |
-| `POST` | `/auth/email/reset` | – | Consume a reset token + set a new password (revokes existing sessions). |
-
-### Discord invite bot (single-use invite tokens)
-
-`SIGNUP_INVITE_CODE` is a *shared, reusable* code. As an alternative you can run a
-small Discord bot (`discord_bot/`) that lets **one** whitelisted operator mint
-**single-use** invite tokens — each registers exactly one account, then is dead.
-Both kinds are accepted in the same signup field, so no frontend change is needed.
-
-Setup:
-
-1. Create a bot at <https://discord.com/developers/applications> → **Bot**, copy
-   its **token**, and enable **Message Content Intent** under *Privileged Gateway
-   Intents* (needed to read commands in servers; DMs work without it).
-2. Set `DISCORD_BOT_TOKEN` and `DISCORD_OWNER_ID` (your numeric Discord user id —
-   enable Developer Mode, right-click your name → *Copy User ID*). Only that user
-   may use the bot; everyone else is silently ignored.
-3. Invite the bot to a server it shares with you (or just DM it).
-
-Run it as its own process — **exactly one instance** (a second gateway login with
-the same token fights the first and double-mints):
-
-```bash
-python -m discord_bot          # locally
-# or, in the bundled stacks, the `discord-bot` service (replicas: 1)
-```
-
-Then DM the bot (commands are owner-only; default prefix `!`):
-
-| Command | Action |
-| :--- | :--- |
-| `!invite [n]` | Mint *n* one-time invite tokens (1–20, default 1). |
-| `!invites` | List outstanding (unused) tokens. |
-| `!revoke <code>` | Delete an unused token. |
-| `!ping` / `!help` | Liveness / usage. |
-
-The bot is hand-rolled on `websockets` + `httpx` (no discord.py) to stay
-wheel-friendly on `python:3.14-slim`, in the same spirit as the vendored Ed25519.
-It only needs the database (tokens land in the same PostgreSQL the API reads at
-`/auth/email/register`), so its container publishes no port. With
-`DISCORD_BOT_TOKEN` unset the process just logs *disabled* and idles.
+| `POST` | `/auth/email/forgot` · `/auth/email/reset` | – | Start / complete a password reset (always `200` on forgot). |
 
 ### Mnemonic + shared account endpoints
 
 | Method | Endpoint | Auth | Description |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/auth/challenge` | – | Get a one-time challenge for a `public_key`. |
-| `POST` | `/auth/register` | – | Create the account (signed challenge proves key ownership) → session. **Invite-gated**: requires a valid `invite_code` (`403` otherwise), like email signup. |
-| `POST` | `/auth/login` | – | Log in to an existing account via signed challenge → session. |
+| `POST` | `/auth/register` | – | Create the account (signed challenge proves key ownership) → session. **Invite-gated** like email signup. |
+| `POST` | `/auth/login` | – | Log in via signed challenge → session. |
 | `POST` | `/auth/logout` | Bearer | Revoke the current session. |
-| `GET`  | `/account/me` | Bearer | Profile + favorite/progress counts. |
-| `GET`/`POST`/`DELETE` | `/account/favorites` | Bearer | List / add / remove a favorited show. |
+| `GET`  | `/account/me` | Bearer | Profile + favorite/progress counts (+ `is_admin`). |
+| `GET`/`POST`/`DELETE` | `/account/favorites` | Bearer | List / add / remove a favorited title (+ `/export`, `/import`). |
 | `GET`/`POST`/`DELETE` | `/account/progress` | Bearer | List / upsert / remove per-episode watch progress. |
-| `GET`  | `/account/continue-watching` | Bearer | In-progress episodes only, most recent first. |
-| `GET`  | `/account/recent` | Bearer | Recently-watched episodes of **any** status (incl. completed), most recent first. `?limit=` (default 20). |
-
-Authenticated requests send `Authorization: Bearer <session_token>`.
+| `GET`  | `/account/continue-watching` · `/account/recent` | Bearer | In-progress / recently-watched episodes. |
 
 ### Client key-derivation spec (the frontend must match this exactly)
 
@@ -362,8 +332,6 @@ keypair   : Ed25519 from privSeed          (RFC 8032; == @noble/ed25519)
 public_key: hex(publicKey)                 (64 lowercase hex chars) → the account id
 ```
 
-In the browser with the standard libraries:
-
 ```js
 import { generateMnemonic, mnemonicToSeedSync } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
@@ -373,106 +341,71 @@ const mnemonic = generateMnemonic(wordlist);              // show once, user sav
 const seed = mnemonicToSeedSync(mnemonic).slice(0, 32);   // 32-byte private seed
 const publicKey = Buffer.from(await ed.getPublicKeyAsync(seed)).toString('hex');
 
-// login / register:
 const { challenge } = await (await fetch('/auth/challenge',
   { method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ public_key: publicKey }) })).json();
 const signature = Buffer.from(
   await ed.signAsync(new TextEncoder().encode(challenge), seed)).toString('hex');
-const res = await fetch('/auth/login',                    // or /auth/register
+const res = await fetch('/auth/login',                    // or /auth/register (+ invite_code)
   { method:'POST', headers:{'Content-Type':'application/json'},
-    // /auth/register additionally requires an `invite_code` (shared SIGNUP_INVITE_CODE
-    // or a single-use Discord-bot token); /auth/login does not.
     body: JSON.stringify({ public_key: publicKey, challenge, signature }) });
 const { session_token } = await res.json();
 ```
 
-Favorites are show-level (keyed by `anilist_id` if given, else `tmdb_id`); watch
-progress is per-episode (`status` auto-flips to `completed` past 90%). Both POST
-bodies accept `{ tmdb_id?, anilist_id?, season_number?, episode_number?, title?,
-poster?, position_seconds?, duration_seconds?, status? }`.
+The Discord invite bot (`python -m discord_bot`) optionally mints **single-use**
+invite tokens for one whitelisted operator — see `.env.example` and `discord_bot/`.
 
 ---
 
 ## ☕ Ko-fi Supporters ("Lumi's Loved Mortals")
 
-A public list of Ko-fi supporters, fed automatically by Ko-fi's webhook — **no
-email scanning, no polling**. Ko-fi has no "list my supporters" API; it only
-*pushes* a webhook to us when a payment happens (tip / membership / commission /
-shop order) and never on cancellation. So the backend keeps an append-only ledger
-of every payment event and derives the public list by aggregating it.
+A public list of Ko-fi supporters, fed automatically by Ko-fi's webhook — no email
+scanning, no polling. Ko-fi only *pushes* a webhook on each payment (and never on
+cancellation), so the backend keeps an append-only ledger and derives the public
+list by aggregating it.
 
-### Setup (one-time)
-
-1. Generate a token and set it: `KOFI_VERIFICATION_TOKEN=<your token>` (see
-   `.env.example`). The token comes from Ko-fi itself.
-2. In Ko-fi → **Settings → Advanced → Webhooks / API**, copy the *Verification
-   Token* into that env var and set the **Webhook URL** to
+1. In Ko-fi → **Settings → Advanced → Webhooks / API**, copy the *Verification
+   Token* into `KOFI_VERIFICATION_TOKEN` and set the **Webhook URL** to
    `https://<your-backend>/kofi/webhook`.
-3. That's it. Every future payment POSTs to that URL and appears on `/supporters`.
-   (Past payments aren't back-filled — Ko-fi only sends new events.)
-
-### Endpoints
-
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/kofi/webhook` | Ko-fi token | **Ko-fi only** — receives payment events. Verifies `verification_token`; idempotent. Do not call from the frontend. |
-| `GET`  | `/supporters` | – | Public list for the page. `?include_lapsed=true` to show lapsed subscribers; `?limit=N` to cap. |
-| `GET`  | `/supporters/stats` | – | `{ supporter_count, total_raised, currency }` for a page header. |
-
-`GET /supporters` returns (most-recent payment first, **never any email**):
-
-```jsonc
-{
-  "success": true,
-  "count": 2,
-  "supporters": [
-    {
-      "name": "Jo Example",          // from_name, or "Anonymous"
-      "message": "Good luck Lumi!",  // the supporter's public message (may be null)
-      "total_amount": 9.0,           // summed across this supporter's payments
-      "currency": "USD",
-      "is_subscription": true,       // monthly member vs. one-time tipper
-      "tier_name": "Bronze",         // membership tier (null for one-off tips)
-      "type": "Subscription",        // latest event type
-      "contribution_count": 3,
-      "first_seen_at": "2026-03-01T10:00:00Z",
-      "last_payment_at": "2026-06-01T10:00:00Z"
-    }
-  ]
-}
-```
-
-### Expand / shrink behaviour
-
-- **Expand** — automatic: each new payment upserts the supporter (a subscription
-  renewal just advances their `last_payment_at`).
-- **Shrink** — Ko-fi gives no cancellation event, so a *subscriber* is listed only
-  while their last payment is within `KOFI_ACTIVE_WINDOW_DAYS` (default **35** =
-  one cycle + grace). One-time tippers are kept forever. Pass `?include_lapsed=true`
-  to override. Identity is grouped by email (server-side only), falling back to
-  display name, so a member's monthly payments collapse into one entry.
-
-> Supporters who chose to keep a donation private (`is_public = false` on Ko-fi)
-> are recorded but excluded from the public list.
+2. Every future payment then appears on `GET /supporters` (`?include_lapsed=true`
+   to show lapsed subscribers; `?limit=N` to cap). `GET /supporters/stats` gives a
+   header summary. Emails are never returned. A subscriber is listed only while
+   their last payment is within `KOFI_ACTIVE_WINDOW_DAYS` (default 35); one-time
+   tippers are kept forever; private donations are recorded but excluded.
 
 ---
 
 ## 🏗 Architecture
 
-- **`api.py`**: Main entry point, routing, and lifecycle management.
-- **`db_pool.py`**: Shared psycopg 3 PostgreSQL connection pool used by every DB caller.
-- **`metadata_engine/`**: Handles the complex mapping between TMDB and AniList. See its [README](metadata_engine/README.md) for details.
-- **`scrapers/`**: Modular providers that find video embeds on streaming sites.
-- **`resolvers/`**: Tools that extract raw video links from those embeds.
-- **`account_engine/`**: Mnemonic (Ed25519) sign-in, favorites and watch progress. Self-contained crypto (`ed25519.py`, no native deps), PostgreSQL store (`db.py`, via the shared `db_pool`), and the API router (`routes.py`).
-- **`supporters_engine/`**: Ko-fi supporters ("Lumi's Loved Mortals"). Webhook ingest into an append-only ledger plus the derived public list, as a PostgreSQL store (`db.py`) + API router (`routes.py`) — same shape as the account engine.
-- **`player.py`**: The logic for our built-in HTML5 video player.
+| Path | Role |
+| :--- | :--- |
+| `api.py` | Main entry point, routing, the `/watch` NDJSON pipeline, the login wall, and lifecycle. |
+| `db_pool.py` | Shared psycopg 3 PostgreSQL connection pool used by every DB caller. |
+| `metadata_engine/` | The TMDB↔AniList mapping/sync (Fribb dataset, `tmdb_seasons`/`tmdb_extras`, overrides). |
+| `scrapers/` | The generic scraper contract + the **operator-owned** sources only: `local_scraper.py`, `cache_scraper.py`, `jellyfin_scraper.py`, and the documented no-op `template_scraper.py`. `ALL_SCRAPERS` is the registry. |
+| `resolvers/` | The matching resolvers (`local.py`, `cache.py`, `jellyfin.py`, `template.py`) + the shared `_crimson_proxy.py` (signing/health for `/sign`), `_proxy_secret.py`, and `_ssrf_guard.py`. `ALL_RESOLVERS` is the registry. |
+| `local_engine/` · `cache_engine/` | The Local source (registered dirs/NAS) and the server-side video cache (background ffmpeg remux + replay). |
+| `account_engine/` | Mnemonic (Ed25519, vendored pure-Python crypto) + email/password sign-in, favorites, progress, and the admin dashboard. |
+| `metadata_engine/`, `recommend_engine/`, `supporters_engine/`, `changelog_engine/`, `subtitles_engine/`, `skiptimes_engine/`, `telemetry_engine/`, `apikey_engine/` | The feature engines (each a small store + router). |
+| `core/` | Cross-cutting helpers: the canonical `/watch` contract, source-health metadata, config report, player. |
 
-### Extending the Engine
-To add a new source, implement a new scraper in `scrapers/` (inheriting from `BaseAnimeScraper`) and, if needed, a resolver in `resolvers/` (inheriting from `BaseResolver`).
+### Adding a source
+
+- **A third-party streaming site** → it does **not** belong in this backend. Add it
+  to the private [`crimson-sources`](../crimson-sources) engine, where it runs in
+  the viewer's browser (extension / proxy). The backend never scrapes third parties.
+- **An operator-owned source** (another media server you control) → copy
+  `scrapers/template_scraper.py` + `resolvers/template.py`, implement the two
+  scraper methods + the resolver, register them in `scrapers/__init__.py` /
+  `resolvers/__init__.py`, and emit a `crimson-<name>:<token>` marker. See
+  `local_scraper.py` + `resolvers/local.py` for a complete worked example.
 
 ---
 
 ## 🌹 TL;DR
-Lumi's FastAPI backend for Crimson Haven. It maps TMDB to AniList, scrapes multiple sources, resolves direct links, and proxies streams to keep your viewing experience pure and ad-free. Set your key, run it, and enjoy! ( ^ ▿ ^ )
+
+Lumi's FastAPI backend for Crimson Haven. It maps TMDB to AniList, runs accounts +
+a members-only login wall, serves your **own** media (Local / Cache / Jellyfin) over
+a progressive NDJSON `/watch` stream, and hands the client engine signed grants so
+**third-party** scraping happens in the viewer's browser — never here. Set your key,
+run it, and enjoy! ( ^ ▿ ^ )
