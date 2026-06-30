@@ -22,3 +22,22 @@ ALL_SCRAPERS = [
     JellyfinScraper,   # Your own self-hosted Jellyfin server (env-gated on JELLYFIN_*).
     # TemplateScraper,   # Inert reference implementation of the scraper contract.
 ]
+
+# --- optional build-time source overlay ------------------------------------
+# An operator build may drop extra scraper modules into this package; they're
+# auto-discovered and appended here, so this registry needs no edit. A build without
+# the overlay has none, so nothing is added. ``showbox_scraper`` is excluded
+# (operator-only, wired into /resolve, not /watch). Off via PRIVATE_SOURCES_ENABLED=0.
+import sys as _sys
+
+from core.private_sources import discover_private_sources
+
+from .base_scraper import BaseAnimeScraper
+
+_PUBLIC_SCRAPER_MODULES = {
+    "base_scraper", "local_scraper", "cache_scraper", "jellyfin_scraper",
+    "template_scraper", "showbox_scraper",
+}
+ALL_SCRAPERS += discover_private_sources(
+    _sys.modules[__name__], BaseAnimeScraper, _PUBLIC_SCRAPER_MODULES
+)
