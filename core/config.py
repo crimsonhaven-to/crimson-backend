@@ -83,6 +83,17 @@ class Config:
     # false to revert to a fully open API.
     REQUIRE_LOGIN = os.getenv("REQUIRE_LOGIN", "true").lower() not in ("0", "false", "no")
 
+    # Demo deployment switch (e.g. demo.crimsonhaven.to). When true: the signup
+    # invite gate is bypassed so anyone can register, and all non-admin account data
+    # (accounts, sessions, favorites, watch progress, invites, challenges) is wiped
+    # nightly so an open-signup demo can't grow without bound. Admin accounts (seeded
+    # from ADMIN_EMAILS) survive the reset. Off by default — a normal deploy is
+    # unaffected. A demo is expected to run with NO sources configured (nothing
+    # resolves), so the only growth is text rows, capped by the nightly reset.
+    DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes", "on")
+    # Hour (server time, UTC in the container) the nightly DEMO_MODE reset runs at.
+    DEMO_RESET_HOUR = int(os.getenv("DEMO_RESET_HOUR", "4"))
+
     # CORS Origins. Overridable via the ALLOWED_ORIGINS env var (comma-separated)
     # so the deploy can lock these down without a code change; falls back to the
     # built-in dev + crimsonhaven.to list.

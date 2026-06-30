@@ -290,6 +290,33 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("OPENSUBTITLES_API_KEY not set — /subtitles will return 503 until configured")
 
+    # DEMO_MODE nightly reset (demo.crimsonhaven.to). Signup is open (invite gate
+    # bypassed in account_engine.routes), so all non-admin account data is wiped each
+    # night to bound growth. Pinned to the single RUN_DB_SYNC replica so multiple
+    # replicas don't race the same DELETE; a demo normally runs one replica with
+    # RUN_DB_SYNC=true (the compose default).
+    if Config.DEMO_MODE:
+        logger.warning(
+            "DEMO_MODE is ON — signup invite gate is bypassed; non-admin data resets "
+            f"nightly at {Config.DEMO_RESET_HOUR:02d}:00 (server time)"
+        )
+        if Config.RUN_DB_SYNC:
+            def _demo_reset():
+                try:
+                    res = account_store.wipe_demo_data()
+                    logger.info(f"DEMO_MODE nightly reset done: {res}")
+                except Exception as e:
+                    logger.error(f"DEMO_MODE nightly reset failed: {e}")
+
+            scheduler.add_job(
+                _demo_reset,
+                trigger=CronTrigger(hour=Config.DEMO_RESET_HOUR, minute=0),
+                id="demo_reset_job",
+                replace_existing=True,
+            )
+        else:
+            logger.info("DEMO_MODE: this replica is not RUN_DB_SYNC — the nightly reset runs on the sync replica")
+
     # The Fribb resync rebuilds the mapping tables wholesale. In a multi-replica
     # Swarm deploy only ONE replica should own it (RUN_DB_SYNC), otherwise every
     # replica downloads + rebuilds in lockstep, wasting bandwidth and contending
@@ -449,7 +476,7 @@ app.add_exception_handler(RateLimitExceeded, _voiced_rate_limit_handler)
 # Defined BEFORE the CORS middleware below so CORS remains the outermost layer and
 # its headers are attached even to the 401 we return here (browsers need that to
 # surface the error instead of an opaque CORS failure).
-_PUBLIC_EXACT = {"/", "/lumi", "/health", "/openapi.json", "/docs", "/redoc"}
+_PUBLIC_EXACT = {"/", "/lumi", "/health", "/config", "/openapi.json", "/docs", "/redoc"}
 _PUBLIC_PREFIXES = (
     "/auth/",
     "/kofi/webhook",
@@ -3427,6 +3454,20 @@ async def get_movie_overview(tmdb_id: int):
     }
 
 # --- HEALTH CHECK ENDPOINT ---
+@app.get("/config")
+async def public_config():
+    """Public, unauthenticated feature flags the frontend needs *before* login.
+
+    Notably ``demo_mode``: on a demo deployment the login page drops the invite-code
+    requirement (signup is open) and can show a "data resets nightly" hint. Booleans
+    only — no secrets, counts, or paths leak through this (it's reachable without a
+    session, whitelisted in _PUBLIC_EXACT)."""
+    return {
+        "demo_mode": Config.DEMO_MODE,
+        "require_login": Config.REQUIRE_LOGIN,
+    }
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
