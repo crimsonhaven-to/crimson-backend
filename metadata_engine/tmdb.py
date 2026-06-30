@@ -550,6 +550,25 @@ async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -
     return titles
 
 
+async def fetch_tmdb_imdb_id(client: httpx.AsyncClient, tmdb_id: int,
+                             media_type: str = "tv") -> Optional[str]:
+    """The IMDb id ("tt…") for a TMDB show/movie, from ``/external_ids``.
+
+    Needed by IMDb-keyed client sources (insertunit). Cached (stable); returns
+    None on failure so callers degrade to skipping that source."""
+    path = "movie" if media_type == "movie" else "tv"
+    cache_key = f"tmdb:imdb:{path}:{tmdb_id}"
+    cached = _local_get(cache_key)
+    if cached is not None:
+        return cached or None
+    data = await fetch_with_retry(
+        client, f"https://api.themoviedb.org/3/{path}/{tmdb_id}/external_ids"
+    )
+    imdb = ((data or {}).get("imdb_id") or "").strip()
+    _local_set(cache_key, imdb, ttl=86400)
+    return imdb or None
+
+
 # --- NON-ANIME TV SHOWS (secondary, additive) -------------------------------
 # These mirror the anime discovery helpers above but invert the AniList gate:
 # they surface TMDB TV results that are NOT mapped anime, so the site can also
