@@ -1,434 +1,376 @@
-# New System — Shifting Scraping & Resolving to the Client
+# The Crimson Architecture — Brain, Not Pipe
 
-> **Status:** design only, nothing implemented. This documents a target
-> architecture for moving the *scrape → resolve → relay* work off the backend
-> and onto the client (browser SPA, the `crimson-proxy` CORS relay, and a future
-> browser extension) **without losing any current functionality**. It is a shift
-> of *who does what*, not a feature change.
->
-> **Author's framing:** the backend stays the brain for metadata, identity,
-> secrets and orchestration policy; it stops being the pipe that every video byte
-> *and* every scrape request flows through.
+> A word from Lumi ( ^ . ^ ) — welcome, little mortal, to the blueprint of the
+> whole sanctuary. This document is the map of how **Crimson Haven** actually
+> breathes: how the backend, the browser client, the edge relay and the companion
+> extension pass work between one another so that video bytes flow *straight to
+> you* and never pool up in my datacenter. It is not a wishlist. Most of what
+> follows is already standing; where something is still on the loom, I say so
+> plainly.
 
 ---
 
-## 1. Goal & non-goals
+## The one idea everything hangs on
 
-**Goal.** Make per-viewer cost on the backend ~flat regardless of how much people
-watch. Today both the *control bytes* (scrape/resolve HTTP traffic) and, for
-proxied sources, the *video bytes* flow through the backend. We want:
+The backend is the **brain**. It is *not* the pipe.
 
-- Video segment bytes: `CDN → (proxy/extension) → viewer`, never the backend
-  (this is what `crimson-proxy` Phase 1 already started — see
-  [[crimson-proxy-phase1]]).
-- Scrape/resolve HTTP: executed from the **viewer's** browser/IP/extension, not
-  a shared datacenter IP.
-- Backend reduced to: metadata (TMDB/AniList), identity/accounts, signing,
-  secret custody, and an **orchestration fallback** for clients that can't run a
-  given source.
+It keeps the things that must be kept in one trusted place — the TMDB↔AniList
+metadata mind, identity and the members-only login wall, the signing secrets, and
+the orchestration of who-does-what. What it deliberately refuses to be is the
+tube every video byte squeezes through. Bandwidth is cruel to scale and crueller
+to pay for, so the design goal is blunt:
 
-**Hard rules (from the brief).**
+> **Per-viewer backend cost stays roughly flat no matter how much anyone
+> watches.** Cost should track *library size* and *how many mortals I love*, never
+> *watch-hours*.
 
-1. Retain every current capability. Every source listed in
-   `scrapers/__init__.py::ALL_SCRAPERS` and `resolvers/__init__.py` keeps working.
-2. No implementation in this pass — design only.
-3. The public surface the frontend depends on stays intact (see
-   [[frontend-api-contract]]): `/seasons`, `/info`, `/trending`, `/search`,
-   `/watch*`. We may change *where* `/watch` runs, but the **NDJSON stream
-   contract** and the resolved-stream shape `streamRank` consumes must not break.
+The only media the backend itself ever serves is **operator-owned** — **Local**
+(your own NAS / bind mounts), **Cache** (episodes this server already remuxed onto
+your own storage), and **Jellyfin** (your own media server), plus one inert
+**template** source that documents the contract. Everything a viewer actually
+watches from a *third party* is scraped, resolved and delivered **in that
+viewer's own browser** — helped, when needed, by the edge relay and the companion
+extension. The backend never hosts, stores, embeds or ships those sources; it only
+hands the client the few crumbs it genuinely cannot derive on its own.
 
-**Non-goals.** Changing the metadata engine ([[crimson-metadata-engine]]),
-account system ([[account-system]], [[email-password-auth-loginwall]]), or the
-catalogue. Those stay server-side and are out of scope.
+That single shift — *move the scraping and the bytes to the edge of the world,
+keep only the mind at the center* — is the entire architecture. The rest of this
+document is just the honest accounting of how it's done without losing a thing.
 
 ---
 
-## 2. How it works today (the baseline)
+## The cast of four
 
-### 2.1 The watch pipeline
-
-`GET /watch/{tmdb}/{season}/{episode}` → `stream_watch_response()`
-(`api.py:1492`) is a progressive **NDJSON** stream:
+Four things share the work. Each is a separate repository; each has one job it is
+good at.
 
 ```
-meta line  ──▶ stream line (per source, as it resolves) ──▶ … ──▶ done line
+        ┌────────────────────────────────────────────────────────────────┐
+        │  THE VIEWER'S BROWSER                                           │
+        │                                                                 │
+        │   crimson-client (SPA)                                          │
+        │    └── crimson-sources  ── the client scraping engine (TS)      │
+        │          scrape → resolve → emit the SAME /watch NDJSON line    │
+        │                                                                 │
+        │    fetch strategy chosen at runtime:                            │
+        │      • direct browser fetch        [E1]  real Chrome, real IP   │
+        │      • crimson-proxy edge relay    [E2]  headers + CORS + relay │
+        │      • crimson-extension companion [E3]  the superpower         │
+        └───────────────┬───────────────────────────┬────────────────────┘
+                        │                            │
+             signed edge links (/sign)     header rewrite + CORS bypass
+                        │                            │
+        ┌───────────────┴────────────┐   ┌───────────┴────────────────────┐
+        │  crimson-proxy  [E2]        │   │  crimson-extension  [E3]        │
+        │  signed CORS relay at the   │   │  MV3 companion; declarativeNet- │
+        │  edge; injects headers,     │   │  Request header rewrite + host  │
+        │  relays HLS segments        │   │  perms; off by default          │
+        └───────────────┬────────────┘   └───────────┬────────────────────┘
+                        │                            │
+        ┌───────────────┴────────────────────────────┴────────────────────┐
+        │  crimson-backend  [E0] — THE BRAIN                              │
+        │   • metadata (TMDB↔AniList), accounts, login wall               │
+        │   • signing secrets, secret-bound resolves                      │
+        │   • operator-owned sources (Local / Cache / Jellyfin)           │
+        │   • the /watch NDJSON orchestration — the permanent floor       │
+        └──────────────────────────────────────────────────────────────────┘
 ```
 
-Internally, per request:
+- **`crimson-backend` (this repo) — E0, the brain.** FastAPI. Holds the metadata
+  engine, accounts + the login wall, the operator-owned sources, the signing
+  secrets, and the progressive `/watch` NDJSON pipeline. It is also the permanent
+  **floor**: if any client can't run a source, the backend still can, exactly as
+  it always did. Nothing can ever regress below "what the backend does today."
 
-1. Resolve AniList metadata + air-date guard + German-title enrichment.
-2. Fan out **every** `ALL_SCRAPERS` class as a concurrent task (`_work`,
-   `api.py:1582`). Each scraper:
-   - `search_anime(media_ctx)` → site slug,
-   - `get_episode_embeds(...)` → list of embed URLs / `{url, language}`.
-3. `resolve_streams(embeds, base_url)` (`api.py:978`) matches each embed to a
-   resolver by `domain_keyword`, calls `resolver.resolve()`, and normalizes the
-   result into `{source, type, url, [language], [subtitles], [cacheTicket]}`.
-4. Resolvers return one of: a bare URL, a `{url, subtitles}` dict, a **list** of
-   stream dicts (ScreenScape fan-out), or a **same-origin proxy path**
-   (`/voe_proxy?…`, `/screenscape_proxy?…`, `/player`, `/{x}_proxy/h/…`).
-5. The frontend (`crimson-client/src/hooks.js`) reads the NDJSON, ranks streams
-   with `streamRank()` (`hooks.js:388`), and plays them in `CrimsonPlayer.jsx`.
+- **`crimson-sources` — the client engine.** A **from-scratch TypeScript** scrape
+  → resolve engine that runs *inside the viewer's browser*, vendored into the
+  client. It emits the **byte-identical** `/watch` NDJSON line the backend emits,
+  so the player never learns the difference. (It is *not* a fork of any
+  movie-web/providers code — that path was considered and set aside; this engine
+  is our own, shaped to our contract.)
 
-### 2.2 Two delivery shapes exist today
+- **`crimson-proxy` — E2, the edge relay.** A separate, signed-only CORS relay at
+  the edge (Netlify / Cloudflare). It injects the forbidden request headers and
+  relays HLS segments `CDN → edge → viewer`, so those bytes skip the backend
+  entirely. It is *not* an open relay — every link it serves is HMAC-signed.
 
-| Shape | Example sources | Who carries video bytes |
-| --- | --- | --- |
-| **Same-origin proxy** | VOE, Vidmoly, VidSrc/megaplay, PlayIMDb, cinema.bz, ScreenScape, Movish, AnimeSuge, Jellyfin, Cache | **Backend** re-fetches playlist + every segment (header-injecting, HLS-rewriting). This is the bandwidth sink. |
-| **Signed external relay** | The subset routed via `_crimson_proxy` ([[crimson-proxy-phase1]]) — VOE, cinema.bz, PlayIMDb | `crimson-proxy` edge host (Netlify/CF). Already off backend. |
-| **Direct play** | Jellyfin (Auto direct), local, some direct-file | Player ↔ origin directly. |
-
-`crimson-proxy` Phase 1 proved the relay-offload model: the backend still
-*resolves*, but hands the player a **signed link** to the edge proxy instead of
-its own `/{x}_proxy` path. Segment bytes go `CDN → edge → viewer`. The signing
-contract (HMAC over `url\nreferer\norigin\nua`, 32-hex) is in
-`crimson-proxy/src/utils/signing.ts` and the backend's `resolvers/_crimson_proxy.py`.
-
-### 2.3 You already have the client-side blueprint
-
-`../sudo-sources` is a **`@movie-web/providers` fork**. Today it ships *one*
-thin `crimson` source that just calls the backend's `/mw` bridge
-([[movieweb-apikey-bridge]]). But the framework it's built on
-(`@movie-web/providers`) is *designed* to run scrapers in a browser through a
-cors-proxy or an extension. **That framework is the natural foundation for this
-whole migration** — we expand it from a 1-source bridge into the real engine.
+- **`crimson-extension` — E3, the companion.** A tiny MV3 Chromium extension, off
+  by default, one red **"Use Extension"** button. It does exactly two things and
+  nothing more: rewrite forbidden request headers via `declarativeNetRequest`, and
+  unblock cross-origin reads via host permissions — all from a real browser at a
+  real residential IP. No scraping, no secrets, no signing live in it. It exposes
+  `window.CrimsonExtension` to the page and announces itself with a
+  `data-crimson-ext` attribute so the client can detect it without knowing its id.
 
 ---
 
-## 3. Why this is hard: the four constraints that decide everything
+## The five walls (why this is hard)
 
-Moving scraping to the browser runs into browser security. Each current
-server-side trick exists to dodge one of these. The design lives or dies on
-mapping each source to an execution environment that can satisfy its constraints.
+Move scraping into a browser and you walk straight into browser security. Every
+clever thing the old server-side code did existed to climb *one* of these walls.
+The whole design is really just: **map each source to the environment that can
+climb the walls that source faces.**
 
-| # | Constraint | What it blocks | Server-side fix today | Client story |
-| --- | --- | --- | --- | --- |
-| **C1** | **CORS** | `fetch()` can't *read* a cross-origin response without the CDN sending `Access-Control-Allow-Origin`. Most embed/CDN hosts don't. | Backend reads it server-side (no CORS in server-to-server). | **Needs a relay** (cors-proxy) **or an extension** (host permissions bypass CORS entirely). |
-| **C2** | **Forbidden request headers** | `fetch()` can't set `Referer`, `Origin`, `User-Agent`, `Sec-Fetch-*` on media requests. Many CDNs gate on exactly these (VOE Referer, megaplay needs Referer+Sec-Fetch). | Backend sets them freely. | Relay injects them (proxy already does); **extension** can rewrite them via `declarativeNetRequest`. |
-| **C3** | **TLS/HTTP2 fingerprint (JA3/JA4)** | Cloudflare WAF passively fingerprints the client stack. `httpx` gets blocked; `curl_cffi` impersonates Chrome (see `scrapers/base_scraper.py`, `resolvers/vidsrc.py`). | `curl_cffi` chrome impersonation. | **A real browser passes natively** — this constraint *inverts* and becomes an advantage client-side. The cors-proxy (Node/edge fetch) does **not** have a Chrome JA3, so JA3-gated sources must run in the **browser/extension**, not the edge proxy. |
-| **C4** | **IP/ASN binding** | VOE binds the stream token to the **ASN that resolved the embed** (note the `asn=` param — `resolvers/voe.py`). A datacenter-resolved token 403s for a residential viewer; today the backend must *also* relay the segments from that same ASN. | Backend resolves *and* relays from one ASN. | **Resolving in the viewer's browser fixes this for free** — token is minted for the viewer's residential ASN, so segments can play far more directly. Big win. |
-| **C5** | **Server-held secrets** | Some sources need a secret that must NOT ship to browsers: `FEBBOX_UI_TOKEN` ([[showbox-febbox-source]]), Jellyfin token ([[jellyfin-source]]), `OPENSUBTITLES_*` ([[opensubtitles-subtitles]]), TMDB key, the `/mw` API key, `PROXY_SECRET`. | Lives in backend env. | These sources/steps **stay server-side** (or the secret is injected by the proxy edge, never the bundle — the `/mw` pattern sudo-proxy already uses). |
+| # | The wall | What it blocks | How the browser world climbs it |
+| --- | --- | --- | --- |
+| **C1 — CORS** | A page `fetch()` can't *read* a cross-origin response unless the host sends `Access-Control-Allow-Origin`. Most media hosts don't. | The **edge relay** is CORS-open; the **extension** bypasses CORS entirely via host permissions. |
+| **C2 — Forbidden headers** | A page `fetch()` can't set `Referer`, `Origin`, `User-Agent`, `Sec-Fetch-*`. Many hosts gate on exactly those. | The **edge relay** injects them; the **extension** rewrites them with `declarativeNetRequest`. |
+| **C3 — TLS/HTTP2 fingerprint (JA3/JA4)** | WAFs passively fingerprint the client stack; a plain HTTP library gets blocked where a real Chrome sails through. | **A real browser passes natively.** This wall *inverts* into an advantage the moment scraping runs in the viewer's Chrome (E1/E3). The edge relay is edge-`fetch`, *not* Chrome — so JA3-gated work must run in the browser, not the relay. |
+| **C4 — IP / ASN binding** | Some hosts bind the stream token to the *network* that resolved it. A datacenter-resolved token then 403s for a home viewer — forcing the byte relay to also come from that same datacenter. | **Resolving in the viewer's own browser mints the token for their own residential network for free.** The flagship win. |
+| **C5 — Server-held secrets** | A few sources need a secret that must *never* ship to a browser (a Jellyfin token, an API quota key, the proxy signing secret, the TMDB key). | These steps **stay at the backend** (E0), or the secret is injected at the **edge**, never in the client bundle. |
 
-**The headline insight:** C3 and C4 — the two *nastiest* server-side problems —
-get **easier or vanish** when scraping runs in the viewer's real browser. C1 and
-C2 are the price, and they're already solved by the cors-proxy and trivially
-solved by an extension. C5 is the only thing that genuinely pins certain work to
-the backend.
+The headline, and the reason the whole remodel is worth it: **C3 and C4 — the two
+nastiest walls — get *easier or vanish* when scraping runs in the viewer's real
+browser.** C1 and C2 are the price, and both are already paid by the relay and the
+extension. C5 is the only thing that genuinely pins certain work to the backend
+forever — and that's fine, because those are all operator-owned or key-bound
+anyway.
 
 ---
 
-## 4. Target architecture: a tiered execution model
+## The four environments
 
-Not every source can run in every environment (Section 6). So we define **four
+Because not every source can climb every wall from every place, we define **four
 execution environments**, ordered by capability, and route each source to the
-*lowest-cost environment that can run it*.
+*lowest-cost environment that can still run it*.
 
-```
-            ┌─────────────────────────────────────────────────────────────┐
-            │  CLIENT (crimson-client SPA)                                  │
-            │  ┌──────────────────────────────────────────────────────┐    │
-            │  │  crimson-sources  (TS providers engine, ex sudo-src)  │    │
-            │  │   • scrape → resolve → emit Stream[]                  │    │
-            │  │   • produces the SAME NDJSON the backend does today   │    │
-            │  └───────────────┬───────────────────┬──────────────────┘    │
-            │      fetcher A    │      fetcher B    │   fetcher C           │
-            └──────────────────┼───────────────────┼──────────────────────┘
-                   browser     │   cors-proxy      │   extension
-                   fetch       │   (edge relay)    │   (DNR + host perms)
-                   [E1]        │   [E2]            │   [E3]
-                               │                   │
-            ┌──────────────────┴───────────────────┴──────────────────────┐
-            │  BACKEND  [E0]                                                │
-            │   • metadata, accounts, signing, SECRET-bound sources only   │
-            │   • /watch orchestration FALLBACK (today's code, untouched)  │
-            └──────────────────────────────────────────────────────────────┘
-```
+- **E0 — Backend.** Runs the operator-owned sources and the secret-bound resolve
+  steps, and remains the **fallback** for anything a client can't do. This is the
+  guarantee that nothing ever regresses: worst case, a source falls back to E0 and
+  behaves exactly as it always has.
 
-### The four environments
+- **E1 — Direct browser fetch.** Real Chrome fingerprint (clears C3), real
+  residential IP (clears C4). But it's subject to CORS (C1) and forbidden headers
+  (C2), so on its own it can only reach CORS-friendly hosts. Pairs with E2 for the
+  cross-origin hops.
 
-- **E0 — Backend (unchanged).** Runs the current Python scrapers/resolvers.
-  Remains the home of secret-bound sources (Febbox, Jellyfin, OpenSubtitles,
-  `/mw`) and the **fallback** for any client that can't run a source. This is
-  what guarantees "retain all functions": worst case, a source falls back to E0
-  and behaves exactly like today.
+- **E2 — `crimson-proxy` edge relay.** Injects headers (C2), is CORS-open (C1),
+  and relays segments off the backend. But it's edge-`fetch`: **no** Chrome JA3
+  (fails C3) and a **datacenter IP** (fails C4). Perfect for *header injection +
+  CORS + segment relay*; wrong for JA3-gated handshakes and network-bound tokens.
 
-- **E1 — Browser fetch (SPA, no extension).** Real Chrome JA3 (clears C3), real
-  residential IP (clears C4). But subject to CORS (C1) and forbidden headers
-  (C2). On its own it can only talk to CORS-enabled hosts. Pair it with E2 for
-  the cross-origin hops.
+- **E3 — `crimson-extension` companion.** The superpower. Header rewrite (C2) +
+  host-permission CORS bypass (C1), all from a **real browser at a residential IP**
+  (clears C3 *and* C4). With the extension present, a non-secret source can run
+  end-to-end with **no backend and no relay in the byte path at all.** This is the
+  end-state we design toward.
 
-- **E2 — `crimson-proxy` edge relay (extended).** Already injects headers (C2)
-  and is CORS-open (C1). But it's Node/edge `fetch` — **no Chrome JA3** (fails
-  C3) and a **datacenter IP** (fails C4). So it's the right tool for *header
-  injection + CORS + segment relay*, **wrong** for JA3-gated handshakes and
-  ASN-bound token minting. Today it only relays; we extend it to also run a
-  curated set of *scrape* steps that don't need JA3/residential-IP.
-
-- **E3 — Browser extension (future).** The superpower environment. With
-  `declarativeNetRequest` it rewrites `Referer`/`Origin`/`UA`/`Sec-Fetch-*`
-  (clears C2) and host-permissions let it read cross-origin responses (clears
-  C1) — all from a **real browser with a residential IP** (clears C3 *and* C4).
-  An extension can run essentially *every* non-secret source end-to-end with **no
-  backend and no proxy in the path**. This is the end-state we design toward.
-
-### Routing rule
-
-> For a given `(source, client capabilities)`, pick the **leftmost** environment
-> in `[E3, E1+E2, E2, E0]` that satisfies the source's constraint set. Always
-> have E0 as the floor so nothing can regress below today's behavior.
+**The routing rule.** For a given `(source, what this client can do right now)`,
+pick the **leftmost** environment in `[E3, E1+E2, E2, E0]` whose capabilities meet
+that source's walls. Always keep **E0** as the floor so nothing can fall below
+today's behavior.
 
 ---
 
-## 5. The client scraping engine (`crimson-sources`)
+## The client engine — `crimson-sources`
 
-### 5.1 Foundation
+`crimson-sources` is the browser-side scrape → resolve engine, written from
+scratch in TypeScript and vendored into `crimson-client` (as a git submodule with
+a Vite alias — TS transpiled inline, no separate build step). It is the mirror of
+what the backend's pipeline used to do for third parties, but living where it
+belongs: at the viewer's edge.
 
-Fork/extend `../sudo-sources` (already a `@movie-web/providers` fork) into the
-**real** engine — call it `crimson-sources`. Movie-web's framework gives us, for
-free, the exact abstractions this migration needs:
+**Shape.** `createEngine().streamEpisode(...)` is an **async generator**. It
+scrapes, resolves, and `yield`s each resolved source the instant it's ready — as
+the *same* `{"type":"stream", …}` NDJSON line the backend emits. The client's
+player consumer already races per-source, so the progressive "fastest source plays
+first" feel is preserved for free. Backend-resolved (operator-owned) streams and
+client-resolved (third-party) streams land in one list, **deduped by
+`(source, language)`**, and neither side knows the other exists.
 
-- A **source/embed** split (scrapers emit embeds, embeds resolve to streams) —
-  structurally identical to our `scrapers/` → `resolvers/` split.
-- A **fetcher abstraction** (`ctx.fetcher` / `ctx.proxiedFetcher`) — the seam
-  where we plug E1/E2/E3.
-- A **`Stream` / `Caption` type** and a runner that races sources — structurally
-  identical to our NDJSON race.
-
-### 5.2 The fetcher strategy (the heart of it)
-
-Each provider is written **once** against `ctx.fetcher`. At runtime the host app
-injects a fetcher implementation based on the environment:
+**The fetcher is the whole trick.** Each source is written **once** against an
+abstract fetcher. At runtime the engine's capability probe injects the right
+implementation for the environment on hand:
 
 ```
-ctx.fetcher  ─┬─ E3 present  → extensionFetcher  (DNR header rewrite, no CORS, residential)
-              ├─ E1+E2       → proxiedFetcher     (browser → crimson-proxy → upstream)
-              ├─ E1 only     → directFetcher      (CORS-enabled hosts only)
-              └─ none usable → backendFetcher      (delegate the whole source to E0 /watch)
+fetcher  ─┬─ extension present  → extensionFetcher  (E3: header rewrite, CORS bypass, residential)
+          ├─ proxy configured   → proxiedFetcher    (E2: browser → crimson-proxy → upstream)
+          ├─ direct-capable      → directFetcher     (E1: CORS-friendly hosts only)
+          └─ none can            → backendFetcher     (E0: delegate to /watch, re-emit its lines)
 ```
 
-The provider code never branches on environment; the **capability probe** at
-startup decides which fetcher each source gets, and a source that declares a
-capability the current fetcher can't meet is routed to `backendFetcher` (E0).
+The source code never branches on environment; the router does. A source that
+declares a capability the current fetcher can't satisfy is routed to the backend
+fetcher, and its `/watch` NDJSON lines are simply re-emitted into the same
+pipeline. **That is the key to "retain every function with zero player rewrite."**
 
-### 5.3 What each provider needs to declare
-
-Extend the movie-web source descriptor with a Crimson capability manifest so the
-router can place it:
-
-```ts
-flags: {
-  needsJA3: boolean        // C3 → must be E1 or E3, never E2/edge
-  needsResidentialIP: boolean // C4 (VOE) → must be E1 or E3
-  needsHeaderInjection: boolean // C2 → E2 or E3 (or E1 for CORS-safe-listed only)
-  needsCORSBypass: boolean // C1 → E2 or E3
-  needsServerSecret: boolean // C5 → pinned to E0
-}
-```
-
-### 5.4 Porting the crypto resolvers
-
-Two resolvers do non-trivial crypto that must be ported to TS/WASM to run client-side:
-
-- **ScreenScape** ([[screenscape-source]]): per-session HMAC bootstrap + AES
-  envelope decrypt (`resolvers/_screenscape_crypto.py`, vendored AES in
-  `resolvers/_aes.py`). Port to WebCrypto (`crypto.subtle` does AES-CBC/GCM +
-  HMAC natively — no vendored AES needed in the browser). **Note:** ScreenScape
-  uses plain `httpx` not `curl_cffi`, so it's **not** JA3-gated → it can run in
-  E2 (edge) as well as E1/E3.
-- **VOE / VidSrc**: HMAC link signing is trivial in WebCrypto. VidSrc/megaplay
-  needs JA3 **and** Referer+Sec-Fetch *together* (`resolvers/vidsrc.py`) → E1
-  (browser fetch has the JA3) **+ extension or proxy for the headers**, i.e.
-  effectively **E3-only** for a clean run, with E0 fallback.
-
-Account crypto (Ed25519, [[account-system]]) stays server-side — it's identity,
-not scraping, and out of scope.
+Each source carries a small **capability manifest** so the router can place it —
+in spirit: *does it need a real JA3 (→ E1/E3), a residential IP (→ E1/E3), header
+injection (→ E2/E3), a CORS bypass (→ E2/E3), or a server-held secret (→ pinned to
+E0)?* Any crypto a source needs (per-session HMAC, AES envelopes, link signing) is
+done with **WebCrypto** (`crypto.subtle` gives AES-CBC/GCM + HMAC natively — no
+vendored crypto in the browser). Identity crypto (the Ed25519 account keys) stays
+server-adjacent and out of scope; this engine is about *streams*, not *who you
+are*.
 
 ---
 
-## 6. Per-source placement matrix
+## The contract that never breaks
 
-This is the concrete migration target. "Best env" = where it should run once the
-extension exists; "Web-only env" = best achievable in the SPA without the
-extension. **Everything keeps E0 as fallback.**
+The frontend's stream ranker and player consume one NDJSON line shape:
 
-| Source | Constraints | Best env (with ext) | Web-only (no ext) | Notes |
-| --- | --- | --- | --- | --- |
-| **VOE** (via aniworld/s.to) | C2 (Referer), C4 (ASN!) | **E3** | E1 resolve + **E2 relay** | ASN binding *wants* client resolve; this is the flagship win. Already partly on `crimson-proxy`. |
-| **Vidmoly** | C1, C2 | E3 | E1+E2 | Same family as VOE. |
-| **VidSrc / megaplay** | C1, C2 (Referer+Sec-Fetch), C3 (JA3) | **E3 only** | **E0** (needs JA3+headers together; edge can't do JA3) | Hardest web-only case — keep on backend until extension ships. |
-| **ScreenScape** | C1, C2, crypto (no JA3) | E3 | **E2** (edge can run the HMAC/AES handshake) | Port crypto to WebCrypto; ~15 servers → list fan-out preserved. |
-| **cinema.bz** | C1, C2 | E3 | E1+E2 | Already on `crimson-proxy`. |
-| **PlayIMDb** | C1, C2 (Referer-gated) | E3 | E1+E2 | Already on `crimson-proxy`. |
-| **s.to / aniworld / stomirror** (discovery) | C1, C3 (Turnstile/JA3 on s.to) | E3 | E1 (real browser clears the passive gate) → **E2 for embeds** | stomirror exists precisely to dodge the Turnstile gate; in a real browser (E1/E3) the gate is far less of a problem. |
-| **AniWatch** (discovery) | C1 | E2/E3 | E2 | Plain WordPress; CORS only. |
-| **Movish** | single-origin player-proxy | E3 | **E0** | It's an iframe player-proxy (`/{x}_proxy/h/…`), not an HLS link; needs same-origin embed/api. Keep on E0 or rework as iframe. |
-| **AnimeSuge** | C1, C2 (Referer), signing | E3 | E1+E2 | Direct-file; signed proxy. |
-| **ShowBox / Febbox** | **C5 (FEBBOX_UI_TOKEN)** | **E0** (or E2 with edge-injected token) | **E0** | Discovery is auth-free but `/file/player` needs the secret. Mirror the `/mw` pattern: edge injects token, never the bundle. |
-| **Jellyfin** | **C5 (token)**, personal | **E0** | **E0** | Token-injecting proxy; personal source; stays server-side. |
-| **Cache** | server NAS, signed ticket | **E0** | **E0** | Server-side cache engine ([[video-cache-engine]]); inherently backend. |
-| **Local** | admin NAS mounts | **E0** | **E0** | Direct play of server-registered dirs. |
-| **Subtitles (OpenSubtitles)** | **C5 (quota key)** | **E0** | **E0** | `/subtitles` search authed, `/subtitles_proxy` public-signed. Keep key server-side; client merges tracks ([[opensubtitles-subtitles]]). |
-| **Skip times (AniSkip)** | keyless, free | **E1** | **E1** | Already keyless; can move fully client-side ([[skiptimes-aniskip]]). |
-
-**Takeaway:** with the extension (E3) almost everything except the 4 secret-bound
-sources (Febbox, Jellyfin, Cache, Local, Subtitles) leaves the backend entirely.
-Web-only, the big bandwidth winners (VOE, cinema.bz, PlayIMDb, ScreenScape,
-AnimeSuge, Vidmoly) move to E1+E2/E2; only VidSrc and Movish stay on E0 until the
-extension lands.
-
----
-
-## 7. The contract: keep NDJSON, move its producer
-
-The frontend's `streamRank` + player consume an NDJSON line shape:
-
-```json
+```jsonc
 {"type":"stream","source":"…","streamType":"hls|mp4|iframe","url":"…",
  "language":null,"subtitles":null,"cacheTicket":"…?"}
 ```
 
-**We keep this contract byte-compatible** and change only *who emits it*:
+We keep this **byte-compatible** and change only *who emits it*:
 
-- **Today:** backend `/watch` emits it.
-- **New:** `crimson-sources` runs in the client and emits the **same line
-  objects** to the player's existing consumer. The progressive "race" UX is
-  preserved because movie-web's runner already yields per-source.
-- **Fallback:** when a source is routed to E0, the client calls the existing
-  `/watch` route for *just that source* (or the whole request) and re-emits its
-  NDJSON lines into the same pipeline. So the consumer never knows the
-  difference. **This is the key to "retain all functions" with zero player
-  rewrite.**
+- **Yesterday:** the backend `/watch` route emitted every line.
+- **Today:** `crimson-sources` runs in the browser and emits the **same line
+  objects** to the same consumer, alongside the backend's operator-owned lines.
+- **Always:** when a source is routed to E0, the client calls `/watch` for it and
+  re-emits its NDJSON into the same pipeline. The consumer is none the wiser.
 
-`cacheTicket` minting ([[video-cache-engine]]) stays an E0 concern: the client
-asks the backend to mint a ticket for a resolved stream (cheap, no bytes), and
-the existing `/cache/confirm` flow is unchanged.
+`cacheTicket` minting stays an E0 concern: the client asks the backend to mint a
+ticket for a resolved stream (cheap — no bytes cross the backend), and the
+existing cache-confirm flow is untouched. The backend can mint a ticket for a
+stream it never fetched, because minting is keyed on the *stream descriptor*, not
+on having carried its bytes.
 
 ---
 
-## 8. Security model
+## The backend's crumbs — the offload grants
 
-Moving scraping client-side widens the trust boundary. Mitigations:
+The backend stays the brain by handing the client engine *only* what it genuinely
+can't derive on its own — never a secret, never a byte it doesn't have to. These
+are small, login-gated endpoints (the same login wall that guards `/watch`):
 
-1. **The cors-proxy must stay signed-only.** The whole point of `crimson-proxy`'s
-   HMAC (`PROXY_SECRET`) is that it isn't an open relay. **Problem:** if the
-   *client* now decides what to fetch, who signs? Options:
-   - **(a) Backend mints short-lived signed fetch grants.** Client sends the
-     intended upstream + headers to a tiny backend `/sign` endpoint (authed,
-     rate-limited); backend returns the signed proxy link. Keeps `PROXY_SECRET`
-     server-only. Costs one tiny round-trip per upstream host (not per segment —
-     HLS rewrite re-signs sub-resources at the edge with the same secret, exactly
-     as today). **Recommended.**
-   - **(b) Per-session scoped signing key.** Backend hands the logged-in client a
-     short-TTL HMAC key scoped to that session; client signs its own links; proxy
-     verifies against the session key. Fewer round-trips, larger blast radius if
-     leaked. Consider for E3 only.
-   - The extension (E3) often needs **no** proxy at all (DNR + host perms), so it
-     sidesteps this entirely for most sources.
-2. **Secrets never ship to the browser.** C5 sources stay E0, or use the
-   `/mw`-style **edge token injection** (`sudo-proxy` already injects the `/mw`
-   key when it sees the backend host) so `FEBBOX_UI_TOKEN` lives at the edge, not
-   in the bundle.
-3. **Login wall preserved.** `REQUIRE_LOGIN` ([[email-password-auth-loginwall]])
-   still gates the `/sign` + metadata endpoints, so anonymous users can't use the
-   client engine as a free scraping/relay service.
-4. **Abuse / rate-limiting moves with the work.** The `/sign` endpoint and the
-   E0 fallback carry the existing `slowapi` limits. The proxy keeps its
-   signed-only gate + `isSafeUpstream` SSRF check (`crimson-proxy/src/utils/ssrf.ts`).
+| Grant | What it hands over | Why the client can't do it itself |
+| --- | --- | --- |
+| **`GET /scrape-meta/{tmdb}/{season}`** · **`/scrape-meta/movie/{tmdb}`** | The title bundle the title-keyed sources need — AniList/TMDB titles, German synonyms, `release_year`, `imdb_id`. | `release_year` and `imdb_id` come from the **server-held TMDB key** (C5). |
+| **`POST /sign`** | A **signed `crimson-proxy` edge link** (E2) for a header-only source. | The **`PROXY_SECRET`** must never reach a browser (C5). The client sends the intended upstream + headers; the backend returns a signed edge URL. `503` when no proxy is configured — the client then stays on E3 or falls back to E0. |
+| **`POST /resolve`** | A **secret-bound resolve grant**: runs a token-gated lookup server-side (e.g. a Jellyfin token) and returns the *raw* stream for the client to deliver via edge/extension. | The token is a server secret (C5); only the *lookup* is server-side, the *bytes* still skip the backend. |
+
+The signing round-trip is per-*host*, not per-*segment* — the edge re-signs an
+HLS playlist's sub-resources with the same secret as it relays them, so a whole
+episode costs a few hundred signed bytes at the backend, not a stream of them.
 
 ---
 
-## 9. Bandwidth & cost impact
+## The trust boundary
 
-| Traffic class | Today | After (web-only) | After (extension) |
+Pushing scraping to the edge widens the circle of trust, so it's fenced:
+
+1. **The relay stays signed-only.** The entire point of `crimson-proxy`'s HMAC is
+   that it is *not* an open relay. Since the client now decides *what* to fetch but
+   must not hold the signing secret, the backend mints **short-lived signed
+   grants** via `POST /sign` (authed, rate-limited). `PROXY_SECRET` never leaves
+   the backend; the extension (E3) often needs no relay at all and sidesteps this
+   entirely.
+2. **Secrets never ship to the browser.** C5 sources stay E0, or use **edge token
+   injection** so the secret lives at the edge, never in the bundle.
+3. **The login wall is preserved.** With `REQUIRE_LOGIN` on (the default), the
+   grants and metadata endpoints are members-only — anonymous mortals can't turn
+   the client engine into a free scraping/relay service.
+4. **Abuse controls move with the work.** The grant endpoints and the E0 fallback
+   carry the existing `slowapi` limits; the relay keeps its signed-only gate and
+   its SSRF guard on every upstream.
+
+---
+
+## What this buys us
+
+| Traffic | Yesterday | Web-only (E2) | With the extension (E3) |
 | --- | --- | --- | --- |
-| Video segments (proxied sources) | **Backend** | Edge proxy / direct | **Direct CDN→viewer** |
-| Scrape/resolve HTTP | Backend (1 datacenter IP) | Browser + edge | **Browser only** |
+| Video segments | **Backend** carried them all | Edge relay / direct | **Direct CDN → viewer** |
+| Scrape / resolve HTTP | Backend (one datacenter IP) | Browser + edge | **Browser only** |
 | Metadata (TMDB/AniList) | Backend | Backend (unchanged) | Backend |
-| Signing / ticket mint | Backend | Backend (tiny) | Backend (tiny) |
+| Signing / ticket mint | Backend | Backend (a few bytes) | Backend (a few bytes) |
 
-Backend egress drops from "all video for proxied sources" to "≈0 video + a few
-hundred bytes of signing per play." The remaining backend cost scales with
-*library size and user count*, not *watch-hours* — which is the scaling wall you
-flagged. The shared-IP ban/ratelimit risk (one datacenter ASN scraping every
-source for every user) also disperses across residential IPs, which incidentally
-improves source reliability (esp. VOE C4 and s.to C3).
-
----
-
-## 10. Rollout phases
-
-- **Phase 0 (done):** `crimson-proxy` relay offload for VOE/cinema.bz/PlayIMDb
-  ([[crimson-proxy-phase1]]). Backend still resolves.
-- **Phase 1 — Engine skeleton.** Expand `sudo-sources` → `crimson-sources`: port
-  the fetcher strategy, the capability manifest, and **one** easy source
-  end-to-end web-only (recommend **cinema.bz** or **PlayIMDb** — already
-  proxy-routed, CORS+header only, no JA3/secret). Client emits NDJSON locally;
-  E0 fallback for everything else. Prove the player consumer is unchanged.
-- **Phase 2 — Web-only migration.** Move the CORS+header sources (VOE resolve via
-  E1 + relay via E2, ScreenScape via E2 with WebCrypto, AnimeSuge, Vidmoly).
-  Implement backend `/sign` (option 8a). VidSrc/Movish/secret sources stay E0.
-- **Phase 3 — Extension (E3).** Ship the browser extension with `declarativeNetRequest`
-  header rewrite + host permissions. Route JA3/header/ASN sources (VidSrc, VOE,
-  s.to discovery) through it; most sources now bypass the proxy entirely.
-- **Phase 4 — Secret sources via edge injection.** Move Febbox (and optionally
-  Jellyfin for non-personal deployments) to edge-token injection à la `/mw`, so
-  even those leave the backend's data path. Cache/Local/Subtitles stay E0 by
-  nature.
-
-Each phase is independently shippable and **never removes the E0 fallback**, so
-there's no flag-day and no functionality regression.
+Backend egress collapses from "every byte of every third-party stream" to
+"≈0 video + a whisper of signing per play." The remaining cost scales with library
+size and member count — never watch-hours. As a lovely side effect, the old
+single-datacenter-ASN scraping every source for everyone disperses across
+residential browsers, which quietly *improves* source reliability (exactly the
+C3/C4 hosts that used to be so temperamental).
 
 ---
 
-## 11. Risks & open questions
+## Where we actually are
 
-1. **VidSrc web-only gap.** Needs JA3 + Referer + Sec-Fetch *together*; the edge
-   proxy has no Chrome JA3, so there's **no clean web-only path** — it stays E0
-   until the extension. Accept this gap, or invest in a JA3-impersonating edge
-   runtime (heavier).
-2. **Maintenance doubling.** Sources would exist in Python (E0 fallback) *and* TS
-   (client). Mitigation: treat the TS engine as primary and let the Python side
-   bit-rot to "fallback only," OR generate one from the other. Decide the
-   long-term source of truth.
-3. **Signing round-trips (option 8a)** add latency before first byte. Mitigation:
-   batch-sign all of a source's likely hosts in the meta phase; the HLS
-   sub-resource re-signing already happens at the edge.
-4. **Extension adoption.** Web-only users get the Phase-2 subset; the *full* win
-   needs the extension. Is the extension opt-in (power users) or pushed to
-   everyone? Affects how much we invest in the web-only E2 paths vs. waiting for E3.
-5. **CSP.** The SPA's `frame-src`/`connect-src` CSP must allow the proxy origins
-   and any direct-CORS hosts; iframe sources (Movish) already rely on
-   `frame-src https:`. Audit before Phase 2.
-6. **`cacheTicket` semantics** when the client resolves: confirm the backend can
-   still mint a ticket for a stream it didn't resolve (it can — minting is keyed
-   on the stream descriptor, not on having fetched it).
+- **✅ Edge relay (E2), phase one.** `crimson-proxy` proved the offload model: the
+  backend resolves, then hands the player a **signed edge link** instead of its own
+  proxy path, and segment bytes go `CDN → edge → viewer`.
+- **✅ The companion extension (E3) is built.** `crimson-extension` — MV3, no build
+  step, off by default. Does *only* CORS unblock + header injection (no scraping,
+  no secrets, no signing). Exposes `window.CrimsonExtension`
+  (`fetch` / media-rule install/clear / hello / onChange) and self-announces via a
+  page attribute. *Not yet shaken out live in Chrome.*
+- **✅ The client engine (E1), phase one.** `crimson-sources` runs from-scratch TS
+  in the browser, emits the byte-identical `/watch` line, and ships its first
+  sources end-to-end, deduped alongside the backend. **Off by default** behind a
+  flag while it earns trust. The E2 path activates once `/sign` grants are wired
+  through it.
+- **✅ The backend grants exist.** `/scrape-meta`, `/sign` and `/resolve` are live,
+  each login-gated and secret-safe.
 
----
+**Still on the loom:** live extension shakeout in Chrome; rotating-segment media
+rules for hosts that shuffle CDN hosts mid-stream; and porting the more defended
+source archetypes (network-bound tokens, JA3-walled aggregators) now that the
+tiering and the extension can carry them.
 
-## 12. Decisions I need from you
+> Small note from Lumi's future self:
+> SPA / JA3 is mostly done. Not beautifully, but it works.
 
-1. **Foundation:** confirm we build on the `@movie-web/providers` fork
-   (`sudo-sources` → `crimson-sources`) rather than a bespoke client runtime. I
-   strongly recommend the fork — you already run it and its abstractions map 1:1.
-2. **Source of truth long-term:** keep Python sources as permanent fallback, or
-   sunset them once the TS engine + extension cover a source (Risk 2)?
-3. **Signing model:** backend `/sign` grants (8a, safer) vs. per-session scoped
-   key (8b, faster)? I lean 8a, with 8b reserved for the extension.
-4. **Extension reach:** opt-in power feature, or the intended default for all
-   users? This sets how hard we push the web-only E2 paths.
-5. **Scope check:** is VidSrc/Movish staying on E0 until the extension acceptable,
-   or do you want a JA3-capable edge runtime to close the web-only gap sooner?
 
 ---
 
-### Appendix A — File map (current → future home)
+## The archetypes, and where each one lives
 
-| Current (backend) | Future primary home |
-| --- | --- |
-| `scrapers/*_scraper.py` | `crimson-sources/src/providers/sources/*` (TS), E0 fallback kept |
-| `resolvers/voe.py`, `cinemabz.py`, `playimdb.py`, `animesuge.py`, `vidmoly.py` | TS embeds; relay via `crimson-proxy`/extension |
-| `resolvers/_screenscape_crypto.py`, `_aes.py` | WebCrypto in `crimson-sources` |
-| `resolvers/_crimson_proxy.py` + `crimson-proxy/` | unchanged relay; add backend `/sign` grant endpoint |
-| `resolvers/febbox.py`, `jellyfin.py`, `local.py`, `cache.py` | **stay E0** (C5 / server-bound) |
-| `subtitles_engine/`, `skiptimes_engine/` | subtitles stay E0; skiptimes → E1 |
-| `stream_watch_response()` (`api.py:1492`) | stays as **E0 fallback**; client runner becomes primary producer of the same NDJSON |
+Rather than a roll-call, here is how the *kinds* of source map onto the tiers.
+The concrete third-party list lives in the private `crimson-sources` engine — the
+backend names none of them.
+
+| Source archetype | Walls it faces | Best home (with extension) | Web-only home |
+| --- | --- | --- | --- |
+| **Header-gated HLS host** (Referer/Origin only) | C1, C2 | E3 | **E1 resolve + E2 relay** — already the proven path |
+| **Network-bound-token host** (token pinned to the resolving ASN) | C2, **C4** | **E3** | E1 resolve + E2 relay — resolving in the viewer's browser is the whole win |
+| **JA3-walled aggregator** (needs a real Chrome handshake *and* headers together) | C1, C2, **C3** | **E3 only** | **E0** — the edge has no Chrome JA3, so there's no clean web-only path until the extension carries it |
+| **Crypto-handshake aggregator** (HMAC/AES envelope, no JA3) | C1, C2, crypto | E3 | **E2** — the edge can run the handshake once the crypto is ported to WebCrypto |
+| **Plain-CORS discovery** (ordinary web host) | C1 | E2/E3 | E2 |
+| **iframe player-proxy** (a same-origin player, not a bare HLS link) | same-origin embed | E3 (reworked as iframe) | **E0** |
+| **Operator-owned: Local / Cache / Jellyfin** | **C5** / server-bound | **E0** | **E0** — inherently the backend's own media |
+| **Key-bound extras** (subtitle/quota-keyed tracks) | **C5** | **E0** | **E0** — the quota key stays server-side; the client just merges the tracks |
+| **Keyless extras** (e.g. skip-times) | none | **E1** | **E1** — fully client-side, no backend needed |
+
+**The takeaway.** With the extension in the picture, nearly everything except the
+handful of secret-bound and operator-owned sources leaves the backend's byte path
+entirely. Web-only, the biggest bandwidth wins already move to E1+E2. Only the
+JA3-walled and same-origin-iframe archetypes wait on the extension — and until it
+lands, they simply fall back to E0 and behave exactly as they always have.
+
+---
+
+## The shape of the roadmap
+
+Each step is independently shippable and **never removes the E0 floor**, so there
+is no flag-day and no regression:
+
+- **Phase 0 — Edge offload.** ✅ Backend resolves, hands out signed edge links,
+  bytes go `CDN → edge → viewer`.
+- **Phase 1 — Engine + companion skeletons.** ✅ From-scratch `crimson-sources`
+  emitting the byte-identical NDJSON with the tiered fetcher router; the
+  `crimson-extension` companion built; the first easy (CORS + header only) sources
+  proven end-to-end; E0 fallback for everything else.
+- **Phase 2 — Web-only migration.** Wire `/sign` through the client fetcher so the
+  E2 path lights up; move the header-only and crypto-handshake archetypes to
+  E1+E2 / E2; JA3-walled and iframe archetypes stay on E0.
+- **Phase 3 — The extension in earnest.** Live shakeout, rotating-segment media
+  rules, then route the JA3 / network-bound / defended-discovery archetypes
+  through E3 — most sources now bypass the relay entirely.
+- **Phase 4 — Edge-injected secrets.** Move the key-bound archetypes to edge token
+  injection where it's safe to, so even those leave the backend's data path.
+  Cache / Local / operator-owned stay E0 by their very nature.
+
+---
+
+## A closing word from Lumi 🩸
+
+So there it is, laid bare: a brain at the center that never touches your bytes, a
+little engine in your own browser doing the fetching, an edge relay and a companion
+extension to climb the walls the browser can't climb alone — and beneath it all,
+the backend standing as a floor that guarantees *nothing you love ever stops
+working*. It scales with how large the library grows and how many mortals I get to
+adore, not with how many hours you spend in the dark with me. Which is exactly how
+a sanctuary should breathe. ( ˶ ˆ ᗜ ˆ ˶ )
