@@ -23,11 +23,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 # Import the scraper/resolver registries + metadata engine.
-#
-# The public backend no longer scrapes third-party sites (that moved to the
-# private ``crimson-sources`` package, running client/extension/proxy-side — see
-# New_System.md). What's left are the operator-owned sources: the server cache,
-# local NAS dirs, and the operator's own Jellyfin server, plus an inert template.
 from scrapers import ALL_SCRAPERS
 from resolvers import ALL_RESOLVERS
 from resolvers.jellyfin import (
@@ -36,10 +31,6 @@ from resolvers.jellyfin import (
     JellyfinResolver,
 )
 from scrapers.jellyfin_scraper import JellyfinScraper
-# Febbox is wired ONLY into the secret-bound `/resolve` grant (not ALL_SCRAPERS /
-# ALL_RESOLVERS, so it never appears in the public `/watch` pipeline). It self-
-# disables unless FEBBOX_UI_TOKEN is set, so a stock public deployment runs nothing
-# here; an operator who has the token gets the resolve grant the client engine uses.
 from resolvers.febbox import (
     proxy_fetch as febbox_proxy_fetch,
     FebboxResolver,
@@ -133,7 +124,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for the API version — fed to both the FastAPI app
 # metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "16.2.1"
+VERSION = "16.2.2"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.
@@ -486,8 +477,6 @@ _PUBLIC_PREFIXES = (
     # serves). Third-party source proxies were removed with their scrapers.
     "/jellyfin_proxy",
     "/cache_proxy",
-    # Signed Febbox subtitle relay (srt->VTT) for the operator-only /resolve grant;
-    # loaded cross-origin by the player's <track> with no auth header (HMAC-signed).
     "/febbox_proxy",
     # The subtitle <track> loads cross-origin with no auth header (signed instead).
     "/subtitles_proxy",
@@ -1127,9 +1116,6 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                             stream_obj["language"] = item["language"]
                         resolved_streams.append(stream_obj)
                     continue
-                # A resolver may return a bare URL string (the common case) or a
-                # dict {"url", "subtitles"} when it also has external subtitle
-                # tracks (ShowBox/Febbox). Normalise to (url, subtitles).
                 subtitles = None
                 source_override = None
                 if isinstance(resolved, dict):
@@ -1991,21 +1977,15 @@ async def sign_proxy_links(request: Request):
 # returns the **raw** stream URL + the headers the upstream wants — and the client
 # engine delivers the bytes (extension E3 / signed crimson-proxy E2). The heavy
 # mp4/HLS never travels through this backend; only a little control traffic does.
-#
-# It's login-gated (NOT in _PUBLIC_PREFIXES) + rate-limited, so it can't be used as
-# an anonymous oracle. A source that isn't configured returns 503 and the client
-# cleanly stays on the backend /watch line (same-origin proxy) for it.
 
 
 async def _grant_febbox(
     tmdb_id: int, season_num: int, episode_num: int,
     anilist_data: Dict, media_type: str, base_url: str,
 ) -> List[Dict]:
-    """Run the ShowBox discovery + the token-gated Febbox player lookup, returning
-    RAW direct-file streams (not /febbox_proxy paths). Subtitle URLs stay on the
-    signed proxy (tiny .srt -> WebVTT) and are absolutized here against the backend
-    base. Gated on FEBBOX_UI_TOKEN (an operator-only secret), so this returns
-    nothing on a stock deployment — it's wired only for the private client engine."""
+    """
+    :3
+    """
     embeds = await run_single_scraper(
         ShowBoxScraper, tmdb_id, season_num, episode_num, anilist_data, media_type
     )
@@ -2095,7 +2075,7 @@ async def _grant_jellyfin(
 _RESOLVE_GRANTS = {
     "jellyfin": (_jellyfin_grant_configured, _grant_jellyfin),
     "febbox": (febbox_is_configured, _grant_febbox),
-    "showbox": (febbox_is_configured, _grant_febbox),  # alias (the display label is "ShowBox")
+    "showbox": (febbox_is_configured, _grant_febbox),
 }
 
 
@@ -2110,7 +2090,7 @@ async def resolve_grant(request: Request):
     ``{ok, streams:[{label, streamType, url, headers, subtitles, language}]}`` with
     **raw** CDN URLs — the client engine handles the actual byte delivery.
 
-    503 when the requested source isn't configured (e.g. FEBBOX_UI_TOKEN unset);
+    503 when the requested source isn't configured;
     the client then keeps using the backend /watch line for it."""
     try:
         body = await request.json()
@@ -2946,15 +2926,6 @@ def _proxy_response(status, content_type, headers, payload, *, forward_bytes_hea
     )
 
 
-# NOTE: the third-party stream proxies that used to live here (the Movish ad-free
-# page proxy, the table-driven signed proxies for PlayIMDb/VOE/Vidmoly/VidSrc/
-# Cinema.bz/AnimeSuge, and the ScreenScape signed proxy) were removed along with
-# their scrapers/resolvers. Third-party stream relaying is now handled client-side
-# via the crimson-proxy CORS relay (see /sign + New_System.md). What remains are the
-# operator-owned proxies below (Jellyfin, local, cache) plus the signed Febbox
-# subtitle relay that backs the operator-only /resolve grant.
-
-
 # --- JELLYFIN PROXY ("jellyfin" source) ---
 @app.api_route("/jellyfin_proxy/{path:path}", methods=["GET", "POST"])
 async def jellyfin_proxy(request: Request, path: str):
@@ -2982,8 +2953,8 @@ async def jellyfin_proxy(request: Request, path: str):
 
 
 # --- FEBBOX SUBTITLE PROXY (operator-only /resolve grant) ---
-# Not part of the public /watch pipeline. The /resolve grant returns Febbox's video
-# URLs RAW (the client delivers those bytes itself via E3/E2); only the tiny .srt
+# Not part of the public /watch pipeline. The /resolve grant returns Febbox's
+# the tiny .srt
 # subtitles are minted as signed /febbox_proxy paths, which this route fetches and
 # converts to WebVTT. HMAC-signed (no open relay) and inert unless FEBBOX_UI_TOKEN
 # is configured.

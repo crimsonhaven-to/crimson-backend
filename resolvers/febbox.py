@@ -68,10 +68,18 @@ UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Quality preference, best first. Febbox labels are like "ORG"/"4K"/"1080P"/…;
-# we normalise to these tokens, surface one tile per distinct quality (best file
-# per quality bucket) and order best-first.
-_QUALITY_ORDER = ("org", "4k", "2160", "1440", "1080", "720", "480", "360", "240")
+# Quality preference, best first. Febbox now serves HLS: the player payload lists
+# an "AUTO" adaptive master alongside fixed-resolution renditions ("4K"/"1080p"/…),
+# so "auto" leads (adaptive picks the best rung the connection sustains — the safe
+# default) and the numeric tiers follow. "org" stays for older direct-file shares.
+_QUALITY_ORDER = ("auto", "org", "4k", "2160", "1440", "1080", "720", "480", "360", "240")
+
+# Febbox's HLS payload also lists audio-only renditions ("audio_1", "audio_1_eac3",
+# …) as `sources[]` entries next to the video variants. They must never surface as a
+# playable quality tile (selecting one plays sound with no picture), so we drop any
+# entry whose label carries an audio/codec marker that never appears in a real
+# video-quality label.
+_AUDIO_ONLY_MARKERS = ("audio", "aac", "eac3", "ac3", "dts", "opus", "flac", "dolby", "atmos")
 
 # How many quality variants to surface per episode (best-first; the cap drops the
 # lowest). Febbox typically returns 3-6; this just guards a pathological response.
@@ -80,6 +88,7 @@ _MAX_VARIANTS = 6
 # Pretty display per normalised quality token — the suffix in the source label
 # ("ShowBox (1080p)"). Unmatched labels keep their raw text (see _quality_display).
 _QUALITY_DISPLAY = {
+    "auto": "Auto",
     "org": "Original",
     "4k": "4K",
     "2160": "4K",
@@ -273,6 +282,15 @@ def _parse_marker(embed_url: str) -> Optional[Tuple[str, str, Optional[int], Opt
     return share_key, fid, season, episode
 
 
+def _is_audio_only(label: str) -> bool:
+    """True for Febbox's audio-only HLS renditions ("audio_1", "audio_1_eac3", …).
+    These ride in the same ``var sources`` array as the video variants; surfacing
+    one as a quality tile would play sound with no picture, so they're filtered out
+    before ranking. The markers never occur in a real video-quality label."""
+    low = (label or "").lower()
+    return any(m in low for m in _AUDIO_ONLY_MARKERS)
+
+
 def _quality_token(label: str) -> Optional[str]:
     """The first _QUALITY_ORDER token present in a febbox source label, or None."""
     low = (label or "").lower()
@@ -364,7 +382,8 @@ def _rank_sources(html: str, fid: str) -> List[Tuple[str, str]]:
 
     candidates = [
         s for s in sources
-        if isinstance(s, dict) and isinstance(s.get("file"), str) and s["file"].startswith("http")
+        if isinstance(s, dict) and isinstance(s.get("file"), str)
+        and s["file"].startswith("http") and not _is_audio_only(s.get("label", ""))
     ]
     if not candidates:
         return []
