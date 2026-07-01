@@ -48,6 +48,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code.
 COPY api.py .
+# The HTTP layer (FastAPI routers + the shared web helpers) that api.py assembles.
+COPY web ./web
 # Shared infrastructure: config, db pool, rate limiter, HTTP client, response
 # cache, plus the small app-wide modules (lumi, player, source_health).
 COPY core ./core
