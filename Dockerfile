@@ -13,7 +13,7 @@ WORKDIR /injected
 RUN mkdir -p resolvers scrapers
 RUN --mount=type=secret,id=sources_pat --mount=type=secret,id=sources_repo \
     if [ -s /run/secrets/sources_pat ] && [ -s /run/secrets/sources_repo ]; then \
-        git clone --depth 1 \
+        git clone --depth 1 --branch main \
           "https://x-access-token:$(cat /run/secrets/sources_pat)@github.com/$(cat /run/secrets/sources_repo).git" /tmp/src && \
         cp /tmp/src/resolvers/*.py resolvers/ && \
         cp /tmp/src/scrapers/*.py scrapers/ && \
