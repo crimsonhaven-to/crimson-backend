@@ -346,6 +346,7 @@ services:
       test: ["NONE"]
 
     environment:
+      - TMDB_API_KEY=${TMDB_API_KEY:- DEFINITELY_NOT_A_FAKE_KEY} # for some reason my discord bot container wants a TMDB API key. Since it doesn't make any requests, this should be fine?
       - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
       # Supplied via crimson.env on the manager. Empty token => bot stays off.
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
