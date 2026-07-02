@@ -108,10 +108,12 @@ async def _resolve_all_streams(tmdb_id: int, season_number: int, episode_number:
 
 def _warmup_pick_best(streams: List[Dict], preferences: Optional[Dict]) -> Optional[Dict]:
     """Pick the stream the viewer would most likely auto-play, mirroring the
-    frontend ranker (crimson-client/src/hooks.js ``streamRank``): the language/
-    dub-sub preference is the PRIMARY key (×1000), the global source priority
-    (Cache > Voe > Jellyfin) is the tiebreaker within a language tier. Lower wins.
-    With no preference set, source priority alone decides. Returns None for []."""
+    frontend ranker (crimson-client/src/streamUtils.js ``streamRank``): the
+    ranking is purely the viewer's language/dub-sub preference — there is NO
+    source-quality/provider priority. Lower (fewer mismatches) wins; ties, and the
+    no-preference case, fall back to list order (``min`` is stable, so the first —
+    i.e. earliest-resolved — stream wins), matching the client's arrival-order
+    fallback. Returns None for []."""
     prefs = preferences or {}
     pref_lang = (prefs.get("language") or "").strip().lower()
     pref_type = (prefs.get("type") or "").strip().lower()
@@ -127,19 +129,9 @@ def _warmup_pick_best(streams: List[Dict], preferences: Optional[Dict]) -> Optio
             miss += 1
         return miss
 
-    def _priority(stream: Dict) -> int:
-        if "/cache_proxy/" in (stream.get("url") or ""):
-            return 0
-        s = (stream.get("source") or "").lower()
-        if "voe" in s:
-            return 1
-        if "jellyfin" in s:
-            return 2
-        return 100
-
     if not streams:
         return None
-    return min(streams, key=lambda s: _mismatch(s) * 1000 + _priority(s))
+    return min(streams, key=_mismatch)
 
 
 async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: int,
