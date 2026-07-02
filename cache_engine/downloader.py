@@ -36,7 +36,6 @@ from starlette.concurrency import run_in_threadpool
 
 from .db import CacheStore
 from . import fs, ticket
-from resolvers import _crimson_proxy
 
 logger = logging.getLogger("cache_engine.downloader")
 
@@ -92,31 +91,32 @@ def _media_url_for_stream(stream: dict) -> Optional[str]:
     return None
 
 
-def _is_external_proxy_url(url: str) -> bool:
-    """True if ``url`` points at an external crimson-proxy edge (a host listed in
-    ``CRIMSON_PROXY_BASE``).
+def _is_loopback_proxy_url(url: str) -> bool:
+    """True when ``url`` is one of the backend's OWN same-origin proxy routes — a
+    ``/{source}_proxy`` path or the ``/player`` wrapper — i.e. a stream the cache
+    can pull back over loopback (``INTERNAL_BASE``) reusing the per-source
+    Referer/HMAC-signing/auth the live player relied on.
 
-    Such a stream was deliberately offloaded off the backend — the no-extension E2
-    path, or a proxy-routed source (see [[crimson-proxy-phase1]]). Caching it would
-    be self-defeating and fragile: ffmpeg would pull every segment back THROUGH the
-    edge proxy to the backend (re-importing the exact bandwidth we offloaded), and
-    the free edge may be down / rate-limited — that's the source of the
-    "ffmpeg failed" cache rows. These are also precisely the streams the client
-    resolves locally, so excluding them is the "don't cache a local/offloaded
-    resolve" guard the cache engine was missing."""
+    This is the exact predicate ``_to_internal`` keys on, so "is this cacheable"
+    and "can I rewrite it onto loopback" can never disagree.
+
+    Anything else is NOT ours to pull and must never be cached:
+
+      * a **raw third-party CDN link** — a stream the client resolved and delivered
+        itself (extension / E3, or a direct-play file). Its token is bound to the
+        VIEWER's IP/ASN, so a backend ffmpeg pull gets 403/429; and it's exactly the
+        byte traffic the New System deliberately moved OFF the backend.
+      * a **crimson-proxy edge link** (E2, ``CRIMSON_PROXY_BASE``, path ``/``) —
+        pulling it re-imports the bandwidth we offloaded and rides the free edge's
+        rate limit (429). This is the offloaded/relay case the old
+        ``_is_external_proxy_url`` host check caught; the positive test subsumes it
+        (an edge link's path is ``/``, so it fails here too) and additionally closes
+        the raw-CDN gap that host check missed."""
     try:
-        host = urlparse(url).netloc.lower()
+        path = urlparse(url).path
     except Exception:
         return False
-    if not host:
-        return False
-    for base in _crimson_proxy.proxy_bases():
-        try:
-            if urlparse(base).netloc.lower() == host:
-                return True
-        except Exception:
-            continue
-    return False
+    return "_proxy" in path or path.rstrip("/").endswith("player")
 
 
 def _to_internal(url: str) -> str:
@@ -124,8 +124,9 @@ def _to_internal(url: str) -> str:
     download stays on-host. Leaves third-party URLs (direct-play streams) alone."""
     parsed = urlparse(url)
     # Only same-backend proxy/player paths are rewritten; a raw CDN URL (direct
-    # play) is fetched as-is.
-    if "_proxy" in parsed.path or parsed.path.rstrip("/").endswith("player"):
+    # play) is fetched as-is. (The cacheability gate already rejects those, so in
+    # practice every job that reaches here is a loopback-proxy URL.)
+    if _is_loopback_proxy_url(url):
         q = f"?{parsed.query}" if parsed.query else ""
         return f"{INTERNAL_BASE}{parsed.path}{q}"
     return url
@@ -194,19 +195,34 @@ class DownloadManager:
 
     # ------------------------------------------------------------------ gate
     async def _cacheable(self, stream: dict) -> bool:
-        """Shared cacheability gate: caching is on, ffmpeg is present, the stream
-        is a tappable media URL, and it isn't our own cache/local output. Used both
-        by the ticket stamp (watch path) and the row claim (confirm path) so the two
-        never disagree on what's cacheable. Deliberately independent of the worker
-        being started — the api replicas mint/claim without running the worker."""
+        """Shared cacheability gate: caching is on, ffmpeg is present, and the stream
+        is a media URL the backend can pull back over its OWN loopback proxy. Used
+        both by the ticket stamp (watch path) and the row claim (confirm/warmup path)
+        so the two never disagree on what's cacheable. Deliberately independent of
+        the worker being started — the api replicas mint/claim without running the
+        worker.
+
+        The load-bearing check is ``_is_loopback_proxy_url``: the cache remuxes a
+        stream by re-fetching it through the backend's own ``/{source}_proxy`` over
+        loopback (``_to_internal``), which only works for our own same-origin proxy
+        routes. Since the E2/E3 offload landed, ``/watch`` also surfaces streams the
+        client delivers itself — raw CDN links (extension) and crimson-proxy edge
+        links — and pulling those back through the backend is exactly what produced
+        the 429 / wrong-ASN / edge-rate-limit cache failures. So caching is now
+        gated *positively* on the same-origin proxy shape rather than blocklisting
+        the two offload shapes we happened to know about."""
         if not await run_in_threadpool(self._store.get_enabled):
             return False
         url = (stream.get("url") or "")
         if any(frag in url for frag in _SKIP_URL_FRAGMENTS):
             return False  # our own cache output / the on-disk Local source
-        if _is_external_proxy_url(url):
-            return False  # offloaded to the edge — never pull it back through us
-        if not _media_url_for_stream(stream):
+        media_url = _media_url_for_stream(stream)
+        if not media_url:
+            return False  # not a tappable media URL (e.g. a player-page iframe)
+        if not _is_loopback_proxy_url(media_url):
+            # Delivered by the client/edge, not fronted by our proxy — not ours to
+            # pull. (Subsumes the old external-proxy-host guard; also catches raw
+            # CDN links the client resolved locally.)
             return False
         if not ffmpeg_available():
             return False
