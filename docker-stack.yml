@@ -272,9 +272,9 @@ services:
     # Writes the cached files — needs the same NAS mount the serving replicas use
     # to read them back via /cache_proxy. Same volumes, so register the same
     # in-container paths (/crimson/cache1, /crimson/cache2) in Admin → Cache.
-    volumes:
-      - crimson_cache1:/crimson/cache1
-      - crimson_cache2:/crimson/cache2
+    # volumes:
+    #   - crimson_cache1:/crimson/cache1
+    #   - crimson_cache2:/crimson/cache2
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
@@ -493,26 +493,26 @@ networks:
 #   TMDB_API_KEY=... PROXY_SECRET=... DATABASE_URL=... \
 #   docker stack deploy -c docker-stack.yml crimson-api
 #
-volumes:
-  crimson_cache1:
-    driver: local
-    driver_opts:
-      type: cifs
-      # // <host-or-ip>/<share> — forward slashes even for a Windows share.
-      device: "//${NAS_IP}/${NAS_SHARE1}"
-      # uid/gid 10001 == the image's non-root `appuser`, so ffmpeg may write;
-      # vers=3.0 suits modern Windows/Samba (drop to 2.1 for very old servers).
-      o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
-
-  crimson_cache2:
-    driver: local
-    driver_opts:
-      type: cifs
-      # // <host-or-ip>/<share> — forward slashes even for a Windows share.
-      device: "//${NAS_IP}/${NAS_SHARE2}"
-      # uid/gid 10001 == the image's non-root `appuser`, so ffmpeg may write;
-      # vers=3.0 suits modern Windows/Samba (drop to 2.1 for very old servers).
-      o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
+# volumes:
+#   crimson_cache1:
+#     driver: local
+#     driver_opts:
+#       type: cifs
+#       # // <host-or-ip>/<share> — forward slashes even for a Windows share.
+#       device: "//${NAS_IP}/${NAS_SHARE1}"
+#       # uid/gid 10001 == the image's non-root `appuser`, so ffmpeg may write;
+#       # vers=3.0 suits modern Windows/Samba (drop to 2.1 for very old servers).
+#       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
+# 
+#   crimson_cache2:
+#     driver: local
+#     driver_opts:
+#       type: cifs
+#       # // <host-or-ip>/<share> — forward slashes even for a Windows share.
+#       device: "//${NAS_IP}/${NAS_SHARE2}"
+#       # uid/gid 10001 == the image's non-root `appuser`, so ffmpeg may write;
+#       # vers=3.0 suits modern Windows/Samba (drop to 2.1 for very old servers).
+#       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
 #
 #   # NFS variant (Unix/Linux NAS) — use THIS block instead of the cifs one above:
 #   # crimson_cache:

@@ -1,9 +1,10 @@
 """
 Startup configuration report.
 
-Crimson has a lot of *optional*, env-gated features (Jellyfin, Febbox, the
-external proxy offload, OpenSubtitles, SMTP, the Discord bot, Ko-fi supporters,
-…). When one is "dark" it's almost always a missing/blank env var, and there was
+Crimson has a lot of *optional*, env-gated features (Jellyfin, the external proxy
+offload, OpenSubtitles, SMTP, the Discord bot, Ko-fi supporters, plus any
+overlay-contributed ones …). When one is "dark" it's almost always a missing/blank
+env var, and there was
 no single place to see what's on. ``build_report()`` inspects the environment and
 returns a tidy, **secret-free** summary (presence only, never values) that
 ``log_report()`` prints once at startup, e.g.::
@@ -67,8 +68,6 @@ FEATURES: List[Feature] = [
             "set JELLYFIN_URL (+ JELLYFIN_USERNAME/PASSWORD)"),
     Feature("Jellyfin edge token-inject", lambda: _flag_on("JELLYFIN_EDGE_INJECT", False),
             "JELLYFIN_EDGE_INJECT=true moves token injection to the edge proxy"),
-    Feature("ShowBox/Febbox source", lambda: _has("FEBBOX_UI_TOKEN"),
-            "set FEBBOX_UI_TOKEN to enable the direct-file source"),
     Feature("OpenSubtitles subtitles", lambda: _has("OPENSUBTITLES_API_KEY"),
             "set OPENSUBTITLES_API_KEY"),
     Feature("Transactional email (SMTP)", lambda: _has("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD"),
@@ -90,10 +89,31 @@ FEATURES: List[Feature] = [
 ]
 
 
+def _overlay_features() -> List[Feature]:
+    """Feature lines contributed by the build-time source overlay (empty in a base
+    build). A client-offload overlay source declares a ``config_feature`` (label,
+    hint) on its RESOLVE_GRANT descriptor; we surface it here so the operator build
+    reports it too — without the public config naming any overlay source. Imported
+    lazily so a diagnostics helper never participates in import ordering."""
+    try:
+        import resolvers as _resolvers_pkg
+        from core.private_sources import discover_resolve_grants
+    except Exception:
+        return []
+    feats: List[Feature] = []
+    for desc in discover_resolve_grants(_resolvers_pkg):
+        cf = desc.get("config_feature")
+        probe = desc.get("is_configured")
+        if cf and probe:
+            label, hint = cf
+            feats.append(Feature(label, probe, hint))
+    return feats
+
+
 def build_report() -> List[str]:
     """Return the report as a list of pre-formatted lines (no I/O, easy to test)."""
     lines: List[str] = ["Crimson feature configuration:"]
-    for feat in FEATURES:
+    for feat in FEATURES + _overlay_features():
         try:
             state = feat.state()
         except Exception:

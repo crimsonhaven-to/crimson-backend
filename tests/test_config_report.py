@@ -10,17 +10,21 @@ from core import config_report
 def test_report_has_header_and_a_line_per_feature():
     lines = config_report.build_report()
     assert lines[0].startswith("Crimson feature configuration")
-    assert len(lines) == 1 + len(config_report.FEATURES)
+    # One line per static feature, plus any overlay-contributed ones (none in a
+    # base build, so this is exact in public CI).
+    assert len(lines) == 1 + len(config_report.FEATURES) + len(config_report._overlay_features())
 
 
 def test_feature_toggles_track_env(monkeypatch):
-    monkeypatch.delenv("FEBBOX_UI_TOKEN", raising=False)
+    # A representative env-gated feature flips on/off with its env var. (The overlay
+    # sources are gated the same way but aren't present in a base build.)
+    monkeypatch.delenv("OPENSUBTITLES_API_KEY", raising=False)
     off = "\n".join(config_report.build_report())
-    assert "[ off] ShowBox/Febbox source" in off
+    assert "[ off] OpenSubtitles subtitles" in off
 
-    monkeypatch.setenv("FEBBOX_UI_TOKEN", "tok")
+    monkeypatch.setenv("OPENSUBTITLES_API_KEY", "tok")
     on = "\n".join(config_report.build_report())
-    assert "[  on] ShowBox/Febbox source" in on
+    assert "[  on] OpenSubtitles subtitles" in on
 
 
 def test_missing_proxy_secret_is_a_warning(monkeypatch):
@@ -30,7 +34,7 @@ def test_missing_proxy_secret_is_a_warning(monkeypatch):
 
 
 def test_report_never_leaks_secret_values(monkeypatch):
-    monkeypatch.setenv("FEBBOX_UI_TOKEN", "super-secret-token-value")
+    monkeypatch.setenv("SMTP_PASSWORD", "super-secret-token-value")
     monkeypatch.setenv("PROXY_SECRET", "another-secret")
     report = "\n".join(config_report.build_report())
     assert "super-secret-token-value" not in report

@@ -22,7 +22,6 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch
-from resolvers.febbox import proxy_fetch as febbox_proxy_fetch
 from local_engine.fs import (
     safe_resolve as local_safe_resolve,
     safe_resolve_transcode as local_safe_resolve_transcode,
@@ -84,26 +83,11 @@ async def jellyfin_proxy(request: Request, path: str):
     return _proxy_response(*result, forward_bytes_headers=True)
 
 
-# --- FEBBOX SUBTITLE PROXY (operator-only /resolve grant) ---
-# Not part of the public /watch pipeline. The /resolve grant returns Febbox's
-# the tiny .srt
-# subtitles are minted as signed /febbox_proxy paths, which this route fetches and
-# converts to WebVTT. HMAC-signed (no open relay) and inert unless FEBBOX_UI_TOKEN
-# is configured.
-@router.get("/febbox_proxy", include_in_schema=False)
-async def febbox_proxy(request: Request):
-    try:
-        result = await febbox_proxy_fetch(
-            url=request.query_params.get("u"),
-            sig=request.query_params.get("s"),
-            range_header=request.headers.get("range"),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except httpx.RequestError as e:
-        logger.error(f"Febbox proxy upstream error: {e}")
-        raise HTTPException(status_code=502, detail="Upstream fetch failed")
-    return _proxy_response(*result)
+# A client-offload overlay source's same-origin subtitle/stream proxy (the signed
+# /<name>_proxy for SRT->WebVTT + any HLS it relays) is NOT wired here — it's
+# auto-registered by api.py's _register_overlay_stream_proxies when the build-time
+# overlay ships a module with a ``proxy_fetch``. So this committed file names no
+# overlay source; a base build serves only the operator-owned proxies below.
 
 
 # --- LOCAL SOURCE PROXY ("Local" source: admin-registered dirs / NAS) ---

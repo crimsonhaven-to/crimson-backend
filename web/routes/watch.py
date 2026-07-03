@@ -19,13 +19,13 @@ from fastapi.requests import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+import resolvers as _resolvers_pkg
 from core.rate_limit import limiter
 from core.http_client import http_client
+from core.private_sources import discover_resolve_grants, load_ref
 from resolvers import _crimson_proxy
 from resolvers.jellyfin import JellyfinResolver, is_configured as jellyfin_is_configured
-from resolvers.febbox import FebboxResolver, is_configured as febbox_is_configured
 from scrapers.jellyfin_scraper import JellyfinScraper
-from scrapers.showbox_scraper import ShowBoxScraper
 from cache_engine.downloader import manager as cache_manager
 from metadata_engine.tmdb import fetch_tmdb_show, fetch_tmdb_movie
 
@@ -75,7 +75,7 @@ async def get_movie_watch_links(request: Request, tmdb_id: int):
 
     The meta line carries null season_number/episode_number; the player ignores
     them for movies."""
-    # A title helps the title-based movie source (ShowBox). Prefer the stored row,
+    # A title helps any title-keyed movie source. Prefer the stored row,
     # then a live TMDB fetch; never hard-fail (sources can still play off the id).
     info = get_movie_info(tmdb_id)
     fallback_title = info.get("title") if info else None
@@ -169,47 +169,58 @@ async def sign_proxy_links(request: Request):
 # mp4/HLS never travels through this backend; only a little control traffic does.
 
 
-async def _grant_febbox(
-    tmdb_id: int, season_num: int, episode_num: int,
-    anilist_data: Dict, media_type: str, base_url: str,
-) -> List[Dict]:
-    """
-    :3
-    """
-    embeds = await run_single_scraper(
-        ShowBoxScraper, tmdb_id, season_num, episode_num, anilist_data, media_type
-    )
-    if not embeds:
-        return []
-    resolver = FebboxResolver()
-    out: List[Dict] = []
-    for embed in embeds:
-        try:
-            streams = await resolver.resolve_direct(embed)
-        except Exception as e:
-            logger.warning(f"[resolve] febbox resolve_direct failed: {type(e).__name__} - {e}")
-            continue
-        # resolve_direct returns one stream per quality variant (best-first).
-        for res in streams or []:
-            if not res.get("url"):
+def _make_offload_grant_runner(scraper_ref: str, resolver_ref: str):
+    """Build a /resolve runner for a scraper->resolver.resolve_direct source declared
+    by an injected overlay's RESOLVE_GRANT descriptor (see core.private_sources). The
+    runner runs discovery, unlocks each embed with the resolver's secret-gated
+    ``resolve_direct``, and returns one raw-URL stream dict per quality variant — the
+    client engine delivers the bytes (E2/E3), so nothing heavy touches this backend.
+    Class refs are strings in the descriptor (to dodge the scraper<->resolver import
+    cycle); they're resolved once here, at import."""
+    scraper_cls = load_ref(scraper_ref)
+    resolver_cls = load_ref(resolver_ref)
+
+    async def _runner(
+        tmdb_id: int, season_num: int, episode_num: int,
+        anilist_data: Dict, media_type: str, base_url: str,
+    ) -> List[Dict]:
+        embeds = await run_single_scraper(
+            scraper_cls, tmdb_id, season_num, episode_num, anilist_data, media_type
+        )
+        if not embeds:
+            return []
+        resolver = resolver_cls()
+        out: List[Dict] = []
+        for embed in embeds:
+            try:
+                streams = await resolver.resolve_direct(embed)
+            except Exception as e:
+                logger.warning(f"[resolve] {resolver.source_name} resolve_direct failed: "
+                               f"{type(e).__name__} - {e}")
                 continue
-            subs = res.get("subtitles") or []
-            if base_url:
-                subs = [
-                    {**s, "url": base_url.rstrip("/") + s["url"]}
-                    if isinstance(s.get("url"), str) and s["url"].startswith("/") else s
-                    for s in subs
-                ]
-            out.append({
-                # per-quality "ShowBox (1080p)" -> dedups with the client tile
-                "label": res.get("label") or resolver.source_name,
-                "streamType": res.get("streamType") or "mp4",
-                "url": res["url"],
-                "headers": res.get("headers") or {},
-                "subtitles": subs,
-                "language": res.get("language"),
-            })
-    return out
+            # resolve_direct returns one stream per quality variant (best-first).
+            for res in streams or []:
+                if not res.get("url"):
+                    continue
+                subs = res.get("subtitles") or []
+                if base_url:
+                    subs = [
+                        {**s, "url": base_url.rstrip("/") + s["url"]}
+                        if isinstance(s.get("url"), str) and s["url"].startswith("/") else s
+                        for s in subs
+                    ]
+                out.append({
+                    # per-quality label (e.g. "Source (1080p)") -> dedups with the client tile
+                    "label": res.get("label") or resolver.source_name,
+                    "streamType": res.get("streamType") or "mp4",
+                    "url": res["url"],
+                    "headers": res.get("headers") or {},
+                    "subtitles": subs,
+                    "language": res.get("language"),
+                })
+        return out
+
+    return _runner
 
 
 def _jellyfin_edge_inject_enabled() -> bool:
@@ -260,13 +271,28 @@ async def _grant_jellyfin(
     return out
 
 
-# Per-source grant registry: source key -> (is_configured probe, runner). Add an
-# operator-owned secret source here and it gains a client-delivery path for free.
-_RESOLVE_GRANTS = {
-    "jellyfin": (_jellyfin_grant_configured, _grant_jellyfin),
-    "febbox": (febbox_is_configured, _grant_febbox),
-    "showbox": (febbox_is_configured, _grant_febbox),
-}
+# Per-source grant registry: source key -> (is_configured probe, runner). Jellyfin
+# is operator-owned and always public; any additional cookie/secret-bound source is
+# contributed by the build-time overlay, which declares a RESOLVE_GRANT descriptor
+# (see core.private_sources.discover_resolve_grants). A base build discovers none, so
+# only Jellyfin is wired and /resolve 404s for any other source — the client then
+# stays on its E0/backend path. This keeps the public backend free of any overlay
+# source name while giving each injected one a client-delivery path for free.
+def _build_resolve_grants() -> Dict:
+    grants = {"jellyfin": (_jellyfin_grant_configured, _grant_jellyfin)}
+    for desc in discover_resolve_grants(_resolvers_pkg):
+        try:
+            runner = _make_offload_grant_runner(desc["scraper"], desc["resolver"])
+        except Exception as e:  # a broken overlay descriptor must not sink /resolve
+            logger.warning(f"[resolve] skipping overlay grant {desc.get('keys')}: "
+                           f"{type(e).__name__} - {e}")
+            continue
+        for key in desc["keys"]:
+            grants[str(key).lower()] = (desc["is_configured"], runner)
+    return grants
+
+
+_RESOLVE_GRANTS = _build_resolve_grants()
 
 
 @router.post("/resolve")

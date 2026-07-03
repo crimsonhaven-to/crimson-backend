@@ -22,15 +22,17 @@ ALL_RESOLVERS = [
 # --- optional build-time source overlay ------------------------------------
 # An operator build may drop extra resolver modules into this package; they're
 # auto-discovered and appended here, so this registry needs no edit. A build without
-# the overlay has none, so nothing is added. ``febbox`` is excluded (operator-only,
-# wired into /resolve, not /watch). Off via PRIVATE_SOURCES_ENABLED=0.
+# the overlay has none, so nothing is added. An overlay module that delivers its
+# bytes off-backend (the /resolve client-offload grant) declares ``RESOLVE_ONLY`` and
+# is skipped here — it wires via discover_resolve_grants instead. Off via
+# PRIVATE_SOURCES_ENABLED=0.
 import sys as _sys
 
 from core.private_sources import discover_private_sources
 
 from .base_resolver import BaseResolver
 
-_PUBLIC_RESOLVER_MODULES = {"base_resolver", "local", "cache", "jellyfin", "template", "febbox"}
+_PUBLIC_RESOLVER_MODULES = {"base_resolver", "local", "cache", "jellyfin", "template"}
 ALL_RESOLVERS += discover_private_sources(
     _sys.modules[__name__], BaseResolver, _PUBLIC_RESOLVER_MODULES
 )

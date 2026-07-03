@@ -24,6 +24,8 @@ from core.db_pool import pool_stats
 from core.http_client import http_client
 from core.version import PROCESS_STARTED_AT, VERSION
 from core import source_health
+import resolvers as _resolvers_pkg
+from core.private_sources import discover_resolve_grants
 from resolvers import ALL_RESOLVERS, _crimson_proxy
 from resolvers.jellyfin import is_configured as jellyfin_is_configured
 from scrapers import ALL_SCRAPERS
@@ -74,6 +76,27 @@ async def admin_system_info() -> Dict:
     # updates the routing health cache that drives automatic failover in proxy_url.
     proxy_hosts = await _crimson_proxy.refresh_health()
 
+    flags = {
+        "require_login": bool(getattr(Config, "REQUIRE_LOGIN", False)),
+        "jellyfin_configured": jellyfin_is_configured(),
+        "local_configured": local_is_configured(),
+        "cache_enabled": bool(cache_enabled),
+        "ffmpeg_available": ffmpeg_available(),
+        "tmdb_key_set": bool(getattr(Config, "TMDB_API_KEY", None)),
+        "rate_limit_storage": os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
+        "github_token_set": bool(os.getenv("GITHUB_TOKEN")),
+        "crimson_proxy_enabled": _crimson_proxy.is_enabled(),
+    }
+    # Overlay-contributed dashboard flags (e.g. a client-offload source's readiness
+    # badge). A base build discovers none, so the flag is simply absent and the
+    # frontend badge reads falsy — the public backend names no overlay source.
+    for _desc in discover_resolve_grants(_resolvers_pkg):
+        for _flag, _probe in (_desc.get("admin_flags") or {}).items():
+            try:
+                flags[_flag] = bool(_probe())
+            except Exception:
+                flags[_flag] = False
+
     now = time.time()
     return {
         "version": VERSION,
@@ -87,17 +110,7 @@ async def admin_system_info() -> Dict:
             "scrapers": len(ALL_SCRAPERS),
             "resolvers": len(ALL_RESOLVERS),
         },
-        "flags": {
-            "require_login": bool(getattr(Config, "REQUIRE_LOGIN", False)),
-            "jellyfin_configured": jellyfin_is_configured(),
-            "local_configured": local_is_configured(),
-            "cache_enabled": bool(cache_enabled),
-            "ffmpeg_available": ffmpeg_available(),
-            "tmdb_key_set": bool(getattr(Config, "TMDB_API_KEY", None)),
-            "rate_limit_storage": os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
-            "github_token_set": bool(os.getenv("GITHUB_TOKEN")),
-            "crimson_proxy_enabled": _crimson_proxy.is_enabled(),
-        },
+        "flags": flags,
         "proxies": {
             "enabled": _crimson_proxy.is_enabled(),
             "secret_set": bool(os.getenv("PROXY_SECRET")),
