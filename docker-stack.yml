@@ -110,9 +110,9 @@ services:
     # ingress traffic, so it does NOT need the mount.) Register the in-container
     # path — /crimson/cache — in Admin → Cache. Uncomment this together with the
     # `crimson_cache` volume definition at the bottom of the file.
-    volumes:
-      - crimson_cache1:/crimson/cache1
-      - crimson_cache2:/crimson/cache2
+    # volumes:
+    #   - crimson_cache1:/crimson/cache1
+    #   - crimson_cache2:/crimson/cache2
 
     # Front this with your reverse proxy. Remove if you attach the proxy directly
     # to crimson_net instead of publishing a host port. Only THIS service may
