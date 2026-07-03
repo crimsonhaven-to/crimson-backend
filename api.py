@@ -413,10 +413,11 @@ _PUBLIC_PREFIXES = (
     "/changelog",
     "/player",
     # Operator-owned source proxies (the only stream proxies the backend still
-    # serves). Third-party source proxies were removed with their scrapers.
+    # serves). Third-party source proxies were removed with their scrapers. Any
+    # overlay-contributed stream proxy is added to _DYNAMIC_PUBLIC_PREFIXES instead
+    # (see _register_overlay_stream_proxies), so this list names no overlay source.
     "/jellyfin_proxy",
     "/cache_proxy",
-    "/febbox_proxy",
     # The subtitle <track> loads cross-origin with no auth header (signed instead).
     "/subtitles_proxy",
     "/docs",
@@ -645,9 +646,9 @@ set_source_health_handler(admin_source_health)
 
 # --- OPTIONAL BUILD-TIME OVERLAY STREAM PROXIES -----------------------------
 # Optional same-origin stream relays for any overlaid module that ships a
-# ``proxy_fetch`` (present only when the build-time overlay added it). Each mirrors
-# /febbox_proxy: schema-hidden, with the HMAC verification / host allow-list living
-# inside the module's own ``proxy_fetch``. A base build has none, so nothing is added.
+# ``proxy_fetch`` (present only when the build-time overlay added it). Each is
+# schema-hidden, with the HMAC verification / host allow-list living inside the
+# module's own ``proxy_fetch``. A base build has none, so nothing is added.
 # Routes are derived from the module names + the wiring shape from each fetch
 # signature, so this file names no overlaid source.
 def _register_overlay_stream_proxies():
@@ -655,7 +656,7 @@ def _register_overlay_stream_proxies():
 
     import resolvers as _res_pkg
 
-    already_wired = {"jellyfin", "febbox", "local", "cache"}
+    already_wired = {"jellyfin", "local", "cache"}
 
     def _signed_stream(fetch_fn):
         async def _route(request: Request):

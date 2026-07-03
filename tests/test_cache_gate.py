@@ -24,7 +24,7 @@ from cache_engine.downloader import (
 # --- same-origin proxy shapes we CAN pull over loopback --------------------
 def test_same_origin_proxy_urls_are_loopback_pullable():
     for url in (
-        "https://api.crimson.to/febbox_proxy?u=x&s=y",   # ShowBox / Febbox
+        "https://api.crimson.to/overlay_proxy?u=x&s=y",   # overlay client-offload subtitle proxy
         "/jellyfin_proxy/Videos/1/master.m3u8",           # Jellyfin (relative)
         "https://api.crimson.to/cache_proxy/abc",         # cache output
         "https://api.crimson.to/voe_proxy?u=x",           # VOE (private overlay)
@@ -52,8 +52,8 @@ def test_malformed_url_is_not_pullable():
 # --- the gate and the rewrite agree by construction ------------------------
 def test_to_internal_rewrites_exactly_the_loopback_pullable_urls():
     # Same-origin proxy -> rewritten onto loopback (query preserved).
-    internal = _to_internal("https://api.crimson.to/febbox_proxy?u=x&s=y")
-    assert internal == f"{INTERNAL_BASE}/febbox_proxy?u=x&s=y"
+    internal = _to_internal("https://api.crimson.to/overlay_proxy?u=x&s=y")
+    assert internal == f"{INTERNAL_BASE}/overlay_proxy?u=x&s=y"
 
     # A raw CDN URL is left untouched (and the gate rejects it upstream, so a job
     # like this never actually reaches _to_internal).
@@ -62,7 +62,7 @@ def test_to_internal_rewrites_exactly_the_loopback_pullable_urls():
 
     # Whatever _to_internal chooses to rewrite is exactly what the gate accepts.
     for url in (
-        "https://api.crimson.to/febbox_proxy?u=x",
+        "https://api.crimson.to/overlay_proxy?u=x",
         "https://hls.shegu.net/x.m3u8",
         "https://crimson-proxy.netlify.app/?u=x&s=y",
         "/jellyfin_proxy/Videos/1/master.m3u8",
