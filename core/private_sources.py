@@ -112,6 +112,35 @@ def discover_resolve_grants(package):
     return out
 
 
+def discover_manga_provider(package):
+    """Return the injected manga provider instance declared by an overlay module in
+    ``package`` (``manga_engine``), or ``None`` in a base build.
+
+    The public backend ships no manga source (it never talks to a manga host); an
+    operator build may drop a module that declares a module-level ``MANGA_PROVIDER``
+    instance (see ``manga_engine.provider.MangaProvider``). This finds the first such
+    module — mirroring ``discover_resolve_grants`` — so the public code names no
+    provider. A build without the overlay finds none. Off via
+    ``PRIVATE_SOURCES_ENABLED=0``.
+    """
+    if os.getenv("PRIVATE_SOURCES_ENABLED", "1") == "0":
+        return None
+    for info in pkgutil.iter_modules(package.__path__):
+        name = info.name
+        if name.startswith("_") or "test" in name:
+            continue
+        try:
+            module = importlib.import_module(f"{package.__name__}.{name}")
+        except Exception as exc:  # noqa: BLE001 - a dead overlay must not break boot
+            logger.warning("manga provider %s.%s failed to import: %s", package.__name__, name, exc)
+            continue
+        provider = getattr(module, "MANGA_PROVIDER", None)
+        if provider is not None:
+            logger.info("registered injected manga provider: %s.%s", package.__name__, name)
+            return provider
+    return None
+
+
 def load_ref(ref: str):
     """Resolve a ``"package.module:ClassName"`` descriptor reference to the object.
     Used to load a grant's scraper/resolver class lazily (the descriptor carries

@@ -143,3 +143,172 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
     except Exception as e:
         logger.error(f"Error fetching from AniList: {e}")
         return {}
+
+
+# --- MANGA (the reading surface) -------------------------------------------
+# AniList's ``MediaType`` already includes ``MANGA``, so the manga surface reuses
+# the exact same GraphQL endpoint + response cache as the anime metadata above —
+# only ``type: MANGA`` and the manga-specific fields (chapters/volumes instead of
+# episodes/airing) differ. Kept here beside the anime fetcher so all AniList logic
+# lives in one place. See manga_engine for how these feed the /manga routes.
+
+def _manga_item(media: Dict) -> Dict:
+    """Project one AniList MANGA ``Media`` node onto the poster-card shape the
+    frontend rows + unified search consume (``kind: 'manga'``)."""
+    title = media.get("title") or {}
+    cover = media.get("coverImage") or {}
+    score = media.get("averageScore")
+    return {
+        "anilist_id": media.get("id"),
+        "title": title.get("english") or title.get("romaji") or title.get("native"),
+        "poster": cover.get("extraLarge") or cover.get("large"),
+        "year": (media.get("startDate") or {}).get("year"),
+        # AniList scores are 0-100; the card renders a 0-10 rating.
+        "vote_average": (score / 10.0) if isinstance(score, (int, float)) and score else None,
+        "kind": "manga",
+    }
+
+
+async def fetch_anilist_manga_metadata(client: httpx.AsyncClient, anilist_id: int) -> Dict:
+    """Full metadata for a single AniList MANGA entry (the manga overview page).
+
+    Cached like the anime fetcher. Returns ``{}`` on any miss/failure so a caller
+    can degrade gracefully."""
+    cache_key = f"anilist:manga:meta:{anilist_id}"
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        return cached_data
+
+    query = """
+    query ($id: Int) {
+      Media (id: $id, type: MANGA) {
+        id
+        idMal
+        status
+        chapters
+        volumes
+        bannerImage
+        coverImage { large extraLarge color }
+        title { romaji english native }
+        synonyms
+        genres
+        description
+        averageScore
+        startDate { year month day }
+        endDate { year month day }
+      }
+    }
+    """
+    try:
+        response = await client.post(
+            "https://graphql.anilist.co",
+            json={"query": query, "variables": {"id": anilist_id}},
+            timeout=Config.REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            logger.error(f"AniList manga API error: Status {response.status_code}")
+            return {}
+        media = (response.json().get("data") or {}).get("Media") or {}
+        if not media:
+            return {}
+
+        title = media.get("title") or {}
+        cover = media.get("coverImage") or {}
+        result = {
+            "anilist_id": media.get("id"),
+            "mal_id": media.get("idMal"),
+            "title": title.get("english") or title.get("romaji"),
+            "title_romaji": title.get("romaji"),
+            "title_english": title.get("english"),
+            "title_native": title.get("native"),
+            "synonyms": media.get("synonyms") or [],
+            "genres": media.get("genres") or [],
+            "status": media.get("status"),
+            "chapters_total": media.get("chapters"),
+            "volumes_total": media.get("volumes"),
+            "banner": media.get("bannerImage"),
+            "cover": cover.get("extraLarge") or cover.get("large"),
+            "color": cover.get("color"),
+            "poster": cover.get("extraLarge") or cover.get("large"),
+            "description": media.get("description"),
+            "average_score": media.get("averageScore"),
+            "start_date": media.get("startDate"),
+            "end_date": media.get("endDate"),
+        }
+        await set_cached_response(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching manga from AniList: {e}")
+        return {}
+
+
+async def search_anilist_manga(client: httpx.AsyncClient, query_name: str, per_page: int = 12) -> list:
+    """AniList MANGA search for the unified landing search — returns a list of
+    poster-card items (``kind: 'manga'``). Non-adult only by default."""
+    graphql = """
+    query ($search: String, $perPage: Int) {
+      Page (page: 1, perPage: $perPage) {
+        media (search: $search, type: MANGA, isAdult: false, sort: SEARCH_MATCH) {
+          id
+          title { romaji english native }
+          coverImage { large extraLarge }
+          startDate { year }
+          averageScore
+        }
+      }
+    }
+    """
+    try:
+        response = await client.post(
+            "https://graphql.anilist.co",
+            json={"query": graphql, "variables": {"search": query_name, "perPage": per_page}},
+            timeout=Config.REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            return []
+        media = ((response.json().get("data") or {}).get("Page") or {}).get("media") or []
+        return [_manga_item(m) for m in media if m.get("id")]
+    except Exception as e:
+        logger.error(f"Error searching manga on AniList: {e}")
+        return []
+
+
+async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> list:
+    """Trending AniList MANGA for the landing page's manga row — poster-card items.
+    Cached (the list is identical for every viewer within the window)."""
+    cache_key = f"anilist:manga:trending:{limit}"
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        return cached_data
+
+    graphql = """
+    query ($perPage: Int) {
+      Page (page: 1, perPage: $perPage) {
+        media (type: MANGA, isAdult: false, sort: TRENDING_DESC) {
+          id
+          title { romaji english native }
+          coverImage { large extraLarge }
+          startDate { year }
+          averageScore
+        }
+      }
+    }
+    """
+    try:
+        response = await client.post(
+            "https://graphql.anilist.co",
+            json={"query": graphql, "variables": {"perPage": limit}},
+            timeout=Config.REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            return []
+        media = ((response.json().get("data") or {}).get("Page") or {}).get("media") or []
+        result = [_manga_item(m) for m in media if m.get("id")]
+        if result:
+            await set_cached_response(
+                cache_key, result, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS
+            )
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching trending manga from AniList: {e}")
+        return []
