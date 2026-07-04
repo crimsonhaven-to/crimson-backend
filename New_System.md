@@ -304,6 +304,17 @@ C3/C4 hosts that used to be so temperamental).
   through it.
 - **✅ The backend grants exist.** `/scrape-meta`, `/sign` and `/resolve` are live,
   each login-gated and secret-safe.
+- **✅ The model generalised past video — the reading (manga) surface.** The public
+  backend never talks to a manga host: discovery/metadata stay server-side (AniList,
+  like TMDB), while the chapter list + page images resolve in the browser via
+  `crimson-sources`' `createMangaEngine` (a self-contained sibling of the stream
+  engine — its unit is a chapter of images, not a `/watch` line). MangaDex's API
+  needs only a CORS bypass (C1 — a "plain-CORS discovery" archetype), so it routes
+  E2/E3; the page images are raw `*.mangadex.network` URLs an `<img>` loads directly,
+  so *no* proxy touches the bytes. The E0 floor is an **optional private provider**
+  injected via the same build-time source overlay as the video sources
+  (`manga_engine.provider` discovers it), so extension-less devices on an operator
+  build still read server-side. A base public build simply has no manga host in it.
 
 **Still on the loom:** live extension shakeout in Chrome; rotating-segment media
 rules for hosts that shuffle CDN hosts mid-stream; and porting the more defended

@@ -55,9 +55,19 @@ async def public_config():
     requirement (signup is open) and can show a "data resets nightly" hint. Booleans
     only — no secrets, counts, or paths leak through this (it's reachable without a
     session, whitelisted in _PUBLIC_EXACT)."""
+    # Whether the manga reading surface is enabled (MANGA_ENABLED); the frontend
+    # hides its trending row / search results / routes when off. Imported lazily so
+    # /config never hard-depends on the manga engine loading.
+    try:
+        from manga_engine.provider import manga_enabled as _manga_enabled
+        manga_enabled = _manga_enabled()
+    except Exception:
+        manga_enabled = False
+
     return {
         "demo_mode": Config.DEMO_MODE,
         "require_login": Config.REQUIRE_LOGIN,
+        "manga_enabled": manga_enabled,
     }
 
 

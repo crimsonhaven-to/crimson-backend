@@ -193,6 +193,12 @@ def _favorite_item_key(
     *tv* ids share the same numeric space, so a movie and a TV show could collide
     on ``tmdb:{id}`` otherwise. Anime (anilist) and TV/show keys are unchanged, so
     existing favorites keep their exact keys (no migration)."""
+    # Manga is an AniList-keyed reading title; namespace it so a manga favorite can
+    # never collide with (or be mistaken for) an anime one, and so the frontend can
+    # route the row to the manga overview. AniList ids are globally unique across
+    # types, so this is belt-and-braces — but it keeps the media_type explicit.
+    if media_type == "manga" and anilist_id is not None:
+        return f"manga:{anilist_id}"
     if anilist_id is not None:
         return f"anilist:{anilist_id}"
     if media_type == "movie":
@@ -212,6 +218,12 @@ def _progress_item_key(
     byte-identical to before."""
     if anilist_id is None and media_type == "movie":
         return f"movie:{tmdb_id}"
+    # Manga reading progress is one row per title (not per chapter): the chapter
+    # ordinal rides in episode_number and the page in position_seconds, so the KEY
+    # omits them and each save updates the single "where you're reading" row —
+    # giving continue-reading for free without a schema change.
+    if media_type == "manga" and anilist_id is not None:
+        return f"manga:{anilist_id}"
     base = f"anilist:{anilist_id}" if anilist_id is not None else f"tmdb:{tmdb_id}"
     if season_number is not None:
         base += f":s{season_number}"
@@ -963,7 +975,7 @@ async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depen
     # Fire-and-forget — never awaited, never allowed to affect this response.
     if (
         _warmup_handler
-        and body.media_type != "movie"
+        and body.media_type not in ("movie", "manga")
         and body.tmdb_id is not None
         and body.season_number is not None
         and body.episode_number is not None

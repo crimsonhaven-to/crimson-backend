@@ -10,15 +10,17 @@ FROM python:3.14-slim AS private-sources
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /injected
-RUN mkdir -p resolvers scrapers
+RUN mkdir -p resolvers scrapers manga
 RUN --mount=type=secret,id=sources_pat --mount=type=secret,id=sources_repo \
     if [ -s /run/secrets/sources_pat ] && [ -s /run/secrets/sources_repo ]; then \
         git clone --depth 1 --branch main \
           "https://x-access-token:$(cat /run/secrets/sources_pat)@github.com/$(cat /run/secrets/sources_repo).git" /tmp/src && \
         cp /tmp/src/resolvers/*.py resolvers/ && \
         cp /tmp/src/scrapers/*.py scrapers/ && \
+        # The manga provider dir is optional in the overlay repo (older overlays lack it).
+        if [ -d /tmp/src/manga ]; then cp /tmp/src/manga/*.py manga/ 2>/dev/null || true; fi && \
         rm -rf /tmp/src && \
-        echo ">> overlay applied: $(ls resolvers | wc -l) resolver / $(ls scrapers | wc -l) scraper file(s)"; \
+        echo ">> overlay applied: $(ls resolvers | wc -l) resolver / $(ls scrapers | wc -l) scraper / $(ls manga | wc -l) manga file(s)"; \
     else \
         echo ">> no overlay secrets supplied — building base image only"; \
     fi
@@ -67,11 +69,15 @@ COPY apikey_engine ./apikey_engine
 COPY subtitles_engine ./subtitles_engine
 COPY skiptimes_engine ./skiptimes_engine
 COPY telemetry_engine ./telemetry_engine
+COPY manga_engine ./manga_engine
 
 # Apply the optional build-time source overlay on top of the base packages. In a
 # build without the overlay secrets these directories are empty, so this is a no-op.
+# The manga overlay (if any) drops a private MangaProvider module into manga_engine/
+# — discovered at runtime by manga_engine.provider.get_provider(); absent by default.
 COPY --from=private-sources /injected/resolvers/ ./resolvers/
 COPY --from=private-sources /injected/scrapers/ ./scrapers/
+COPY --from=private-sources /injected/manga/ ./manga_engine/
 
 # Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
 # container is stateless and needs no writable data volume.

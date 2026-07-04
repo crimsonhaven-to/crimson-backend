@@ -62,6 +62,7 @@ from changelog_engine import router as changelog_router, service as changelog_se
 from recommend_engine import router as recommend_router
 from subtitles_engine import router as subtitles_router, service as subtitles_service
 from skiptimes_engine import router as skiptimes_router
+from manga_engine import manga_router
 from metadata_engine import maintenance as metadata_maintenance
 
 # The HTTP layer — singletons, the injected engine handlers, and the routers. The
@@ -420,6 +421,11 @@ _PUBLIC_PREFIXES = (
     "/cache_proxy",
     # The subtitle <track> loads cross-origin with no auth header (signed instead).
     "/subtitles_proxy",
+    # The manga page <img> loads cross-origin with no auth header (signed instead) —
+    # same reasoning as /subtitles_proxy. Dormant (503) unless an operator build
+    # injects a manga provider; the public build resolves pages client-side. See
+    # manga_engine.
+    "/manga_proxy",
     "/docs",
 )
 
@@ -623,6 +629,13 @@ app.include_router(subtitles_router)
 # authed (behind the login wall); anime-only (resolves anilist_id -> mal_id) and
 # best-effort — see skiptimes_engine.
 app.include_router(skiptimes_router)
+
+# Manga — the reading surface (AniList discovery; chapters/pages resolved in the
+# viewer's browser by crimson-sources, or by an injected private provider on an
+# operator build). Its /manga_proxy image relay is public + signed but dormant
+# without a provider (see _PUBLIC_PREFIXES); the rest is behind the login wall like
+# every other content route. Additive; anime/shows/movies are untouched.
+app.include_router(manga_router)
 
 # The core surface (system, discovery, watch, metadata, proxies) — see web.routes.
 for _router in all_routers:
