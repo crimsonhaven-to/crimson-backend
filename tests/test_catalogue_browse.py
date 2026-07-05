@@ -75,8 +75,9 @@ def test_media_sort_tokens_map_to_anilist_enums():
 
 async def test_anilist_browse_flags_upstream_error_as_unavailable(monkeypatch):
     # AniList returns HTTP 200 with an `errors` field on an outage (e.g. the whole
-    # API being disabled). That must surface as unavailable (→ 503), NOT an empty
-    # page — otherwise the hub shows a misleading "nothing matched".
+    # API being disabled). That must surface as `unavailable` (which the route turns
+    # into the local-DB fallback), NOT an empty page — otherwise the hub would show
+    # a misleading "nothing matched".
     async def _no_cache(*a, **k):
         return None
     monkeypatch.setattr(anilist, "get_cached_response", _no_cache)
@@ -105,6 +106,32 @@ async def test_anilist_browse_projects_and_tags_kind(monkeypatch):
     assert result["has_next"] is True and result["total"] == 100
     assert result["items"][0]["kind"] == "anime"  # re-tagged from the generic projection
     assert result["items"][0]["anilist_id"] == 21
+
+
+def test_local_anime_fallback_ordering():
+    # The AniList-outage fallback (_order_local_anime): non-title sorts surface
+    # poster-bearing, newest titles first (a 'trending' stand-in); title sorts stay
+    # purely alphabetical regardless of poster/year.
+    from web.routes.discovery import _order_local_anime
+
+    items = [
+        {"title": "z-old-poster", "year": 2000, "poster": "p"},
+        {"title": "a-no-poster-new", "year": 2020, "poster": None},
+        {"title": "m-poster-new", "year": 2022, "poster": "p"},
+    ]
+
+    # trending → poster first, then newest, then title.
+    assert [i["title"] for i in _order_local_anime(items, "trending")] == [
+        "m-poster-new", "z-old-poster", "a-no-poster-new",
+    ]
+    # newest → year desc, ignoring poster presence.
+    assert [i["title"] for i in _order_local_anime(items, "newest")] == [
+        "m-poster-new", "a-no-poster-new", "z-old-poster",
+    ]
+    # title → pure alphabetical.
+    assert [i["title"] for i in _order_local_anime(items, "title")] == [
+        "a-no-poster-new", "m-poster-new", "z-old-poster",
+    ]
 
 
 def test_manga_item_projection():
