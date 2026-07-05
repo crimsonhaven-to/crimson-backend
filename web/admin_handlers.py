@@ -31,9 +31,10 @@ from resolvers.jellyfin import is_configured as jellyfin_is_configured
 from scrapers import ALL_SCRAPERS
 from local_engine.fs import is_configured as local_is_configured
 from cache_engine.downloader import ffmpeg_available
+from download_engine import aria2 as download_aria2
 from metadata_engine.anilist import fetch_anilist_metadata
 
-from web.context import cache_store, db_engine, local_source_store
+from web.context import cache_store, db_engine, download_store, local_source_store
 from web.pipeline import run_single_scraper
 
 logger = logging.getLogger("crimson.admin")
@@ -70,6 +71,9 @@ async def admin_system_info() -> Dict:
     cache_targets = await run_in_threadpool(cache_store.enabled_targets)
     local_sources = await run_in_threadpool(local_source_store.list_sources)
     local_enabled = sum(1 for s in local_sources if s.get("enabled"))
+    download_enabled = sum(1 for s in local_sources if s.get("download_enabled") and s.get("enabled"))
+    download_stats = await run_in_threadpool(download_store.stats)
+    aria2_ok = await download_aria2.is_available()
     # Live-ping the external CORS proxies (if any) so the dashboard shows which
     # are up. Cheap GET / health check per host; off entirely when unconfigured.
     # Uses refresh_health (not bare probe_bases) so opening the dashboard also
@@ -82,6 +86,8 @@ async def admin_system_info() -> Dict:
         "local_configured": local_is_configured(),
         "cache_enabled": bool(cache_enabled),
         "ffmpeg_available": ffmpeg_available(),
+        "aria2_available": aria2_ok,
+        "downloads_enabled_sources": download_enabled,
         "tmdb_key_set": bool(getattr(Config, "TMDB_API_KEY", None)),
         "rate_limit_storage": os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
         "github_token_set": bool(os.getenv("GITHUB_TOKEN")),
@@ -124,6 +130,11 @@ async def admin_system_info() -> Dict:
             **cache_stats,
         },
         "local_sources": {"total": len(local_sources), "enabled": local_enabled},
+        "downloads": {
+            "aria2_available": aria2_ok,
+            "enabled_sources": download_enabled,
+            **download_stats,
+        },
     }
 
 

@@ -68,6 +68,16 @@ class Config:
     # on cache-worker. The DB claim dedupes if more than one process runs it.
     RUN_CACHE_WORKER = os.getenv("RUN_CACHE_WORKER", "true").lower() not in ("0", "false", "no")
 
+    # Only the dedicated download-worker service runs the aria2 poll loop (submit +
+    # progress + publish); the api/api-sync replicas just write pending download rows
+    # and issue pause/resume/cancel straight to the aria2 sidecar. Same rationale as
+    # RUN_CACHE_WORKER: the DB row is the queue, so a download survives an api
+    # redeploy and the begin_submit claim dedupes if more than one process runs it.
+    # Defaults true so a single-container (docker-compose) deploy downloads without
+    # extra config; the Swarm stack sets it false on api/api-sync and true on the
+    # download-worker.
+    RUN_DOWNLOAD_WORKER = os.getenv("RUN_DOWNLOAD_WORKER", "true").lower() not in ("0", "false", "no")
+
     # Emails promoted to admin on startup (comma-separated). Seeds the first
     # admin so the /admin dashboard is reachable without hand-editing the DB;
     # afterwards admins can promote others from the dashboard itself. Only takes

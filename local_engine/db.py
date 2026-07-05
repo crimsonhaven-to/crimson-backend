@@ -21,7 +21,7 @@ from typing import List, Optional
 
 from core.db_pool import get_connection, lock_schema_init
 
-_COLS = "id, label, path, enabled, encoding, created_at"
+_COLS = "id, label, path, enabled, encoding, download_enabled, created_at"
 
 
 def _now_iso() -> str:
@@ -33,8 +33,10 @@ class LocalSourceStore:
 
     # The enabled-roots config is read on every scrape AND every /local_proxy /
     # /local_hls request, so it's cached process-wide for a few seconds. Each cached
-    # entry is ``{"path", "encoding"}`` so callers can tell direct-play roots from
-    # transcode-enabled ones without a second query. Kept at class level so the cache
+    # entry is ``{"path", "encoding", "download_enabled", "label"}`` so callers can tell
+    # direct-play roots from transcode-enabled ones, tell which roots the downloader may
+    # write into (and name a file's source) without a second query.
+    # Kept at class level so the cache
     # is shared no matter which instance (scraper/resolver/route/admin) reads it; any
     # write invalidates it via _bump().
     _roots_cache: Optional[List[dict]] = None
@@ -66,6 +68,15 @@ class LocalSourceStore:
             conn.execute(
                 "ALTER TABLE local_media_sources ADD COLUMN IF NOT EXISTS encoding BOOLEAN NOT NULL DEFAULT FALSE"
             )
+            # Per-source "the background downloader may write into this root" switch.
+            # OFF by default so registering a source never silently makes it a write
+            # target; the operator opts a source in from the Admin Dashboard, and the
+            # downloader lands files under ``<root>/crimson-downloads/`` on the first
+            # download-enabled root with enough free space (see download_engine). Added
+            # via ALTER for DBs created before the downloader existed.
+            conn.execute(
+                "ALTER TABLE local_media_sources ADD COLUMN IF NOT EXISTS download_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+            )
 
     # -- reads ----------------------------------------------------------------
     def list_sources(self) -> List[dict]:
@@ -91,9 +102,19 @@ class LocalSourceStore:
         try:
             with get_connection() as conn:
                 rows = conn.execute(
-                    "SELECT path, encoding FROM local_media_sources WHERE enabled = TRUE"
+                    "SELECT id, path, encoding, download_enabled, label "
+                    "FROM local_media_sources WHERE enabled = TRUE ORDER BY created_at, id"
                 ).fetchall()
-            config = [{"path": r["path"], "encoding": bool(r["encoding"])} for r in rows]
+            config = [
+                {
+                    "id": r["id"],
+                    "path": r["path"],
+                    "encoding": bool(r["encoding"]),
+                    "download_enabled": bool(r["download_enabled"]),
+                    "label": r["label"],
+                }
+                for r in rows
+            ]
         except Exception:
             # DB hiccup: serve the last known config rather than 500 a playback.
             config = cached or []
@@ -105,16 +126,24 @@ class LocalSourceStore:
         """Paths of all enabled sources (cached briefly; see class docstring)."""
         return [r["path"] for r in self.enabled_roots_config()]
 
+    def download_roots_config(self) -> List[dict]:
+        """Enabled sources the downloader may write into (``download_enabled = TRUE``),
+        in registration order — the order the downloader tries them for free space.
+        Derived from the same cached enabled-roots config, so this adds no DB hit."""
+        return [r for r in self.enabled_roots_config() if r.get("download_enabled")]
+
     # -- writes ---------------------------------------------------------------
-    def add_source(self, label: str, path: str, encoding: bool = False) -> dict:
+    def add_source(
+        self, label: str, path: str, encoding: bool = False, download_enabled: bool = False
+    ) -> dict:
         with get_connection() as conn:
             row = conn.execute(
                 f"""
-                INSERT INTO local_media_sources (label, path, enabled, encoding, created_at)
-                VALUES (%s, %s, TRUE, %s, %s)
+                INSERT INTO local_media_sources (label, path, enabled, encoding, download_enabled, created_at)
+                VALUES (%s, %s, TRUE, %s, %s, %s)
                 RETURNING {_COLS}
                 """,
-                (label, path, encoding, _now_iso()),
+                (label, path, encoding, download_enabled, _now_iso()),
             ).fetchone()
         self._bump()
         return row
@@ -125,6 +154,7 @@ class LocalSourceStore:
         label: Optional[str] = None,
         enabled: Optional[bool] = None,
         encoding: Optional[bool] = None,
+        download_enabled: Optional[bool] = None,
     ) -> Optional[dict]:
         sets, vals = [], []
         if label is not None:
@@ -136,6 +166,9 @@ class LocalSourceStore:
         if encoding is not None:
             sets.append("encoding = %s")
             vals.append(encoding)
+        if download_enabled is not None:
+            sets.append("download_enabled = %s")
+            vals.append(download_enabled)
         if not sets:
             return self.get_source(source_id)
         vals.append(source_id)

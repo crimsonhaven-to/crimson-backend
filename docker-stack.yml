@@ -95,6 +95,13 @@ services:
       # service below, so a long remux isn't killed every time `api` rolls. Keep
       # this false here; only cache-worker sets it true.
       - RUN_CACHE_WORKER=false
+      # --- Background downloader (aria2) ---------------------------------------
+      # Serving replicas QUEUE downloads and issue pause/resume/cancel straight to
+      # the aria2 sidecar, but they do NOT run the poll loop — that's the dedicated
+      # download-worker below. The secret MUST equal the aria2 service's RPC_SECRET.
+      - RUN_DOWNLOAD_WORKER=false
+      - ARIA2_RPC_URL=${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
+      - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:-}
       # Downloader tuning for cache_engine. All have sane defaults baked in, so
       # you only need these to override them. The NAS itself is mounted via the
       # `crimson_cache` volume below — NOT through these env vars. Uncomment to tune.
@@ -179,6 +186,7 @@ services:
       - RUN_DB_SYNC=true
       # api-sync serves no ingress and has no NAS mount; it never downloads.
       - RUN_CACHE_WORKER=false
+      - RUN_DOWNLOAD_WORKER=false
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
@@ -253,6 +261,8 @@ services:
       # Never the resync owner; always the download worker.
       - RUN_DB_SYNC=false
       - RUN_CACHE_WORKER=true
+      # This is the CACHE worker, not the aria2 download worker.
+      - RUN_DOWNLOAD_WORKER=false
       # Source env the replayed proxies may need on this worker's own loopback
       # (a cached Jellyfin/ShowBox stream is pulled back through these proxies).
       - JELLYFIN_URL=${JELLYFIN_URL:-}
@@ -322,6 +332,132 @@ services:
         reservations:
           cpus: "0.25"
           memory: 256M
+
+    networks:
+      - crimson_net
+
+  # --- aria2 downloader sidecar (optional, exactly one) ----------------------
+  # Does the byte-pulling for the admin downloader (http/https + magnet), exposing
+  # JSON-RPC on :6800 on crimson_net ONLY — never published to the internet. Keep it
+  # replicas: 1 (one shared queue); leech-only is enforced per-download by the
+  # backend (seed-time=0), so no inbound BitTorrent port is published. RPC_SECRET
+  # MUST equal the api/download-worker ARIA2_RPC_SECRET. Needs the SAME media NAS
+  # mount, at the SAME in-container path, as the download-worker and api (a job's
+  # <root>/crimson-downloads path must be valid in all three). PUID/PGID 10001 match
+  # the api image's appuser so the files aria2 writes stay movable by the worker.
+  aria2:
+    image: p3terx/aria2-pro
+    environment:
+      - RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET}
+      - RPC_PORT=6800
+      - PUID=10001
+      - PGID=10001
+      - DISK_CACHE=64M
+      - UPDATE_TRACKERS=true
+
+    # Mount the SAME media volume the download-worker + api use, at the SAME path,
+    # so aria2 writes into <root>/crimson-downloads/.incoming where the worker reads.
+    # volumes:
+    #   - crimson_media:/crimson/media
+
+    healthcheck:
+      test: ["NONE"]
+
+    stop_grace_period: 20s
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: stop-first
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+    networks:
+      - crimson_net
+
+  # --- Download worker (optional, exactly one) -------------------------------
+  # Same image + default CMD (uvicorn) as `api`, but it runs the aria2 poll loop
+  # (RUN_DOWNLOAD_WORKER=true): claim pending download_jobs rows, hand the URL to the
+  # aria2 sidecar, track progress, and move the finished payload out of staging into
+  # crimson-downloads (leech-only). The api replicas only queue rows + issue
+  # pause/resume/cancel. MUST stay replicas: 1 (the begin_submit claim dedupes if a
+  # second ever runs). Needs the SAME media NAS mount as aria2 + api (it does the
+  # move), and the ARIA2_* env pointing at the sidecar.
+  download-worker:
+    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
+      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
+      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
+      - RUN_DB_SYNC=false
+      - RUN_CACHE_WORKER=false
+      - RUN_DOWNLOAD_WORKER=true
+      - ARIA2_RPC_URL=${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
+      - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET}
+      # Downloader tuning (defaults baked in; uncomment to override).
+      # - DOWNLOAD_MAX_ACTIVE=3          # simultaneous downloads
+      # - DOWNLOAD_POLL_INTERVAL=5       # seconds between aria2 status polls
+      # - DOWNLOAD_MIN_FREE_BYTES=2147483648  # min free space to start (2 GiB)
+
+    # Writes the finished files — needs the SAME media NAS mount as aria2 + api, at
+    # the SAME in-container path. Register that path in Admin → Local Sources with
+    # "download into this source" enabled.
+    # volumes:
+    #   - crimson_media:/crimson/media
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+    # aria2 keeps running in the sidecar across a worker roll; the next worker
+    # reclaims (resumes) any in-flight row, so a short drain is enough.
+    stop_grace_period: 20s
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        # stop-first: never two workers at once. aria2 keeps running in its own
+        # container across the roll, so the new worker re-attaches to in-flight rows
+        # via the monitor (it only requeues gids aria2 has genuinely forgotten).
+        order: stop-first
+        failure_action: rollback
+        monitor: 30s
+        max_failure_ratio: 0.3
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+        order: stop-first
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 384M
+        reservations:
+          cpus: "0.10"
+          memory: 128M
 
     networks:
       - crimson_net

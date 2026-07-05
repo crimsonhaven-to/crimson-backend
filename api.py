@@ -46,6 +46,7 @@ from core.http_client import (
 )
 from core.response_cache import purge_expired_cache
 from cache_engine.downloader import manager as cache_manager
+from download_engine.manager import manager as download_manager
 from resolvers import _crimson_proxy
 
 from account_engine import router as account_router, store as account_store
@@ -72,6 +73,7 @@ from web.context import (
     db_engine,
     local_source_store,
     cache_store,
+    download_store,
     telemetry_store,
 )
 from web.pipeline import _enrich_progress_rows
@@ -113,6 +115,7 @@ async def lifespan(app: FastAPI):
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
     local_source_store.init_db()  # admin-managed local media sources (resync-safe)
     cache_store.init_db()  # server-side video cache tables (resync-safe)
+    download_store.init_db()  # admin download queue (resync-safe)
     telemetry_store.init_db()  # anonymous resolve telemetry (resync-safe)
 
     # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
@@ -343,11 +346,23 @@ async def lifespan(app: FastAPI):
             "does not download (the cache-worker service does)"
         )
 
+    # Background download worker (aria2 poll loop). Same split as the cache worker:
+    # only the dedicated download-worker service submits/polls; other replicas just
+    # write pending rows and issue pause/resume/cancel to the aria2 sidecar.
+    if Config.RUN_DOWNLOAD_WORKER:
+        await download_manager.start_worker()
+    else:
+        logger.info(
+            "RUN_DOWNLOAD_WORKER disabled — this replica queues downloads but does "
+            "not run the aria2 poll loop (the download-worker service does)"
+        )
+
     yield
 
     # Shutdown
     logger.info("Shutting down...")
     await cache_manager.stop()
+    await download_manager.stop()
     if getattr(app.state, 'scheduler', None) is not None:
         app.state.scheduler.shutdown()
     await close_http_client()
@@ -419,6 +434,16 @@ _PUBLIC_PREFIXES = (
     # (see _register_overlay_stream_proxies), so this list names no overlay source.
     "/jellyfin_proxy",
     "/cache_proxy",
+    # Local media: a <video> (direct play) and hls.js (transcode) load these
+    # cross-origin and CANNOT attach the login-wall bearer, exactly like /cache_proxy
+    # — so they must be public. Each maps an opaque path token back to a file ONLY
+    # inside a currently-enabled source root (safe_resolve / safe_resolve_transcode),
+    # re-checked per request, so being public doesn't widen what they can reach.
+    "/local_proxy",
+    "/local_hls",
+    # Local poster/cover art loads cross-origin in an <img> with no auth header;
+    # it's HMAC-signed instead (see local_engine.fs.art_proxy_url / the /local_art route).
+    "/local_art",
     # The subtitle <track> loads cross-origin with no auth header (signed instead).
     "/subtitles_proxy",
     # The manga page <img> loads cross-origin with no auth header (signed instead) —

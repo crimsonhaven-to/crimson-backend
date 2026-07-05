@@ -12,6 +12,7 @@ from core.db_pool import get_pool
 from metadata_engine.db_handler import MappingDatabaseEngine
 from local_engine.db import LocalSourceStore
 from cache_engine.db import CacheStore
+from download_engine.db import DownloadStore
 from telemetry_engine import TelemetryStore
 
 # Mapping/metadata engine (storage is the shared PostgreSQL pool; see db_pool).
@@ -26,6 +27,11 @@ local_source_store = LocalSourceStore()
 # them as a named source). Schema-init'd + download manager started in lifespan;
 # the scraper/resolver/proxy read enabled targets via their own CacheStore.
 cache_store = CacheStore()
+
+# Admin download queue (aria2-backed background downloads landing under a
+# download-enabled local source's crimson-downloads/ dir). Schema-init'd in
+# lifespan; only the RUN_DOWNLOAD_WORKER replica runs the poll worker.
+download_store = DownloadStore()
 
 # Anonymous per-source resolve telemetry (client beacons -> daily aggregates).
 # Restores the source-success visibility lost when resolving moved client-side.

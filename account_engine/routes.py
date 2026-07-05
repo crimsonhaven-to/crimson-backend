@@ -209,13 +209,24 @@ def _favorite_item_key(
 def _progress_item_key(
     tmdb_id: Optional[int], anilist_id: Optional[int],
     season_number: Optional[int], episode_number: Optional[int],
-    media_type: Optional[str] = None,
+    media_type: Optional[str] = None, local_id: Optional[str] = None,
 ) -> str:
     """Stable dedup key for a single episode's progress (or a whole movie).
 
     Movies are namespaced ``movie:{tmdb_id}`` (no season/episode — a movie is one
     item) for the same id-collision reason as _favorite_item_key. TV/anime keys are
     byte-identical to before."""
+    # Local media has no tmdb/anilist id — key off the on-disk title's path token
+    # (local_id) in a ``local:`` namespace, per-episode like TV (a movie omits the
+    # s/e suffix, so it's one row). This is what gives local media continue-watching
+    # + per-episode resume, and _dedup_by_show collapses on the shared local_id.
+    if media_type == "local" and local_id:
+        base = f"local:{local_id}"
+        if season_number is not None:
+            base += f":s{season_number}"
+        if episode_number is not None:
+            base += f":e{episode_number}"
+        return base
     if anilist_id is None and media_type == "movie":
         return f"movie:{tmdb_id}"
     # Manga reading progress is one row per title (not per chapter): the chapter
@@ -298,13 +309,17 @@ class ProgressIn(BaseModel):
     title: Optional[str] = None
     poster: Optional[str] = None
     # 'movie' namespaces the progress key (and lets the frontend route history rows
-    # back to /watch-movie). Optional, so existing TV/anime clients are unaffected.
+    # back to /watch-movie); 'local' is on-disk media keyed by local_id below.
+    # Optional, so existing TV/anime clients are unaffected.
     media_type: Optional[str] = None
+    # On-disk title path token — the identity for media_type='local' rows (which
+    # carry no tmdb/anilist id). Ignored for every other media type.
+    local_id: Optional[str] = None
 
     @model_validator(mode="after")
     def _need_an_id(self):
-        if self.tmdb_id is None and self.anilist_id is None:
-            raise ValueError("Provide at least one of tmdb_id or anilist_id")
+        if self.tmdb_id is None and self.anilist_id is None and self.local_id is None:
+            raise ValueError("Provide at least one of tmdb_id, anilist_id or local_id")
         return self
 
 
@@ -923,6 +938,9 @@ def _dedup_by_show(rows: List[dict], limit: Optional[int] = None) -> List[dict]:
     for row in rows:
         if row.get("anilist_id") is not None:
             show_key = f"anilist:{row['anilist_id']}"
+        elif row.get("media_type") == "local":
+            # All episodes of one local title share its path token -> one card.
+            show_key = f"local:{row.get('local_id')}"
         elif row.get("media_type") == "movie":
             show_key = f"movie:{row['tmdb_id']}"
         else:
@@ -960,7 +978,7 @@ async def get_progress(
 async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depends(require_user)):
     item_key = _progress_item_key(
         body.tmdb_id, body.anilist_id, body.season_number, body.episode_number,
-        body.media_type,
+        body.media_type, body.local_id,
     )
     payload = body.model_dump()
     payload["status"] = _resolve_status(body)
@@ -975,7 +993,7 @@ async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depen
     # Fire-and-forget — never awaited, never allowed to affect this response.
     if (
         _warmup_handler
-        and body.media_type not in ("movie", "manga")
+        and body.media_type not in ("movie", "manga", "local")
         and body.tmdb_id is not None
         and body.season_number is not None
         and body.episode_number is not None
@@ -1030,12 +1048,13 @@ async def remove_progress(
     anilist_id: Optional[int] = Query(None),
     season_number: Optional[int] = Query(None),
     episode_number: Optional[int] = Query(None),
-    media_type: Optional[str] = Query(None, description="'movie' to target the movie namespace"),
+    media_type: Optional[str] = Query(None, description="'movie'/'local' to target that namespace"),
+    local_id: Optional[str] = Query(None, description="on-disk title token (media_type='local')"),
 ):
     if not item_key:
-        if tmdb_id is None and anilist_id is None:
-            raise HTTPException(status_code=400, detail="Provide item_key, or tmdb_id/anilist_id (+season/episode)")
-        item_key = _progress_item_key(tmdb_id, anilist_id, season_number, episode_number, media_type)
+        if tmdb_id is None and anilist_id is None and local_id is None:
+            raise HTTPException(status_code=400, detail="Provide item_key, or tmdb_id/anilist_id/local_id (+season/episode)")
+        item_key = _progress_item_key(tmdb_id, anilist_id, season_number, episode_number, media_type, local_id)
     removed = store.remove_progress(user["user_id"], item_key)
     if not removed:
         raise HTTPException(status_code=404, detail="Progress entry not found")

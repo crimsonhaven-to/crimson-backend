@@ -68,6 +68,10 @@ async def public_config():
         "demo_mode": Config.DEMO_MODE,
         "require_login": Config.REQUIRE_LOGIN,
         "manga_enabled": manga_enabled,
+        # Whether any local media source is enabled — drives the Index's "Local"
+        # view toggle + the local search surface on the frontend (both hidden when
+        # off). local_is_configured() is a cached, DB-backed check.
+        "local_library_enabled": local_is_configured(),
     }
 
 
