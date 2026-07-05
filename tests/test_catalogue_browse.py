@@ -7,8 +7,35 @@ readers themselves (get_shows_catalogue_items / get_movies_catalogue_items) are
 thin SELECT + project loops exercised end-to-end by the running service.
 """
 
+import metadata_engine.anilist as anilist
 from web.queries import _decode_genres
-from metadata_engine.anilist import _MEDIA_SORTS, CATALOGUE_DEFAULT_SORT, MANGA_DEFAULT_SORT, _manga_item
+from metadata_engine.anilist import (
+    _MEDIA_SORTS,
+    CATALOGUE_DEFAULT_SORT,
+    MANGA_DEFAULT_SORT,
+    _fetch_media_catalogue,
+    _manga_item,
+)
+
+
+class _FakeResp:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    """Minimal stand-in for httpx.AsyncClient returning a canned AniList payload."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def post(self, *args, **kwargs):
+        return _FakeResp(self._payload)
 
 
 def test_decode_genres_is_defensive():
@@ -44,6 +71,40 @@ def test_media_sort_tokens_map_to_anilist_enums():
     assert _MEDIA_SORTS["score"] == "SCORE_DESC"
     # Back-compat alias still points at the default.
     assert MANGA_DEFAULT_SORT == CATALOGUE_DEFAULT_SORT
+
+
+async def test_anilist_browse_flags_upstream_error_as_unavailable(monkeypatch):
+    # AniList returns HTTP 200 with an `errors` field on an outage (e.g. the whole
+    # API being disabled). That must surface as unavailable (→ 503), NOT an empty
+    # page — otherwise the hub shows a misleading "nothing matched".
+    async def _no_cache(*a, **k):
+        return None
+    monkeypatch.setattr(anilist, "get_cached_response", _no_cache)
+    monkeypatch.setattr(anilist, "set_cached_response", _no_cache)
+
+    client = _FakeClient({"errors": [{"message": "API disabled"}], "data": None})
+    result = await _fetch_media_catalogue(client, "ANIME", "anime", None, "trending", 1, 30)
+    assert result["unavailable"] is True
+    assert result["items"] == []
+
+
+async def test_anilist_browse_projects_and_tags_kind(monkeypatch):
+    async def _no_cache(*a, **k):
+        return None
+    monkeypatch.setattr(anilist, "get_cached_response", _no_cache)
+    monkeypatch.setattr(anilist, "set_cached_response", _no_cache)
+
+    payload = {"data": {"Page": {
+        "pageInfo": {"hasNextPage": True, "total": 100, "currentPage": 1},
+        "media": [{"id": 21, "title": {"english": "One Piece"},
+                   "coverImage": {"extraLarge": "u"}, "startDate": {"year": 1999},
+                   "averageScore": 88}],
+    }}}
+    result = await _fetch_media_catalogue(_FakeClient(payload), "ANIME", "anime", None, "trending", 1, 30)
+    assert result.get("unavailable") is None
+    assert result["has_next"] is True and result["total"] == 100
+    assert result["items"][0]["kind"] == "anime"  # re-tagged from the generic projection
+    assert result["items"][0]["anilist_id"] == 21
 
 
 def test_manga_item_projection():

@@ -415,6 +415,10 @@ async def _fetch_media_catalogue(
     variables = {"page": page, "perPage": per_page, "type": media_type, "sort": [sort_enum]}
     if genre:
         variables["genre"] = genre
+    # An upstream failure is distinct from a genuinely empty page: the caller turns
+    # `unavailable` into a 503 so the hub shows "temporarily unavailable" instead of
+    # the misleading "nothing matched". Never cached, so it self-heals on retry.
+    unavailable = {"items": [], "page": page, "has_next": False, "total": 0, "unavailable": True}
     try:
         response = await client.post(
             "https://graphql.anilist.co",
@@ -423,8 +427,16 @@ async def _fetch_media_catalogue(
         )
         if response.status_code != 200:
             logger.error(f"AniList {kind} browse error: Status {response.status_code}")
-            return {"items": [], "page": page, "has_next": False, "total": 0}
-        page_data = ((response.json().get("data") or {}).get("Page") or {})
+            return unavailable
+        payload = response.json()
+        # AniList returns HTTP 200 even on failure, with the real error in `errors`
+        # (e.g. the whole API being disabled). Treat that as unavailable, not empty —
+        # and LOG it, so an outage leaves a breadcrumb instead of a silent blank grid.
+        if payload.get("errors"):
+            msg = (payload["errors"][0] or {}).get("message", "unknown error")
+            logger.warning(f"AniList {kind} browse GraphQL error: {msg}")
+            return unavailable
+        page_data = ((payload.get("data") or {}).get("Page") or {})
         info = page_data.get("pageInfo") or {}
         media = page_data.get("media") or []
         # _manga_item is the generic AniList-media projection; only the `kind` tag
@@ -449,7 +461,7 @@ async def _fetch_media_catalogue(
         return result
     except Exception as e:
         logger.error(f"Error fetching {kind} catalogue from AniList: {e}")
-        return {"items": [], "page": page, "has_next": False, "total": 0}
+        return unavailable
 
 
 async def fetch_manga_catalogue(

@@ -138,6 +138,10 @@ async def catalogue_manga(
     async with http_client() as client:
         genres = await fetch_anilist_genres(client)
         result = await fetch_manga_catalogue(client, genre=genre, sort=sort, page=page)
+    # Upstream (AniList) failure → 503, so the hub shows "temporarily unavailable"
+    # rather than a misleading empty grid (AniList returns HTTP 200 even on outage).
+    if result.get("unavailable"):
+        raise HTTPException(status_code=503, detail="Manga discovery (AniList) is temporarily unavailable — please try again shortly.")
     return {
         "success": True,
         "count": len(result["items"]),

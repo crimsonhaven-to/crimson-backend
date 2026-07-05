@@ -274,6 +274,11 @@ async def get_anime_catalogue(
     async with http_client() as client:
         genres = await fetch_anilist_genres(client)
         result = await fetch_anime_catalogue(client, genre=genre, sort=sort, page=page)
+    # Upstream (AniList) failure — surface it as 503 so the hub shows an honest
+    # "temporarily unavailable" instead of a misleading empty grid. The anime hub's
+    # local "Archive" view is unaffected.
+    if result.get("unavailable"):
+        raise HTTPException(status_code=503, detail="Anime discovery (AniList) is temporarily unavailable — please try again shortly.")
     return {
         "success": True,
         "count": len(result["items"]),
