@@ -39,6 +39,14 @@ logger = logging.getLogger("local_engine.fs")
 EMBED_MARKER = "crimson-local"
 PROXY_PREFIX = "/local_proxy"
 HLS_PREFIX = "/local_hls"
+# Subdirectory (under a download-enabled source root) the background downloader
+# lands finished media into: ``<root>/crimson-downloads/<title>/…``. The library
+# scanner treats it like any other container (its children are titles), so a
+# downloaded show surfaces automatically. In-progress downloads live under the
+# dot-prefixed staging dir below, which the scanner skips.
+DOWNLOADS_SUBDIR = "crimson-downloads"
+STAGING_SUBDIR = ".incoming"
+
 # Poster / cover art discovered next to a title (Kodi/Jellyfin convention) is
 # served from here. Unlike the video proxies this route is PUBLIC (an <img> can't
 # carry the login-wall bearer), so each URL is HMAC-signed — see art_proxy_url /
@@ -125,6 +133,24 @@ def is_art_path(path: str) -> bool:
 
 def art_media_type_for(path: str) -> str:
     return _ART_MEDIA_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+def download_roots_config() -> List[dict]:
+    """Enabled source roots the downloader may write into (``download_enabled``), in
+    the order it should try them for free space. Thin pass-through to the store so the
+    download engine doesn't import the DB layer directly (mirrors ``enabled_roots``)."""
+    return _store.download_roots_config()
+
+
+def is_within_enabled_root(real_path: str) -> Optional[str]:
+    """The enabled source root that contains ``real_path`` (already fully resolved),
+    or None. Public wrapper over the private ``_within`` traversal check so the
+    download engine can verify a computed destination stays inside a registered root
+    before writing to it — the same containment guarantee playback relies on."""
+    for root in _store.enabled_roots():
+        if _within(real_path, root):
+            return root
+    return None
 
 
 def source_label_for(real_path: str) -> Optional[str]:

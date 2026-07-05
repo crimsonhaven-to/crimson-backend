@@ -43,6 +43,10 @@ from local_engine.transcode import tools_available as encoding_tools_available
 from cache_engine.db import CacheStore
 from cache_engine import fs as cache_fs
 from cache_engine import downloader as cache_dl
+from download_engine.db import DownloadStore, KIND_HTTP, KIND_TORRENT
+from download_engine import fs as download_fs
+from download_engine import aria2 as download_aria2
+from download_engine import manager as download_manager
 from telemetry_engine import TelemetryStore
 from apikey_engine import store as apikey_store
 from .db import AccountStore
@@ -52,6 +56,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 store = AccountStore()
 local_store = LocalSourceStore()
 cache_store = CacheStore()
+download_store = DownloadStore()
 telemetry_store = TelemetryStore()
 
 
@@ -447,20 +452,29 @@ class LocalSourceCreate(BaseModel):
     # On-the-fly HLS transcoding for non-web containers (mkv/avi/…). Off by default
     # so a new source is direct-play-only until the operator opts in.
     encoding: bool = False
+    # Whether the background downloader may write into this root (under
+    # crimson-downloads/). Off by default — the operator opts a source in.
+    download_enabled: bool = False
 
 
 class LocalSourceUpdate(BaseModel):
     label: Optional[str] = Field(None, min_length=1, max_length=100)
     enabled: Optional[bool] = None
     encoding: Optional[bool] = None
+    download_enabled: Optional[bool] = None
 
 
 def _local_with_status(row: dict) -> dict:
-    """Merge a stored source row with a live filesystem probe for the dashboard."""
+    """Merge a stored source row with a live filesystem probe for the dashboard.
+    Download-enabled roots additionally carry a free-space/occupancy probe of their
+    crimson-downloads dir so the dashboard can show which one the downloader will pick."""
     out = dict(row)
     out["enabled"] = bool(out.get("enabled"))
     out["encoding"] = bool(out.get("encoding"))
+    out["download_enabled"] = bool(out.get("download_enabled"))
     out["status"] = inspect_path(row["path"])
+    if out["download_enabled"]:
+        out["downloads"] = download_fs.inspect_downloads(row["path"])
     return out
 
 
@@ -519,7 +533,7 @@ async def add_local_source(body: LocalSourceCreate, user: dict = Depends(require
         raise HTTPException(status_code=409, detail="That path is already registered")
 
     row = await run_in_threadpool(
-        local_store.add_source, body.label.strip(), path, body.encoding
+        local_store.add_source, body.label.strip(), path, body.encoding, body.download_enabled
     )
     return {"success": True, "source": await run_in_threadpool(_local_with_status, row)}
 
@@ -533,7 +547,8 @@ async def update_local_source(source_id: int, body: LocalSourceUpdate, user: dic
         raise HTTPException(status_code=404, detail="Source not found")
     label = body.label.strip() if body.label is not None else None
     row = await run_in_threadpool(
-        local_store.update_source, source_id, label, body.enabled, body.encoding
+        local_store.update_source, source_id, label, body.enabled, body.encoding,
+        body.download_enabled,
     )
     return {"success": True, "source": await run_in_threadpool(_local_with_status, row)}
 
@@ -715,3 +730,163 @@ async def delete_cached_episode(entry_id: int, user: dict = Depends(require_admi
 
     await run_in_threadpool(_unlink)
     return {"success": True, "deleted": entry_id}
+
+
+# --- background downloader (aria2) ------------------------------------------
+# Admin-submitted downloads: a plain http/https URL or a magnet link, fetched in
+# the background by the aria2 sidecar and landed under <root>/crimson-downloads/ on
+# the first *download-enabled* local source with free space. Once on disk, the
+# local library scanner surfaces it like any other on-disk title. See
+# download_engine/.
+class DownloadCreate(BaseModel):
+    url: str = Field(..., min_length=1, max_length=8000, description="An http(s) URL or a magnet: link")
+    # Optional title — becomes the crimson-downloads/<name>/ folder, which greatly
+    # helps the library scanner identify the download. Omit to keep the source's own
+    # file/release name.
+    name: Optional[str] = Field(None, max_length=180)
+
+
+def _classify_download_url(url: str) -> str:
+    """Map a submitted URL to a download kind, or raise a 400 with guidance."""
+    u = url.strip()
+    low = u.lower()
+    if low.startswith("magnet:"):
+        return KIND_TORRENT
+    if low.startswith(("http://", "https://")):
+        if low.split("?", 1)[0].endswith(".torrent"):
+            raise HTTPException(
+                status_code=400,
+                detail="Paste the magnet link instead of a .torrent file URL.",
+            )
+        return KIND_HTTP
+    raise HTTPException(
+        status_code=400,
+        detail="URL must be an http(s):// link or a magnet: link.",
+    )
+
+
+def _job_public(row: dict) -> dict:
+    """Shape a download_jobs row for the dashboard (drops nothing sensitive — it's
+    admin-only — but normalises the numeric/progress fields)."""
+    out = dict(row)
+    total = out.get("bytes_total")
+    done = out.get("bytes_done") or 0
+    out["bytes_done"] = int(done)
+    out["bytes_total"] = int(total) if total else None
+    out["download_speed"] = int(out.get("download_speed") or 0)
+    out["progress"] = (done / total) if (total and total > 0) else None
+    return out
+
+
+@router.get("/downloads")
+async def downloads_overview(user: dict = Depends(require_admin)):
+    """Downloader status for the dashboard: aria2 availability, config, aggregate
+    job counts, and the download-enabled roots with their free space (the order the
+    downloader tries them)."""
+    aria2_ok = await download_aria2.is_available()
+    stats = await run_in_threadpool(download_store.stats)
+    roots = await run_in_threadpool(local_store.download_roots_config)
+
+    def _root_view():
+        out = []
+        for r in roots:
+            out.append({
+                "id": r["id"],
+                "label": r.get("label"),
+                "path": r["path"],
+                **download_fs.inspect_downloads(r["path"]),
+            })
+        return out
+
+    targets = await run_in_threadpool(_root_view)
+    return {
+        "success": True,
+        "aria2_available": aria2_ok,
+        "aria2_rpc_url": download_aria2.RPC_URL,
+        "download_targets": targets,
+        "stats": stats,
+        "config": {
+            "max_active": download_manager.MAX_ACTIVE,
+            "min_free_bytes": download_manager.MIN_FREE_BYTES,
+            "poll_interval": download_manager.POLL_INTERVAL,
+        },
+    }
+
+
+@router.get("/download-jobs")
+async def list_download_jobs(
+    user: dict = Depends(require_admin),
+    status: Optional[str] = Query(None, description="pending / active / paused / complete / failed"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    rows = await run_in_threadpool(download_store.list_jobs, status, limit, offset)
+    total = await run_in_threadpool(download_store.count_jobs, status)
+    return {
+        "success": True,
+        "count": len(rows),
+        "total": total,
+        "jobs": [_job_public(r) for r in rows],
+    }
+
+
+@router.post("/downloads")
+@limiter.limit("60/minute")
+async def create_download(request: Request, body: DownloadCreate, user: dict = Depends(require_admin)):
+    """Queue a download. Rejected up front when no local source is download-enabled
+    (turn one on under Local Sources first) so the operator gets a clear error instead
+    of a job that silently never lands anywhere."""
+    kind = _classify_download_url(body.url)
+    roots = await run_in_threadpool(local_store.download_roots_config)
+    if not roots:
+        raise HTTPException(
+            status_code=400,
+            detail="No local source is download-enabled. Enable one under Local Sources first.",
+        )
+    created_by = f"admin:{user.get('email') or user['user_id']}"
+    name = (body.name or "").strip() or None
+    row = await run_in_threadpool(
+        download_store.create_job, kind, body.url.strip(), name, created_by
+    )
+    return {"success": True, "job": _job_public(row)}
+
+
+@router.post("/download-jobs/{job_id}/pause")
+async def pause_download(job_id: int, user: dict = Depends(require_admin)):
+    job = await run_in_threadpool(download_store.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Download not found")
+    row = await download_manager.pause_job(download_store, job)
+    return {"success": True, "job": _job_public(row) if row else None}
+
+
+@router.post("/download-jobs/{job_id}/resume")
+async def resume_download(job_id: int, user: dict = Depends(require_admin)):
+    job = await run_in_threadpool(download_store.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Download not found")
+    row = await download_manager.resume_job(download_store, job)
+    return {"success": True, "job": _job_public(row) if row else None}
+
+
+@router.post("/download-jobs/{job_id}/retry")
+async def retry_download(job_id: int, user: dict = Depends(require_admin)):
+    """Re-queue a failed (or stuck) download. Its staging dir is left in place so
+    aria2 resumes from the partial rather than starting over."""
+    job = await run_in_threadpool(download_store.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Download not found")
+    row = await run_in_threadpool(download_store.requeue, job_id)
+    return {"success": True, "job": _job_public(row) if row else None}
+
+
+@router.delete("/download-jobs/{job_id}")
+async def delete_download(job_id: int, user: dict = Depends(require_admin)):
+    """Cancel + remove a download. Stops it in aria2 and deletes any in-progress
+    staging files; a *completed* download's published file under crimson-downloads is
+    left in place (delete it from the Local library if you want the space back)."""
+    row = await run_in_threadpool(download_store.delete_job, job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Download not found")
+    await download_manager.cancel_and_delete_job(download_store, row)
+    return {"success": True, "deleted": job_id}

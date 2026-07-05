@@ -46,6 +46,7 @@ from core.http_client import (
 )
 from core.response_cache import purge_expired_cache
 from cache_engine.downloader import manager as cache_manager
+from download_engine.manager import manager as download_manager
 from resolvers import _crimson_proxy
 
 from account_engine import router as account_router, store as account_store
@@ -72,6 +73,7 @@ from web.context import (
     db_engine,
     local_source_store,
     cache_store,
+    download_store,
     telemetry_store,
 )
 from web.pipeline import _enrich_progress_rows
@@ -113,6 +115,7 @@ async def lifespan(app: FastAPI):
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
     local_source_store.init_db()  # admin-managed local media sources (resync-safe)
     cache_store.init_db()  # server-side video cache tables (resync-safe)
+    download_store.init_db()  # admin download queue (resync-safe)
     telemetry_store.init_db()  # anonymous resolve telemetry (resync-safe)
 
     # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
@@ -343,11 +346,23 @@ async def lifespan(app: FastAPI):
             "does not download (the cache-worker service does)"
         )
 
+    # Background download worker (aria2 poll loop). Same split as the cache worker:
+    # only the dedicated download-worker service submits/polls; other replicas just
+    # write pending rows and issue pause/resume/cancel to the aria2 sidecar.
+    if Config.RUN_DOWNLOAD_WORKER:
+        await download_manager.start_worker()
+    else:
+        logger.info(
+            "RUN_DOWNLOAD_WORKER disabled — this replica queues downloads but does "
+            "not run the aria2 poll loop (the download-worker service does)"
+        )
+
     yield
 
     # Shutdown
     logger.info("Shutting down...")
     await cache_manager.stop()
+    await download_manager.stop()
     if getattr(app.state, 'scheduler', None) is not None:
         app.state.scheduler.shutdown()
     await close_http_client()

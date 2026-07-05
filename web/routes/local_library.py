@@ -33,6 +33,7 @@ from core.http_client import http_client
 from core.response_cache import _local_get, _local_set
 from local_engine.fs import is_configured as local_is_configured
 from local_engine.library import (
+    browse_dir,
     get_library_item,
     scan_library,
     search_library,
@@ -247,6 +248,29 @@ async def get_local_overview(token: str):
     await _ensure_enriched(item)
     item = _apply_cached_enrichment(item)
     return {"success": True, "kind": "local", **item}
+
+
+@router.get("/local-browse")
+async def get_local_browse(token: Optional[str] = Query(None, description="Directory token; omit for the source-root level")):
+    """Folder-navigation view of the local library: the immediate children of one
+    directory (or the enabled source roots when ``token`` is omitted). ``title``
+    entries carry the same poster/metadata shape as the list — with cached TMDB
+    enrichment overlaid so identified folders show a real tile — while ``folder`` and
+    ``file`` entries are the raw-filesystem fallback for media that never resolved to a
+    title. 404 when ``token`` doesn't resolve inside a currently enabled root."""
+    if not local_is_configured():
+        raise HTTPException(status_code=404, detail="Local library not enabled")
+    view = await run_in_threadpool(browse_dir, token)
+    if view is None:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    # Overlay any cached enrichment on title entries so identified folders show real
+    # art/titles (no network here — reuses what the list/overview warmed).
+    view["entries"] = [
+        {**e, **{k: v for k, v in _apply_cached_enrichment(e).items() if k not in ("type",)}}
+        if e.get("type") == "title" else e
+        for e in view.get("entries", [])
+    ]
+    return {"success": True, "kind": "local-browse", **view}
 
 
 @router.get("/search/local")

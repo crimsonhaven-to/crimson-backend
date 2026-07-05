@@ -187,6 +187,85 @@ def test_get_item_rejects_token_outside_enabled_root(tmp_path, monkeypatch):
     assert lib.get_library_item(token) is None
 
 
+# --- identify-or-descend recursion (nested libraries + crimson-downloads) ----
+def test_container_folder_is_descended_not_one_title(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path)
+    # A category container holding two distinct titles must yield two tiles, not one.
+    _mp4(tmp_path / "Movies" / "Inception (2010)" / "Inception.mp4")
+    _mp4(tmp_path / "Movies" / "Dune (2021)" / "Dune.mp4")
+
+    titles = sorted(i["title"] for i in lib.scan_library())
+    assert titles == ["Dune", "Inception"]
+
+
+def test_crimson_downloads_subdir_surfaces_its_children(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path)
+    # The downloader lands titles under crimson-downloads/<title>/…
+    _mp4(tmp_path / "crimson-downloads" / "Cowboy Bebop" / "S01E01.mp4")
+    _mp4(tmp_path / "crimson-downloads" / "Cowboy Bebop" / "S01E02.mp4")
+    _mp4(tmp_path / "Frieren" / "S01E01.mp4")  # a normal top-level title too
+
+    items = {i["title"]: i for i in lib.scan_library()}
+    assert set(items) == {"Cowboy Bebop", "Frieren"}
+    assert items["Cowboy Bebop"]["media_kind"] == "show"
+    assert items["Cowboy Bebop"]["episode_count"] == 2
+
+
+def test_multiseason_show_stays_one_tile_when_nested(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path)
+    # Season folders under a container must NOT split the show into per-season tiles.
+    show = tmp_path / "crimson-downloads" / "Breaking Bad"
+    _mp4(show / "Season 1" / "S01E01.mp4")
+    _mp4(show / "Season 2" / "S02E01.mp4")
+
+    items = lib.scan_library()
+    assert len(items) == 1
+    assert items[0]["title"] == "Breaking Bad"
+    assert items[0]["episode_count"] == 2
+
+
+def test_incoming_staging_dir_is_ignored(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path)
+    # In-progress downloads live in a dot-prefixed staging dir the scanner must skip.
+    _mp4(tmp_path / "crimson-downloads" / ".incoming" / "5" / "partial.mp4")
+    _mp4(tmp_path / "crimson-downloads" / "Real Movie" / "Real.mp4")
+
+    titles = [i["title"] for i in lib.scan_library()]
+    assert titles == ["Real Movie"]
+
+
+# --- folder-navigation browse -----------------------------------------------
+def test_browse_root_lists_source_roots(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path, label="My NAS")
+    _mp4(tmp_path / "Movies" / "Dune (2021)" / "Dune.mp4")
+
+    view = lib.browse_dir(None)
+    assert view["parent"] is None
+    assert [e["name"] for e in view["entries"]] == ["My NAS"]
+    assert view["entries"][0]["type"] == "folder"
+
+
+def test_browse_dir_mixes_titles_folders_and_files(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path)
+    _mp4(tmp_path / "Inception (2010)" / "Inception.mp4")  # a title
+    _mp4(tmp_path / "Movies" / "Dune (2021)" / "Dune.mp4")  # a container
+    _mp4(tmp_path / "loose.mp4")                            # a loose file
+
+    root_token = fs.encode_token(str(tmp_path))
+    view = lib.browse_dir(root_token)
+    by_type = {}
+    for e in view["entries"]:
+        by_type.setdefault(e["type"], []).append(e)
+    assert any(e["title"] == "Inception" for e in by_type.get("title", []))
+    assert any(e["name"] == "Movies" for e in by_type.get("folder", []))
+    assert any(e["name"] == "loose.mp4" for e in by_type.get("file", []))
+    # Drilling into the container reaches its title.
+    folder = next(e for e in by_type["folder"] if e["name"] == "Movies")
+    sub = lib.browse_dir(folder["id"])
+    assert any(e.get("title") == "Dune" for e in sub["entries"])
+    assert sub["parent"] == root_token
+
+
 # --- search -----------------------------------------------------------------
 def test_search_matches_on_title_substring(tmp_path, monkeypatch):
     _point_roots_at(monkeypatch, tmp_path)

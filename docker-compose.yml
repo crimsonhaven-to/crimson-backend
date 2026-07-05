@@ -76,6 +76,20 @@ services:
       # here to reach the container; unset => /subtitles returns 503.
       # - OPENSUBTITLES_API_KEY=
       # - OPENSUBTITLES_APP_NAME=CrimsonHaven v1.0
+      # --- Background downloader (aria2 sidecar) -------------------------------
+      # The admin downloader hands http/magnet links to the aria2 service below over
+      # the internal network. The secret MUST equal aria2's RPC_SECRET. Finished
+      # media lands under <root>/crimson-downloads on a *download-enabled* Local
+      # source, so mount your media volume into BOTH this service and `aria2` at the
+      # SAME in-container path (see the aria2 service note) and enable the source in
+      # Admin → Local Sources. RUN_DOWNLOAD_WORKER defaults true, so this single
+      # container both queues and runs the aria2 poll loop.
+      - ARIA2_RPC_URL=http://aria2:6800/jsonrpc
+      - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET (e.g. openssl rand -hex 24)}
+      # Mount your media library here (same path as on the aria2 service) and
+      # register it in Admin → Local Sources with "download into this source" on:
+      # volumes:
+      #   - /srv/media:/crimson/media
 
     # Container-level health is also defined in the Dockerfile; declared here too
     # so `docker compose` reports it without relying on the image default.
@@ -106,5 +120,31 @@ services:
           cpus: "0.25"
           memory: 256M
 
+  # --- aria2 downloader sidecar ----------------------------------------------
+  # Does the actual byte-pulling for the admin downloader (http/https + magnet),
+  # exposing JSON-RPC on :6800 over the internal network only (never published to
+  # the host / public proxy). Leech-only is enforced per-download by the backend
+  # (seed-time=0), so no inbound BitTorrent port needs publishing.
+  #
+  # IMPORTANT: mount your media library into this service at the SAME in-container
+  # path as `anime-api`, so a job's <root>/crimson-downloads path is valid in both.
+  # PUID/PGID 10001 match the api image's non-root appuser so the files aria2 writes
+  # stay readable/movable by the backend.
+  aria2:
+    image: p3terx/aria2-pro
+    environment:
+      - RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET (e.g. openssl rand -hex 24)}
+      - RPC_PORT=6800
+      - PUID=10001
+      - PGID=10001
+      - DISK_CACHE=64M
+      - UPDATE_TRACKERS=true
+    volumes:
+      - crimson-aria2-config:/config
+      # Mount the SAME media volume here as on anime-api, at the SAME path:
+      # - /srv/media:/crimson/media
+    restart: unless-stopped
+
 volumes:
-  crimson-pgdata:   # PostgreSQL data directory (named volume)
+  crimson-pgdata:        # PostgreSQL data directory (named volume)
+  crimson-aria2-config:  # aria2 session/config (named volume)

@@ -63,6 +63,7 @@ COPY supporters_engine ./supporters_engine
 COPY discord_bot ./discord_bot
 COPY local_engine ./local_engine
 COPY cache_engine ./cache_engine
+COPY download_engine ./download_engine
 COPY changelog_engine ./changelog_engine
 COPY recommend_engine ./recommend_engine
 COPY apikey_engine ./apikey_engine

@@ -52,7 +52,6 @@ from .fs import (
     art_proxy_url,
     encode_token,
     is_playable_path,
-    is_web_playable_path,
     safe_resolve,
     safe_resolve_dir,
     source_label_for,
@@ -514,47 +513,159 @@ def _build_title(entry_path: str, is_dir: bool, embed_budget: List[int]) -> Opti
     }
 
 
+# --- identify-or-descend classification -------------------------------------
+# How deep the recursive scan will descend through *container* folders (categories,
+# crimson-downloads, nested libraries) before giving up — a guard against a
+# pathological tree, not a limit on a title's own season/episode nesting.
+_MAX_SCAN_DEPTH = 6
+
+# Classification of a directory during the recursive scan.
+_TITLE = "title"          # a single show/movie — emit one tile, walk within it
+_CONTAINER = "container"  # holds only other titles/containers — descend into it
+_EMPTY = "empty"          # nothing playable anywhere beneath — skip
+
+
+def _dir_has_media(dir_path: str, cap: int = 1) -> bool:
+    """Whether ``dir_path`` holds at least one playable file anywhere beneath it
+    (bounded — stops at the first hit)."""
+    for _root, _dirs, files in os.walk(dir_path):
+        for f in files:
+            try:
+                if is_playable_path(os.path.join(_root, f)):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _has_direct_media(dir_path: str) -> bool:
+    """Whether ``dir_path`` holds a playable file *directly* (depth 0)."""
+    try:
+        with os.scandir(dir_path) as it:
+            for e in it:
+                if e.is_file():
+                    try:
+                        if is_playable_path(e.path):
+                            return True
+                    except Exception:
+                        continue
+    except OSError:
+        pass
+    return False
+
+
+def _child_dirs(dir_path: str) -> List[str]:
+    """Immediate, non-hidden subdirectories of ``dir_path`` (absolute paths)."""
+    out: List[str] = []
+    try:
+        with os.scandir(dir_path) as it:
+            for e in it:
+                if e.is_dir() and not e.name.startswith("."):
+                    out.append(e.path)
+    except OSError:
+        pass
+    return out
+
+
+def _classify_dir(dir_path: str) -> str:
+    """Decide whether ``dir_path`` is a single **title**, a **container** of other
+    titles, or **empty**.
+
+    A folder is a *title* when it holds media directly (a movie file, loose episodes)
+    or in ``Season N``/``Staffel N``/``Sxx`` subfolders (a normal multi-season show) —
+    i.e. it maps to one show/movie. A folder that holds neither, but does contain
+    subfolders that themselves hold media (a category dir like ``Movies/`` or the
+    downloader's ``crimson-downloads/``), is a *container* the scanner descends into.
+    Everything else is empty. This is what lets crimson-downloads and nested libraries
+    work without a multi-season show splitting into one tile per season."""
+    if _has_direct_media(dir_path):
+        return _TITLE
+    subdirs = _child_dirs(dir_path)
+    if not subdirs:
+        return _EMPTY
+    # Season-named subfolders that actually hold media => this dir is one show.
+    for sub in subdirs:
+        if _season_from_dir(os.path.basename(sub)) is not None and _dir_has_media(sub):
+            return _TITLE
+    # Otherwise: a container iff at least one child holds media somewhere.
+    for sub in subdirs:
+        if _dir_has_media(sub):
+            return _CONTAINER
+    return _EMPTY
+
+
 # --- public API -------------------------------------------------------------
+def _scan_dir(dir_path: str, items: List[Dict], seen: set, embed_budget: List[int],
+              depth: int) -> bool:
+    """Recursively turn one directory's children into title items (identify-or-descend).
+    A child that is a *title* becomes one item; a *container* is descended into; loose
+    playable files become single-file movie titles. Returns False once _MAX_TITLES is
+    hit so the caller stops walking."""
+    if depth > _MAX_SCAN_DEPTH:
+        return True
+    try:
+        names = sorted(os.listdir(dir_path))
+    except OSError as e:
+        logger.warning(f"[library] could not scan {dir_path!r}: {e}")
+        return True
+
+    for name in names:
+        if name.startswith("."):
+            continue
+        full = os.path.join(dir_path, name)
+        try:
+            is_dir = os.path.isdir(full)
+        except OSError:
+            continue
+
+        if not is_dir:
+            # Loose playable file -> a single-file movie title (as before).
+            try:
+                if not is_playable_path(full):
+                    continue
+                item = _build_title(full, False, embed_budget)
+            except Exception as e:
+                logger.warning(f"[library] failed to build title for {full!r}: {e}")
+                item = None
+        else:
+            cls = _classify_dir(full)
+            if cls == _CONTAINER:
+                if not _scan_dir(full, items, seen, embed_budget, depth + 1):
+                    return False
+                continue
+            if cls == _EMPTY:
+                continue
+            try:
+                item = _build_title(full, True, embed_budget)
+            except Exception as e:
+                logger.warning(f"[library] failed to build title for {full!r}: {e}")
+                item = None
+
+        if not item or item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        items.append(item)
+        if len(items) >= _MAX_TITLES:
+            logger.warning(f"[library] hit _MAX_TITLES={_MAX_TITLES}; truncating scan")
+            return False
+    return True
+
+
 def scan_library() -> List[Dict]:
     """Scan every enabled source root into a flat list of title items (offline —
-    no external calls). Blocking disk I/O; call via run_in_threadpool. Sorted by
+    no external calls). Recurses through *container* folders (categories, nested
+    libraries, the downloader's ``crimson-downloads/``) so a title deep in the tree
+    still surfaces, without a multi-season show splitting into per-season tiles — see
+    :func:`_classify_dir`. Blocking disk I/O; call via run_in_threadpool. Sorted by
     title. Bounded by _MAX_TITLES so a huge NAS can't blow up the response."""
     items: List[Dict] = []
     embed_budget = [_EMBED_PROBE_BUDGET]
     seen_ids: set = set()
     for root in _store.enabled_roots():
-        try:
-            if not os.path.isdir(root):
-                continue
-            for name in sorted(os.listdir(root)):
-                if name.startswith("."):
-                    continue
-                full = os.path.join(root, name)
-                is_dir = os.path.isdir(full)
-                is_loose_media = (not is_dir) and is_web_playable_path(full)
-                # Non-web loose files (mkv) only when their source has encoding on.
-                if not is_dir and not is_loose_media:
-                    if is_playable_path(full):
-                        is_loose_media = True
-                    else:
-                        continue
-                try:
-                    item = _build_title(full, is_dir, embed_budget)
-                except Exception as e:
-                    logger.warning(f"[library] failed to build title for {full!r}: {e}")
-                    item = None
-                if not item:
-                    continue
-                if item["id"] in seen_ids:
-                    continue
-                seen_ids.add(item["id"])
-                items.append(item)
-                if len(items) >= _MAX_TITLES:
-                    logger.warning(f"[library] hit _MAX_TITLES={_MAX_TITLES}; truncating scan")
-                    items.sort(key=lambda x: (x["title"] or "").lower())
-                    return items
-        except Exception as e:
-            logger.warning(f"[library] could not scan root {root!r}: {e}")
+        if not os.path.isdir(root):
+            continue
+        if not _scan_dir(root, items, seen_ids, embed_budget, depth=0):
+            break
     items.sort(key=lambda x: (x["title"] or "").lower())
     return items
 
@@ -644,6 +755,93 @@ def get_library_item(token: str) -> Optional[Dict]:
         return item
 
     return None
+
+
+def browse_dir(token: Optional[str] = None) -> Optional[Dict]:
+    """Folder-navigation view of the library for the client's local browser: the
+    immediate children of one directory (or, with no token, the enabled source roots
+    as top-level folders). Each child is one of:
+
+      * ``title``  — a confidently-scanned show/movie folder, carried with the same
+                     poster/metadata shape as a list item (so the browser can show a
+                     real tile and open its /local-overview),
+      * ``folder`` — a container to drill into (browse again with its ``id``),
+      * ``file``   — a loose playable file (play via /watch-local with its ``id``).
+
+    This is the "fall back to folder-navigation + filenames" surface: media that never
+    resolves to a title is still reachable by walking the tree. Returns None when the
+    token doesn't resolve inside a currently enabled root. Blocking; call via
+    run_in_threadpool."""
+    embed_budget = [_EMBED_PROBE_BUDGET]
+
+    # Root level: list each enabled source root as a folder.
+    if not token:
+        entries: List[Dict] = []
+        for r in _store.enabled_roots_config():
+            path = r["path"]
+            if not os.path.isdir(path):
+                continue
+            entries.append({
+                "type": "folder",
+                "id": encode_token(os.path.realpath(path)),
+                "name": r.get("label") or os.path.basename(path.rstrip(os.sep)) or path,
+            })
+        return {"token": None, "name": "Local", "parent": None, "entries": entries}
+
+    real_dir = safe_resolve_dir(token)
+    if not real_dir:
+        return None
+
+    entries = []
+    try:
+        names = sorted(os.listdir(real_dir))
+    except OSError:
+        names = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        full = os.path.join(real_dir, name)
+        try:
+            is_dir = os.path.isdir(full)
+        except OSError:
+            continue
+        if is_dir:
+            cls = _classify_dir(full)
+            if cls == _TITLE:
+                try:
+                    item = _build_title(full, True, embed_budget)
+                except Exception:
+                    item = None
+                if item:
+                    entries.append({"type": "title", **item})
+            elif cls == _CONTAINER:
+                entries.append({
+                    "type": "folder",
+                    "id": encode_token(os.path.realpath(full)),
+                    "name": name,
+                })
+            # _EMPTY: skip
+        elif is_playable_path(full):
+            entries.append({
+                "type": "file",
+                "id": encode_token(os.path.realpath(full)),
+                "name": name,
+                "media_kind": "movie",
+            })
+
+    # Parent token for "up" navigation: None when this dir is itself a source root
+    # (up goes to the synthetic root list), else the parent directory's token.
+    roots_real = {os.path.realpath(r) for r in _store.enabled_roots()}
+    parent = None if os.path.realpath(real_dir) in roots_real else encode_token(
+        os.path.realpath(os.path.dirname(real_dir))
+    )
+    return {
+        "token": token,
+        "name": os.path.basename(real_dir.rstrip(os.sep)) or real_dir,
+        "source_label": source_label_for(real_dir),
+        "parent": parent,
+        "entries": entries,
+    }
 
 
 def search_library(query: str, items: Optional[List[Dict]] = None, limit: int = 20) -> List[Dict]:
