@@ -326,20 +326,28 @@ async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> li
 # fetch_trending_manga. The frontend Manga hub drives page/sort/genre and appends
 # pages ("load more"), since the full corpus is far too large to ship at once.
 
+# The anime browse hub shares this exact machinery (only ``type: ANIME`` differs):
+# the anime /catalogue is 6,800 mapped titles and slow to ship+render whole, so the
+# DEFAULT anime browse is this same fast, paginated, poster-rich AniList grid; the
+# full local catalogue stays a secondary "Archive" view.
+
 # Friendly sort token -> AniList MediaSort enum. Trending is the default browse
-# order (matches the trending row); the rest give the hub its sort control.
-_MANGA_SORTS = {
+# order (matches the trending row); the rest give the hub its sort control. Shared
+# by the anime + manga catalogue browses (MediaSort applies to both media types).
+_MEDIA_SORTS = {
     "trending": "TRENDING_DESC",
     "popular": "POPULARITY_DESC",
     "score": "SCORE_DESC",
     "newest": "START_DATE_DESC",
     "title": "TITLE_ROMAJI",
 }
-MANGA_DEFAULT_SORT = "trending"
+CATALOGUE_DEFAULT_SORT = "trending"
+# Back-compat alias (manga_engine + older imports referenced MANGA_DEFAULT_SORT).
+MANGA_DEFAULT_SORT = CATALOGUE_DEFAULT_SORT
 
 
-async def fetch_manga_genres(client: httpx.AsyncClient) -> list:
-    """AniList's genre vocabulary (shared anime/manga) for the Manga hub's filter
+async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
+    """AniList's genre vocabulary (shared anime/manga) for the browse hubs' filter
     chips. Tiny and very stable, so cached aggressively (L1 + response cache)."""
     cache_key = "anilist:genres"
     local = _local_get(cache_key)
@@ -367,30 +375,34 @@ async def fetch_manga_genres(client: httpx.AsyncClient) -> list:
         return []
 
 
-async def fetch_manga_catalogue(
+async def _fetch_media_catalogue(
     client: httpx.AsyncClient,
-    genre: Optional[str] = None,
-    sort: str = MANGA_DEFAULT_SORT,
-    page: int = 1,
-    per_page: int = 30,
+    media_type: str,
+    kind: str,
+    genre: Optional[str],
+    sort: str,
+    page: int,
+    per_page: int,
 ) -> Dict:
-    """One page of the manga browse hub — AniList ``Page.media(type: MANGA)`` with
-    an optional ``genre_in`` filter and a friendly ``sort`` token. Returns
-    ``{items, page, has_next, total}``; ``items`` are _manga_item poster cards.
-    Cached per (genre, sort, page)."""
-    sort_enum = _MANGA_SORTS.get(sort, _MANGA_SORTS[MANGA_DEFAULT_SORT])
+    """One page of an AniList browse hub for ``media_type`` ('ANIME' | 'MANGA').
+
+    ``Page.media(type: …)`` with an optional ``genre`` filter and a friendly
+    ``sort`` token; returns ``{items, page, has_next, total}`` where ``items`` are
+    poster cards tagged ``kind`` (so anime routes to /anime/{id}, manga to
+    /manga/{id}). Cached per (media_type, genre, sort, page)."""
+    sort_enum = _MEDIA_SORTS.get(sort, _MEDIA_SORTS[CATALOGUE_DEFAULT_SORT])
     page = max(1, page)
     genre_key = (genre or "").casefold()
-    cache_key = f"anilist:manga:browse:{genre_key}:{sort_enum}:{page}:{per_page}"
+    cache_key = f"anilist:{media_type.lower()}:browse:{genre_key}:{sort_enum}:{page}:{per_page}"
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         return cached_data
 
     graphql = """
-    query ($page: Int, $perPage: Int, $sort: [MediaSort], $genre: String) {
+    query ($page: Int, $perPage: Int, $type: MediaType, $sort: [MediaSort], $genre: String) {
       Page (page: $page, perPage: $perPage) {
         pageInfo { hasNextPage total currentPage lastPage }
-        media (type: MANGA, isAdult: false, sort: $sort, genre: $genre) {
+        media (type: $type, isAdult: false, sort: $sort, genre: $genre) {
           id
           title { romaji english native }
           coverImage { large extraLarge }
@@ -400,7 +412,7 @@ async def fetch_manga_catalogue(
       }
     }
     """
-    variables = {"page": page, "perPage": per_page, "sort": [sort_enum]}
+    variables = {"page": page, "perPage": per_page, "type": media_type, "sort": [sort_enum]}
     if genre:
         variables["genre"] = genre
     try:
@@ -410,13 +422,22 @@ async def fetch_manga_catalogue(
             timeout=Config.REQUEST_TIMEOUT,
         )
         if response.status_code != 200:
-            logger.error(f"AniList manga browse error: Status {response.status_code}")
+            logger.error(f"AniList {kind} browse error: Status {response.status_code}")
             return {"items": [], "page": page, "has_next": False, "total": 0}
         page_data = ((response.json().get("data") or {}).get("Page") or {})
         info = page_data.get("pageInfo") or {}
         media = page_data.get("media") or []
+        # _manga_item is the generic AniList-media projection; only the `kind` tag
+        # differs between anime and manga, so re-tag it for anime.
+        items = []
+        for m in media:
+            if not m.get("id"):
+                continue
+            item = _manga_item(m)
+            item["kind"] = kind
+            items.append(item)
         result = {
-            "items": [_manga_item(m) for m in media if m.get("id")],
+            "items": items,
             "page": info.get("currentPage") or page,
             "has_next": bool(info.get("hasNextPage")),
             "total": info.get("total") or 0,
@@ -427,5 +448,29 @@ async def fetch_manga_catalogue(
             )
         return result
     except Exception as e:
-        logger.error(f"Error fetching manga catalogue from AniList: {e}")
+        logger.error(f"Error fetching {kind} catalogue from AniList: {e}")
         return {"items": [], "page": page, "has_next": False, "total": 0}
+
+
+async def fetch_manga_catalogue(
+    client: httpx.AsyncClient,
+    genre: Optional[str] = None,
+    sort: str = CATALOGUE_DEFAULT_SORT,
+    page: int = 1,
+    per_page: int = 30,
+) -> Dict:
+    """One page of the manga browse hub — see _fetch_media_catalogue."""
+    return await _fetch_media_catalogue(client, "MANGA", "manga", genre, sort, page, per_page)
+
+
+async def fetch_anime_catalogue(
+    client: httpx.AsyncClient,
+    genre: Optional[str] = None,
+    sort: str = CATALOGUE_DEFAULT_SORT,
+    page: int = 1,
+    per_page: int = 30,
+) -> Dict:
+    """One page of the anime browse hub (the fast default view) — the anime twin of
+    fetch_manga_catalogue. Items are ``kind: 'anime'`` poster cards keyed by
+    anilist_id, so they route through the existing /anime/{anilist_id} pages."""
+    return await _fetch_media_catalogue(client, "ANIME", "anime", genre, sort, page, per_page)

@@ -22,6 +22,11 @@ from core.response_cache import (
     get_cached_response,
     set_cached_response,
 )
+from metadata_engine.anilist import (
+    CATALOGUE_DEFAULT_SORT,
+    fetch_anilist_genres,
+    fetch_anime_catalogue,
+)
 from metadata_engine.tmdb import (
     fetch_tmdb_search_results,
     fetch_trending_anime,
@@ -252,6 +257,33 @@ async def get_catalogue(
         "genres": derived["genres"],
         "animes": animes,
     })
+
+
+@router.get("/catalogue/anime")
+async def get_anime_catalogue(
+    genre: Optional[str] = Query(None, description="Optional AniList genre filter, e.g. Action, Romance"),
+    sort: str = Query(CATALOGUE_DEFAULT_SORT, description="trending | popular | score | newest | title"),
+    page: int = Query(1, ge=1, le=200, description="1-based page for the browse hub"),
+):
+    """The fast, default anime browse — one page of AniList ANIME (poster-rich,
+    genre + sort, paginated), the anime twin of /catalogue/manga. Distinct from
+    /catalogue (the full 6,800-title local archive, which the hub keeps as a
+    secondary view): shipping + rendering that whole list is slow, so this is the
+    landing view. Items are ``kind: 'anime'`` cards keyed by anilist_id.
+    """
+    async with http_client() as client:
+        genres = await fetch_anilist_genres(client)
+        result = await fetch_anime_catalogue(client, genre=genre, sort=sort, page=page)
+    return {
+        "success": True,
+        "count": len(result["items"]),
+        "total": result.get("total", 0),
+        "page": result.get("page", page),
+        "has_next": result.get("has_next", False),
+        "sort": sort,
+        "genres": [{"genre": g} for g in genres],
+        "animes": result["items"],
+    }
 
 
 # --- Non-anime catalogues (shows / movies), served from the local TMDB tables ---

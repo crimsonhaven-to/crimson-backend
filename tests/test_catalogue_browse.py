@@ -8,7 +8,7 @@ thin SELECT + project loops exercised end-to-end by the running service.
 """
 
 from web.queries import _decode_genres
-from metadata_engine.anilist import _MANGA_SORTS, MANGA_DEFAULT_SORT, _manga_item
+from metadata_engine.anilist import _MEDIA_SORTS, CATALOGUE_DEFAULT_SORT, MANGA_DEFAULT_SORT, _manga_item
 
 
 def test_decode_genres_is_defensive():
@@ -37,10 +37,13 @@ def test_popularity_sort_puts_popular_first_and_nulls_last():
     assert [r["title"] for r in sorted(rows, key=_sort_key)] == ["c", "a", "b"]
 
 
-def test_manga_sort_tokens_map_to_anilist_enums():
-    assert set(_MANGA_SORTS) == {"trending", "popular", "score", "newest", "title"}
-    assert _MANGA_SORTS[MANGA_DEFAULT_SORT] == "TRENDING_DESC"
-    assert _MANGA_SORTS["score"] == "SCORE_DESC"
+def test_media_sort_tokens_map_to_anilist_enums():
+    # Shared by the anime + manga AniList browses.
+    assert set(_MEDIA_SORTS) == {"trending", "popular", "score", "newest", "title"}
+    assert _MEDIA_SORTS[CATALOGUE_DEFAULT_SORT] == "TRENDING_DESC"
+    assert _MEDIA_SORTS["score"] == "SCORE_DESC"
+    # Back-compat alias still points at the default.
+    assert MANGA_DEFAULT_SORT == CATALOGUE_DEFAULT_SORT
 
 
 def test_manga_item_projection():

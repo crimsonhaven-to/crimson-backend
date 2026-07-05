@@ -3,7 +3,7 @@
   "info": {
     "title": "Anime Streaming API",
     "description": "API for streaming anime with multi-season support",
-    "version": "17.0.0"
+    "version": "18.0.0"
   },
   "paths": {
     "/auth/challenge": {
@@ -4852,6 +4852,79 @@
               "title": "Genre"
             },
             "description": "Optional genre filter, e.g. Action, Romance, Comedy"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/catalogue/anime": {
+      "get": {
+        "summary": "Get Anime Catalogue",
+        "description": "The fast, default anime browse — one page of AniList ANIME (poster-rich,\ngenre + sort, paginated), the anime twin of /catalogue/manga. Distinct from\n/catalogue (the full 6,800-title local archive, which the hub keeps as a\nsecondary view): shipping + rendering that whole list is slow, so this is the\nlanding view. Items are ``kind: 'anime'`` cards keyed by anilist_id.",
+        "operationId": "get_anime_catalogue_catalogue_anime_get",
+        "parameters": [
+          {
+            "name": "genre",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional AniList genre filter, e.g. Action, Romance",
+              "title": "Genre"
+            },
+            "description": "Optional AniList genre filter, e.g. Action, Romance"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "trending | popular | score | newest | title",
+              "default": "trending",
+              "title": "Sort"
+            },
+            "description": "trending | popular | score | newest | title"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "description": "1-based page for the browse hub",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "1-based page for the browse hub"
           }
         ],
         "responses": {

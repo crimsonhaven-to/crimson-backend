@@ -98,6 +98,6 @@ def test_app_imports_and_openapi_generates():
     assert paths, "OpenAPI produced no paths"
     # A few load-bearing endpoints the frontend contract depends on must exist.
     joined = json.dumps(list(paths.keys()))
-    for needle in ["/watch/", "/info/", "/trending", "/search/",
+    for needle in ["/watch/", "/info/", "/trending", "/search/", "/catalogue/anime",
                    "/catalogue/shows", "/catalogue/movies", "/catalogue/manga"]:
         assert needle in joined, f"missing expected path containing {needle}"

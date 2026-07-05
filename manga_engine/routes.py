@@ -28,9 +28,9 @@ from core.http_client import http_client
 from core.response_cache import get_cached_response, set_cached_response
 from metadata_engine.anilist import (
     MANGA_DEFAULT_SORT,
+    fetch_anilist_genres,
     fetch_anilist_manga_metadata,
     fetch_manga_catalogue,
-    fetch_manga_genres,
     fetch_trending_manga,
     search_anilist_manga,
 )
@@ -136,7 +136,7 @@ async def catalogue_manga(
     if not manga_enabled():
         raise HTTPException(status_code=503, detail="Manga is not enabled")
     async with http_client() as client:
-        genres = await fetch_manga_genres(client)
+        genres = await fetch_anilist_genres(client)
         result = await fetch_manga_catalogue(client, genre=genre, sort=sort, page=page)
     return {
         "success": True,
