@@ -395,10 +395,12 @@ async def get_anime_catalogue(
     async with http_client() as client:
         genres = await fetch_anilist_genres(client)
         result = await fetch_anime_catalogue(client, genre=genre, sort=sort, page=page)
-        # Upstream (AniList) failure — don't 503. Fall back to the reliable local
-        # anime DB (paginated, poster-first, TMDB-trending-seeded on page 1) so the
-        # Discover hub keeps working instead of dying. ``fallback: true`` lets the
-        # client show a gentle "showing local archive" notice.
+        # Upstream (AniList) failure — don't 503. The fetcher first tries to serve the
+        # last known good copy of this page (``stale: true``, real AniList data); only
+        # if there's no shadow does it report ``unavailable``, and we fall back to the
+        # reliable local anime DB (paginated, poster-first, TMDB-trending-seeded on
+        # page 1) so the Discover hub keeps working instead of dying. ``fallback: true``
+        # lets the client show a gentle "showing local archive" notice.
         if result.get("unavailable"):
             fb = await _build_local_anime_fallback(client, genre=genre, sort=sort, page=page)
             return {
@@ -420,6 +422,8 @@ async def get_anime_catalogue(
         "has_next": result.get("has_next", False),
         "sort": sort,
         "fallback": False,
+        # True when AniList was down but a cached page was served instead of a live one.
+        "stale": bool(result.get("stale")),
         "genres": [{"genre": g} for g in genres],
         "animes": result["items"],
     }

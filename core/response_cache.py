@@ -106,6 +106,41 @@ async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Con
         logger.error(f"Cache storage error for key {cache_key}: {e}")
 
 
+# --- SERVE-STALE-ON-ERROR ---------------------------------------------------
+# A "last known good" shadow copy kept alongside the normal (short-TTL) cache
+# entry, used when the live upstream (AniList) fails so the discovery hubs serve
+# the previous result instead of a 503 / empty grid. The shadow lives far longer
+# than any fresh TTL — it only ever surfaces during an outage, so it can be safely
+# old; a week keeps the hubs alive across a prolonged outage while still eventually
+# expiring genuinely dead content.
+STALE_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _stale_key(cache_key: str) -> str:
+    return f"stale:{cache_key}"
+
+
+async def set_cached_response_shadowed(cache_key: str, data: Dict, ttl_seconds: int = Config.CACHE_TTL_SECONDS):
+    """Write the fresh cache entry AND a long-lived 'last known good' shadow.
+
+    The shadow (see ``get_stale_response``) is what serve-stale-on-error reads when
+    the upstream is down. No-op on empty data (mirrors ``set_cached_response``), so
+    a failed fetch never overwrites a good shadow with nothing.
+    """
+    if not data:
+        return
+    await set_cached_response(cache_key, data, ttl_seconds)
+    await set_cached_response(_stale_key(cache_key), data, STALE_TTL_SECONDS)
+
+
+async def get_stale_response(cache_key: str) -> Optional[Dict]:
+    """The last known good copy of ``cache_key`` (its shadow), if still retained.
+
+    Returned only on the failure path — a live success always prefers the fresh
+    entry via ``get_cached_response``."""
+    return await get_cached_response(_stale_key(cache_key))
+
+
 def purge_expired_cache() -> int:
     """Delete expired api_cache rows. Returns the number removed."""
     with get_connection() as conn:

@@ -118,8 +118,11 @@ async def trending_manga(limit: int = Query(12, ge=1, le=50, description="Number
     if not manga_enabled():
         raise HTTPException(status_code=503, detail="Manga is not enabled")
     async with http_client() as client:
-        results = await fetch_trending_manga(client, limit)
-    return {"success": True, "count": len(results), "manga": results}
+        result = await fetch_trending_manga(client, limit)
+    # ``stale`` is True when AniList was down and we served the last known good row,
+    # so the frontend can show a gentle "showing recent results" note if it wants.
+    items = result["items"]
+    return {"success": True, "count": len(items), "stale": result["stale"], "manga": items}
 
 
 @router.get("/catalogue/manga")
@@ -138,8 +141,10 @@ async def catalogue_manga(
     async with http_client() as client:
         genres = await fetch_anilist_genres(client)
         result = await fetch_manga_catalogue(client, genre=genre, sort=sort, page=page)
-    # Upstream (AniList) failure → 503, so the hub shows "temporarily unavailable"
-    # rather than a misleading empty grid (AniList returns HTTP 200 even on outage).
+    # Upstream (AniList) failure with no cached page to fall back on → 503, so the hub
+    # shows "temporarily unavailable" rather than a misleading empty grid (AniList
+    # returns HTTP 200 even on outage). When a last-known-good page IS available the
+    # fetcher returns it tagged ``stale`` instead, so we serve that below.
     if result.get("unavailable"):
         raise HTTPException(status_code=503, detail="Manga discovery (AniList) is temporarily unavailable — please try again shortly.")
     return {
@@ -149,6 +154,8 @@ async def catalogue_manga(
         "page": result.get("page", page),
         "has_next": result.get("has_next", False),
         "sort": sort,
+        # True when served from the stale shadow during an AniList outage.
+        "stale": bool(result.get("stale")),
         # Shape parity with the anime/local genre facet ([{genre, count}]); manga
         # has no per-genre counts (live corpus), so count is omitted.
         "genres": [{"genre": g} for g in genres],

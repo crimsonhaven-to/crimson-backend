@@ -6,6 +6,7 @@ info), plus the tiny ``_empty`` coroutine api.py uses to gather an optional
 AniList fetch without branching.
 """
 
+import asyncio
 import logging
 from typing import Dict, Optional
 
@@ -16,16 +17,98 @@ from core.response_cache import (
     _local_get,
     _local_set,
     get_cached_response,
-    set_cached_response,
+    get_stale_response,
+    set_cached_response_shadowed,
 )
 
 logger = logging.getLogger("crimson.anilist")
+
+ANILIST_URL = "https://graphql.anilist.co"
+# Cap how long a single web request will block on an AniList Retry-After. AniList
+# can ask for 60s+ when rate-limiting; we won't hang a user request that long —
+# past this ceiling we give up and let the caller degrade (serve-stale / empty).
+_MAX_RETRY_WAIT = 8.0
 
 
 async def _empty() -> Dict:
     """A coroutine that resolves to ``{}`` — lets us ``asyncio.gather`` an
     optional fetch (e.g. AniList when there's no mapping) without branching."""
     return {}
+
+
+def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
+    """Parse a Retry-After header (delta-seconds form, which AniList uses)."""
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return float(raw.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+async def anilist_post(
+    client: httpx.AsyncClient,
+    query: str,
+    variables: Optional[Dict] = None,
+    *,
+    timeout: Optional[float] = None,
+) -> Optional[httpx.Response]:
+    """POST a GraphQL query to AniList with retry + backoff.
+
+    AniList is frequently rate-limited (a degraded ~30 req/min ceiling → HTTP 429)
+    or transiently 5xx; a one-shot POST turns that blip into a hard failure and, on
+    the discovery hubs, a 503 or an empty grid. This retries 429 (honoring
+    Retry-After, capped at ``_MAX_RETRY_WAIT`` so a request never hangs) and
+    500/502/503/504 with exponential backoff, and retries network/timeout errors.
+
+    Returns the final ``httpx.Response`` — the successful one, or the last failing
+    one once retries are exhausted — so callers keep their existing status-code and
+    GraphQL-``errors[]`` handling unchanged. Re-raises the last network exception
+    only if no attempt ever produced a response.
+    """
+    payload: Dict = {"query": query}
+    if variables is not None:
+        payload["variables"] = variables
+    timeout = timeout or Config.REQUEST_TIMEOUT
+
+    response: Optional[httpx.Response] = None
+    for attempt in range(Config.MAX_RETRIES):
+        last = attempt == Config.MAX_RETRIES - 1
+        try:
+            response = await client.post(ANILIST_URL, json=payload, timeout=timeout)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if last:
+                raise
+            logger.warning(
+                f"AniList request error ({type(e).__name__}); retry {attempt + 1}/{Config.MAX_RETRIES}"
+            )
+            await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
+            continue
+
+        if response.status_code == 429:
+            if last:
+                return response
+            wait = _retry_after_seconds(response)
+            wait = min(wait, _MAX_RETRY_WAIT) if wait is not None else Config.RETRY_BACKOFF_FACTOR * (2 ** attempt)
+            logger.warning(
+                f"AniList rate limited (429); waiting {wait}s before retry {attempt + 1}/{Config.MAX_RETRIES}"
+            )
+            await asyncio.sleep(wait)
+            continue
+
+        if response.status_code in (500, 502, 503, 504):
+            if last:
+                return response
+            logger.warning(
+                f"AniList upstream {response.status_code}; retry {attempt + 1}/{Config.MAX_RETRIES}"
+            )
+            await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
+            continue
+
+        return response
+
+    return response
 
 
 async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> Dict:
@@ -37,7 +120,6 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
     if cached_data:
         return cached_data
     
-    url = "https://graphql.anilist.co"
     query = """
     query ($id: Int) {
       Media (id: $id, type: ANIME) {
@@ -81,16 +163,15 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
     """
     
     try:
-        response = await client.post(
-            url, 
-            json={"query": query, "variables": {"id": anilist_id}},
-            timeout=Config.REQUEST_TIMEOUT
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"AniList API error: Status {response.status_code}")
-            return {}
-        
+        response = await anilist_post(client, query, {"id": anilist_id})
+
+        if response is None or response.status_code != 200:
+            status = response.status_code if response is not None else "no response"
+            logger.error(f"AniList API error: Status {status}")
+            # Outage → serve the last known good copy rather than a blank {} (which
+            # would 404 the overview / drop metadata from the watch pipeline).
+            return await get_stale_response(cache_key) or {}
+
         data = response.json()
         media = data.get("data", {}).get("Media", {})
         if not media: return {}
@@ -139,15 +220,15 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
             "episodes_list": formatted_episodes
         }
         
-        # Cache the result
+        # Cache the result (+ a long-lived shadow for serve-stale-on-error).
         if result:
-            await set_cached_response(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
-        
+            await set_cached_response_shadowed(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
+
         return result
-        
+
     except Exception as e:
         logger.error(f"Error fetching from AniList: {e}")
-        return {}
+        return await get_stale_response(cache_key) or {}
 
 
 # --- MANGA (the reading surface) -------------------------------------------
@@ -205,17 +286,14 @@ async def fetch_anilist_manga_metadata(client: httpx.AsyncClient, anilist_id: in
     }
     """
     try:
-        response = await client.post(
-            "https://graphql.anilist.co",
-            json={"query": query, "variables": {"id": anilist_id}},
-            timeout=Config.REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
-            logger.error(f"AniList manga API error: Status {response.status_code}")
-            return {}
+        response = await anilist_post(client, query, {"id": anilist_id})
+        if response is None or response.status_code != 200:
+            status = response.status_code if response is not None else "no response"
+            logger.error(f"AniList manga API error: Status {status}")
+            return await get_stale_response(cache_key) or {}
         media = (response.json().get("data") or {}).get("Media") or {}
         if not media:
-            return {}
+            return await get_stale_response(cache_key) or {}
 
         title = media.get("title") or {}
         cover = media.get("coverImage") or {}
@@ -240,11 +318,11 @@ async def fetch_anilist_manga_metadata(client: httpx.AsyncClient, anilist_id: in
             "start_date": media.get("startDate"),
             "end_date": media.get("endDate"),
         }
-        await set_cached_response(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
+        await set_cached_response_shadowed(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
         return result
     except Exception as e:
         logger.error(f"Error fetching manga from AniList: {e}")
-        return {}
+        return await get_stale_response(cache_key) or {}
 
 
 async def search_anilist_manga(client: httpx.AsyncClient, query_name: str, per_page: int = 12) -> list:
@@ -264,12 +342,8 @@ async def search_anilist_manga(client: httpx.AsyncClient, query_name: str, per_p
     }
     """
     try:
-        response = await client.post(
-            "https://graphql.anilist.co",
-            json={"query": graphql, "variables": {"search": query_name, "perPage": per_page}},
-            timeout=Config.REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
+        response = await anilist_post(client, graphql, {"search": query_name, "perPage": per_page})
+        if response is None or response.status_code != 200:
             return []
         media = ((response.json().get("data") or {}).get("Page") or {}).get("media") or []
         return [_manga_item(m) for m in media if m.get("id")]
@@ -278,13 +352,17 @@ async def search_anilist_manga(client: httpx.AsyncClient, query_name: str, per_p
         return []
 
 
-async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> list:
-    """Trending AniList MANGA for the landing page's manga row — poster-card items.
-    Cached (the list is identical for every viewer within the window)."""
+async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> dict:
+    """Trending AniList MANGA for the landing page's manga row.
+
+    Returns ``{"items": [poster-cards], "stale": bool}``. Cached (the list is
+    identical for every viewer within the window); on an AniList outage it serves
+    the last known good copy tagged ``stale: True`` instead of an empty row.
+    """
     cache_key = f"anilist:manga:trending:{limit}"
     cached_data = await get_cached_response(cache_key)
     if cached_data:
-        return cached_data
+        return {"items": cached_data, "stale": False}
 
     graphql = """
     query ($perPage: Int) {
@@ -299,24 +377,26 @@ async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> li
       }
     }
     """
+    result: list = []
     try:
-        response = await client.post(
-            "https://graphql.anilist.co",
-            json={"query": graphql, "variables": {"perPage": limit}},
-            timeout=Config.REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
-            return []
-        media = ((response.json().get("data") or {}).get("Page") or {}).get("media") or []
-        result = [_manga_item(m) for m in media if m.get("id")]
-        if result:
-            await set_cached_response(
-                cache_key, result, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS
-            )
-        return result
+        response = await anilist_post(client, graphql, {"perPage": limit})
+        if response is not None and response.status_code == 200:
+            media = ((response.json().get("data") or {}).get("Page") or {}).get("media") or []
+            result = [_manga_item(m) for m in media if m.get("id")]
     except Exception as e:
         logger.error(f"Error fetching trending manga from AniList: {e}")
-        return []
+
+    if result:
+        await set_cached_response_shadowed(
+            cache_key, result, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS
+        )
+        return {"items": result, "stale": False}
+
+    # Live fetch failed/empty → serve the last known good row if we have one.
+    stale = await get_stale_response(cache_key)
+    if stale:
+        return {"items": stale, "stale": True}
+    return {"items": [], "stale": False}
 
 
 # --- Manga browse hub (live AniList; no DB table, so this cannot be local) ----
@@ -358,21 +438,28 @@ async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
         _local_set(cache_key, cached["genres"])
         return cached["genres"]
     query = "query { GenreCollection }"
+
+    async def _stale_genres() -> list:
+        """Last known good genre vocabulary (chips still render during an outage)."""
+        stale = await get_stale_response(cache_key)
+        if stale and stale.get("genres"):
+            _local_set(cache_key, stale["genres"])
+            return stale["genres"]
+        return []
+
     try:
-        response = await client.post(
-            "https://graphql.anilist.co", json={"query": query},
-            timeout=Config.REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
-            return []
+        response = await anilist_post(client, query)
+        if response is None or response.status_code != 200:
+            return await _stale_genres()
         genres = (response.json().get("data") or {}).get("GenreCollection") or []
         if genres:
-            await set_cached_response(cache_key, {"genres": genres}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+            await set_cached_response_shadowed(cache_key, {"genres": genres}, ttl_seconds=Config.CACHE_TTL_SECONDS)
             _local_set(cache_key, genres)
-        return genres
+            return genres
+        return await _stale_genres()
     except Exception as e:
         logger.error(f"Error fetching AniList genres: {e}")
-        return []
+        return await _stale_genres()
 
 
 async def _fetch_media_catalogue(
@@ -415,19 +502,27 @@ async def _fetch_media_catalogue(
     variables = {"page": page, "perPage": per_page, "type": media_type, "sort": [sort_enum]}
     if genre:
         variables["genre"] = genre
-    # An upstream failure is distinct from a genuinely empty page: the caller turns
-    # `unavailable` into a 503 so the hub shows "temporarily unavailable" instead of
-    # the misleading "nothing matched". Never cached, so it self-heals on retry.
-    unavailable = {"items": [], "page": page, "has_next": False, "total": 0, "unavailable": True}
+
+    # An upstream failure is distinct from a genuinely empty page. Rather than the
+    # bare "temporarily unavailable", first try to serve the last known good copy of
+    # THIS exact page (tagged `stale: True`); only if no shadow exists do we return
+    # `unavailable`, which the caller turns into a 503 (manga) or the local-DB
+    # fallback (anime). Never caches the failure, so it self-heals on retry.
+    async def _unavailable_or_stale() -> Dict:
+        shadow = await get_stale_response(cache_key)
+        if shadow:
+            out = dict(shadow)
+            out["stale"] = True
+            out.pop("unavailable", None)
+            return out
+        return {"items": [], "page": page, "has_next": False, "total": 0, "unavailable": True}
+
     try:
-        response = await client.post(
-            "https://graphql.anilist.co",
-            json={"query": graphql, "variables": variables},
-            timeout=Config.REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
-            logger.error(f"AniList {kind} browse error: Status {response.status_code}")
-            return unavailable
+        response = await anilist_post(client, graphql, variables)
+        if response is None or response.status_code != 200:
+            status = response.status_code if response is not None else "no response"
+            logger.error(f"AniList {kind} browse error: Status {status}")
+            return await _unavailable_or_stale()
         payload = response.json()
         # AniList returns HTTP 200 even on failure, with the real error in `errors`
         # (e.g. the whole API being disabled). Treat that as unavailable, not empty —
@@ -435,7 +530,7 @@ async def _fetch_media_catalogue(
         if payload.get("errors"):
             msg = (payload["errors"][0] or {}).get("message", "unknown error")
             logger.warning(f"AniList {kind} browse GraphQL error: {msg}")
-            return unavailable
+            return await _unavailable_or_stale()
         page_data = ((payload.get("data") or {}).get("Page") or {})
         info = page_data.get("pageInfo") or {}
         media = page_data.get("media") or []
@@ -455,13 +550,13 @@ async def _fetch_media_catalogue(
             "total": info.get("total") or 0,
         }
         if result["items"]:
-            await set_cached_response(
+            await set_cached_response_shadowed(
                 cache_key, result, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS
             )
         return result
     except Exception as e:
         logger.error(f"Error fetching {kind} catalogue from AniList: {e}")
-        return unavailable
+        return await _unavailable_or_stale()
 
 
 async def fetch_manga_catalogue(
