@@ -25,6 +25,8 @@ from resolvers.jellyfin import proxy_fetch as jellyfin_proxy_fetch
 from local_engine.fs import (
     safe_resolve as local_safe_resolve,
     safe_resolve_transcode as local_safe_resolve_transcode,
+    safe_resolve_art as local_safe_resolve_art,
+    art_media_type_for as local_art_media_type,
     media_type_for as local_media_type,
 )
 from local_engine import transcode as local_transcode
@@ -144,6 +146,28 @@ async def local_hls(token: str, resource: str):
         return Response(content=data, media_type="video/mp2t")
 
     raise HTTPException(status_code=404, detail="Not found")
+
+
+@router.get("/local_art")
+async def local_art(
+    f: str = Query(..., description="base64url path token of a local artwork file"),
+    s: str = Query(..., description="HMAC signature"),
+):
+    """Serve a poster/cover image discovered next to a local title.
+
+    PUBLIC (an ``<img>`` can't carry the login-wall bearer), so the ``f`` path token
+    is HMAC-signed — a forged/unsigned token is rejected. ``safe_resolve_art`` then
+    re-validates on every request that it maps to a real image file inside a
+    *currently enabled* source root (traversal/symlink escapes / disabled sources
+    all 404), exactly like /local_proxy for video."""
+    real_path = await run_in_threadpool(local_safe_resolve_art, f, s)
+    if not real_path:
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(
+        real_path,
+        media_type=local_art_media_type(real_path),
+        headers={"Cache-Control": "public, max-age=86400", "Access-Control-Allow-Origin": "*"},
+    )
 
 
 @router.get("/cache_proxy/{token}")

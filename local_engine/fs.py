@@ -20,10 +20,15 @@ crucially, one security model:
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
+import logging
 import os
 from typing import List, Optional
 
 from .db import LocalSourceStore
+
+logger = logging.getLogger("local_engine.fs")
 
 # The scraper emits ``crimson-local:{token}``; the resolver matches on this
 # keyword and serves it via one of two routes depending on the file + the source's
@@ -34,6 +39,11 @@ from .db import LocalSourceStore
 EMBED_MARKER = "crimson-local"
 PROXY_PREFIX = "/local_proxy"
 HLS_PREFIX = "/local_hls"
+# Poster / cover art discovered next to a title (Kodi/Jellyfin convention) is
+# served from here. Unlike the video proxies this route is PUBLIC (an <img> can't
+# carry the login-wall bearer), so each URL is HMAC-signed — see art_proxy_url /
+# verify_art_sig, mirroring the subtitles_proxy signing model.
+ART_PREFIX = "/local_art"
 
 # A browser ``<video>`` element can play these as-is, so the backend just
 # range-serves the bytes (the ``/local_proxy`` direct-play path).
@@ -56,7 +66,25 @@ _MEDIA_TYPES = {
     ".webm": "video/webm",
 }
 
+# Poster / cover / fanart images the library scanner surfaces from disk (served,
+# signed, via /local_art). Kept separate from the video extension sets above.
+ART_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+_ART_MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+}
+
 _store = LocalSourceStore()
+
+# Stable-within-process fallback secret for /local_art signatures when neither
+# PROXY_SECRET nor LOCAL_PROXY_SECRET is set (single-instance dev). Production /
+# multi-replica deploys MUST set PROXY_SECRET so a link minted by one replica
+# verifies on another — same requirement as the other signed proxies.
+_DEV_ART_SECRET: Optional[bytes] = None
 
 
 # --- config -----------------------------------------------------------------
@@ -89,6 +117,24 @@ def is_transcodable_path(path: str) -> bool:
 
 def media_type_for(path: str) -> str:
     return _MEDIA_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+def is_art_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in ART_EXTENSIONS
+
+
+def art_media_type_for(path: str) -> str:
+    return _ART_MEDIA_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+def source_label_for(real_path: str) -> Optional[str]:
+    """Human label of the enabled source root that contains ``real_path`` (already
+    resolved), or None. Lets the library surface which registered source a title
+    came from without a second DB read."""
+    for root in _store.enabled_roots_config():
+        if _within(real_path, root["path"]):
+            return root.get("label")
+    return None
 
 
 def _encoding_root_for(real_path: str) -> Optional[dict]:
@@ -163,6 +209,80 @@ def safe_resolve_transcode(token: str) -> Optional[str]:
     if not os.path.isfile(real) or not is_transcodable_path(real):
         return None
     return real if encoding_enabled_for(real) else None
+
+
+def safe_resolve_dir(token: str) -> Optional[str]:
+    """Map a library title token back to a real *directory* inside a currently
+    enabled source root, or None. The browsable-library counterpart of
+    :func:`safe_resolve`: the same per-request enabled-root + traversal/symlink
+    check, but for a folder (so ``/local-overview`` can list a title's episodes)."""
+    raw = decode_token(token)
+    if not raw:
+        return None
+    real = os.path.realpath(raw)
+    if not os.path.isdir(real):
+        return None
+    for root in _store.enabled_roots():
+        if _within(real, root):
+            return real
+    return None
+
+
+# --- signed local artwork (/local_art) --------------------------------------
+def _art_secret() -> bytes:
+    """Signing secret for /local_art URLs. Shared PROXY_SECRET first (so it's stable
+    across restarts + identical on every replica), then LOCAL_PROXY_SECRET, then a
+    random per-process fallback (single-instance dev only)."""
+    value = os.getenv("PROXY_SECRET") or os.getenv("LOCAL_PROXY_SECRET")
+    if value:
+        return value.encode("utf-8")
+    global _DEV_ART_SECRET
+    if _DEV_ART_SECRET is None:
+        logger.warning(
+            "PROXY_SECRET/LOCAL_PROXY_SECRET not set — using a random per-process "
+            "secret for /local_art signatures. Local poster links break on restart "
+            "and won't verify across replicas. Set PROXY_SECRET for production."
+        )
+        _DEV_ART_SECRET = os.urandom(32)
+    return _DEV_ART_SECRET
+
+
+def sign_art_token(token: str) -> str:
+    """HMAC signature (hex) for an art path token."""
+    return hmac.new(_art_secret(), token.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def verify_art_sig(token: str, sig: str) -> bool:
+    if not token or not sig:
+        return False
+    return hmac.compare_digest(sign_art_token(token), sig)
+
+
+def art_proxy_url(path: str) -> str:
+    """Signed same-origin ``/local_art`` URL for a local artwork file. The returned
+    path is relative (``/local_art?f=..&s=..``); callers absolutize it against the
+    backend base like the other proxy paths."""
+    token = encode_token(path)
+    return f"{ART_PREFIX}?f={token}&s={sign_art_token(token)}"
+
+
+def safe_resolve_art(token: str, sig: str) -> Optional[str]:
+    """Map a signed ``/local_art`` token back to a real image file inside a currently
+    enabled source root, or None. Public route, so the HMAC ``sig`` is what gates it
+    (an <img> can't send the login-wall bearer); the enabled-root + traversal checks
+    still apply, re-validated per request."""
+    if not verify_art_sig(token, sig):
+        return None
+    raw = decode_token(token)
+    if not raw:
+        return None
+    real = os.path.realpath(raw)
+    if not os.path.isfile(real) or not is_art_path(real):
+        return None
+    for root in _store.enabled_roots():
+        if _within(real, root):
+            return real
+    return None
 
 
 # --- admin dashboard helpers (read-only) ------------------------------------

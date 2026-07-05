@@ -419,6 +419,10 @@ _PUBLIC_PREFIXES = (
     # (see _register_overlay_stream_proxies), so this list names no overlay source.
     "/jellyfin_proxy",
     "/cache_proxy",
+    # Local poster/cover art loads cross-origin in an <img> with no auth header;
+    # it's HMAC-signed instead (see local_engine.fs.art_proxy_url / the /local_art
+    # route). The video bytes (/local_proxy, /local_hls) stay behind the login wall.
+    "/local_art",
     # The subtitle <track> loads cross-origin with no auth header (signed instead).
     "/subtitles_proxy",
     # The manga page <img> loads cross-origin with no auth header (signed instead) —

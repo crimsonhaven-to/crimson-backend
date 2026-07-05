@@ -33,8 +33,9 @@ class LocalSourceStore:
 
     # The enabled-roots config is read on every scrape AND every /local_proxy /
     # /local_hls request, so it's cached process-wide for a few seconds. Each cached
-    # entry is ``{"path", "encoding"}`` so callers can tell direct-play roots from
-    # transcode-enabled ones without a second query. Kept at class level so the cache
+    # entry is ``{"path", "encoding", "label"}`` so callers can tell direct-play roots
+    # from transcode-enabled ones (and name a file's source) without a second query.
+    # Kept at class level so the cache
     # is shared no matter which instance (scraper/resolver/route/admin) reads it; any
     # write invalidates it via _bump().
     _roots_cache: Optional[List[dict]] = None
@@ -91,9 +92,12 @@ class LocalSourceStore:
         try:
             with get_connection() as conn:
                 rows = conn.execute(
-                    "SELECT path, encoding FROM local_media_sources WHERE enabled = TRUE"
+                    "SELECT path, encoding, label FROM local_media_sources WHERE enabled = TRUE"
                 ).fetchall()
-            config = [{"path": r["path"], "encoding": bool(r["encoding"])} for r in rows]
+            config = [
+                {"path": r["path"], "encoding": bool(r["encoding"]), "label": r["label"]}
+                for r in rows
+            ]
         except Exception:
             # DB hiccup: serve the last known config rather than 500 a playback.
             config = cached or []
