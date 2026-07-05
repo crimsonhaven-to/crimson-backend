@@ -3,7 +3,7 @@
   "info": {
     "title": "Anime Streaming API",
     "description": "API for streaming anime with multi-season support",
-    "version": "15.9.0"
+    "version": "17.0.0"
   },
   "paths": {
     "/auth/challenge": {
@@ -1258,10 +1258,28 @@
                   "type": "null"
                 }
               ],
-              "description": "'movie' to target the movie namespace",
+              "description": "'movie'/'local' to target that namespace",
               "title": "Media Type"
             },
-            "description": "'movie' to target the movie namespace"
+            "description": "'movie'/'local' to target that namespace"
+          },
+          {
+            "name": "local_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "on-disk title token (media_type='local')",
+              "title": "Local Id"
+            },
+            "description": "on-disk title token (media_type='local')"
           },
           {
             "name": "authorization",
@@ -2613,7 +2631,7 @@
           "admin"
         ],
         "summary": "Update Local Source",
-        "description": "Toggle a source on/off or rename it (the path is immutable — delete + re-add).",
+        "description": "Toggle a source on/off, flip its encoding (transcoding) switch, or rename it\n(the path is immutable — delete + re-add).",
         "operationId": "update_local_source_admin_local_sources__source_id__patch",
         "parameters": [
           {
@@ -3252,6 +3270,424 @@
         }
       }
     },
+    "/admin/downloads": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Downloads Overview",
+        "description": "Downloader status for the dashboard: aria2 availability, config, aggregate\njob counts, and the download-enabled roots with their free space (the order the\ndownloader tries them).",
+        "operationId": "downloads_overview_admin_downloads_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Create Download",
+        "description": "Queue a download. Rejected up front when no local source is download-enabled\n(turn one on under Local Sources first) so the operator gets a clear error instead\nof a job that silently never lands anywhere.",
+        "operationId": "create_download_admin_downloads_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DownloadCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/download-jobs": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Download Jobs",
+        "operationId": "list_download_jobs_admin_download_jobs_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "pending / active / paused / complete / failed",
+              "title": "Status"
+            },
+            "description": "pending / active / paused / complete / failed"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/download-jobs/{job_id}/pause": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Pause Download",
+        "operationId": "pause_download_admin_download_jobs__job_id__pause_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/download-jobs/{job_id}/resume": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Resume Download",
+        "operationId": "resume_download_admin_download_jobs__job_id__resume_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/download-jobs/{job_id}/retry": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Retry Download",
+        "description": "Re-queue a failed (or stuck) download. Its staging dir is left in place so\naria2 resumes from the partial rather than starting over.",
+        "operationId": "retry_download_admin_download_jobs__job_id__retry_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/download-jobs/{job_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Delete Download",
+        "description": "Cancel + remove a download. Stops it in aria2 and deletes any in-progress\nstaging files; a *completed* download's published file under crimson-downloads is\nleft in place (delete it from the Local library if you want the space back).",
+        "operationId": "delete_download_admin_download_jobs__job_id__delete",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/kofi/webhook": {
       "post": {
         "tags": [
@@ -3714,6 +4150,347 @@
         }
       }
     },
+    "/search/manga": {
+      "get": {
+        "tags": [
+          "manga"
+        ],
+        "summary": "Search Manga",
+        "description": "Search manga by name via AniList (kind='manga', keyed by anilist_id).",
+        "operationId": "search_manga_search_manga_get",
+        "parameters": [
+          {
+            "name": "query_name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Manga name to search",
+              "title": "Query Name"
+            },
+            "description": "Manga name to search"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trending/manga": {
+      "get": {
+        "tags": [
+          "manga"
+        ],
+        "summary": "Trending Manga",
+        "description": "Trending manga via AniList.",
+        "operationId": "trending_manga_trending_manga_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "description": "Number of results to return",
+              "default": 12,
+              "title": "Limit"
+            },
+            "description": "Number of results to return"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/catalogue/manga": {
+      "get": {
+        "tags": [
+          "manga"
+        ],
+        "summary": "Catalogue Manga",
+        "description": "The Manga browse hub — one page of AniList MANGA, filterable by genre and\nsortable. Unlike /catalogue/shows|movies this is live + paginated (there is no\nlocal manga table), so the frontend appends pages via ``has_next``. ``genres``\nis AniList's shared genre vocabulary for the filter chips.",
+        "operationId": "catalogue_manga_catalogue_manga_get",
+        "parameters": [
+          {
+            "name": "genre",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional AniList genre filter, e.g. Action, Romance",
+              "title": "Genre"
+            },
+            "description": "Optional AniList genre filter, e.g. Action, Romance"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "trending | popular | score | newest | title",
+              "default": "trending",
+              "title": "Sort"
+            },
+            "description": "trending | popular | score | newest | title"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "description": "1-based page for the browse hub",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "1-based page for the browse hub"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/manga-overview/{anilist_id}": {
+      "get": {
+        "tags": [
+          "manga"
+        ],
+        "summary": "Manga Overview",
+        "description": "AniList manga metadata plus — when a server-side provider is present — the\nmapped chapter list. In a base build ``chapters`` is empty (``mapped`` false) and\nthe client resolves the chapter list itself from ``candidate_titles`` +\n``content_rating`` + ``language`` (all returned here), so the page always renders.",
+        "operationId": "manga_overview_manga_overview__anilist_id__get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Anilist Id"
+            }
+          },
+          {
+            "name": "language",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Preferred chapter language (default: server default)",
+              "title": "Language"
+            },
+            "description": "Preferred chapter language (default: server default)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/read/{anilist_id}/{chapter_id}": {
+      "get": {
+        "tags": [
+          "manga"
+        ],
+        "summary": "Read Chapter",
+        "description": "Ordered page images for one chapter, when a server-side provider is present.\nIn a base build there is no provider, so this reports 404 and the client resolves\nthe pages itself (raw image URLs an ``<img>`` loads directly — no proxy needed).",
+        "operationId": "read_chapter_read__anilist_id___chapter_id__get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Anilist Id"
+            }
+          },
+          {
+            "name": "chapter_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Chapter Id"
+            }
+          },
+          {
+            "name": "data_saver",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Serve smaller data-saver images",
+              "default": false,
+              "title": "Data Saver"
+            },
+            "description": "Serve smaller data-saver images"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/manga_proxy": {
+      "get": {
+        "tags": [
+          "manga"
+        ],
+        "summary": "Manga Proxy",
+        "description": "Relay one page image same-origin. Only functional in a provider (operator)\nbuild — the provider owns the HMAC verification AND host allow-list, so it can't\nbe turned into an open proxy. Dormant (503) in a base build, where page images are\nserved to the browser as raw upstream URLs instead.",
+        "operationId": "manga_proxy_manga_proxy_get",
+        "parameters": [
+          {
+            "name": "u",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Upstream page-image URL (HMAC-signed)",
+              "title": "U"
+            },
+            "description": "Upstream page-image URL (HMAC-signed)"
+          },
+          {
+            "name": "s",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "signature",
+              "title": "S"
+            },
+            "description": "signature"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/": {
       "get": {
         "summary": "Root",
@@ -3736,6 +4513,40 @@
         "summary": "Lumi Blessing",
         "description": "A little shrine to the empress. Returns a random royal blessing — used by\nthe frontend's Konami-code secret page and anyone curious enough to find it.\nPublic (whitelisted on the login wall) so Lumi greets even the uninvited.",
         "operationId": "lumi_blessing_lumi_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/config": {
+      "get": {
+        "summary": "Public Config",
+        "description": "Public, unauthenticated feature flags the frontend needs *before* login.\n\nNotably ``demo_mode``: on a demo deployment the login page drops the invite-code\nrequirement (signup is open) and can show a \"data resets nightly\" hint. Booleans\nonly — no secrets, counts, or paths leak through this (it's reachable without a\nsession, whitelisted in _PUBLIC_EXACT).",
+        "operationId": "public_config_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health Check",
+        "description": "Health check endpoint",
+        "operationId": "health_check_health_get",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -4065,20 +4876,29 @@
         }
       }
     },
-    "/show/{tmdb_id}": {
+    "/catalogue/shows": {
       "get": {
-        "summary": "Get Show Details",
-        "description": "Returns show info + every TMDB season (playable via the TMDB-keyed sources), AniList-mapped where known.",
-        "operationId": "get_show_details_show__tmdb_id__get",
+        "summary": "Get Shows Catalogue",
+        "description": "Full non-anime TV-show catalogue for the Shows browse hub (local DB only).\n\nItems are ``kind: 'show'`` poster cards keyed by tmdb_id, ordered popular-first.\n``genres`` always reflects the whole catalogue; ``shows`` is filtered by\n``genre`` when given. Gzip-compressed when the client accepts it.",
+        "operationId": "get_shows_catalogue_catalogue_shows_get",
         "parameters": [
           {
-            "name": "tmdb_id",
-            "in": "path",
-            "required": true,
+            "name": "genre",
+            "in": "query",
+            "required": false,
             "schema": {
-              "type": "integer",
-              "title": "Tmdb Id"
-            }
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional genre filter, e.g. Drama, Comedy, Crime",
+              "title": "Genre"
+            },
+            "description": "Optional genre filter, e.g. Drama, Comedy, Crime"
           }
         ],
         "responses": {
@@ -4103,29 +4923,29 @@
         }
       }
     },
-    "/season/{tmdb_id}/{season_number}": {
+    "/catalogue/movies": {
       "get": {
-        "summary": "Get Season Details",
-        "description": "Combined TMDB season metadata + AniList metadata (AniList optional).",
-        "operationId": "get_season_details_season__tmdb_id___season_number__get",
+        "summary": "Get Movies Catalogue",
+        "description": "Full general-movie catalogue for the Movies browse hub (local DB only).\n\nItems are ``kind: 'movie'`` poster cards keyed by tmdb_id (carrying\n``vote_average``), ordered popular-first. Genre facet + filter as /catalogue/shows.",
+        "operationId": "get_movies_catalogue_catalogue_movies_get",
         "parameters": [
           {
-            "name": "tmdb_id",
-            "in": "path",
-            "required": true,
+            "name": "genre",
+            "in": "query",
+            "required": false,
             "schema": {
-              "type": "integer",
-              "title": "Tmdb Id"
-            }
-          },
-          {
-            "name": "season_number",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Season Number"
-            }
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional genre filter, e.g. Action, Drama, Horror",
+              "title": "Genre"
+            },
+            "description": "Optional genre filter, e.g. Action, Drama, Horror"
           }
         ],
         "responses": {
@@ -4244,91 +5064,6 @@
         }
       }
     },
-    "/scrape-meta/{tmdb_id}/{season_number}": {
-      "get": {
-        "summary": "Get Scrape Meta",
-        "description": "The title bundle the *client-side* discovery sources need to search the\ntarget sites (New System, Phase 1.5).\n\nThe TS engine running in the viewer's browser (crimson-sources) resolves\nTMDB-keyed sources off the id alone, but the title-matching discovery sources\n(aniworld / s.to / stomirror / aniwatch / AnimeSuge) search by title — and the\nGerman broadcast synonyms come from TMDB /translations, which needs the\nserver-held TMDB key (a C5 secret that must never ship to the browser). So the\nclient fetches this grant and merges it into its MediaCtx, keeping title\nmatching byte-identical to the backend scrapers without leaking the key.\n\nReturns exactly the fields the backend's own ``media_ctx`` carries (see\n``stream_watch_response``): primary title, the AniList title variants, and the\nsynonym list (AniList synonyms + German titles). Login-gated like ``/watch``,\nso anonymous users can't use it as a free metadata service.",
-        "operationId": "get_scrape_meta_scrape_meta__tmdb_id___season_number__get",
-        "parameters": [
-          {
-            "name": "tmdb_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Tmdb Id"
-            }
-          },
-          {
-            "name": "season_number",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Season Number"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/scrape-meta/movie/{tmdb_id}": {
-      "get": {
-        "summary": "Get Scrape Meta Movie",
-        "description": "Movie twin of /scrape-meta — the title + release year + IMDb id the\ntitle/IMDb-keyed client sources (hdrezka/lookmovie/insertunit) need to match a\nmovie. The TMDB key stays server-side (C5). Login-gated like /watch.",
-        "operationId": "get_scrape_meta_movie_scrape_meta_movie__tmdb_id__get",
-        "parameters": [
-          {
-            "name": "tmdb_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Tmdb Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/sign": {
       "post": {
         "summary": "Sign Proxy Links",
@@ -4349,7 +5084,7 @@
     "/resolve": {
       "post": {
         "summary": "Resolve Grant",
-        "description": "Server-side resolve grant for cookie/secret-bound sources (New System).\n\nBody is the client's MediaCtx + a ``source`` key:\n``{source, tmdbId, mediaType, season, episode, title, titleEnglish,\ntitleRomaji, titleNative, synonyms}``. Returns\n``{ok, streams:[{label, streamType, url, headers, subtitles, language}]}`` with\n**raw** CDN URLs — the client engine handles the actual byte delivery.\n\n503 when the requested source isn't configured (e.g. FEBBOX_UI_TOKEN unset);\nthe client then keeps using the backend /watch line for it.",
+        "description": "Server-side resolve grant for cookie/secret-bound sources (New System).\n\nBody is the client's MediaCtx + a ``source`` key:\n``{source, tmdbId, mediaType, season, episode, title, titleEnglish,\ntitleRomaji, titleNative, synonyms}``. Returns\n``{ok, streams:[{label, streamType, url, headers, subtitles, language}]}`` with\n**raw** CDN URLs — the client engine handles the actual byte delivery.\n\n503 when the requested source isn't configured;\nthe client then keeps using the backend /watch line for it.",
         "operationId": "resolve_grant_resolve_post",
         "responses": {
           "200": {
@@ -4491,6 +5226,233 @@
         }
       }
     },
+    "/watch/{anilist_id}/{episode_number}": {
+      "get": {
+        "summary": "Deprecated Watch",
+        "description": "Watch by anilist_id. TV seasons redirect to the canonical /watch route;\nextras (specials/OVAs/movies) have no TMDB season number, so they are served\ndirectly here.",
+        "operationId": "deprecated_watch_watch__anilist_id___episode_number__get",
+        "parameters": [
+          {
+            "name": "anilist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Anilist Id"
+            }
+          },
+          {
+            "name": "episode_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Episode Number"
+            }
+          },
+          {
+            "name": "season_part",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "title": "Season Part"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/show/{tmdb_id}": {
+      "get": {
+        "summary": "Get Show Details",
+        "description": "Returns show info + every TMDB season (playable via the TMDB-keyed sources), AniList-mapped where known.",
+        "operationId": "get_show_details_show__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/season/{tmdb_id}/{season_number}": {
+      "get": {
+        "summary": "Get Season Details",
+        "description": "Combined TMDB season metadata + AniList metadata (AniList optional).",
+        "operationId": "get_season_details_season__tmdb_id___season_number__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "season_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Season Number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scrape-meta/{tmdb_id}/{season_number}": {
+      "get": {
+        "summary": "Get Scrape Meta",
+        "description": "The title bundle the *client-side* discovery sources need to search the\ntarget sites (New System, Phase 1.5).\n\nThe TS engine running in the viewer's browser (crimson-sources) resolves\nTMDB-keyed sources off the id alone, but the title-matching discovery sources\n(aniworld / s.to / stomirror / aniwatch / AnimeSuge) search by title — and the\nGerman broadcast synonyms come from TMDB /translations, which needs the\nserver-held TMDB key (a C5 secret that must never ship to the browser). So the\nclient fetches this grant and merges it into its MediaCtx, keeping title\nmatching byte-identical to the backend scrapers without leaking the key.\n\nReturns exactly the fields the backend's own ``media_ctx`` carries (see\n``stream_watch_response``): primary title, the AniList title variants, and the\nsynonym list (AniList synonyms + German titles). Login-gated like ``/watch``,\nso anonymous users can't use it as a free metadata service.",
+        "operationId": "get_scrape_meta_scrape_meta__tmdb_id___season_number__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          },
+          {
+            "name": "season_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Season Number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scrape-meta/movie/{tmdb_id}": {
+      "get": {
+        "summary": "Get Scrape Meta Movie",
+        "description": "Movie twin of /scrape-meta — the title + release year + IMDb id the\ntitle/IMDb-keyed client sources (hdrezka/lookmovie/insertunit) need to match a\nmovie. The TMDB key stays server-side (C5). Login-gated like /watch.",
+        "operationId": "get_scrape_meta_movie_scrape_meta_movie__tmdb_id__get",
+        "parameters": [
+          {
+            "name": "tmdb_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/anilist/{anilist_id}": {
       "get": {
         "summary": "Get Anilist Mapping",
@@ -4556,277 +5518,6 @@
               "title": "Season"
             },
             "description": "TMDB season number"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/watch/{anilist_id}/{episode_number}": {
-      "get": {
-        "summary": "Deprecated Watch",
-        "description": "Watch by anilist_id. TV seasons redirect to the canonical /watch route;\nextras (specials/OVAs/movies) have no TMDB season number, so they are served\ndirectly here.",
-        "operationId": "deprecated_watch_watch__anilist_id___episode_number__get",
-        "parameters": [
-          {
-            "name": "anilist_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Anilist Id"
-            }
-          },
-          {
-            "name": "episode_number",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Episode Number"
-            }
-          },
-          {
-            "name": "season_part",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 1,
-              "title": "Season Part"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/jellyfin_proxy/{path}": {
-      "get": {
-        "summary": "Jellyfin Proxy",
-        "description": "Authenticated reverse proxy to the user's Jellyfin server. Injects the\naccess token server-side (so it never reaches the browser) and rewrites HLS\nplaylists to flow back through this proxy; media segments / direct files are\nstreamed straight through with Range passthrough. Configured via the\nJELLYFIN_* env vars (see resolvers.jellyfin).",
-        "operationId": "jellyfin_proxy_jellyfin_proxy__path__get",
-        "parameters": [
-          {
-            "name": "path",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Path"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "summary": "Jellyfin Proxy",
-        "description": "Authenticated reverse proxy to the user's Jellyfin server. Injects the\naccess token server-side (so it never reaches the browser) and rewrites HLS\nplaylists to flow back through this proxy; media segments / direct files are\nstreamed straight through with Range passthrough. Configured via the\nJELLYFIN_* env vars (see resolvers.jellyfin).",
-        "operationId": "jellyfin_proxy_jellyfin_proxy__path__get",
-        "parameters": [
-          {
-            "name": "path",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Path"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/local_proxy/{token}": {
-      "get": {
-        "summary": "Local Proxy",
-        "description": "Stream a browser-playable file from an admin-registered local source.\n\n``token`` is an opaque base64url of the absolute path the LocalScraper found.\n``safe_resolve`` maps it back to a real file ONLY when it currently lives\ninside an *enabled* source root (path traversal / symlink escapes / disabled\nsources all resolve to None → 404), re-checked on every request. Starlette's\nFileResponse handles HTTP Range requests, so the player can seek.",
-        "operationId": "local_proxy_local_proxy__token__get",
-        "parameters": [
-          {
-            "name": "token",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Token"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/cache_proxy/{token}": {
-      "get": {
-        "summary": "Cache Proxy",
-        "description": "Stream a server-side-cached episode straight off the NAS.\n\n``token`` is an opaque base64url of the cached file's absolute path.\n``cache_safe_resolve`` maps it back to a real file ONLY when it currently\nlives inside an *enabled* cache target (traversal/symlink escapes / disabled\ntargets all 404), re-checked per request. FileResponse handles Range so the\nplayer can seek. Mirrors /local_proxy.",
-        "operationId": "cache_proxy_cache_proxy__token__get",
-        "parameters": [
-          {
-            "name": "token",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Token"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/player": {
-      "get": {
-        "summary": "Player",
-        "description": "Serve a Crimson-themed player for a same-origin proxied stream. Resolvers\nthat return a raw hls/mp4 stream (e.g. Jellyfin) wrap it in this page so the\nfrontend can iframe it like any other source. ``src`` is restricted to\nsame-origin relative paths to prevent embedding arbitrary external content.",
-        "operationId": "player_player_get",
-        "parameters": [
-          {
-            "name": "src",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Same-origin stream path to play",
-              "title": "Src"
-            },
-            "description": "Same-origin stream path to play"
-          },
-          {
-            "name": "type",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "description": "hls or mp4 (inferred if omitted)",
-              "default": "",
-              "title": "Type"
-            },
-            "description": "hls or mp4 (inferred if omitted)"
-          },
-          {
-            "name": "title",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "description": "Optional title",
-              "default": "",
-              "title": "Title"
-            },
-            "description": "Optional title"
           }
         ],
         "responses": {
@@ -5003,17 +5694,509 @@
         }
       }
     },
-    "/health": {
+    "/jellyfin_proxy/{path}": {
       "get": {
-        "summary": "Health Check",
-        "description": "Health check endpoint",
-        "operationId": "health_check_health_get",
+        "summary": "Jellyfin Proxy",
+        "description": "Authenticated reverse proxy to the user's Jellyfin server. Injects the\naccess token server-side (so it never reaches the browser) and rewrites HLS\nplaylists to flow back through this proxy; media segments / direct files are\nstreamed straight through with Range passthrough. Configured via the\nJELLYFIN_* env vars (see resolvers.jellyfin).",
+        "operationId": "jellyfin_proxy_jellyfin_proxy__path__get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Jellyfin Proxy",
+        "description": "Authenticated reverse proxy to the user's Jellyfin server. Injects the\naccess token server-side (so it never reaches the browser) and rewrites HLS\nplaylists to flow back through this proxy; media segments / direct files are\nstreamed straight through with Range passthrough. Configured via the\nJELLYFIN_* env vars (see resolvers.jellyfin).",
+        "operationId": "jellyfin_proxy_jellyfin_proxy__path__get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/local_proxy/{token}": {
+      "get": {
+        "summary": "Local Proxy",
+        "description": "Stream a browser-playable file from an admin-registered local source.\n\n``token`` is an opaque base64url of the absolute path the LocalScraper found.\n``safe_resolve`` maps it back to a real file ONLY when it currently lives\ninside an *enabled* source root (path traversal / symlink escapes / disabled\nsources all resolve to None → 404), re-checked on every request. Starlette's\nFileResponse handles HTTP Range requests, so the player can seek.",
+        "operationId": "local_proxy_local_proxy__token__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/local_hls/{token}/{resource}": {
+      "get": {
+        "summary": "Local Hls",
+        "description": "On-the-fly HLS for a transcodable Local file (mkv/avi/ts/…) whose source has\nencoding enabled — the non-direct-play counterpart of /local_proxy.\n\n``resource`` is either the VOD playlist (``master.m3u8``/``media.m3u8``) or a\nsegment (``seg{n}.ts``). ``safe_resolve_transcode`` re-validates on EVERY request\nthat the token maps to a transcodable file inside a *currently enabled* source\nroot with **encoding on** — so disabling the source (or just its encoding) instantly\n404s its transcode streams, exactly like /local_proxy for direct play. Gated by the\nlogin wall (NOT a public prefix), so the player must carry the session token; the\nbytes never leave this host's library unauthenticated.",
+        "operationId": "local_hls_local_hls__token___resource__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          },
+          {
+            "name": "resource",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Resource"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/local_art": {
+      "get": {
+        "summary": "Local Art",
+        "description": "Serve a poster/cover image discovered next to a local title.\n\nPUBLIC (an ``<img>`` can't carry the login-wall bearer), so the ``f`` path token\nis HMAC-signed — a forged/unsigned token is rejected. ``safe_resolve_art`` then\nre-validates on every request that it maps to a real image file inside a\n*currently enabled* source root (traversal/symlink escapes / disabled sources\nall 404), exactly like /local_proxy for video.",
+        "operationId": "local_art_local_art_get",
+        "parameters": [
+          {
+            "name": "f",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "base64url path token of a local artwork file",
+              "title": "F"
+            },
+            "description": "base64url path token of a local artwork file"
+          },
+          {
+            "name": "s",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "HMAC signature",
+              "title": "S"
+            },
+            "description": "HMAC signature"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cache_proxy/{token}": {
+      "get": {
+        "summary": "Cache Proxy",
+        "description": "Stream a server-side-cached episode straight off the NAS.\n\n``token`` is an opaque base64url of the cached file's absolute path.\n``cache_safe_resolve`` maps it back to a real file ONLY when it currently\nlives inside an *enabled* cache target (traversal/symlink escapes / disabled\ntargets all 404), re-checked per request. FileResponse handles Range so the\nplayer can seek. Mirrors /local_proxy.",
+        "operationId": "cache_proxy_cache_proxy__token__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/player": {
+      "get": {
+        "summary": "Player",
+        "description": "Serve a Crimson-themed player for a same-origin proxied stream. Resolvers\nthat return a raw hls/mp4 stream (e.g. Jellyfin) wrap it in this page so the\nfrontend can iframe it like any other source. ``src`` is restricted to\nsame-origin relative paths to prevent embedding arbitrary external content.",
+        "operationId": "player_player_get",
+        "parameters": [
+          {
+            "name": "src",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Same-origin stream path to play",
+              "title": "Src"
+            },
+            "description": "Same-origin stream path to play"
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "hls or mp4 (inferred if omitted)",
+              "default": "",
+              "title": "Type"
+            },
+            "description": "hls or mp4 (inferred if omitted)"
+          },
+          {
+            "name": "title",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Optional title",
+              "default": "",
+              "title": "Title"
+            },
+            "description": "Optional title"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/local-library": {
+      "get": {
+        "summary": "Get Local Library",
+        "description": "Browsable list of local titles for the Index's \"Local\" view. Gzip-compressed\nwhen the client accepts it; ``enabled: false`` when no local source is on.",
+        "operationId": "get_local_library_local_library_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/local-overview/{token}": {
+      "get": {
+        "summary": "Get Local Overview",
+        "description": "One local title's detail: metadata + episodes (show) or a play descriptor\n(movie). 404 when the token doesn't resolve inside a currently enabled root.",
+        "operationId": "get_local_overview_local_overview__token__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/local-browse": {
+      "get": {
+        "summary": "Get Local Browse",
+        "description": "Folder-navigation view of the local library: the immediate children of one\ndirectory (or the enabled source roots when ``token`` is omitted). ``title``\nentries carry the same poster/metadata shape as the list — with cached TMDB\nenrichment overlaid so identified folders show a real tile — while ``folder`` and\n``file`` entries are the raw-filesystem fallback for media that never resolved to a\ntitle. 404 when ``token`` doesn't resolve inside a currently enabled root.",
+        "operationId": "get_local_browse_local_browse_get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Directory token; omit for the source-root level",
+              "title": "Token"
+            },
+            "description": "Directory token; omit for the source-root level"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/search/local": {
+      "get": {
+        "summary": "Search Local",
+        "description": "Search the local library by title/filename. Shaped like the other /search/*\nsurfaces: ``suggestions`` tagged ``kind: \"local\"`` so the unified search can\nroute a hit to the local overview. Empty (not an error) when disabled.",
+        "operationId": "search_local_search_local_get",
+        "parameters": [
+          {
+            "name": "query_name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Local title/filename to search",
+              "title": "Query Name"
+            },
+            "description": "Local title/filename to search"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/watch-local/{token}": {
+      "get": {
+        "summary": "Watch Local",
+        "description": "Streaming link(s) for one local file as the same progressive NDJSON the TMDB\n/watch routes emit — so the player reuses the identical source pipeline. Emits a\n``meta`` line, at most one ``stream`` line (the local file), then ``done``.",
+        "operationId": "watch_local_watch_local__token__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          },
+          {
+            "name": "title",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Title"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -5201,6 +6384,34 @@
           "expires_at"
         ],
         "title": "ChallengeResponse"
+      },
+      "DownloadCreate": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "maxLength": 8000,
+            "minLength": 1,
+            "title": "Url",
+            "description": "An http(s) URL or a magnet: link"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 180
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "DownloadCreate"
       },
       "EmailLoginRequest": {
         "properties": {
@@ -5412,6 +6623,16 @@
             "maxLength": 1000,
             "minLength": 1,
             "title": "Path"
+          },
+          "encoding": {
+            "type": "boolean",
+            "title": "Encoding",
+            "default": false
+          },
+          "download_enabled": {
+            "type": "boolean",
+            "title": "Download Enabled",
+            "default": false
           }
         },
         "type": "object",
@@ -5446,6 +6667,28 @@
               }
             ],
             "title": "Enabled"
+          },
+          "encoding": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Encoding"
+          },
+          "download_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Enabled"
           }
         },
         "type": "object",
@@ -5585,6 +6828,17 @@
               }
             ],
             "title": "Media Type"
+          },
+          "local_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Local Id"
           }
         },
         "type": "object",

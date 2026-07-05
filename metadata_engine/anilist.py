@@ -7,12 +7,17 @@ AniList fetch without branching.
 """
 
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 import httpx
 
 from core.config import Config
-from core.response_cache import get_cached_response, set_cached_response
+from core.response_cache import (
+    _local_get,
+    _local_set,
+    get_cached_response,
+    set_cached_response,
+)
 
 logger = logging.getLogger("crimson.anilist")
 
@@ -312,3 +317,115 @@ async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> li
     except Exception as e:
         logger.error(f"Error fetching trending manga from AniList: {e}")
         return []
+
+
+# --- Manga browse hub (live AniList; no DB table, so this cannot be local) ----
+# The manga twin of /catalogue/shows|movies, but paginated + live: there is no
+# manga table (see manga_engine docstring), so a genre/sort browse must hit
+# AniList directly. Cached per (genre, sort, page) in the response cache like
+# fetch_trending_manga. The frontend Manga hub drives page/sort/genre and appends
+# pages ("load more"), since the full corpus is far too large to ship at once.
+
+# Friendly sort token -> AniList MediaSort enum. Trending is the default browse
+# order (matches the trending row); the rest give the hub its sort control.
+_MANGA_SORTS = {
+    "trending": "TRENDING_DESC",
+    "popular": "POPULARITY_DESC",
+    "score": "SCORE_DESC",
+    "newest": "START_DATE_DESC",
+    "title": "TITLE_ROMAJI",
+}
+MANGA_DEFAULT_SORT = "trending"
+
+
+async def fetch_manga_genres(client: httpx.AsyncClient) -> list:
+    """AniList's genre vocabulary (shared anime/manga) for the Manga hub's filter
+    chips. Tiny and very stable, so cached aggressively (L1 + response cache)."""
+    cache_key = "anilist:genres"
+    local = _local_get(cache_key)
+    if local is not None:
+        return local
+    cached = await get_cached_response(cache_key)
+    if cached and "genres" in cached:
+        _local_set(cache_key, cached["genres"])
+        return cached["genres"]
+    query = "query { GenreCollection }"
+    try:
+        response = await client.post(
+            "https://graphql.anilist.co", json={"query": query},
+            timeout=Config.REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            return []
+        genres = (response.json().get("data") or {}).get("GenreCollection") or []
+        if genres:
+            await set_cached_response(cache_key, {"genres": genres}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+            _local_set(cache_key, genres)
+        return genres
+    except Exception as e:
+        logger.error(f"Error fetching AniList genres: {e}")
+        return []
+
+
+async def fetch_manga_catalogue(
+    client: httpx.AsyncClient,
+    genre: Optional[str] = None,
+    sort: str = MANGA_DEFAULT_SORT,
+    page: int = 1,
+    per_page: int = 30,
+) -> Dict:
+    """One page of the manga browse hub — AniList ``Page.media(type: MANGA)`` with
+    an optional ``genre_in`` filter and a friendly ``sort`` token. Returns
+    ``{items, page, has_next, total}``; ``items`` are _manga_item poster cards.
+    Cached per (genre, sort, page)."""
+    sort_enum = _MANGA_SORTS.get(sort, _MANGA_SORTS[MANGA_DEFAULT_SORT])
+    page = max(1, page)
+    genre_key = (genre or "").casefold()
+    cache_key = f"anilist:manga:browse:{genre_key}:{sort_enum}:{page}:{per_page}"
+    cached_data = await get_cached_response(cache_key)
+    if cached_data:
+        return cached_data
+
+    graphql = """
+    query ($page: Int, $perPage: Int, $sort: [MediaSort], $genre: String) {
+      Page (page: $page, perPage: $perPage) {
+        pageInfo { hasNextPage total currentPage lastPage }
+        media (type: MANGA, isAdult: false, sort: $sort, genre: $genre) {
+          id
+          title { romaji english native }
+          coverImage { large extraLarge }
+          startDate { year }
+          averageScore
+        }
+      }
+    }
+    """
+    variables = {"page": page, "perPage": per_page, "sort": [sort_enum]}
+    if genre:
+        variables["genre"] = genre
+    try:
+        response = await client.post(
+            "https://graphql.anilist.co",
+            json={"query": graphql, "variables": variables},
+            timeout=Config.REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            logger.error(f"AniList manga browse error: Status {response.status_code}")
+            return {"items": [], "page": page, "has_next": False, "total": 0}
+        page_data = ((response.json().get("data") or {}).get("Page") or {})
+        info = page_data.get("pageInfo") or {}
+        media = page_data.get("media") or []
+        result = {
+            "items": [_manga_item(m) for m in media if m.get("id")],
+            "page": info.get("currentPage") or page,
+            "has_next": bool(info.get("hasNextPage")),
+            "total": info.get("total") or 0,
+        }
+        if result["items"]:
+            await set_cached_response(
+                cache_key, result, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS
+            )
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching manga catalogue from AniList: {e}")
+        return {"items": [], "page": page, "has_next": False, "total": 0}

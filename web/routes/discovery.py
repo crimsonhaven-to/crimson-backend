@@ -31,7 +31,11 @@ from metadata_engine.tmdb import (
     fetch_trending_movies,
 )
 
-from web.queries import get_catalogue_items
+from web.queries import (
+    get_catalogue_items,
+    get_movies_catalogue_items,
+    get_shows_catalogue_items,
+)
 from web.serialization import _gzip_json, _gzip_response, _json_gzip_bodies
 
 logger = logging.getLogger("crimson.discovery")
@@ -248,3 +252,109 @@ async def get_catalogue(
         "genres": derived["genres"],
         "animes": animes,
     })
+
+
+# --- Non-anime catalogues (shows / movies), served from the local TMDB tables ---
+# The show/movie twins of /catalogue: a full browse list built entirely from the
+# local tmdb_shows / tmdb_movies tables (no live TMDB), with a genre facet the
+# frontend renders as filter chips. Same three-cache + gzip treatment as
+# /catalogue; genres always reflect the WHOLE catalogue so every chip renders,
+# while the list is filtered when a ?genre= is given. Kept generic because shows
+# and movies differ only in table/list-key (movies additionally carry
+# vote_average, already baked into the item by the builder).
+
+async def _serve_local_catalogue(request, *, cache_prefix, builder, list_key, genre):
+    """Shared /catalogue-style responder for a locally-built poster-card list.
+
+    ``builder`` is the sync DB reader (run in a threadpool). ``list_key`` names
+    the item array in the JSON body (``shows`` / ``movies``). The unfiltered body
+    is serialized + gzipped once per cache window and the bytes reused; a
+    ``genre`` filter is computed on demand. Mirrors get_catalogue's cache layout.
+    """
+    items_key = f"{cache_prefix}:v1"
+    derived_key = f"{cache_prefix}:v1:derived"
+    body_key = f"{cache_prefix}:v1:body"
+
+    items = _local_get(items_key)
+    derived = _local_get(derived_key)
+    if items is None or derived is None:
+        if items is None:
+            cached = await get_cached_response(items_key)
+            if cached and "items" in cached:
+                items = cached["items"]
+            else:
+                loop = asyncio.get_event_loop()
+                items = await loop.run_in_executor(None, builder)
+                if items:
+                    await set_cached_response(items_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+            items = items or []
+            _local_set(items_key, items)
+
+        # Genre breakdown over the FULL catalogue (before any filtering), memoized
+        # like the anime catalogue's — shows/movies have no format "category" axis.
+        genre_counts: Dict[str, int] = {}
+        for it in items:
+            for g in it.get("genres") or []:
+                genre_counts[g] = genre_counts.get(g, 0) + 1
+        derived = {"genres": [{"genre": k, "count": v} for k, v in sorted(genre_counts.items())]}
+        _local_set(derived_key, derived)
+        _local_cache.pop(body_key, None)
+
+    if not genre:
+        bodies = _local_get(body_key)
+        if bodies is None:
+            bodies = _json_gzip_bodies({
+                "success": True,
+                "count": len(items),
+                "total": len(items),
+                "genres": derived["genres"],
+                list_key: items,
+            })
+            _local_set(body_key, bodies)
+        return _gzip_response(request, bodies)
+
+    wanted_g = genre.strip().casefold()
+    filtered = [
+        it for it in items
+        if any(g.casefold() == wanted_g for g in (it.get("genres") or []))
+    ]
+    return _gzip_json(request, {
+        "success": True,
+        "count": len(filtered),
+        "total": len(items),
+        "genres": derived["genres"],
+        list_key: filtered,
+    })
+
+
+@router.get("/catalogue/shows")
+async def get_shows_catalogue(
+    request: Request,
+    genre: Optional[str] = Query(None, description="Optional genre filter, e.g. Drama, Comedy, Crime"),
+):
+    """Full non-anime TV-show catalogue for the Shows browse hub (local DB only).
+
+    Items are ``kind: 'show'`` poster cards keyed by tmdb_id, ordered popular-first.
+    ``genres`` always reflects the whole catalogue; ``shows`` is filtered by
+    ``genre`` when given. Gzip-compressed when the client accepts it.
+    """
+    return await _serve_local_catalogue(
+        request, cache_prefix="catalogue:shows", builder=get_shows_catalogue_items,
+        list_key="shows", genre=genre,
+    )
+
+
+@router.get("/catalogue/movies")
+async def get_movies_catalogue(
+    request: Request,
+    genre: Optional[str] = Query(None, description="Optional genre filter, e.g. Action, Drama, Horror"),
+):
+    """Full general-movie catalogue for the Movies browse hub (local DB only).
+
+    Items are ``kind: 'movie'`` poster cards keyed by tmdb_id (carrying
+    ``vote_average``), ordered popular-first. Genre facet + filter as /catalogue/shows.
+    """
+    return await _serve_local_catalogue(
+        request, cache_prefix="catalogue:movies", builder=get_movies_catalogue_items,
+        list_key="movies", genre=genre,
+    )

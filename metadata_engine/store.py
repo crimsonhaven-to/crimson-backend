@@ -59,13 +59,14 @@ def upsert_show_info(show: Dict) -> None:
             with get_connection() as conn:
                 conn.execute("""
                     INSERT INTO tmdb_shows
-                        (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date, genres, last_updated)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        (tmdb_id, title, overview, poster_path, backdrop_path, first_air_date, genres, popularity, last_updated)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (tmdb_id) DO UPDATE SET
                         title=EXCLUDED.title, overview=EXCLUDED.overview,
                         poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
                         first_air_date=EXCLUDED.first_air_date,
                         genres=COALESCE(EXCLUDED.genres, tmdb_shows.genres),
+                        popularity=COALESCE(EXCLUDED.popularity, tmdb_shows.popularity),
                         last_updated=CURRENT_TIMESTAMP
                 """, (
                     show.get("tmdb_id"),
@@ -75,6 +76,7 @@ def upsert_show_info(show: Dict) -> None:
                     show.get("backdrop_path"),
                     show.get("first_air_date"),
                     genres_json,
+                    show.get("popularity"),
                 ))
         _write()
     except Exception as e:
@@ -99,8 +101,8 @@ def upsert_movie_info(movie: Dict) -> None:
                 conn.execute("""
                     INSERT INTO tmdb_movies
                         (tmdb_id, title, overview, poster_path, backdrop_path, release_date,
-                         genres, runtime, vote_average, status, original_title, last_updated)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                         genres, runtime, vote_average, popularity, status, original_title, last_updated)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (tmdb_id) DO UPDATE SET
                         title=EXCLUDED.title, overview=EXCLUDED.overview,
                         poster_path=EXCLUDED.poster_path, backdrop_path=EXCLUDED.backdrop_path,
@@ -108,6 +110,7 @@ def upsert_movie_info(movie: Dict) -> None:
                         genres=COALESCE(EXCLUDED.genres, tmdb_movies.genres),
                         runtime=COALESCE(EXCLUDED.runtime, tmdb_movies.runtime),
                         vote_average=COALESCE(EXCLUDED.vote_average, tmdb_movies.vote_average),
+                        popularity=COALESCE(EXCLUDED.popularity, tmdb_movies.popularity),
                         status=COALESCE(EXCLUDED.status, tmdb_movies.status),
                         original_title=COALESCE(EXCLUDED.original_title, tmdb_movies.original_title),
                         last_updated=CURRENT_TIMESTAMP
@@ -121,6 +124,7 @@ def upsert_movie_info(movie: Dict) -> None:
                     genres_json,
                     movie.get("runtime"),
                     movie.get("vote_average"),
+                    movie.get("popularity"),
                     movie.get("status"),
                     movie.get("original_title"),
                 ))
@@ -148,6 +152,7 @@ def _persist_discovered_show(item: Dict, genre_map: Dict[int, str]) -> None:
         "backdrop_path": item.get("backdrop_path"),
         "first_air_date": item.get("first_air_date"),
         "genres": _genre_names(item, genre_map),
+        "popularity": item.get("popularity"),
     })
 
 
@@ -163,4 +168,5 @@ def _persist_discovered_movie(item: Dict, genre_map: Dict[int, str]) -> None:
         "backdrop_path": item.get("backdrop_path"),
         "release_date": item.get("release_date"),
         "genres": _genre_names(item, genre_map),
+        "popularity": item.get("popularity"),
     })

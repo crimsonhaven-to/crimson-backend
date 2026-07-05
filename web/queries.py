@@ -238,3 +238,108 @@ def get_catalogue_items() -> List[Dict]:
 
     items.sort(key=lambda x: (x["title"] or "").lower())
     return items
+
+
+def _decode_genres(raw) -> List[str]:
+    """Decode a tmdb_shows/tmdb_movies ``genres`` JSON string column to a list.
+
+    Null (rows synced before genres, or with none) and malformed values both
+    degrade to ``[]`` — mirrors the defensive decode in get_catalogue_items.
+    """
+    try:
+        return json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+
+
+def get_shows_catalogue_items() -> List[Dict]:
+    """Full non-anime TV-show catalogue from the local tmdb_shows table (no live
+    TMDB). One poster-card item per row, tagged ``kind: 'show'`` and keyed by
+    tmdb_id so the frontend routes it through the TMDB-keyed show pages. Ordered
+    by popularity (desc, NULLS LAST) then year then title, so the browse grid
+    leads with the popular titles even before a full backfill.
+
+    Rows are lazily populated by /search/shows, /trending/shows and show
+    overviews, and bulk-populated by the nightly TMDB-discover backfill.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT tmdb_id, title, poster_path, first_air_date, genres, popularity
+                   FROM tmdb_shows"""
+            )
+            rows = cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Database error in get_shows_catalogue_items: {e}")
+        return []
+
+    items: List[Dict] = []
+    for r in rows:
+        title = r["title"]
+        if not title:
+            continue  # a row with no resolved title is useless in a browse list
+        first_air = r["first_air_date"] or ""
+        items.append({
+            "tmdb_id": r["tmdb_id"],
+            "anilist_id": None,
+            "kind": "show",
+            "title": title,
+            "poster": _tmdb_img(r["poster_path"]) if r["poster_path"] else None,
+            "year": first_air[:4] if first_air else None,
+            "popularity": r["popularity"],
+            "genres": _decode_genres(r["genres"]),
+        })
+
+    # Popular first (NULLS LAST via the -inf sentinel), then newest, then title.
+    items.sort(key=lambda x: (
+        -(x["popularity"] if isinstance(x["popularity"], (int, float)) else float("-inf")),
+        -(int(x["year"]) if (x["year"] or "").isdigit() else 0),
+        (x["title"] or "").lower(),
+    ))
+    return items
+
+
+def get_movies_catalogue_items() -> List[Dict]:
+    """Full general-movie catalogue from the local tmdb_movies table (no live
+    TMDB). The movie twin of get_shows_catalogue_items — additionally carries
+    ``vote_average`` (movies have a rating column; shows do not). Ordered by
+    popularity (desc, NULLS LAST) then year then title.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT tmdb_id, title, poster_path, release_date, genres,
+                          popularity, vote_average
+                   FROM tmdb_movies"""
+            )
+            rows = cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Database error in get_movies_catalogue_items: {e}")
+        return []
+
+    items: List[Dict] = []
+    for r in rows:
+        title = r["title"]
+        if not title:
+            continue
+        release = r["release_date"] or ""
+        items.append({
+            "tmdb_id": r["tmdb_id"],
+            "anilist_id": None,
+            "kind": "movie",
+            "title": title,
+            "poster": _tmdb_img(r["poster_path"]) if r["poster_path"] else None,
+            "year": release[:4] if release else None,
+            "popularity": r["popularity"],
+            "vote_average": r["vote_average"],
+            "genres": _decode_genres(r["genres"]),
+        })
+
+    items.sort(key=lambda x: (
+        -(x["popularity"] if isinstance(x["popularity"], (int, float)) else float("-inf")),
+        -(int(x["year"]) if (x["year"] or "").isdigit() else 0),
+        (x["title"] or "").lower(),
+    ))
+    return items
