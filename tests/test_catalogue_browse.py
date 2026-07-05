@@ -81,7 +81,10 @@ async def test_anilist_browse_flags_upstream_error_as_unavailable(monkeypatch):
     async def _no_cache(*a, **k):
         return None
     monkeypatch.setattr(anilist, "get_cached_response", _no_cache)
-    monkeypatch.setattr(anilist, "set_cached_response", _no_cache)
+    monkeypatch.setattr(anilist, "set_cached_response_shadowed", _no_cache)
+    # The unavailable path now consults the stale shadow before giving up; stub it
+    # so the test stays hermetic (no DB) and asserts the no-shadow → unavailable case.
+    monkeypatch.setattr(anilist, "get_stale_response", _no_cache)
 
     client = _FakeClient({"errors": [{"message": "API disabled"}], "data": None})
     result = await _fetch_media_catalogue(client, "ANIME", "anime", None, "trending", 1, 30)
@@ -93,7 +96,8 @@ async def test_anilist_browse_projects_and_tags_kind(monkeypatch):
     async def _no_cache(*a, **k):
         return None
     monkeypatch.setattr(anilist, "get_cached_response", _no_cache)
-    monkeypatch.setattr(anilist, "set_cached_response", _no_cache)
+    monkeypatch.setattr(anilist, "set_cached_response_shadowed", _no_cache)
+    monkeypatch.setattr(anilist, "get_stale_response", _no_cache)
 
     payload = {"data": {"Page": {
         "pageInfo": {"hasNextPage": True, "total": 100, "currentPage": 1},
