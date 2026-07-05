@@ -259,6 +259,127 @@ async def get_catalogue(
     })
 
 
+# --- Local anime fallback (AniList Discover outage) -------------------------
+# When AniList's browse API is down, /catalogue/anime falls back to the local
+# 6,800-entry mapping DB instead of 503-ing, so the Discover hub stays alive.
+# The local list is paginated + genre-filterable like the real thing, ordered
+# poster-first, and (for the default trending/popular view) seeded with TMDB
+# trending anime so page 1 still leads with pretty, current posters.
+
+LOCAL_ANIME_PER_PAGE = 30
+
+
+async def _load_catalogue_items_cached() -> list:
+    """The full local anime catalogue, sharing /catalogue's cache slot (v2).
+
+    Same three-step load as get_catalogue's item slot (L1 → response cache → DB
+    in a threadpool), so the fallback rides the existing cache instead of paying
+    a fresh DB scan on every outage request.
+    """
+    cache_key = "catalogue:v2"
+    items = _local_get(cache_key)
+    if items is None:
+        cached = await get_cached_response(cache_key)
+        if cached and "items" in cached:
+            items = cached["items"]
+        else:
+            loop = asyncio.get_event_loop()
+            items = await loop.run_in_executor(None, get_catalogue_items)
+            if items:
+                await set_cached_response(cache_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+        items = items or []
+        _local_set(cache_key, items)
+    return items
+
+
+def _anime_year(it: Dict) -> int:
+    """Numeric start year (0 when unknown) for ordering; year may be int/str/None."""
+    y = it.get("year")
+    return int(y) if str(y or "").isdigit() else 0
+
+
+def _order_local_anime(items: list, sort: str) -> list:
+    """Order the local catalogue for the fallback grid. No score/popularity exists
+    locally, so non-title sorts surface poster-bearing, newest titles first (a
+    reasonable 'trending' stand-in); title sorts stay purely alphabetical."""
+    if sort == "title":
+        return sorted(items, key=lambda it: (it.get("title") or "").lower())
+    if sort == "newest":
+        return sorted(items, key=lambda it: (-_anime_year(it), (it.get("title") or "").lower()))
+    # trending / popular / score → poster first, then newest, then title.
+    return sorted(
+        items,
+        key=lambda it: (0 if it.get("poster") else 1, -_anime_year(it), (it.get("title") or "").lower()),
+    )
+
+
+async def _build_local_anime_fallback(client, *, genre, sort, page, per_page=LOCAL_ANIME_PER_PAGE):
+    """Build one page of the local-DB anime fallback in the /catalogue/anime shape.
+
+    Returns ``{items, total, page, has_next, genres}``. Items are ``kind:'anime'``
+    poster cards keyed by anilist_id (route-compatible with the live grid). The
+    genre facet is computed over the WHOLE local catalogue so every chip renders.
+    For the default (no-genre) trending/popular view, TMDB trending anime are
+    surfaced first and lend posters to any posterless local twin — best-effort, so
+    a simultaneous TMDB outage just drops the top-up.
+    """
+    items = await _load_catalogue_items_cached()
+    cards = [dict(it, kind="anime") for it in items if it.get("anilist_id")]
+
+    # Genre facet over the full catalogue (before filtering), like get_catalogue.
+    genre_counts: Dict[str, int] = {}
+    for it in cards:
+        for g in it.get("genres") or []:
+            genre_counts[g] = genre_counts.get(g, 0) + 1
+    genres = [{"genre": k, "count": v} for k, v in sorted(genre_counts.items())]
+
+    if genre:
+        wanted = genre.strip().casefold()
+        cards = [it for it in cards if any((g or "").casefold() == wanted for g in (it.get("genres") or []))]
+
+    ordered = _order_local_anime(cards, sort)
+
+    if not genre and sort in ("trending", "popular"):
+        try:
+            trending = await fetch_trending_anime(client, limit=20)
+        except Exception as e:  # TMDB also down — just skip the top-up.
+            logger.warning(f"Anime fallback TMDB top-up failed: {e}")
+            trending = []
+        if trending:
+            by_id = {it["anilist_id"]: it for it in ordered if it.get("anilist_id")}
+            seen: set = set()
+            head = []
+            for t in trending:
+                aid = t.get("anilist_id")
+                if not aid or aid in seen:
+                    continue
+                seen.add(aid)
+                local = by_id.get(aid)
+                if local:
+                    merged = dict(local)
+                    if not merged.get("poster") and t.get("poster"):
+                        merged["poster"] = t["poster"]
+                    head.append(merged)
+                else:
+                    head.append({
+                        "anilist_id": aid, "kind": "anime",
+                        "title": t.get("title"), "poster": t.get("poster"),
+                        "year": t.get("year"), "genres": [],
+                    })
+            ordered = head + [it for it in ordered if it.get("anilist_id") not in seen]
+
+    total = len(ordered)
+    start = (page - 1) * per_page
+    window = ordered[start:start + per_page]
+    return {
+        "items": window,
+        "total": total,
+        "page": page,
+        "has_next": start + per_page < total,
+        "genres": genres,
+    }
+
+
 @router.get("/catalogue/anime")
 async def get_anime_catalogue(
     genre: Optional[str] = Query(None, description="Optional AniList genre filter, e.g. Action, Romance"),
@@ -274,11 +395,23 @@ async def get_anime_catalogue(
     async with http_client() as client:
         genres = await fetch_anilist_genres(client)
         result = await fetch_anime_catalogue(client, genre=genre, sort=sort, page=page)
-    # Upstream (AniList) failure — surface it as 503 so the hub shows an honest
-    # "temporarily unavailable" instead of a misleading empty grid. The anime hub's
-    # local "Archive" view is unaffected.
-    if result.get("unavailable"):
-        raise HTTPException(status_code=503, detail="Anime discovery (AniList) is temporarily unavailable — please try again shortly.")
+        # Upstream (AniList) failure — don't 503. Fall back to the reliable local
+        # anime DB (paginated, poster-first, TMDB-trending-seeded on page 1) so the
+        # Discover hub keeps working instead of dying. ``fallback: true`` lets the
+        # client show a gentle "showing local archive" notice.
+        if result.get("unavailable"):
+            fb = await _build_local_anime_fallback(client, genre=genre, sort=sort, page=page)
+            return {
+                "success": True,
+                "count": len(fb["items"]),
+                "total": fb["total"],
+                "page": fb["page"],
+                "has_next": fb["has_next"],
+                "sort": sort,
+                "fallback": True,
+                "genres": fb["genres"],
+                "animes": fb["items"],
+            }
     return {
         "success": True,
         "count": len(result["items"]),
@@ -286,6 +419,7 @@ async def get_anime_catalogue(
         "page": result.get("page", page),
         "has_next": result.get("has_next", False),
         "sort": sort,
+        "fallback": False,
         "genres": [{"genre": g} for g in genres],
         "animes": result["items"],
     }
