@@ -117,6 +117,24 @@ def _parse_year(raw: str) -> Optional[int]:
     return y if 1900 <= y <= 2100 else None
 
 
+# The server-side Cache (cache_engine.fs.plan_rel_path) writes titles into folders
+# whose NAME is a TMDB id, not a human title:
+#   TV    -> ``tmdb-<id>/S<ss>E<ee>[ - <language>].<ext>``
+#   movie -> ``movie-tmdb-<id>/movie[ - <language>].<ext>``
+# Recognise those so a cached library shows real titles (resolved from that id) and a
+# correct kind — instead of every folder collapsing to "tmdb".
+_TMDB_DIR_RE = re.compile(r"^(movie-)?tmdb[-_](\d+)$", re.I)
+
+
+def _tmdb_from_dirname(name: str):
+    """``(tmdb_id, media_kind)`` if ``name`` is a TMDB-id-encoding folder (the Cache's
+    naming), else ``(None, None)``."""
+    m = _TMDB_DIR_RE.match((name or "").strip())
+    if not m:
+        return None, None
+    return int(m.group(2)), ("movie" if m.group(1) else "show")
+
+
 # Season/episode parsed from a filename (mirrors the scraper, kept local so the
 # library has no scraper import).
 _SE_PATTERNS = [
@@ -415,14 +433,28 @@ def _resolve_metadata(dir_path: str, media_files: List[str], stem: Optional[str]
             if emb and emb.get("title"):
                 meta = dict(emb)
 
-    # 4) filename / folder-name parse (always the floor)
+    # 4) TMDB-id-encoding folder (the server-side Cache's tmdb-<id>/ dirs). Only a
+    #    folder title's name can be an id — a loose file (stem set) is never one.
+    tmdb_dir_id, tmdb_dir_kind = _tmdb_from_dirname(base_name) if stem is None else (None, None)
+
+    # 5) filename / folder-name parse — the floor, but NOT for an id folder (whose
+    #    "name" is an id, not a title): leave the title to TMDB resolution.
     if not meta.get("title"):
-        meta = {"source": "filename", "title": _clean_title(base_name)}
+        if tmdb_dir_id:
+            meta = {"source": "tmdb-dir"}
+        else:
+            meta = {"source": "filename", "title": _clean_title(base_name)}
+    if tmdb_dir_id:
+        meta["tmdb_id"] = meta.get("tmdb_id") or tmdb_dir_id
+        # The tmdb-/movie-tmdb- prefix is the authority on kind for a cached title.
+        meta["media_kind"] = tmdb_dir_kind
     if not meta.get("year"):
         meta["year"] = _parse_year(base_name)
     if "media_kind" not in meta:
         meta["media_kind"] = "movie" if is_movie_hint else "show"
-    meta["has_metadata"] = meta.get("source") in ("nfo", "json", "embedded")
+    # An id folder is authoritative metadata (it carries a real TMDB id), so it is
+    # NOT flagged as a filename-only guess.
+    meta["has_metadata"] = meta.get("source") in ("nfo", "json", "embedded", "tmdb-dir")
     return meta
 
 
@@ -456,14 +488,25 @@ def _build_title(entry_path: str, is_dir: bool, embed_budget: List[int]) -> Opti
     art_path = _find_artwork(art_dir, art_stem)
     poster = meta.get("poster") or (art_proxy_url(art_path) if art_path else None)
 
+    # Metadata resolution may have corrected the kind (e.g. a cache tmdb-<id> TV
+    # folder with a single cached episode is still a show), so trust it over the
+    # early file-count heuristic when deciding movie-vs-show shape.
+    final_kind = meta.get("media_kind") or ("movie" if is_movie else "show")
+    final_is_movie = final_kind == "movie"
+    # Title floor: a real title, else a per-id placeholder ("TMDB 280042") the route
+    # replaces via enrichment — never the bare "tmdb" folder name.
+    title = meta.get("title")
+    if not title:
+        title = f"TMDB {meta['tmdb_id']}" if meta.get("tmdb_id") else _clean_title(os.path.basename(rep_for_token))
+
     return {
         "id": encode_token(rep_for_token),
-        "title": meta.get("title") or _clean_title(os.path.basename(rep_for_token)),
+        "title": title,
         "year": meta.get("year"),
         "poster": poster,
         "genres": meta.get("genres") or [],
-        "media_kind": meta.get("media_kind") or ("movie" if is_movie else "show"),
-        "episode_count": 0 if is_movie else len(media_files),
+        "media_kind": final_kind,
+        "episode_count": 0 if final_is_movie else len(media_files),
         "source_label": source_label_for(os.path.realpath(rep_for_token)) or "Local",
         "has_metadata": bool(meta.get("has_metadata")),
         "tmdb_id": meta.get("tmdb_id"),

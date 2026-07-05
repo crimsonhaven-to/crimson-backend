@@ -419,9 +419,15 @@ _PUBLIC_PREFIXES = (
     # (see _register_overlay_stream_proxies), so this list names no overlay source.
     "/jellyfin_proxy",
     "/cache_proxy",
+    # Local media: a <video> (direct play) and hls.js (transcode) load these
+    # cross-origin and CANNOT attach the login-wall bearer, exactly like /cache_proxy
+    # — so they must be public. Each maps an opaque path token back to a file ONLY
+    # inside a currently-enabled source root (safe_resolve / safe_resolve_transcode),
+    # re-checked per request, so being public doesn't widen what they can reach.
+    "/local_proxy",
+    "/local_hls",
     # Local poster/cover art loads cross-origin in an <img> with no auth header;
-    # it's HMAC-signed instead (see local_engine.fs.art_proxy_url / the /local_art
-    # route). The video bytes (/local_proxy, /local_hls) stay behind the login wall.
+    # it's HMAC-signed instead (see local_engine.fs.art_proxy_url / the /local_art route).
     "/local_art",
     # The subtitle <track> loads cross-origin with no auth header (signed instead).
     "/subtitles_proxy",

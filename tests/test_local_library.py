@@ -64,6 +64,47 @@ def test_loose_file_in_root_is_a_movie_title(tmp_path, monkeypatch):
     assert items[0]["title"] == "Some Random Clip"
 
 
+# --- cache-style tmdb-<id> folders ------------------------------------------
+def test_cache_tmdb_folder_is_a_show_keyed_by_id(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path)
+    # The server-side Cache writes tmdb-<id>/S..E.. - <language>.mp4
+    d = tmp_path / "tmdb-280042"
+    _mp4(d / "S01E11 - German Dub.mp4")
+    _mp4(d / "S01E12 - German Sub.mp4")
+
+    it = lib.scan_library()[0]
+    assert it["media_kind"] == "show"
+    assert it["tmdb_id"] == 280042
+    assert it["episode_count"] == 2
+    assert it["has_metadata"] is True          # id-derived, not a filename guess
+    # Never the bare "tmdb" folder name — a per-id placeholder the route enriches.
+    assert it["title"] == "TMDB 280042"
+    assert it["title"].lower() != "tmdb"
+
+
+def test_cache_single_episode_folder_is_still_a_show(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path)
+    d = tmp_path / "tmdb-555"
+    _mp4(d / "S01E01 - German Dub.mp4")
+    it = lib.scan_library()[0]
+    # The tmdb- prefix is authoritative: one episode is still a show, not a movie.
+    assert it["media_kind"] == "show"
+    assert it["tmdb_id"] == 555
+    assert it["episode_count"] == 1
+
+
+def test_cache_movie_folder_is_a_movie_keyed_by_id(tmp_path, monkeypatch):
+    _point_roots_at(monkeypatch, tmp_path)
+    d = tmp_path / "movie-tmdb-603"
+    _mp4(d / "movie - German Dub.mp4")
+    it = lib.scan_library()[0]
+    assert it["media_kind"] == "movie"
+    assert it["tmdb_id"] == 603
+    assert it["title"] == "TMDB 603"
+    detail = lib.get_library_item(it["id"])
+    assert detail["play"] and detail["play"]["id"]
+
+
 # --- metadata precedence ----------------------------------------------------
 def test_nfo_metadata_wins_over_filename(tmp_path, monkeypatch):
     _point_roots_at(monkeypatch, tmp_path)

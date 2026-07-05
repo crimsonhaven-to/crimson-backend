@@ -19,6 +19,7 @@ uses (no DB, derived from disk on demand):
 All of these no-op cleanly (empty / 404) unless a local source is enabled.
 """
 
+import asyncio
 import logging
 from typing import Dict, List, Optional
 
@@ -37,13 +38,15 @@ from local_engine.library import (
     search_library,
 )
 from metadata_engine.tmdb import (
+    fetch_tmdb_movie,
     fetch_tmdb_movie_search_results,
+    fetch_tmdb_show,
     fetch_tmdb_show_search_results,
 )
 from resolvers.local import LocalResolver
 
 from web.serialization import _gzip_json
-from web.util import _ndjson, _public_base_url, _STREAM_HEADERS
+from web.util import _ndjson, _public_base_url, _STREAM_HEADERS, _year_from_date
 
 logger = logging.getLogger("crimson.local_library")
 
@@ -70,69 +73,123 @@ def _enrich_key(token: str) -> str:
     return f"local-enrich:{token}"
 
 
+def _is_placeholder_title(item: Dict) -> bool:
+    """True when the item's title is a stand-in the scanner couldn't resolve to a
+    human name — an empty title, or the ``TMDB <id>`` placeholder a cache-style
+    ``tmdb-<id>`` folder gets until enrichment supplies the real one."""
+    title = (item.get("title") or "").strip()
+    return (not title) or title.startswith("TMDB ")
+
+
 def _apply_cached_enrichment(item: Dict) -> Dict:
-    """Overlay any cached TMDB enrichment (poster/overview/genres) onto a list item,
-    without making a network call. Local artwork + explicit metadata always win."""
+    """Overlay any cached TMDB enrichment (title/poster/genres/…) onto a list item,
+    without making a network call. On-disk metadata wins — except the title, which the
+    enrichment replaces when the scanner only had a placeholder (a ``tmdb-<id>`` folder)."""
     enrich = _local_get(_enrich_key(item["id"]))
     if not enrich:
         return item
     out = dict(item)
-    if not out.get("poster") and enrich.get("poster"):
-        out["poster"] = enrich["poster"]
-    if not out.get("genres") and enrich.get("genres"):
-        out["genres"] = enrich["genres"]
-    if not out.get("year") and enrich.get("year"):
-        out["year"] = enrich["year"]
-    if not out.get("tmdb_id") and enrich.get("tmdb_id"):
-        out["tmdb_id"] = enrich["tmdb_id"]
+    if enrich.get("title") and _is_placeholder_title(out):
+        out["title"] = enrich["title"]
+    for field in ("poster", "genres", "year", "tmdb_id", "backdrop", "description"):
+        if not out.get(field) and enrich.get(field):
+            out[field] = enrich[field]
     return out
 
 
-async def _enrich_with_tmdb(item: Dict) -> Dict:
-    """Best-effort live TMDB lookup for a filename-only title (no on-disk metadata,
-    no tmdb_id, no poster). Borrows the first confident hit's poster/overview/genres
-    and caches it. Never raises — enrichment is purely additive."""
-    if item.get("has_metadata") and item.get("poster"):
-        return item
-    if item.get("poster") and item.get("tmdb_id"):
-        return item
+async def _fetch_enrichment(client, item: Dict) -> Dict:
+    """Fetch TMDB enrichment for one item. When the item already carries a tmdb_id
+    (e.g. a cache ``tmdb-<id>`` folder), resolve it **by id** (exact — title included);
+    otherwise fall back to a title search (poster/genres only, keeping the item's own
+    title). Returns {} on any miss. Never raises here — callers cache the result."""
+    tmdb_id = item.get("tmdb_id")
+    is_movie = item.get("media_kind") == "movie"
+    if tmdb_id:
+        data = await (fetch_tmdb_movie(client, tmdb_id) if is_movie else fetch_tmdb_show(client, tmdb_id))
+        if not data:
+            return {}
+        date = data.get("release_date") if is_movie else data.get("first_air_date")
+        return {
+            "title": data.get("title"),
+            "poster": data.get("poster"),
+            "backdrop": data.get("backdrop"),
+            "genres": data.get("genres") or [],
+            "year": item.get("year") or _year_from_date(date),
+            "description": item.get("description") or data.get("overview"),
+            "tmdb_id": tmdb_id,
+        }
+    # No id — best-effort title search (leaves the item's parsed title in place).
     title = (item.get("title") or "").strip()
     if not title:
-        return item
+        return {}
+    results = await (fetch_tmdb_movie_search_results(client, title, limit=1) if is_movie
+                     else fetch_tmdb_show_search_results(client, title, limit=1))
+    hit = results[0] if results else None
+    if not hit:
+        return {}
+    return {
+        "poster": hit.get("poster"),
+        "genres": hit.get("genres") or [],
+        "year": item.get("year") or hit.get("year"),
+        "tmdb_id": hit.get("tmdb_id"),
+        "backdrop": hit.get("backdrop"),
+        "description": item.get("description") or hit.get("overview"),
+    }
 
-    cache_k = _enrich_key(item["id"])
-    cached = _local_get(cache_k)
-    if cached is not None:
-        return {**item, **{k: v for k, v in cached.items() if v and not item.get(k)}}
 
+def _wants_enrichment(item: Dict) -> bool:
+    """Whether an item would benefit from a TMDB lookup (missing a real title, poster
+    or genres). A fully-resolved on-disk title with art skips it."""
+    if _is_placeholder_title(item):
+        return True
+    return not item.get("poster") or not item.get("genres")
+
+
+async def _ensure_enriched(item: Dict) -> None:
+    """Populate the per-item enrichment cache once (id lookup or title search), so a
+    later _apply_cached_enrichment has something to overlay. Best-effort + cached
+    (including a cached empty result, so a miss isn't retried every request)."""
+    if _local_get(_enrich_key(item["id"])) is not None:
+        return
     enrich: Dict = {}
+    if _wants_enrichment(item):
+        try:
+            async with http_client() as client:
+                enrich = await _fetch_enrichment(client, item)
+        except Exception as e:
+            logger.debug(f"[local] tmdb enrich failed for {item.get('title')!r}: {e}")
+    _local_set(_enrich_key(item["id"]), enrich, ttl=_ENRICH_TTL)
+
+
+async def _enrich_id_items(items: List[Dict]) -> None:
+    """Batch-enrich (bounded concurrency) the list items that carry a tmdb_id and are
+    still missing a real title/art — i.e. the cache's ``tmdb-<id>`` folders. Only
+    id-keyed items are enriched here (exact + cheap + cached); title-search enrichment
+    stays lazy on the overview to avoid a search fan-out per list load. Uncached
+    misses cache an empty result so this doesn't re-fetch every browse."""
+    need = [
+        it for it in items
+        if it.get("tmdb_id") and _wants_enrichment(it)
+        and _local_get(_enrich_key(it["id"])) is None
+    ]
+    if not need:
+        return
+    sem = asyncio.Semaphore(8)
+
+    async def _one(client, it: Dict) -> None:
+        async with sem:
+            try:
+                enrich = await _fetch_enrichment(client, it)
+            except Exception as e:
+                logger.debug(f"[local] id enrich failed for tmdb {it.get('tmdb_id')}: {e}")
+                enrich = {}
+        _local_set(_enrich_key(it["id"]), enrich, ttl=_ENRICH_TTL)
+
     try:
         async with http_client() as client:
-            if item.get("media_kind") == "movie":
-                results = await fetch_tmdb_movie_search_results(client, title, limit=1)
-            else:
-                results = await fetch_tmdb_show_search_results(client, title, limit=1)
-        hit = results[0] if results else None
-        if hit:
-            enrich = {
-                "poster": hit.get("poster"),
-                "genres": hit.get("genres") or [],
-                "year": item.get("year") or hit.get("year"),
-                "tmdb_id": hit.get("tmdb_id"),
-                "backdrop": hit.get("backdrop"),
-                "description": item.get("description") or hit.get("overview"),
-            }
+            await asyncio.gather(*(_one(client, it) for it in need), return_exceptions=True)
     except Exception as e:
-        logger.debug(f"[local] tmdb enrich failed for {title!r}: {e}")
-
-    _local_set(cache_k, enrich, ttl=_ENRICH_TTL)
-    if not enrich:
-        return item
-    merged = dict(item)
-    for k, v in enrich.items():
-        if v and not merged.get(k):
-            merged[k] = v
-    return merged
+        logger.debug(f"[local] batch enrich failed: {e}")
 
 
 def _breakdowns(items: List[Dict]) -> Dict:
@@ -161,7 +218,10 @@ async def get_local_library(request: Request):
             "count": 0, "total": 0, "items": [], "kinds": [], "genres": [],
         })
     items = await run_in_threadpool(_cached_items)
-    # Overlay any enrichment already computed by prior overview views (no network).
+    # Resolve real titles/art for id-carrying titles (the cache's tmdb-<id> folders)
+    # by their TMDB id — bounded + cached, so this is a one-time cost per title.
+    await _enrich_id_items(items)
+    # Overlay all cached enrichment (the batch above + any from prior overview views).
     view = [_apply_cached_enrichment(it) for it in items]
     breakdown = _breakdowns(view)
     return _gzip_json(request, {
@@ -184,7 +244,8 @@ async def get_local_overview(token: str):
     item = await run_in_threadpool(get_library_item, token)
     if not item:
         raise HTTPException(status_code=404, detail="Title not found")
-    item = await _enrich_with_tmdb(item)
+    await _ensure_enriched(item)
+    item = _apply_cached_enrichment(item)
     return {"success": True, "kind": "local", **item}
 
 
@@ -196,12 +257,16 @@ async def search_local(query_name: str = Query(..., min_length=1, description="L
     if not local_is_configured():
         return {"success": True, "query": query_name, "count": 0, "suggestions": []}
     items = await run_in_threadpool(_cached_items)
-    matches = search_library(query_name, items=items, limit=20)
+    # Match against the ENRICHED titles (no network) so a cache-style ``tmdb-<id>``
+    # title is findable by its real name once the Local view has warmed its cache —
+    # not just by the "TMDB <id>" placeholder.
+    enriched = [_apply_cached_enrichment(it) for it in items]
+    matches = search_library(query_name, items=enriched, limit=20)
     suggestions = [
         {
             "id": m["id"],
             "title": m["title"],
-            "poster": _apply_cached_enrichment(m).get("poster"),
+            "poster": m.get("poster"),
             "year": m.get("year"),
             "media_kind": m.get("media_kind"),
             "kind": "local",
