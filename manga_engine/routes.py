@@ -27,7 +27,10 @@ from fastapi.responses import Response, StreamingResponse
 from core.http_client import http_client
 from core.response_cache import get_cached_response, set_cached_response
 from metadata_engine.anilist import (
+    MANGA_DEFAULT_SORT,
+    fetch_anilist_genres,
     fetch_anilist_manga_metadata,
+    fetch_manga_catalogue,
     fetch_trending_manga,
     search_anilist_manga,
 )
@@ -117,6 +120,40 @@ async def trending_manga(limit: int = Query(12, ge=1, le=50, description="Number
     async with http_client() as client:
         results = await fetch_trending_manga(client, limit)
     return {"success": True, "count": len(results), "manga": results}
+
+
+@router.get("/catalogue/manga")
+async def catalogue_manga(
+    genre: Optional[str] = Query(None, description="Optional AniList genre filter, e.g. Action, Romance"),
+    sort: str = Query(MANGA_DEFAULT_SORT, description="trending | popular | score | newest | title"),
+    page: int = Query(1, ge=1, le=200, description="1-based page for the browse hub"),
+):
+    """The Manga browse hub — one page of AniList MANGA, filterable by genre and
+    sortable. Unlike /catalogue/shows|movies this is live + paginated (there is no
+    local manga table), so the frontend appends pages via ``has_next``. ``genres``
+    is AniList's shared genre vocabulary for the filter chips.
+    """
+    if not manga_enabled():
+        raise HTTPException(status_code=503, detail="Manga is not enabled")
+    async with http_client() as client:
+        genres = await fetch_anilist_genres(client)
+        result = await fetch_manga_catalogue(client, genre=genre, sort=sort, page=page)
+    # Upstream (AniList) failure → 503, so the hub shows "temporarily unavailable"
+    # rather than a misleading empty grid (AniList returns HTTP 200 even on outage).
+    if result.get("unavailable"):
+        raise HTTPException(status_code=503, detail="Manga discovery (AniList) is temporarily unavailable — please try again shortly.")
+    return {
+        "success": True,
+        "count": len(result["items"]),
+        "total": result.get("total", 0),
+        "page": result.get("page", page),
+        "has_next": result.get("has_next", False),
+        "sort": sort,
+        # Shape parity with the anime/local genre facet ([{genre, count}]); manga
+        # has no per-genre counts (live corpus), so count is omitted.
+        "genres": [{"genre": g} for g in genres],
+        "manga": result["items"],
+    }
 
 
 # --- overview (metadata + chapter list) ------------------------------------

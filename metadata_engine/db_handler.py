@@ -150,6 +150,7 @@ class MappingDatabaseEngine:
                     backdrop_path  TEXT,
                     first_air_date TEXT,
                     genres         TEXT,
+                    popularity     DOUBLE PRECISION,
                     last_updated   TIMESTAMP
                 )
                 """
@@ -159,6 +160,11 @@ class MappingDatabaseEngine:
             # genres twin of anime_entries.genres). Stored as a JSON list of genre
             # names, lazily populated by /show* (fetch_tmdb_show); null until then.
             cursor.execute("ALTER TABLE tmdb_shows ADD COLUMN IF NOT EXISTS genres TEXT")
+            # TMDB popularity score, carried by discover/search/overview payloads.
+            # tmdb_shows had no score column, so the /catalogue/shows browse orders
+            # by it (popular first, NULLS LAST) — null on pre-existing rows until a
+            # backfill/refresh repopulates them.
+            cursor.execute("ALTER TABLE tmdb_shows ADD COLUMN IF NOT EXISTS popularity DOUBLE PRECISION")
             # When a row was last (re)written from TMDB. Drives the periodic
             # staleness refresher (metadata_engine.maintenance); NULL on pre-existing
             # rows so they sort oldest-first and get refreshed before anything else.
@@ -183,6 +189,7 @@ class MappingDatabaseEngine:
                     genres         TEXT,
                     runtime        INTEGER,
                     vote_average   DOUBLE PRECISION,
+                    popularity     DOUBLE PRECISION,
                     status         TEXT,
                     original_title TEXT,
                     last_updated   TIMESTAMP
@@ -193,6 +200,10 @@ class MappingDatabaseEngine:
             # Backfill genres on pre-existing tmdb_movies (see tmdb_shows above);
             # JSON list of genre names, lazily populated by fetch_tmdb_movie.
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS genres TEXT")
+            # TMDB popularity score — the /catalogue/movies browse default order
+            # (popular first). Distinct from vote_average (rating); null until a
+            # backfill/refresh repopulates pre-existing rows.
+            cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS popularity DOUBLE PRECISION")
             # Richer movie fields that fetch_tmdb_movie already pulls from TMDB but
             # previously only lived in the api_cache JSON — now persisted so the
             # table can be queried/sorted by them (and survives a cache miss).

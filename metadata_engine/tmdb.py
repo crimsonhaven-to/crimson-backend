@@ -122,11 +122,12 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int,
         # Genre names — the non-anime twin of anime_entries.genres. Stored into
         # tmdb_shows so the recommend engine can score shows by genre too.
         "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
+        "popularity": data.get("popularity"),
         "seasons": seasons,
     }
 
     upsert_show_info({k: result.get(k) for k in
-                      ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "first_air_date", "genres")})
+                      ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "first_air_date", "genres", "popularity")})
     await set_cached_response(cache_key, result)
     return result
 
@@ -163,12 +164,13 @@ async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int,
         "runtime": data.get("runtime"),
         "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
         "vote_average": data.get("vote_average"),
+        "popularity": data.get("popularity"),
         "status": data.get("status"),
     }
 
     upsert_movie_info({k: result.get(k) for k in
                        ("tmdb_id", "title", "overview", "poster_path", "backdrop_path", "release_date",
-                        "genres", "runtime", "vote_average", "status", "original_title")})
+                        "genres", "runtime", "vote_average", "popularity", "status", "original_title")})
     await set_cached_response(cache_key, result)
     return result
 
