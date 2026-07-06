@@ -17,6 +17,7 @@ from resolvers import ALL_RESOLVERS
 from resolvers.jellyfin import is_configured as jellyfin_is_configured
 from scrapers import ALL_SCRAPERS
 from local_engine.fs import is_configured as local_is_configured
+from metadata_engine import sync_status
 
 from web.context import get_db_connection
 
@@ -88,6 +89,11 @@ async def health_check():
             "status": "healthy",
             "database": "connected",
             "entries_count": count,
+            # Where the boot-time Fribb mapping sync is up to. The initial sync runs
+            # in the background now, so on a cold single-replica boot this reports
+            # {"phase": "running"} while /health already answers healthy; it settles
+            # to "up_to_date" / "done" (or "disabled" on a non-sync replica).
+            "mapping_sync": sync_status.snapshot(),
             "scrapers_available": len(ALL_SCRAPERS),
             "resolvers_available": len(ALL_RESOLVERS),
             "jellyfin_configured": jellyfin_is_configured(),

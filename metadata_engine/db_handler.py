@@ -424,12 +424,18 @@ class MappingDatabaseEngine:
     # ------------------------------------------------------------------ #
     # Sync
     # ------------------------------------------------------------------ #
-    async def sync_database_async(self, force: bool = False):
+    async def sync_database_async(self, force: bool = False) -> str:
         """Download the Fribb dataset and rebuild the mapping tables.
 
         ``force=True`` rebuilds even when the upstream ETag is unchanged — used by
         the manual `python -m metadata_engine.resync` trigger to backfill after a
         schema change (e.g. the genres column) without waiting for Fribb to move.
+
+        Returns an outcome string so callers (the boot-time background sync in
+        ``api.py``) can tell what actually happened without re-deriving it:
+        ``"up_to_date"`` (ETag matched a non-empty DB, nothing rebuilt),
+        ``"synced"`` (tables rebuilt + committed), ``"empty"`` (upstream parsed to
+        no mappings — DB left intact), or ``"failed"`` (download/rollback error).
         """
         self.init_db()
 
@@ -439,7 +445,7 @@ class MappingDatabaseEngine:
             if not new_etag:
                 if not force:
                     print("[DB Engine] Mappings already up-to-date.")
-                    return
+                    return "up_to_date"
                 # Forced rebuild despite a matching ETag. Capture the current ETag
                 # so sync_meta stays in step and the next scheduled check doesn't
                 # see a phantom change and resync again.
@@ -457,7 +463,7 @@ class MappingDatabaseEngine:
                 anime_data: List[Dict[str, Any]] = response.json()
             except Exception as e:
                 print(f"[DB Engine] Download failed: {e}")
-                return
+                return "failed"
 
         # 1. Group Fribb entries by TMDB tv id.
         groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
@@ -524,7 +530,7 @@ class MappingDatabaseEngine:
 
         if not season_rows and not extra_rows:
             print("[DB Engine] No mappings parsed from dataset; aborting (DB left intact).")
-            return
+            return "empty"
 
         # 3. Enrich with AniList titles (best-effort).
         print(f"[DB Engine] Fetching AniList metadata for {len(all_anilist_ids)} ids...")
@@ -623,6 +629,11 @@ class MappingDatabaseEngine:
                 f"entries={len(entry_rows)} seasons={len(season_rows)} extras={len(extra_rows)} "
                 f"catalogue_cache_purged={catalogue_cache_purged}"
             )
+            return "synced"
+
+        # Rebuild transaction rolled back (see the except above) — the previous
+        # snapshot is still live thanks to MVCC.
+        return "failed"
 
 
 async def _main():

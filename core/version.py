@@ -8,7 +8,7 @@ app — avoiding a circular import back through ``api.py``.
 import time
 
 # Fed to the FastAPI app metadata (OpenAPI/docs) and the "/" root greeting.
-VERSION = "18.0.2"
+VERSION = "18.0.3"
 
 # Wall-clock at process start — the admin dashboard derives this replica's uptime
 # from it. Module-load time is close enough to "boot" for an operator metric.

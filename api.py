@@ -65,6 +65,7 @@ from subtitles_engine import router as subtitles_router, service as subtitles_se
 from skiptimes_engine import router as skiptimes_router
 from manga_engine import manga_router
 from metadata_engine import maintenance as metadata_maintenance
+from metadata_engine import sync_status
 
 # The HTTP layer — singletons, the injected engine handlers, and the routers. The
 # routes and their logic all live under the ``web`` package now; this file only
@@ -256,13 +257,43 @@ async def lifespan(app: FastAPI):
     # on the shared DB. Other replicas just serve from the synced DB.
     if not Config.RUN_DB_SYNC:
         logger.info("RUN_DB_SYNC is disabled — this replica will not run the mapping resync")
+        sync_status.set_phase("disabled", "RUN_DB_SYNC is off on this replica")
     else:
-        # Run initial sync
-        try:
-            await db_engine.sync_database_async()
-            logger.info("Initial database sync completed")
-        except Exception as e:
-            logger.error(f"Initial database sync failed: {e}")
+        # Initial sync — fire-and-forget so uvicorn + /health come up immediately
+        # instead of blocking boot on Fribb's multi-minute download + AniList
+        # enrichment (which matters most in single-replica dev, where the one API
+        # container is also the sync replica). The up-to-date check lives inside
+        # sync_database_async: it HEADs the Fribb URL and, if the stored ETag still
+        # matches a non-empty DB, returns "up_to_date" without rebuilding — so a
+        # warm DB pays only a cheap conditional HEAD here, not a full resync.
+        #
+        # The work is pushed onto a worker thread (run_in_threadpool -> asyncio.run,
+        # the same shape the scheduled job uses) so the heavy synchronous DB writes
+        # never stall the event loop that's now serving requests.
+        async def _initial_sync():
+            sync_status.set_phase("running", "Fribb mapping sync started", started=True)
+            try:
+                result = await run_in_threadpool(
+                    lambda: asyncio.run(db_engine.sync_database_async())
+                )
+            except Exception as e:
+                sync_status.set_phase("failed", str(e), finished=True)
+                logger.error(f"Initial database sync failed: {e}")
+                return
+
+            if result == "up_to_date":
+                sync_status.set_phase("up_to_date", "Mappings already up-to-date", finished=True)
+                logger.info("Initial mapping sync: DB already up-to-date, nothing rebuilt")
+            elif result == "synced":
+                sync_status.set_phase("done", "Mapping tables rebuilt from Fribb", finished=True)
+                logger.info("Initial database sync completed (tables rebuilt)")
+            else:
+                # "failed" / "empty" — sync_database_async already logged the cause;
+                # the previous DB snapshot is intact (MVCC / left-untouched).
+                sync_status.set_phase("failed", result or "unknown outcome", finished=True)
+                logger.warning(f"Initial database sync did not rebuild (outcome={result})")
+
+        asyncio.create_task(_initial_sync())  # fire-and-forget; runs off the boot path
 
         # Periodic sync. BackgroundScheduler runs jobs in a worker thread with no
         # running event loop, so the job spins up its own.
