@@ -65,10 +65,20 @@ async def public_config():
     except Exception:
         manga_enabled = False
 
+    # Whether the Live TV surface is enabled (IPTV_ENABLED, default on); drives
+    # the frontend's nav entry + /live routes. Lazy import for the same reason
+    # as the manga flag above.
+    try:
+        from iptv_engine import enabled as _iptv_enabled
+        live_tv_enabled = _iptv_enabled()
+    except Exception:
+        live_tv_enabled = False
+
     return {
         "demo_mode": Config.DEMO_MODE,
         "require_login": Config.REQUIRE_LOGIN,
         "manga_enabled": manga_enabled,
+        "live_tv_enabled": live_tv_enabled,
         # Whether any local media source is enabled — drives the Index's "Local"
         # view toggle + the local search surface on the frontend (both hidden when
         # off). local_is_configured() is a cached, DB-backed check.

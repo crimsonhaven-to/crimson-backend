@@ -73,6 +73,8 @@ FEATURES: List[Feature] = [
     Feature("Manga reading surface", lambda: _flag_on("MANGA_ENABLED", True),
             "MANGA_ENABLED=false disables the manga surface (pages resolve client-side; "
             "a server-side provider is optional via the source overlay)"),
+    Feature("Live TV surface (iptv-org)", lambda: _flag_on("IPTV_ENABLED", True),
+            "IPTV_ENABLED=false disables the Live TV catalogue + /iptv_proxy"),
     Feature("Transactional email (SMTP)", lambda: _has("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD"),
             "set SMTP_HOST/SMTP_USER/SMTP_PASSWORD for verify + reset mail"),
     Feature("Changelog (GitHub Releases)", lambda: _has("GITHUB_TOKEN"),

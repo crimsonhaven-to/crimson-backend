@@ -64,6 +64,11 @@ from recommend_engine import router as recommend_router
 from subtitles_engine import router as subtitles_router, service as subtitles_service
 from skiptimes_engine import router as skiptimes_router
 from manga_engine import manga_router
+from iptv_engine import (
+    router as iptv_router,
+    service as iptv_service,
+    enabled as iptv_enabled,
+)
 from metadata_engine import maintenance as metadata_maintenance
 from metadata_engine import sync_status
 
@@ -189,6 +194,36 @@ async def lifespan(app: FastAPI):
         )
     else:
         logger.info("GITHUB_TOKEN not set — /changelog will return 503 until configured")
+
+    # Live TV catalogue (per-replica, like the changelog). The initial warm-up is
+    # a ~25 MB JSON pull from iptv-org's GitHub Pages, so it runs off the event
+    # loop and never delays startup; the interval refresh (upstream publishes
+    # daily) runs in the scheduler's worker thread. Routes also self-heal — they
+    # kick a background refresh when asked while cold/stale (see iptv_engine).
+    if iptv_enabled():
+        async def _warm_iptv():
+            try:
+                await run_in_threadpool(iptv_service.refresh)
+                logger.info("IPTV catalogue warmed from iptv-org")
+            except Exception as e:
+                logger.error(f"Initial IPTV warm-up failed (will retry on schedule): {e}")
+
+        asyncio.create_task(_warm_iptv())  # fire-and-forget
+
+        def _refresh_iptv():
+            try:
+                iptv_service.refresh()
+            except Exception as e:
+                logger.error(f"IPTV catalogue refresh failed: {e}")
+
+        scheduler.add_job(
+            _refresh_iptv,
+            trigger=IntervalTrigger(hours=12),
+            id="iptv_refresh_job",
+            replace_existing=True,
+        )
+    else:
+        logger.info("IPTV_ENABLED=false — the Live TV surface is dark")
 
     # CORS-proxy health cache (every replica keeps its own, since each routes
     # independently). Periodically probes every CRIMSON_PROXY_BASE host so proxy_url
@@ -482,6 +517,10 @@ _PUBLIC_PREFIXES = (
     # injects a manga provider; the public build resolves pages client-side. See
     # manga_engine.
     "/manga_proxy",
+    # Live TV playlists/segments: hls.js loads these cross-origin and can't carry
+    # the login-wall bearer — HMAC-signed instead (URL + header overrides), and the
+    # fetch runs through the SSRF-guarded client. See iptv_engine.
+    "/iptv_proxy",
     "/docs",
 )
 
@@ -692,6 +731,11 @@ app.include_router(skiptimes_router)
 # without a provider (see _PUBLIC_PREFIXES); the rest is behind the login wall like
 # every other content route. Additive; anime/shows/movies are untouched.
 app.include_router(manga_router)
+
+# Live TV — a browsable catalogue of free-to-air broadcasts indexed by the
+# iptv-org project. Read-only and additive; browse/search/detail sit behind the
+# login wall, /iptv_proxy is public + signed (see iptv_engine + _PUBLIC_PREFIXES).
+app.include_router(iptv_router)
 
 # The core surface (system, discovery, watch, metadata, proxies) — see web.routes.
 for _router in all_routers:
