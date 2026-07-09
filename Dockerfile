@@ -71,6 +71,7 @@ COPY subtitles_engine ./subtitles_engine
 COPY skiptimes_engine ./skiptimes_engine
 COPY telemetry_engine ./telemetry_engine
 COPY manga_engine ./manga_engine
+COPY iptv_engine ./iptv_engine
 
 # Apply the optional build-time source overlay on top of the base packages. In a
 # build without the overlay secrets these directories are empty, so this is a no-op.

@@ -64,7 +64,13 @@ from recommend_engine import router as recommend_router
 from subtitles_engine import router as subtitles_router, service as subtitles_service
 from skiptimes_engine import router as skiptimes_router
 from manga_engine import manga_router
+from iptv_engine import (
+    router as iptv_router,
+    service as iptv_service,
+    enabled as iptv_enabled,
+)
 from metadata_engine import maintenance as metadata_maintenance
+from metadata_engine import sync_status
 
 # The HTTP layer — singletons, the injected engine handlers, and the routers. The
 # routes and their logic all live under the ``web`` package now; this file only
@@ -189,6 +195,36 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("GITHUB_TOKEN not set — /changelog will return 503 until configured")
 
+    # Live TV catalogue (per-replica, like the changelog). The initial warm-up is
+    # a ~25 MB JSON pull from iptv-org's GitHub Pages, so it runs off the event
+    # loop and never delays startup; the interval refresh (upstream publishes
+    # daily) runs in the scheduler's worker thread. Routes also self-heal — they
+    # kick a background refresh when asked while cold/stale (see iptv_engine).
+    if iptv_enabled():
+        async def _warm_iptv():
+            try:
+                await run_in_threadpool(iptv_service.refresh)
+                logger.info("IPTV catalogue warmed from iptv-org")
+            except Exception as e:
+                logger.error(f"Initial IPTV warm-up failed (will retry on schedule): {e}")
+
+        asyncio.create_task(_warm_iptv())  # fire-and-forget
+
+        def _refresh_iptv():
+            try:
+                iptv_service.refresh()
+            except Exception as e:
+                logger.error(f"IPTV catalogue refresh failed: {e}")
+
+        scheduler.add_job(
+            _refresh_iptv,
+            trigger=IntervalTrigger(hours=12),
+            id="iptv_refresh_job",
+            replace_existing=True,
+        )
+    else:
+        logger.info("IPTV_ENABLED=false — the Live TV surface is dark")
+
     # CORS-proxy health cache (every replica keeps its own, since each routes
     # independently). Periodically probes every CRIMSON_PROXY_BASE host so proxy_url
     # routes only to the ones that are up — automatic failover between the Cloudflare
@@ -256,13 +292,43 @@ async def lifespan(app: FastAPI):
     # on the shared DB. Other replicas just serve from the synced DB.
     if not Config.RUN_DB_SYNC:
         logger.info("RUN_DB_SYNC is disabled — this replica will not run the mapping resync")
+        sync_status.set_phase("disabled", "RUN_DB_SYNC is off on this replica")
     else:
-        # Run initial sync
-        try:
-            await db_engine.sync_database_async()
-            logger.info("Initial database sync completed")
-        except Exception as e:
-            logger.error(f"Initial database sync failed: {e}")
+        # Initial sync — fire-and-forget so uvicorn + /health come up immediately
+        # instead of blocking boot on Fribb's multi-minute download + AniList
+        # enrichment (which matters most in single-replica dev, where the one API
+        # container is also the sync replica). The up-to-date check lives inside
+        # sync_database_async: it HEADs the Fribb URL and, if the stored ETag still
+        # matches a non-empty DB, returns "up_to_date" without rebuilding — so a
+        # warm DB pays only a cheap conditional HEAD here, not a full resync.
+        #
+        # The work is pushed onto a worker thread (run_in_threadpool -> asyncio.run,
+        # the same shape the scheduled job uses) so the heavy synchronous DB writes
+        # never stall the event loop that's now serving requests.
+        async def _initial_sync():
+            sync_status.set_phase("running", "Fribb mapping sync started", started=True)
+            try:
+                result = await run_in_threadpool(
+                    lambda: asyncio.run(db_engine.sync_database_async())
+                )
+            except Exception as e:
+                sync_status.set_phase("failed", str(e), finished=True)
+                logger.error(f"Initial database sync failed: {e}")
+                return
+
+            if result == "up_to_date":
+                sync_status.set_phase("up_to_date", "Mappings already up-to-date", finished=True)
+                logger.info("Initial mapping sync: DB already up-to-date, nothing rebuilt")
+            elif result == "synced":
+                sync_status.set_phase("done", "Mapping tables rebuilt from Fribb", finished=True)
+                logger.info("Initial database sync completed (tables rebuilt)")
+            else:
+                # "failed" / "empty" — sync_database_async already logged the cause;
+                # the previous DB snapshot is intact (MVCC / left-untouched).
+                sync_status.set_phase("failed", result or "unknown outcome", finished=True)
+                logger.warning(f"Initial database sync did not rebuild (outcome={result})")
+
+        asyncio.create_task(_initial_sync())  # fire-and-forget; runs off the boot path
 
         # Periodic sync. BackgroundScheduler runs jobs in a worker thread with no
         # running event loop, so the job spins up its own.
@@ -451,6 +517,10 @@ _PUBLIC_PREFIXES = (
     # injects a manga provider; the public build resolves pages client-side. See
     # manga_engine.
     "/manga_proxy",
+    # Live TV playlists/segments: hls.js loads these cross-origin and can't carry
+    # the login-wall bearer — HMAC-signed instead (URL + header overrides), and the
+    # fetch runs through the SSRF-guarded client. See iptv_engine.
+    "/iptv_proxy",
     "/docs",
 )
 
@@ -661,6 +731,11 @@ app.include_router(skiptimes_router)
 # without a provider (see _PUBLIC_PREFIXES); the rest is behind the login wall like
 # every other content route. Additive; anime/shows/movies are untouched.
 app.include_router(manga_router)
+
+# Live TV — a browsable catalogue of free-to-air broadcasts indexed by the
+# iptv-org project. Read-only and additive; browse/search/detail sit behind the
+# login wall, /iptv_proxy is public + signed (see iptv_engine + _PUBLIC_PREFIXES).
+app.include_router(iptv_router)
 
 # The core surface (system, discovery, watch, metadata, proxies) — see web.routes.
 for _router in all_routers:

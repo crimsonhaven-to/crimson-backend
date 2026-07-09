@@ -17,6 +17,7 @@ from resolvers import ALL_RESOLVERS
 from resolvers.jellyfin import is_configured as jellyfin_is_configured
 from scrapers import ALL_SCRAPERS
 from local_engine.fs import is_configured as local_is_configured
+from metadata_engine import sync_status
 
 from web.context import get_db_connection
 
@@ -64,10 +65,20 @@ async def public_config():
     except Exception:
         manga_enabled = False
 
+    # Whether the Live TV surface is enabled (IPTV_ENABLED, default on); drives
+    # the frontend's nav entry + /live routes. Lazy import for the same reason
+    # as the manga flag above.
+    try:
+        from iptv_engine import enabled as _iptv_enabled
+        live_tv_enabled = _iptv_enabled()
+    except Exception:
+        live_tv_enabled = False
+
     return {
         "demo_mode": Config.DEMO_MODE,
         "require_login": Config.REQUIRE_LOGIN,
         "manga_enabled": manga_enabled,
+        "live_tv_enabled": live_tv_enabled,
         # Whether any local media source is enabled — drives the Index's "Local"
         # view toggle + the local search surface on the frontend (both hidden when
         # off). local_is_configured() is a cached, DB-backed check.
@@ -88,6 +99,11 @@ async def health_check():
             "status": "healthy",
             "database": "connected",
             "entries_count": count,
+            # Where the boot-time Fribb mapping sync is up to. The initial sync runs
+            # in the background now, so on a cold single-replica boot this reports
+            # {"phase": "running"} while /health already answers healthy; it settles
+            # to "up_to_date" / "done" (or "disabled" on a non-sync replica).
+            "mapping_sync": sync_status.snapshot(),
             "scrapers_available": len(ALL_SCRAPERS),
             "resolvers_available": len(ALL_RESOLVERS),
             "jellyfin_configured": jellyfin_is_configured(),
