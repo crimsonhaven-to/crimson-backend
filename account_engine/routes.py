@@ -43,7 +43,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
-from . import ed25519, mailer, passwords
+from . import audit, ed25519, mailer, passwords
 from .db import AccountStore, QuotaExceeded, VERIFY_TOKEN_TTL, RESET_TOKEN_TTL
 from core.config import Config
 from core.rate_limit import limiter
@@ -108,7 +108,8 @@ def _allowed_invite_codes() -> set:
     return {c.strip() for c in raw.split(",") if c.strip()}
 
 
-def _check_invite_code(code: str) -> bool:
+def _check_invite_code(code: str, request: Optional[Request] = None,
+                       identity: Optional[str] = None, flow: Optional[str] = None) -> bool:
     """Validate an invite code for NEW-account creation, shared by both the email
     and mnemonic signup flows. Two kinds of invite are accepted in the same field:
 
@@ -120,7 +121,10 @@ def _check_invite_code(code: str) -> bool:
     single-use token; raises HTTPException(403) if it's neither. This does NOT
     consume a single-use token — burn that with _consume_invite_code only once
     you're committed to creating the account, so a later 409/validation failure
-    doesn't waste it."""
+    doesn't waste it.
+
+    request/identity/flow are audit context: a rejection is recorded as an
+    ``invite_invalid`` security event (the very signal that motivated the log)."""
     # Demo deployments accept any (or no) invite code so anyone can try the haven;
     # runaway growth is bounded by the nightly DEMO_MODE reset, not the invite gate.
     # Returning True marks it "static" so _consume_invite_code is a no-op (nothing to
@@ -131,18 +135,27 @@ def _check_invite_code(code: str) -> bool:
     static_codes = _allowed_invite_codes()
     is_static = bool(static_codes) and code in static_codes
     if not is_static and not store.invite_token_is_available(code):
+        audit.log_event(
+            "invite_invalid", outcome="failure", request=request, identity=identity,
+            detail={"flow": flow, "reason": "unknown_code"},
+        )
         raise HTTPException(status_code=403, detail="Invalid invite code")
     return is_static
 
 
-def _consume_invite_code(code: str, is_static: bool, used_by: str) -> None:
+def _consume_invite_code(code: str, is_static: bool, used_by: str,
+                         request: Optional[Request] = None, flow: Optional[str] = None) -> None:
     """Burn a single-use invite token now that we're committed to creating the
     account. No-op for a shared static code. Race-safe via consume_invite_token:
     if a concurrent signup consumed the token in the gap since _check_invite_code,
-    this fails closed with 403."""
+    this fails closed with 403 (and an ``invite_invalid`` security event)."""
     if is_static:
         return
     if not store.consume_invite_token((code or "").strip(), used_by=used_by):
+        audit.log_event(
+            "invite_invalid", outcome="failure", request=request, identity=used_by,
+            detail={"flow": flow, "reason": "already_used"},
+        )
         raise HTTPException(status_code=403, detail="This invite code has already been used")
 
 
@@ -151,9 +164,11 @@ def _normalize_email(email: str) -> str:
 
 
 # --- helpers ---------------------------------------------------------------
-def _verify_signed_challenge(public_key: str, challenge: str, signature: str) -> None:
+def _verify_signed_challenge(public_key: str, challenge: str, signature: str,
+                             request: Optional[Request] = None, flow: Optional[str] = None) -> None:
     """Consume the one-time challenge and verify the Ed25519 signature over it.
-    Raises HTTPException(401) on any failure."""
+    Raises HTTPException(401) on any failure (recorded as a ``login_failed``
+    security event — request/flow are that audit context)."""
     if not _HEX64.match(public_key or ""):
         raise HTTPException(status_code=400, detail="public_key must be 64 hex chars (32-byte Ed25519 key)")
     if not _HEX128.match(signature or ""):
@@ -162,6 +177,11 @@ def _verify_signed_challenge(public_key: str, challenge: str, signature: str) ->
     public_key = public_key.lower()
     # Single-use: consume first so a leaked/failed attempt can't be replayed.
     if not store.consume_challenge(challenge, public_key, CHALLENGE_PURPOSE):
+        audit.log_event(
+            "login_failed", outcome="failure", request=request,
+            identity=audit.key_prefix(public_key),
+            detail={"method": "mnemonic", "flow": flow, "reason": "bad_challenge"},
+        )
         raise HTTPException(status_code=401, detail="Invalid or expired challenge")
 
     ok = ed25519.verify(
@@ -170,6 +190,11 @@ def _verify_signed_challenge(public_key: str, challenge: str, signature: str) ->
         bytes.fromhex(signature),
     )
     if not ok:
+        audit.log_event(
+            "login_failed", outcome="failure", request=request,
+            identity=audit.key_prefix(public_key),
+            detail={"method": "mnemonic", "flow": flow, "reason": "bad_signature"},
+        )
         raise HTTPException(status_code=401, detail="Signature verification failed")
 
 
@@ -366,14 +391,20 @@ async def auth_register(request: Request, body: RegisterRequest):
 
     # Validate the invite (does not consume single-use tokens yet) before the
     # one-time challenge, so a bad code doesn't burn the challenge.
-    is_static = _check_invite_code(body.invite_code)
+    is_static = _check_invite_code(body.invite_code, request, audit.key_prefix(pk), "mnemonic_register")
 
-    _verify_signed_challenge(pk, body.challenge, body.signature)
+    _verify_signed_challenge(pk, body.challenge, body.signature, request, "register")
     # Committed now: burn the single-use token (race-safe; no-op for static codes).
-    _consume_invite_code(body.invite_code, is_static, used_by=f"mnemonic:{pk}")
+    _consume_invite_code(body.invite_code, is_static, used_by=f"mnemonic:{pk}",
+                         request=request, flow="mnemonic_register")
     account = store.create_account(pk, body.label)
     token, expires_at = store.create_session(account["user_id"])
     store.touch_login(account["user_id"])
+    audit.log_event(
+        "register_success", outcome="success", request=request,
+        user_id=account["user_id"], identity=audit.key_prefix(pk),
+        detail={"method": "mnemonic"},
+    )
     return AuthResponse(
         public_key=pk, label=account.get("label"),
         session_token=token, expires_at=expires_at, created=True,
@@ -394,13 +425,21 @@ async def auth_login(request: Request, body: LoginRequest):
     if not _HEX64.match(pk):
         raise HTTPException(status_code=400, detail="public_key must be 64 hex chars")
 
+    # The 404 is deliberately NOT a security event: it's a step of the client's
+    # normal login→register fallback for a brand-new key, not an attack signal
+    # (and the 256-bit keyspace makes key probing meaningless anyway).
     account = store.get_account_by_public_key(pk)
     if not account:
         raise HTTPException(status_code=404, detail="No account for this key; use /auth/register")
 
-    _verify_signed_challenge(pk, body.challenge, body.signature)
+    _verify_signed_challenge(pk, body.challenge, body.signature, request, "login")
     token, expires_at = store.create_session(account["user_id"])
     store.touch_login(account["user_id"])
+    audit.log_event(
+        "login_success", outcome="success", request=request,
+        user_id=account["user_id"], identity=audit.key_prefix(pk),
+        detail={"method": "mnemonic"},
+    )
     return AuthResponse(
         public_key=pk, label=account.get("label"),
         session_token=token, expires_at=expires_at, created=False,
@@ -487,15 +526,24 @@ async def email_register(request: Request, body: EmailRegisterRequest):
     # Invite-gated (shared static code OR single-use Discord-bot token); validated
     # here but only *consumed* once we're committed to creating the account, so a
     # 409 (email taken) doesn't burn a single-use token. See _check_invite_code.
-    is_static = _check_invite_code(body.invite_code)
+    is_static = _check_invite_code(body.invite_code, request, email, "email_register")
 
     if store.get_account_by_email(email):
+        audit.log_event(
+            "register_blocked", outcome="failure", request=request, identity=email,
+            detail={"method": "email", "reason": "email_taken"},
+        )
         raise HTTPException(status_code=409, detail="An account with this email already exists")
 
-    _consume_invite_code(body.invite_code, is_static, used_by=email)
+    _consume_invite_code(body.invite_code, is_static, used_by=email,
+                         request=request, flow="email_register")
 
     pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
     account = store.create_email_account(email, pw_hash, body.label)
+    audit.log_event(
+        "register_success", outcome="success", request=request,
+        user_id=account["user_id"], identity=email, detail={"method": "email"},
+    )
 
     # Demo deployments run with no SMTP and want frictionless signup, so skip the
     # verify-by-email step: mark the account verified and sign the user straight in.
@@ -534,9 +582,18 @@ async def email_login(request: Request, body: EmailLoginRequest):
         stored_hash or "pbkdf2_sha256$1$AAAA$AAAA",
     )
     if not account or not stored_hash or not ok:
+        audit.log_event(
+            "login_failed", outcome="failure", request=request, identity=email,
+            user_id=account["user_id"] if account else None,
+            detail={"method": "email", "reason": "bad_credentials"},
+        )
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not account.get("email_verified"):
+        audit.log_event(
+            "login_unverified", outcome="failure", request=request, identity=email,
+            user_id=account["user_id"], detail={"method": "email"},
+        )
         raise HTTPException(
             status_code=403,
             detail="Please verify your email before signing in. Check your inbox or request a new link.",
@@ -547,6 +604,10 @@ async def email_login(request: Request, body: EmailLoginRequest):
         new_hash = await run_in_threadpool(passwords.hash_password, body.password)
         store.set_password(account["user_id"], new_hash)
 
+    audit.log_event(
+        "login_success", outcome="success", request=request, identity=email,
+        user_id=account["user_id"], detail={"method": "email"},
+    )
     return _session_payload(account, created=False)
 
 
@@ -557,9 +618,14 @@ async def email_verify(request: Request, body: EmailTokenRequest):
     in (returns a session) so verifying lands them straight in the app."""
     user_id = store.consume_email_token(body.token, "verify")
     if user_id is None:
+        audit.log_event("verify_failed", outcome="failure", request=request)
         raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
     store.set_email_verified(user_id, True)
     account = store.get_account(user_id)
+    audit.log_event(
+        "email_verified", outcome="success", request=request,
+        user_id=user_id, identity=account.get("email"),
+    )
     return _session_payload(account, created=True)
 
 
@@ -570,9 +636,16 @@ async def email_resend(request: Request, body: EmailOnlyRequest):
     oracle); only actually sends for an existing, still-unverified account."""
     email = _normalize_email(body.email)
     account = store.get_account_by_email(email)
-    if account and account.get("email") and not account.get("email_verified"):
+    sent = bool(account and account.get("email") and not account.get("email_verified"))
+    if sent:
         token = store.create_email_token(account["user_id"], "verify", VERIFY_TOKEN_TTL)
         await run_in_threadpool(mailer.send_verification_email, email, token)
+    # Logged even when nothing is sent: a burst of resend requests for emails that
+    # don't exist is exactly the kind of probing the ledger is for. Only admins can
+    # read the log, so recording `sent` here re-opens no account-existence oracle.
+    audit.log_event(
+        "verify_resend_requested", request=request, identity=email, detail={"sent": sent},
+    )
     return {"success": True, "message": "If that account exists and is unverified, a new link is on its way."}
 
 
@@ -583,9 +656,13 @@ async def email_forgot(request: Request, body: EmailOnlyRequest):
     only sends for an existing email+password account."""
     email = _normalize_email(body.email)
     account = store.get_account_by_email(email)
-    if account and account.get("password_hash"):
+    sent = bool(account and account.get("password_hash"))
+    if sent:
         token = store.create_email_token(account["user_id"], "reset", RESET_TOKEN_TTL)
         await run_in_threadpool(mailer.send_reset_email, email, token)
+    audit.log_event(
+        "password_reset_requested", request=request, identity=email, detail={"sent": sent},
+    )
     return {"success": True, "message": "If that account exists, a reset link is on its way."}
 
 
@@ -598,12 +675,14 @@ async def email_reset(request: Request, body: ResetPasswordRequest):
     _validate_password(body.password)
     user_id = store.consume_email_token(body.token, "reset")
     if user_id is None:
+        audit.log_event("password_reset_failed", outcome="failure", request=request)
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired")
 
     pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
     store.set_password(user_id, pw_hash)
     store.set_email_verified(user_id, True)
     store.revoke_user_sessions(user_id)
+    audit.log_event("password_reset_success", outcome="success", request=request, user_id=user_id)
     return {"success": True, "message": "Password updated. You can now sign in."}
 
 

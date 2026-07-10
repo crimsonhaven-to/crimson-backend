@@ -50,6 +50,7 @@ from download_engine.manager import manager as download_manager
 from resolvers import _crimson_proxy
 
 from account_engine import router as account_router, store as account_store
+from account_engine import audit as security_audit
 from account_engine.routes import set_episode_enricher, set_warmup_handler
 from account_engine.admin_routes import (
     router as admin_router,
@@ -117,6 +118,7 @@ async def lifespan(app: FastAPI):
     # Initialize databases (idempotent — safe on every replica).
     db_engine.init_db()
     account_store.init_db()  # account tables (untouched by mapping resyncs)
+    security_audit.init_db()  # security event ledger (resync-safe, additive)
     apikey_store.init_db()  # movie-web bridge API keys (resync-safe)
     supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
     local_source_store.init_db()  # admin-managed local media sources (resync-safe)
@@ -157,6 +159,14 @@ async def lifespan(app: FastAPI):
                 logger.info(f"Purged {n} expired api_cache rows")
         except Exception as e:
             logger.error(f"Expired api_cache purge failed: {e}")
+        # Security-event retention (SECURITY_EVENTS_RETENTION_DAYS, default 90).
+        # Idempotent DELETE, so several replicas sweeping on their own clocks is fine.
+        try:
+            n = security_audit.purge_old()
+            if n:
+                logger.info(f"Purged {n} security events past retention")
+        except Exception as e:
+            logger.error(f"Security event purge failed: {e}")
 
     scheduler.add_job(
         _purge_expired,
@@ -457,6 +467,12 @@ app.state.limiter = limiter
 async def _voiced_rate_limit_handler(request: Request, exc: RateLimitExceeded):
     """Like slowapi's default 429, but in Lumi's voice. Delegates to the original
     to get the correct status + ``Retry-After``, then re-skins the body."""
+    # A tripped limiter is the strongest brute-force/flood signal we have — record
+    # it in the security ledger (fire-and-forget; see account_engine.audit).
+    security_audit.log_event(
+        "rate_limited", outcome="failure", request=request,
+        detail={"path": request.url.path},
+    )
     base = _rate_limit_exceeded_handler(request, exc)
     retry_after = {
         k: v for k, v in base.headers.items() if k.lower() == "retry-after"
