@@ -49,6 +49,7 @@ from download_engine import aria2 as download_aria2
 from download_engine import manager as download_manager
 from telemetry_engine import TelemetryStore
 from apikey_engine import store as apikey_store
+from . import audit
 from .db import AccountStore
 from .routes import require_user
 
@@ -73,6 +74,17 @@ def require_admin(user: dict = Depends(require_user)) -> dict:
     if not user.get("is_admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+def _audit_admin(request: Optional[Request], user: dict, action: str, **detail) -> None:
+    """Paper-trail a sensitive admin change as an ``admin_action`` security event
+    (who did what to whom, from where). Fire-and-forget like all audit writes."""
+    audit.log_event(
+        "admin_action", outcome="success", request=request,
+        user_id=user["user_id"],
+        identity=f"admin:{user.get('email') or user['user_id']}",
+        detail={"action": action, **{k: v for k, v in detail.items() if v is not None}},
+    )
 
 
 def _public_user(row: Optional[dict]) -> Optional[dict]:
@@ -240,6 +252,49 @@ async def admin_source_stats(
     return {"success": True, "generated_at": _now_iso(), "days": days, "sources": rows}
 
 
+# --- security event log ------------------------------------------------------
+# The ledger the auth choke points, the 429 handler and the admin actions above
+# write into (see account_engine.audit). Two reads: aggregate metrics for the
+# dashboard's tiles/charts, and the filterable raw event table.
+@router.get("/security/stats")
+async def security_stats(
+    user: dict = Depends(require_admin),
+    days: int = Query(14, ge=1, le=90, description="Window for the chart/aggregates"),
+):
+    """Security metrics for the dashboard: 24h tiles (failed logins, invite
+    rejections, rate-limit trips, distinct offending IPs), a zero-filled per-day
+    event series, per-type totals, top offending IPs and the most-targeted
+    identities over the last ``days`` days."""
+    data = await run_in_threadpool(audit.stats, days)
+    return {"success": True, "generated_at": _now_iso(), **data}
+
+
+@router.get("/security/events")
+async def security_events(
+    user: dict = Depends(require_admin),
+    event_type: Optional[str] = Query(None, description="Filter to one event type"),
+    outcome: Optional[str] = Query(None, description="success / failure / info"),
+    ip: Optional[str] = Query(None, description="Exact client IP"),
+    search: Optional[str] = Query(None, description="Substring match on identity / IP"),
+    hours: Optional[int] = Query(None, ge=1, le=2160, description="Only events from the last N hours"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """The raw ledger, newest first, filterable — the drill-down behind every
+    number /admin/security/stats shows."""
+    data = await run_in_threadpool(
+        lambda: audit.list_events(event_type, outcome, ip, search, hours, limit, offset)
+    )
+    return {
+        "success": True,
+        "generated_at": _now_iso(),
+        "count": len(data["events"]),
+        "total": data["total"],
+        "events": data["events"],
+        "event_types": list(audit.EVENT_TYPES),
+    }
+
+
 # --- users -----------------------------------------------------------------
 class UserUpdate(BaseModel):
     is_admin: Optional[bool] = None
@@ -259,7 +314,7 @@ async def list_users(
 
 
 @router.patch("/users/{user_id}")
-async def update_user(user_id: int, body: UserUpdate, user: dict = Depends(require_admin)):
+async def update_user(request: Request, user_id: int, body: UserUpdate, user: dict = Depends(require_admin)):
     """Toggle a user's admin / verified flags. You can't revoke your OWN admin
     flag (locking yourself out), nor demote the last remaining admin."""
     target = await run_in_threadpool(store.get_account, user_id)
@@ -273,33 +328,41 @@ async def update_user(user_id: int, body: UserUpdate, user: dict = Depends(requi
             if await run_in_threadpool(store.count_admins) <= 1:
                 raise HTTPException(status_code=400, detail="Cannot demote the last admin")
         await run_in_threadpool(store.set_admin, user_id, body.is_admin)
+        _audit_admin(request, user, "admin_granted" if body.is_admin else "admin_revoked",
+                     target_user_id=user_id, target=target.get("email"))
 
     if body.email_verified is not None:
         await run_in_threadpool(store.set_email_verified, user_id, body.email_verified)
+        _audit_admin(request, user, "verified_set" if body.email_verified else "verified_cleared",
+                     target_user_id=user_id, target=target.get("email"))
 
     fresh = await run_in_threadpool(store.get_account, user_id)
     return {"success": True, "user": _public_user(fresh)}
 
 
 @router.post("/users/{user_id}/revoke-sessions")
-async def revoke_user_sessions(user_id: int, user: dict = Depends(require_admin)):
+async def revoke_user_sessions(request: Request, user_id: int, user: dict = Depends(require_admin)):
     """Force-log-out a user by dropping all their active sessions."""
     target = await run_in_threadpool(store.get_account, user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     await run_in_threadpool(store.revoke_user_sessions, user_id)
+    _audit_admin(request, user, "sessions_revoked", target_user_id=user_id, target=target.get("email"))
     return {"success": True, "user_id": user_id}
 
 
 @router.delete("/users/{user_id}")
-async def delete_user(user_id: int, user: dict = Depends(require_admin)):
+async def delete_user(request: Request, user_id: int, user: dict = Depends(require_admin)):
     """Delete an account and (via ON DELETE CASCADE) its favorites / progress /
     sessions. You cannot delete your own account here."""
     if user_id == user["user_id"]:
         raise HTTPException(status_code=400, detail="You cannot delete your own account")
+    target = await run_in_threadpool(store.get_account, user_id)
     removed = await run_in_threadpool(store.delete_account, user_id)
     if not removed:
         raise HTTPException(status_code=404, detail="User not found")
+    _audit_admin(request, user, "user_deleted", target_user_id=user_id,
+                 target=(target or {}).get("email"))
     return {"success": True, "deleted": user_id}
 
 
@@ -331,14 +394,16 @@ async def create_invites(request: Request, body: InviteCreate, user: dict = Depe
         await run_in_threadpool(store.create_invite_token, created_by, ttl)
         for _ in range(body.count)
     ]
+    _audit_admin(request, user, "invites_minted", count=len(codes), ttl_hours=body.ttl_hours)
     return {"success": True, "count": len(codes), "codes": codes}
 
 
 @router.delete("/invites/{code}")
-async def revoke_invite(code: str, user: dict = Depends(require_admin)):
+async def revoke_invite(request: Request, code: str, user: dict = Depends(require_admin)):
     ok = await run_in_threadpool(store.revoke_invite_token, code)
     if not ok:
         raise HTTPException(status_code=404, detail="Unknown or already-used invite code")
+    _audit_admin(request, user, "invite_revoked")
     return {"success": True, "revoked": code}
 
 
@@ -370,16 +435,18 @@ async def create_api_key(request: Request, body: ApiKeyCreate, user: dict = Depe
     it can't be retrieved later, only revoked + replaced."""
     created_by = f"admin:{user.get('email') or user['user_id']}"
     raw, info = await run_in_threadpool(apikey_store.create_key, (body.label or None), created_by)
+    _audit_admin(request, user, "api_key_created", label=body.label)
     return {"success": True, "key": raw, "info": info}
 
 
 @router.delete("/api-keys/{key_id}")
-async def revoke_api_key(key_id: str, user: dict = Depends(require_admin)):
+async def revoke_api_key(request: Request, key_id: str, user: dict = Depends(require_admin)):
     """Revoke a bridge key by its id. Takes effect within the login wall's
     validation-cache TTL (~60s)."""
     ok = await run_in_threadpool(apikey_store.revoke_key, key_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Unknown or already-revoked API key")
+    _audit_admin(request, user, "api_key_revoked", key_id=key_id)
     return {"success": True, "revoked": key_id}
 
 

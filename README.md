@@ -134,6 +134,7 @@ for the fully-commented list). The most relevant:
 | `JELLYFIN_EDGE_INJECT` | no | `off` | Deliver Jellyfin off-backend via crimson-proxy **edge token injection** instead of the backend `/jellyfin_proxy`. Requires the proxy deployed with `NITRO_JELLYFIN_*`. Off ⇒ backend-proxied (default, no regression). |
 | `ALLOWED_ORIGINS` | no | built-in list | Comma-separated CORS origins (e.g. `https://crimsonhaven.to`). |
 | `RATE_LIMIT_STORAGE_URI` | no | `memory://` | Rate-limit backend; `redis://…` to share limits across replicas. |
+| `SECURITY_EVENTS_RETENTION_DAYS` | no | `90` | How long the security event ledger (Admin › Security: auth denials, rate-limit trips, admin actions) keeps rows before the housekeeping sweep prunes them. |
 | `DEBUG` | no | unset | When truthy, includes exception detail in 500 responses. Leave unset in production. |
 
 Other optional integrations (each self-disables when unset): the **Discord invite
