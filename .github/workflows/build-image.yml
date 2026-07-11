@@ -135,9 +135,9 @@ jobs:
           # Optional build-time source overlay (see self-hosting docs): a clone URL
           # and token passed as BuildKit secrets. Unset = empty = the build skips the
           # overlay. Never baked into a layer.
-          secrets: |
-            sources_pat=${{ secrets.SOURCES_PAT }}
-            sources_repo=${{ secrets.SOURCES_REPO }}
+          # secrets: |
+          #   sources_pat=${{ secrets.SOURCES_PAT }}
+          #   sources_repo=${{ secrets.SOURCES_REPO }}
           # Registry-backed layer cache keeps rebuilds fast across runner restarts.
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
