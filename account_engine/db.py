@@ -404,6 +404,21 @@ class AccountStore:
                 f"SELECT COUNT(*) AS n FROM accounts {where}", tuple(params)
             ).fetchone()["n"]
 
+    def email_recipients(self, verified_only: bool = True) -> List[Dict]:
+        """Everyone an admin broadcast email can reach: accounts that signed up
+        with an email address (mnemonic-only accounts have none and are skipped),
+        with their optional display name for personalisation. ``verified_only``
+        additionally drops addresses that never clicked their verification link
+        (they may not even belong to the account holder)."""
+        where = "email IS NOT NULL"
+        if verified_only:
+            where += " AND email_verified = TRUE"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT user_id, email, username FROM accounts WHERE {where} ORDER BY user_id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def admin_overview(self) -> Dict:
         """Aggregate account-system stats for the admin health dashboard."""
         with self._connect() as conn:

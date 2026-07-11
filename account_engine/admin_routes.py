@@ -49,7 +49,7 @@ from download_engine import aria2 as download_aria2
 from download_engine import manager as download_manager
 from telemetry_engine import TelemetryStore
 from apikey_engine import store as apikey_store
-from . import audit
+from . import audit, mailer
 from .db import AccountStore
 from .routes import require_user
 
@@ -364,6 +364,101 @@ async def delete_user(request: Request, user_id: int, user: dict = Depends(requi
     _audit_admin(request, user, "user_deleted", target_user_id=user_id,
                  target=(target or {}).get("email"))
     return {"success": True, "deleted": user_id}
+
+
+# --- broadcast email ---------------------------------------------------------
+# The Users tab's "E-Mail sender": one plaintext message, fanned out to every
+# account that signed up with an email address (mnemonic-only accounts have no
+# address and are skipped), personalised with the account's display name. Sending
+# happens in the background over one SMTP connection (mailer.send_broadcast);
+# this state dict mirrors _resync_state so the dashboard can poll live progress.
+_broadcast_lock = asyncio.Lock()
+_broadcast_state = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "subject": None,
+    "total": 0,
+    "sent": 0,
+    "failed": 0,
+    "triggered_by": None,
+}
+
+
+class BroadcastEmail(BaseModel):
+    subject: str = Field(..., min_length=1, max_length=200)
+    message: str = Field(..., min_length=1, max_length=20000)
+    # Skip addresses that never clicked their verification link (they may not
+    # even belong to the account holder). The dashboard surfaces the toggle.
+    verified_only: bool = True
+
+
+async def _run_broadcast(recipients: list, subject: str, message: str) -> None:
+    async with _broadcast_lock:
+        def _progress(sent: int, failed: int) -> None:
+            _broadcast_state.update(sent=sent, failed=failed)
+
+        try:
+            result = await run_in_threadpool(
+                mailer.send_broadcast, recipients, subject, message, _progress
+            )
+            _broadcast_state.update(sent=result["sent"], failed=result["failed"])
+        except Exception:  # send_broadcast fails soft; this is a belt-and-braces net
+            _broadcast_state["failed"] = len(recipients) - _broadcast_state["sent"]
+        finally:
+            _broadcast_state.update(running=False, finished_at=_now_iso())
+
+
+@router.get("/broadcast-email")
+async def broadcast_email_status(user: dict = Depends(require_admin)):
+    """Everything the E-Mail sender panel needs up front: whether SMTP is
+    configured at all (the form greys out when it isn't), how many accounts a
+    send would reach, and the live/last run's progress."""
+    counts = {
+        "verified": len(await run_in_threadpool(store.email_recipients, True)),
+        "all": len(await run_in_threadpool(store.email_recipients, False)),
+    }
+    return {
+        "success": True,
+        "configured": mailer.is_configured(),
+        "recipients": counts,
+        "broadcast": _broadcast_state,
+    }
+
+
+@router.post("/broadcast-email")
+@limiter.limit("5/minute")
+async def send_broadcast_email(request: Request, body: BroadcastEmail, user: dict = Depends(require_admin)):
+    """Queue the broadcast and return immediately; poll GET /admin/broadcast-email
+    for progress. Refused cleanly (not a 500) when SMTP isn't configured, when a
+    send is already running, or when there's nobody to email."""
+    if not mailer.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="SMTP is not configured — set SMTP_HOST (and friends) in the backend environment first.",
+        )
+    if _broadcast_state["running"]:
+        return {"success": False, "message": "A broadcast is already being sent", "broadcast": _broadcast_state}
+    recipients = await run_in_threadpool(store.email_recipients, body.verified_only)
+    if not recipients:
+        raise HTTPException(status_code=400, detail="No email accounts to send to")
+    triggered_by = f"admin:{user.get('email') or user['user_id']}"
+    _audit_admin(request, user, "broadcast_email", subject=body.subject,
+                 recipients=len(recipients), verified_only=body.verified_only)
+    # Flip the state HERE (not in the task) so a double-click can't queue a second
+    # send behind the lock and email everyone twice.
+    _broadcast_state.update(
+        running=True, started_at=_now_iso(), finished_at=None,
+        subject=body.subject.strip(), total=len(recipients), sent=0, failed=0,
+        triggered_by=triggered_by,
+    )
+    asyncio.create_task(_run_broadcast(recipients, body.subject.strip(), body.message))
+    return {
+        "success": True,
+        "message": f"Sending to {len(recipients)} recipient{'s' if len(recipients) != 1 else ''}",
+        "recipients": len(recipients),
+        "broadcast": _broadcast_state,
+    }
 
 
 # --- invite codes ----------------------------------------------------------

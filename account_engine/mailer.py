@@ -21,10 +21,12 @@ raising into the request — so registration still succeeds even if mail is down
 (the user can use "resend verification" once mail is fixed).
 """
 
+import html
 import logging
 import os
 import smtplib
 import ssl
+from contextlib import contextmanager
 from email.message import EmailMessage
 from email.utils import formataddr
 
@@ -43,42 +45,52 @@ def _from_address() -> str:
     return os.getenv("SMTP_FROM") or os.getenv("SMTP_USER") or "service@agony.ch"
 
 
-def send_email(to: str, subject: str, text: str, html: str | None = None) -> bool:
-    """Send one message. Returns True on success, False (logged) on any failure
-    or when SMTP isn't configured."""
+@contextmanager
+def _connection():
+    """A logged-in SMTP connection per the env config. Raises on any failure
+    (missing config, connect/auth error) — callers decide how soft to fail."""
     host = os.getenv("SMTP_HOST")
     if not host:
-        logger.warning("[mailer] SMTP_HOST unset — skipping email to %s (%r)", to, subject)
-        return False
-
+        raise RuntimeError("SMTP_HOST unset")
     port = int(os.getenv("SMTP_PORT", "587"))
     security = (os.getenv("SMTP_SECURITY") or "starttls").lower()
     user = os.getenv("SMTP_USER") or _from_address()
     password = os.getenv("SMTP_PASSWORD") or ""
-    from_name = os.getenv("SMTP_FROM_NAME", "CrimsonHaven")
+    context = ssl.create_default_context()
+    if security == "ssl":
+        with smtplib.SMTP_SSL(host, port, timeout=20, context=context) as server:
+            if password:
+                server.login(user, password)
+            yield server
+    else:
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            if security == "starttls":
+                server.starttls(context=context)
+            if password:
+                server.login(user, password)
+            yield server
 
+
+def _build_message(to: str, subject: str, text: str, html_body: str | None = None) -> EmailMessage:
     msg = EmailMessage()
-    msg["From"] = formataddr((from_name, _from_address()))
+    msg["From"] = formataddr((os.getenv("SMTP_FROM_NAME", "CrimsonHaven"), _from_address()))
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(text)
-    if html:
-        msg.add_alternative(html, subtype="html")
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
+    return msg
 
+
+def send_email(to: str, subject: str, text: str, html: str | None = None) -> bool:
+    """Send one message. Returns True on success, False (logged) on any failure
+    or when SMTP isn't configured."""
+    if not is_configured():
+        logger.warning("[mailer] SMTP_HOST unset — skipping email to %s (%r)", to, subject)
+        return False
     try:
-        context = ssl.create_default_context()
-        if security == "ssl":
-            with smtplib.SMTP_SSL(host, port, timeout=20, context=context) as server:
-                if password:
-                    server.login(user, password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=20) as server:
-                if security == "starttls":
-                    server.starttls(context=context)
-                if password:
-                    server.login(user, password)
-                server.send_message(msg)
+        with _connection() as server:
+            server.send_message(_build_message(to, subject, text, html))
         logger.info("[mailer] sent %r to %s", subject, to)
         return True
     except Exception as e:  # noqa: BLE001 — fail soft, never break the request
@@ -87,7 +99,11 @@ def send_email(to: str, subject: str, text: str, html: str | None = None) -> boo
 
 
 # --- branded templates -----------------------------------------------------
-def _wrap(title: str, body_html: str) -> str:
+def _wrap(
+    title: str,
+    body_html: str,
+    footer: str = "If you didn't request this, you can safely ignore this message.",
+) -> str:
     return f"""\
 <div style="background:#0a0305;padding:40px 0;font-family:Inter,Segoe UI,Arial,sans-serif">
   <div style="max-width:480px;margin:0 auto;background:#15080c;border:1px solid #3a0d18;
@@ -100,7 +116,7 @@ def _wrap(title: str, body_html: str) -> str:
     </p>
     {body_html}
     <p style="margin:32px 0 0;font-size:11px;color:#6b1f2e;line-height:1.6">
-      If you didn't request this, you can safely ignore this message.
+      {footer}
     </p>
   </div>
 </div>"""
@@ -150,3 +166,51 @@ def send_reset_email(to: str, token: str) -> bool:
         f'<p style="font-size:11px;color:#6b1f2e;margin:24px 0 0">This link expires in 1 hour.</p>',
     )
     return send_email(to, "Reset your CrimsonHaven password", text, html)
+
+
+# --- admin broadcast ---------------------------------------------------------
+def _broadcast_bodies(message: str, username: str | None) -> tuple[str, str]:
+    """(text, html) for one broadcast recipient: the admin's plaintext message,
+    personalised with the account's display name when they've set one."""
+    greeting = f"Greetings, {username}." if username else "Greetings, mortal."
+    text = f"{greeting}\n\n{message}"
+    body = html.escape(message).replace("\n", "<br>")
+    html_body = _wrap(
+        "A message from the haven",
+        f'<p style="font-size:14px;line-height:1.7;color:#d9aab4;margin:0 0 16px">{html.escape(greeting)}</p>'
+        f'<p style="font-size:14px;line-height:1.7;color:#d9aab4;margin:0">{body}</p>',
+        footer="You're receiving this because you're a member of CrimsonHaven.",
+    )
+    return text, html_body
+
+
+def send_broadcast(recipients: list[dict], subject: str, message: str, progress=None) -> dict:
+    """Send the admin's plaintext ``message`` to every recipient (dicts with
+    ``email`` + optional ``username``) over ONE SMTP connection. Fails soft per
+    recipient (one bad address doesn't abort the rest) and entirely (a dead/
+    unconfigured server yields sent=0, not an exception). ``progress``, if given,
+    is called as progress(sent, failed) after each attempt so the caller can
+    surface live status. Blocking — run through a threadpool."""
+    sent, failed = 0, 0
+    if not is_configured():
+        logger.warning("[mailer] SMTP_HOST unset — broadcast %r skipped", subject)
+        return {"sent": 0, "failed": len(recipients)}
+    try:
+        with _connection() as server:
+            for r in recipients:
+                text, html_body = _broadcast_bodies(message, r.get("username"))
+                try:
+                    server.send_message(_build_message(r["email"], subject, text, html_body))
+                    sent += 1
+                except Exception as e:  # noqa: BLE001 — skip the bad address, keep going
+                    logger.error("[mailer] broadcast to %s failed: %s", r.get("email"), e)
+                    failed += 1
+                if progress:
+                    progress(sent, failed)
+    except Exception as e:  # noqa: BLE001 — connection/auth died; the rest never sent
+        logger.error("[mailer] broadcast %r aborted: %s", subject, e)
+        failed = len(recipients) - sent
+        if progress:
+            progress(sent, failed)
+    logger.info("[mailer] broadcast %r: %d sent, %d failed", subject, sent, failed)
+    return {"sent": sent, "failed": failed}
