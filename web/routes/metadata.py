@@ -194,6 +194,9 @@ async def get_scrape_meta(request: Request, tmdb_id: int, season_number: int):
         return {
             "success": True,
             "anilist_id": anilist_id,
+            # MAL id (AniList idMal, via Fribb) — for the MAL-keyed client source
+            # (kissanime.ing -> megaplay). Already in anilist_data, so no extra fetch.
+            "mal_id": anilist_data.get("mal_id"),
             "title": title,
             "title_english": anilist_data.get("title_english"),
             "title_romaji": anilist_data.get("title_romaji"),
@@ -223,6 +226,7 @@ async def get_scrape_meta(request: Request, tmdb_id: int, season_number: int):
     return {
         "success": True,
         "anilist_id": None,
+        "mal_id": None,  # no AniList entry -> no MAL id
         "title": title,
         "title_english": title,
         "title_romaji": None,
@@ -269,6 +273,7 @@ async def get_scrape_meta_movie(request: Request, tmdb_id: int):
     return {
         "success": True,
         "anilist_id": None,
+        "mal_id": None,  # movies carry no MAL id
         "title": title,
         "title_english": title,
         "title_romaji": None,
