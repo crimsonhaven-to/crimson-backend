@@ -18,5 +18,9 @@
 *.db-wal
 *.db-shm
 
-# db migration
+# ad-hoc local db dumps / scratch SQL
 *.sql
+# ...but the versioned schema migrations are tracked: they must ship in the image,
+# or a deployed container finds zero migration files and reports itself up to date
+# while actually being unmigrated. See core/migrations.py.
+!migrations/*.sql

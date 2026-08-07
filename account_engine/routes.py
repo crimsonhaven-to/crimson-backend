@@ -351,7 +351,7 @@ class ProgressIn(BaseModel):
 # --- auth endpoints --------------------------------------------------------
 @router.post("/auth/challenge", response_model=ChallengeResponse)
 @limiter.limit("20/minute")
-async def auth_challenge(request: Request, body: ChallengeRequest):
+def auth_challenge(request: Request, body: ChallengeRequest):
     """Issue a one-time challenge for a public key. The client signs the
     returned ``challenge`` string with its Ed25519 private key, then calls
     /auth/register or /auth/login."""
@@ -364,7 +364,7 @@ async def auth_challenge(request: Request, body: ChallengeRequest):
 
 @router.post("/auth/register", response_model=AuthResponse)
 @limiter.limit("10/minute")
-async def auth_register(request: Request, body: RegisterRequest):
+def auth_register(request: Request, body: RegisterRequest):
     """Create the account for a public key (proving key possession via the
     signed challenge) and return a session. 409 if the key is already
     registered — use /auth/login instead.
@@ -413,7 +413,7 @@ async def auth_register(request: Request, body: RegisterRequest):
 
 @router.post("/auth/login", response_model=AuthResponse)
 @limiter.limit("10/minute")
-async def auth_login(request: Request, body: LoginRequest):
+def auth_login(request: Request, body: LoginRequest):
     """Log in to an existing account by signing the challenge. 404 if the public
     key isn't registered yet — use /auth/register.
 
@@ -447,7 +447,7 @@ async def auth_login(request: Request, body: LoginRequest):
 
 
 @router.post("/auth/logout")
-async def auth_logout(authorization: Optional[str] = Header(None)):
+def auth_logout(authorization: Optional[str] = Header(None)):
     """Revoke the current session token."""
     if authorization and authorization.lower().startswith("bearer "):
         store.delete_session(authorization.split(" ", 1)[1].strip())
@@ -457,8 +457,11 @@ async def auth_logout(authorization: Optional[str] = Header(None)):
 # --- email + password auth -------------------------------------------------
 # Added alongside the mnemonic/Ed25519 flow above. Registration is gated by an
 # invite code (SIGNUP_INVITE_CODE) and requires email verification before login,
-# so the site stays closed to strangers. Password hashing (PBKDF2, ~0.3s) and
-# SMTP sending both run in a threadpool so the event loop is never blocked.
+# so the site stays closed to strangers. These handlers must stay `async def`
+# (unlike their plain-`def` siblings below) because they interleave awaits; every
+# blocking step inside them (password hashing at ~0.3s, SMTP sending, and every
+# store/audit DB call) is therefore wrapped in run_in_threadpool so the event loop
+# is never blocked.
 class EmailRegisterRequest(BaseModel):
     email: str
     password: str
@@ -526,21 +529,27 @@ async def email_register(request: Request, body: EmailRegisterRequest):
     # Invite-gated (shared static code OR single-use Discord-bot token); validated
     # here but only *consumed* once we're committed to creating the account, so a
     # 409 (email taken) doesn't burn a single-use token. See _check_invite_code.
-    is_static = _check_invite_code(body.invite_code, request, email, "email_register")
+    is_static = await run_in_threadpool(
+        _check_invite_code, body.invite_code, request, email, "email_register"
+    )
 
-    if store.get_account_by_email(email):
-        audit.log_event(
+    if await run_in_threadpool(store.get_account_by_email, email):
+        await run_in_threadpool(
+            audit.log_event,
             "register_blocked", outcome="failure", request=request, identity=email,
             detail={"method": "email", "reason": "email_taken"},
         )
         raise HTTPException(status_code=409, detail="An account with this email already exists")
 
-    _consume_invite_code(body.invite_code, is_static, used_by=email,
-                         request=request, flow="email_register")
+    await run_in_threadpool(
+        _consume_invite_code, body.invite_code, is_static, used_by=email,
+        request=request, flow="email_register",
+    )
 
     pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
-    account = store.create_email_account(email, pw_hash, body.label)
-    audit.log_event(
+    account = await run_in_threadpool(store.create_email_account, email, pw_hash, body.label)
+    await run_in_threadpool(
+        audit.log_event,
         "register_success", outcome="success", request=request,
         user_id=account["user_id"], identity=email, detail={"method": "email"},
     )
@@ -549,11 +558,14 @@ async def email_register(request: Request, body: EmailRegisterRequest):
     # verify-by-email step: mark the account verified and sign the user straight in.
     # (The nightly DEMO_MODE reset wipes these accounts anyway.)
     if Config.DEMO_MODE:
-        store.set_email_verified(account["user_id"], True)
-        account = store.get_account(account["user_id"])
-        return {**_session_payload(account, created=True), "requires_verification": False}
+        await run_in_threadpool(store.set_email_verified, account["user_id"], True)
+        account = await run_in_threadpool(store.get_account, account["user_id"])
+        payload = await run_in_threadpool(_session_payload, account, created=True)
+        return {**payload, "requires_verification": False}
 
-    token = store.create_email_token(account["user_id"], "verify", VERIFY_TOKEN_TTL)
+    token = await run_in_threadpool(
+        store.create_email_token, account["user_id"], "verify", VERIFY_TOKEN_TTL
+    )
     await run_in_threadpool(mailer.send_verification_email, email, token)
 
     return {
@@ -571,7 +583,7 @@ async def email_login(request: Request, body: EmailLoginRequest):
     credentials (deliberately generic, no account-existence oracle); 403 if the
     email isn't verified yet."""
     email = _normalize_email(body.email)
-    account = store.get_account_by_email(email)
+    account = await run_in_threadpool(store.get_account_by_email, email)
 
     # Always run a hash comparison (against the stored hash, or a throwaway) so
     # the response time doesn't reveal whether the email exists.
@@ -582,7 +594,8 @@ async def email_login(request: Request, body: EmailLoginRequest):
         stored_hash or "pbkdf2_sha256$1$AAAA$AAAA",
     )
     if not account or not stored_hash or not ok:
-        audit.log_event(
+        await run_in_threadpool(
+            audit.log_event,
             "login_failed", outcome="failure", request=request, identity=email,
             user_id=account["user_id"] if account else None,
             detail={"method": "email", "reason": "bad_credentials"},
@@ -590,7 +603,8 @@ async def email_login(request: Request, body: EmailLoginRequest):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not account.get("email_verified"):
-        audit.log_event(
+        await run_in_threadpool(
+            audit.log_event,
             "login_unverified", outcome="failure", request=request, identity=email,
             user_id=account["user_id"], detail={"method": "email"},
         )
@@ -602,18 +616,19 @@ async def email_login(request: Request, body: EmailLoginRequest):
     # Transparently upgrade an out-of-date hash now that we have the plaintext.
     if passwords.needs_rehash(stored_hash):
         new_hash = await run_in_threadpool(passwords.hash_password, body.password)
-        store.set_password(account["user_id"], new_hash)
+        await run_in_threadpool(store.set_password, account["user_id"], new_hash)
 
-    audit.log_event(
+    await run_in_threadpool(
+        audit.log_event,
         "login_success", outcome="success", request=request, identity=email,
         user_id=account["user_id"], detail={"method": "email"},
     )
-    return _session_payload(account, created=False)
+    return await run_in_threadpool(_session_payload, account, created=False)
 
 
 @router.post("/auth/email/verify")
 @limiter.limit("20/minute")
-async def email_verify(request: Request, body: EmailTokenRequest):
+def email_verify(request: Request, body: EmailTokenRequest):
     """Consume a verification token, mark the email verified, and sign the user
     in (returns a session) so verifying lands them straight in the app."""
     user_id = store.consume_email_token(body.token, "verify")
@@ -635,15 +650,18 @@ async def email_resend(request: Request, body: EmailOnlyRequest):
     """Resend the verification email. Always returns success (no account-exists
     oracle); only actually sends for an existing, still-unverified account."""
     email = _normalize_email(body.email)
-    account = store.get_account_by_email(email)
+    account = await run_in_threadpool(store.get_account_by_email, email)
     sent = bool(account and account.get("email") and not account.get("email_verified"))
     if sent:
-        token = store.create_email_token(account["user_id"], "verify", VERIFY_TOKEN_TTL)
+        token = await run_in_threadpool(
+            store.create_email_token, account["user_id"], "verify", VERIFY_TOKEN_TTL
+        )
         await run_in_threadpool(mailer.send_verification_email, email, token)
     # Logged even when nothing is sent: a burst of resend requests for emails that
     # don't exist is exactly the kind of probing the ledger is for. Only admins can
     # read the log, so recording `sent` here re-opens no account-existence oracle.
-    audit.log_event(
+    await run_in_threadpool(
+        audit.log_event,
         "verify_resend_requested", request=request, identity=email, detail={"sent": sent},
     )
     return {"success": True, "message": "If that account exists and is unverified, a new link is on its way."}
@@ -655,12 +673,15 @@ async def email_forgot(request: Request, body: EmailOnlyRequest):
     """Start a password reset. Always returns success (no account-exists oracle);
     only sends for an existing email+password account."""
     email = _normalize_email(body.email)
-    account = store.get_account_by_email(email)
+    account = await run_in_threadpool(store.get_account_by_email, email)
     sent = bool(account and account.get("password_hash"))
     if sent:
-        token = store.create_email_token(account["user_id"], "reset", RESET_TOKEN_TTL)
+        token = await run_in_threadpool(
+            store.create_email_token, account["user_id"], "reset", RESET_TOKEN_TTL
+        )
         await run_in_threadpool(mailer.send_reset_email, email, token)
-    audit.log_event(
+    await run_in_threadpool(
+        audit.log_event,
         "password_reset_requested", request=request, identity=email, detail={"sent": sent},
     )
     return {"success": True, "message": "If that account exists, a reset link is on its way."}
@@ -673,22 +694,27 @@ async def email_reset(request: Request, body: ResetPasswordRequest):
     all existing sessions, and (since controlling the inbox proves ownership)
     mark the email verified."""
     _validate_password(body.password)
-    user_id = store.consume_email_token(body.token, "reset")
+    user_id = await run_in_threadpool(store.consume_email_token, body.token, "reset")
     if user_id is None:
-        audit.log_event("password_reset_failed", outcome="failure", request=request)
+        await run_in_threadpool(
+            audit.log_event, "password_reset_failed", outcome="failure", request=request
+        )
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired")
 
     pw_hash = await run_in_threadpool(passwords.hash_password, body.password)
-    store.set_password(user_id, pw_hash)
-    store.set_email_verified(user_id, True)
-    store.revoke_user_sessions(user_id)
-    audit.log_event("password_reset_success", outcome="success", request=request, user_id=user_id)
+    await run_in_threadpool(store.set_password, user_id, pw_hash)
+    await run_in_threadpool(store.set_email_verified, user_id, True)
+    await run_in_threadpool(store.revoke_user_sessions, user_id)
+    await run_in_threadpool(
+        audit.log_event,
+        "password_reset_success", outcome="success", request=request, user_id=user_id,
+    )
     return {"success": True, "message": "Password updated. You can now sign in."}
 
 
 # --- account info ----------------------------------------------------------
 @router.get("/account/me")
-async def account_me(user: dict = Depends(require_user)):
+def account_me(user: dict = Depends(require_user)):
     favs = store.list_favorites(user["user_id"])
     prog = store.list_progress(user["user_id"])
     return {
@@ -720,7 +746,7 @@ _MAX_PREFERENCES_BYTES = 4096
 
 
 @router.get("/account/preferences")
-async def get_preferences(user: dict = Depends(require_user)):
+def get_preferences(user: dict = Depends(require_user)):
     """The account's stored client preferences (``{}`` when none set yet)."""
     return {"success": True, "preferences": store.get_preferences(user["user_id"])}
 
@@ -743,7 +769,7 @@ async def put_preferences(request: Request, user: dict = Depends(require_user)):
         raise HTTPException(status_code=400, detail="Preferences must be a JSON object")
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="Preferences must be a JSON object")
-    saved = store.set_preferences(user["user_id"], data)
+    saved = await run_in_threadpool(store.set_preferences, user["user_id"], data)
     return {"success": True, "preferences": saved}
 
 
@@ -762,7 +788,7 @@ class UsernameIn(BaseModel):
 
 @router.put("/account/username")
 @limiter.limit("20/minute")
-async def set_username(request: Request, body: UsernameIn, user: dict = Depends(require_user)):
+def set_username(request: Request, body: UsernameIn, user: dict = Depends(require_user)):
     """Set or clear the account's cosmetic display name. Trimmed; an empty value
     clears it. Purely additive — never affects auth, favorites or progress."""
     name = (body.username or "").strip()
@@ -776,7 +802,7 @@ async def set_username(request: Request, body: UsernameIn, user: dict = Depends(
 # The default list is 'favorites' (original single-tab behaviour); any other
 # list_name is a custom watchlist. A show may live in several lists at once.
 @router.get("/account/favorites")
-async def get_favorites(
+def get_favorites(
     user: dict = Depends(require_user),
     list_name: Optional[str] = Query(None, description="Filter to one list; omit for all lists"),
 ):
@@ -785,7 +811,7 @@ async def get_favorites(
 
 
 @router.get("/account/watchlists")
-async def get_watchlists(user: dict = Depends(require_user)):
+def get_watchlists(user: dict = Depends(require_user)):
     """The user's distinct list names, each with its item count."""
     lists = store.list_watchlists(user["user_id"])
     return {"success": True, "count": len(lists), "watchlists": lists}
@@ -801,7 +827,7 @@ _EXPORT_FIELDS = (
 
 
 @router.get("/account/favorites/export")
-async def export_favorites(
+def export_favorites(
     user: dict = Depends(require_user),
     format: str = Query("csv", pattern="^(csv|json)$", description="csv (default) or json"),
 ):
@@ -971,7 +997,7 @@ async def import_favorites(
 
 @router.post("/account/favorites")
 @limiter.limit("60/minute")
-async def add_favorite(request: Request, body: FavoriteIn, user: dict = Depends(require_user)):
+def add_favorite(request: Request, body: FavoriteIn, user: dict = Depends(require_user)):
     item_key = _favorite_item_key(body.tmdb_id, body.anilist_id, body.media_type)
     fav = {"item_key": item_key, **body.model_dump(exclude={"list_name"})}
     try:
@@ -982,7 +1008,7 @@ async def add_favorite(request: Request, body: FavoriteIn, user: dict = Depends(
 
 
 @router.delete("/account/favorites")
-async def remove_favorite(
+def remove_favorite(
     user: dict = Depends(require_user),
     tmdb_id: Optional[int] = Query(None),
     anilist_id: Optional[int] = Query(None),
@@ -1044,7 +1070,7 @@ def _resolve_status(body: ProgressIn) -> str:
 
 
 @router.get("/account/progress")
-async def get_progress(
+def get_progress(
     user: dict = Depends(require_user),
     status: Optional[str] = Query(None, description="Filter: in_progress | completed"),
 ):
@@ -1062,7 +1088,9 @@ async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depen
     payload = body.model_dump()
     payload["status"] = _resolve_status(body)
     try:
-        prog = store.upsert_progress(user["user_id"], {"item_key": item_key, **payload})
+        prog = await run_in_threadpool(
+            store.upsert_progress, user["user_id"], {"item_key": item_key, **payload}
+        )
     except QuotaExceeded as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -1078,12 +1106,17 @@ async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depen
         and body.episode_number is not None
     ):
         try:
+            prefs = await run_in_threadpool(store.get_preferences, user["user_id"])
+            # NB: _warmup_handler calls asyncio.create_task (see web.warmup.
+            # schedule_warmup), so it MUST run on the event loop, not in the
+            # threadpool. That is also why this handler stays `async def` while its
+            # siblings became plain `def`.
             _warmup_handler(
                 request,
                 tmdb_id=body.tmdb_id,
                 season_number=body.season_number,
                 episode_number=body.episode_number,
-                preferences=store.get_preferences(user["user_id"]),
+                preferences=prefs,
             )
         except Exception as e:
             logger.warning(f"warmup scheduling failed: {e}")
@@ -1098,7 +1131,8 @@ async def continue_watching(user: dict = Depends(require_user)):
 
     Collapsed to one entry per show (latest in-progress episode), so a series
     you're partway through several episodes of appears once."""
-    items = await _enrich(_dedup_by_show(store.list_progress(user["user_id"], status="in_progress")))
+    rows = await run_in_threadpool(store.list_progress, user["user_id"], status="in_progress")
+    items = await _enrich(_dedup_by_show(rows))
     return {"success": True, "count": len(items), "items": items}
 
 
@@ -1115,12 +1149,13 @@ async def recent(
     progress). Rows are newest-first, so the first time we see a show is its
     latest episode. Unlike /account/continue-watching (which is in_progress only),
     this keeps finished episodes so the history stays populated after completion."""
-    items = await _enrich(_dedup_by_show(store.list_progress(user["user_id"]), limit=limit))
+    rows = await run_in_threadpool(store.list_progress, user["user_id"])
+    items = await _enrich(_dedup_by_show(rows, limit=limit))
     return {"success": True, "count": len(items), "items": items}
 
 
 @router.delete("/account/progress")
-async def remove_progress(
+def remove_progress(
     user: dict = Depends(require_user),
     item_key: Optional[str] = Query(None),
     tmdb_id: Optional[int] = Query(None),

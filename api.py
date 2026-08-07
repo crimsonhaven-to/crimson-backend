@@ -39,6 +39,7 @@ from core import lumi
 from core import config_report
 from core.version import VERSION
 from core.config import Config
+from core import migrations
 from core.db_pool import close_pool
 from core.http_client import (
     open_client as open_http_client,
@@ -125,6 +126,17 @@ async def lifespan(app: FastAPI):
     cache_store.init_db()  # server-side video cache tables (resync-safe)
     download_store.init_db()  # admin download queue (resync-safe)
     telemetry_store.init_db()  # anonymous resolve telemetry (resync-safe)
+
+    # Versioned schema migrations. Runs AFTER the init_db()s above, which still own
+    # the pre-migration baseline: this applies everything from version 0 onward.
+    # Takes the same cluster-wide advisory lock, so concurrent replica boots
+    # serialize (the first applies; the rest find nothing pending). Non-fatal by
+    # design: a migration failure is loud in the log and visible on /health, but
+    # it must not turn a bookkeeping problem into a boot loop across every replica.
+    try:
+        migrations.apply_pending(logger)
+    except Exception as e:
+        logger.error(f"Schema migrations failed: {e}", exc_info=True)
 
     # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
     # that already exist). Lets the operator reach the /admin dashboard without

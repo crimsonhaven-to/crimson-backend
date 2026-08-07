@@ -9,10 +9,12 @@ import os
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from core.config import Config
 from core.version import VERSION
 from core import lumi
+from core import migrations
 from resolvers import ALL_RESOLVERS
 from resolvers.jellyfin import is_configured as jellyfin_is_configured
 from scrapers import ALL_SCRAPERS
@@ -86,14 +88,24 @@ async def public_config():
     }
 
 
+def _entries_count() -> int:
+    """The mapping-table row count behind /health's ``entries_count``.
+
+    Split out as a plain sync function so the route can hand it to a worker
+    thread: it is a real Postgres round-trip (through PgBouncer in production),
+    and the Swarm healthcheck fires it every 30s per replica. Running it inline on
+    the event loop would stall any /watch NDJSON stream sharing that worker."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) AS n FROM anime_entries")
+        return cursor.fetchone()["n"]
+
+
 @router.get("/health")
 async def health_check():
     """Health check endpoint"""
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) AS n FROM anime_entries")
-            count = cursor.fetchone()["n"]
+        count = await run_in_threadpool(_entries_count)
 
         return {
             "status": "healthy",
@@ -104,6 +116,11 @@ async def health_check():
             # {"phase": "running"} while /health already answers healthy; it settles
             # to "up_to_date" / "done" (or "disabled" on a non-sync replica).
             "mapping_sync": sync_status.snapshot(),
+            # Schema version this replica booted at, from the startup snapshot (no
+            # DB hit, since this probe fires every 30s per replica). Makes a
+            # version-skewed replica visible to an uptime check instead of only
+            # surfacing as a request-time error. See core/migrations.py.
+            "schema": migrations.cached_status(),
             "scrapers_available": len(ALL_SCRAPERS),
             "resolvers_available": len(ALL_RESOLVERS),
             "jellyfin_configured": jellyfin_is_configured(),

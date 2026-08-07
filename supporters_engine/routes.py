@@ -28,6 +28,7 @@ from typing import Dict, List, Optional
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
 
 from .db import SupporterStore
 
@@ -135,7 +136,7 @@ async def kofi_webhook(request: Request):
     if not secrets.compare_digest(str(token), expected):
         raise HTTPException(status_code=401, detail="Invalid verification token")
 
-    inserted = store.record_transaction(event)
+    inserted = await run_in_threadpool(store.record_transaction, event)
     if inserted:
         # New money in → drop the cached list so the page reflects it promptly.
         with _cache_lock:
@@ -153,7 +154,7 @@ async def list_supporters(
 ):
     """Public list for the 'Lumi's Loved Mortals' page. No auth. Most-recent
     payment first. Lapsed subscribers are hidden unless ``include_lapsed=true``."""
-    rows = _cached_rows()
+    rows = await run_in_threadpool(_cached_rows)
     cutoff = _now() - timedelta(days=_ACTIVE_WINDOW_DAYS)
     if not include_lapsed:
         rows = [r for r in rows if _is_active(r, cutoff)]
@@ -169,7 +170,7 @@ async def supporters_stats():
 
     Sums over *active* supporters (same rule as /supporters). ``total_raised`` is
     a naive cross-currency sum; ``currency`` is the most common one seen."""
-    rows = _cached_rows()
+    rows = await run_in_threadpool(_cached_rows)
     cutoff = _now() - timedelta(days=_ACTIVE_WINDOW_DAYS)
     active = [r for r in rows if _is_active(r, cutoff)]
 
