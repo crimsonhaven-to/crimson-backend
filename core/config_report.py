@@ -106,6 +106,11 @@ FEATURES: List[Feature] = [
     Feature("Metrics scrape token", lambda: _has("METRICS_TOKEN"),
             "set METRICS_TOKEN for a Prometheus scrape; without it /metrics is "
             "reachable only with an admin session"),
+    # Without this the Admin › Metrics tab still works, it just has no time axis
+    # (live snapshot of one replica only). See deploy/prometheus/README.md.
+    Feature("Metrics history (Prometheus)", lambda: _has("PROMETHEUS_URL"),
+            "set PROMETHEUS_URL (e.g. http://prometheus:9090) to give the admin "
+            "dashboard charts over time; unset leaves it on the live snapshot"),
     Feature("JSON log format", lambda: os.getenv("LOG_FORMAT", "plain").strip().lower() == "json",
             "LOG_FORMAT=json emits one JSON object per line (default is the plain format)"),
     Feature("Fribb mapping resync (this replica)", lambda: _flag_on("RUN_DB_SYNC", True),

@@ -1,0 +1,67 @@
+# Scrape config for the Crimsonhaven backend fleet.
+#
+# Deployed as a Swarm config (see docker-stack.prometheus.yml). Nothing secret
+# lives in here: the scrape credential is read from a Swarm secret at the path
+# below, so this file is safe to commit and to `docker config inspect`.
+
+global:
+  # 15s matches the step of the dashboard's shortest range (1h), so the finest
+  # chart is drawing roughly one point per scrape rather than interpolating.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: crimsonhaven
+
+scrape_configs:
+  # --- the backend fleet -----------------------------------------------------
+  # `tasks.<service>` is Swarm's per-task DNS name: it resolves to the container
+  # IP of EVERY replica, whereas the bare service name resolves to a single load
+  # balanced VIP. Scraping the VIP is the classic mistake here. Counters are per
+  # process, so consecutive scrapes would land on different replicas and every
+  # counter would appear to sawtooth up and down at random. Task discovery gives
+  # each replica its own timeseries, which is also what makes `count(up)` a
+  # truthful replica count and `max(crimson_schema_version)` a rolling-deploy
+  # detector.
+  #
+  # The job name MUST match the backend's PROMETHEUS_JOB (default "crimson-api"),
+  # because every panel in core/prom_query.py filters on it.
+  - job_name: crimson-api
+    dns_sd_configs:
+      # The service names are <stack>_<service>. These assume the stack was
+      # deployed as `crimson-api` (docker stack deploy -c docker-stack.yml
+      # crimson-api). Rename them if your stack has a different name.
+      - names:
+          - tasks.crimson-api_api
+          - tasks.crimson-api_api-sync
+          - tasks.crimson-api_cache-worker
+          - tasks.crimson-api_download-worker
+        type: A
+        port: 8000
+        # Faster than the 30s default: Swarm reschedules tasks onto new IPs and a
+        # stale record means a replica silently stops being scraped.
+        refresh_interval: 15s
+
+    metrics_path: /metrics
+    # /metrics enforces its own auth (web/routes/metrics.py): the METRICS_TOKEN
+    # presented as a bearer, or an admin session. Prometheus trims surrounding
+    # whitespace out of a credentials file, so a trailing newline in the secret is
+    # harmless, but the token itself must not contain spaces.
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/metrics_token
+
+    relabel_configs:
+      # __address__ is ip:8000, which is a useless label once Swarm reschedules
+      # the task onto a new IP. Keep it as `instance` (there is nothing more
+      # stable to key on inside a container), but record which service the task
+      # belongs to so `api` can be told apart from `cache-worker` in a query.
+      - source_labels: [__meta_dns_name]
+        regex: 'tasks\.(.+)'
+        target_label: service
+        replacement: '$1'
+
+  # --- Prometheus itself -----------------------------------------------------
+  # Cheap, and it is the thing that tells you the scraper is falling behind.
+  - job_name: prometheus
+    static_configs:
+      - targets: ['127.0.0.1:9090']

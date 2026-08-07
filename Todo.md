@@ -289,6 +289,57 @@ the admin UI with no time series, so only "now" is visible and never a trend.
 log format (unchanged by default) and the login-wall whitelist (one entry, and the
 route behind it is closed by default).
 
+### Phase 1: the time axis
+
+Phase 0 above gave the dashboard real numbers but no history: `/metrics` is a live
+snapshot of whichever replica answered, so counters reset on every deploy and
+"only now is visible, never a trend" was only half solved. Phase 1 adds a private
+Prometheus that scrapes every Swarm task, plus a named-panel proxy the admin
+dashboard reads instead of talking to Prometheus itself.
+
+* `core/prom_query.py`: a catalogue of 20 panels across four groups (Traffic,
+  Playback, Sources, Fleet), each one a fixed PromQL expression, plus five range
+  presets and the query client.
+* `/admin/metrics/panels`, `/admin/metrics/series`, `/admin/metrics/targets` in
+  `account_engine/admin_routes.py`, all behind `require_admin`.
+* `deploy/prometheus/`: scrape config, its own Swarm stack, and a walkthrough.
+  Deployed as a **separate stack** joining the API's existing overlay, so a backend
+  rollout never redeploys the monitoring that watches it.
+* Client (`crimson-client`): `chartFormat.js` (geometry + formatting, pure),
+  `TimeChart.jsx` (hand-rolled SVG, no charting dependency) and
+  `MetricsHistory.jsx`, above the Phase 0 snapshot, which is kept rather than
+  replaced.
+
+### Phase 1 landmines (checked, must be respected)
+
+1. **The browser must never send PromQL.** It sends a panel id, which is a dict
+   key; anything else is a 404. Prometheus has no auth and no read-only mode, so a
+   passthrough would hand any admin session the whole TSDB.
+2. **Three metrics are cluster-wide and must never be summed.**
+   `crimson_download_jobs` and `crimson_source_success_ratio` are read out of the
+   shared database, so every replica reports the same value and `sum()` silently
+   multiplies it by the replica count. They use `max()`. `crimson_schema_version`
+   uses `max()` and `min()` side by side so a rolling deploy is visible.
+   `tests/test_prom_query.py` asserts this structurally.
+3. **NaN is the normal case, not the edge case.** Every ratio panel divides by a
+   rate that is zero whenever traffic is zero, and Prometheus reports that as the
+   string `"NaN"`. Passing it through emits a body that is not valid JSON, so
+   `res.json()` throws in the browser and the whole tab blanks over a quiet
+   minute. `_finite()` turns it into `null`, which the chart draws as a gap.
+4. **Scrape the tasks, not the service VIP.** `dns_sd_configs` on
+   `tasks.<service>` gives every replica its own timeseries. Scraping the load
+   balanced VIP would land consecutive scrapes on different replicas and make
+   every per-process counter appear to sawtooth.
+5. **Series do not share timestamps.** `sum by (status) (rate(...))` emits nothing
+   at all for a status nobody hit during part of the window, so zipping two series
+   by array index slides one of them sideways in time. `alignSeries` rebuilds a
+   shared grid from the reported start/end/step and places each sample by its own
+   timestamp.
+
+**Risk as built:** low, and gated. With `PROMETHEUS_URL` unset (the default)
+`/admin/metrics/panels` reports `available: false` and the dashboard renders
+exactly what it rendered before. Nothing in the serving path is touched.
+
 ---
 
 ## Smaller items, not scheduled

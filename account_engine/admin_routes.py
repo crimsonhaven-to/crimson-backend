@@ -35,6 +35,7 @@ from starlette.concurrency import run_in_threadpool
 
 from core.config import Config
 from core.db_pool import get_connection
+from core import prom_query
 from core.rate_limit import limiter
 from metadata_engine import maintenance as metadata_maintenance
 from local_engine.db import LocalSourceStore
@@ -1052,3 +1053,72 @@ async def delete_download(job_id: int, user: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="Download not found")
     await download_manager.cancel_and_delete_job(download_store, row)
     return {"success": True, "deleted": job_id}
+
+
+# --- metrics history (Prometheus) -------------------------------------------
+# The time axis behind the Metrics tab. /metrics itself is a live snapshot of one
+# replica; these three read a private Prometheus that scrapes every replica, so
+# they can answer "what did the fleet do over the last week" instead.
+#
+# The catalogue of panels and the PromQL behind each one live in core/prom_query.py
+# and are NOT client-supplied: the browser sends a panel id, which is a dictionary
+# key. See the module docstring there for why.
+
+
+@router.get("/metrics/panels")
+async def metrics_panels(user: dict = Depends(require_admin)):
+    """What the history section can draw, and whether it can draw anything at all.
+
+    ``available: false`` is the normal answer for a deploy without Prometheus, and
+    the dashboard degrades to the live snapshot rather than showing errors, so this
+    is a plain fact about the environment and not a failure."""
+    if not prom_query.available():
+        return {
+            "success": True,
+            "available": False,
+            "reason": "PROMETHEUS_URL is not set, so no history is being collected",
+            "panels": [],
+            "ranges": [],
+        }
+    return {
+        "success": True,
+        "available": True,
+        "job": prom_query.job_label(),
+        "retention": await prom_query.retention_hint(),
+        "panels": prom_query.panel_catalogue(),
+        "ranges": prom_query.range_catalogue(),
+        "default_range": prom_query.DEFAULT_RANGE,
+    }
+
+
+@router.get("/metrics/series")
+@limiter.limit("240/minute")
+async def metrics_series(
+    request: Request,
+    panel: str = Query(..., description="Panel id from /admin/metrics/panels"),
+    # Aliased rather than named `range` so the handler does not shadow the builtin
+    # while the query string still reads the way the client writes it.
+    range_id: str = Query(prom_query.DEFAULT_RANGE, alias="range", description="Range id from /admin/metrics/panels"),
+    user: dict = Depends(require_admin),
+):
+    """One panel's timeseries.
+
+    The rate limit is generous because opening the tab fires one of these per
+    panel, and changing the range refires all of them; it is here to stop a stuck
+    client looping on Prometheus, not to pace normal use."""
+    if not prom_query.available():
+        raise HTTPException(status_code=503, detail="No Prometheus is configured (set PROMETHEUS_URL)")
+    if panel not in prom_query.PANELS:
+        raise HTTPException(status_code=404, detail=f"Unknown panel '{panel[:40]}'")
+    if range_id not in prom_query.RANGES:
+        raise HTTPException(status_code=404, detail=f"Unknown range '{range_id[:40]}'")
+    return await prom_query.query_panel(panel, range_id)
+
+
+@router.get("/metrics/targets")
+async def metrics_targets(user: dict = Depends(require_admin)):
+    """The replicas Prometheus is scraping, so an empty chart can be told apart
+    from a scraper that has lost the fleet."""
+    if not prom_query.available():
+        raise HTTPException(status_code=503, detail="No Prometheus is configured (set PROMETHEUS_URL)")
+    return await prom_query.scrape_targets()
