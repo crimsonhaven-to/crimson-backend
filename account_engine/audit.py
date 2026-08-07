@@ -147,8 +147,10 @@ def log_event(
     """Record one security event. Fire-and-forget: never raises, never blocks a
     login on the log — a failed write is a warning in the app log and nothing else.
 
-    Synchronous by design, matching how the account routes already call their
-    store (single small INSERT per auth attempt; see AccountStore docstring)."""
+    Synchronous by design (single small INSERT per auth attempt; see AccountStore
+    docstring). Callers are responsible for keeping it off the event loop: the
+    account routes either run wholly in a worker thread (plain ``def`` handlers)
+    or wrap this in ``run_in_threadpool``."""
     try:
         if outcome not in OUTCOMES:
             outcome = "info"

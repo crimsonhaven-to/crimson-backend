@@ -39,6 +39,9 @@ from core import lumi
 from core import config_report
 from core.version import VERSION
 from core.config import Config
+from core import migrations
+from core import logging_setup
+from core import observability
 from core.db_pool import close_pool
 from core.http_client import (
     open_client as open_http_client,
@@ -89,11 +92,10 @@ from web.admin_handlers import admin_source_health, admin_system_info, forced_re
 from web.routes import all_routers
 from web.routes.proxies import _proxy_response
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Configure logging. Same output as the basicConfig this replaces, plus the
+# per-request correlation id when one is bound (and an opt-in JSON format via
+# LOG_FORMAT=json). See core/logging_setup.py.
+logging_setup.configure(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -125,6 +127,24 @@ async def lifespan(app: FastAPI):
     cache_store.init_db()  # server-side video cache tables (resync-safe)
     download_store.init_db()  # admin download queue (resync-safe)
     telemetry_store.init_db()  # anonymous resolve telemetry (resync-safe)
+
+    # Versioned schema migrations. Runs AFTER the init_db()s above, which still own
+    # the pre-migration baseline: this applies everything from version 0 onward.
+    # Takes the same cluster-wide advisory lock, so concurrent replica boots
+    # serialize (the first applies; the rest find nothing pending). Non-fatal by
+    # design: a migration failure is loud in the log and visible on /health, but
+    # it must not turn a bookkeeping problem into a boot loop across every replica.
+    try:
+        migrations.apply_pending(logger)
+    except Exception as e:
+        logger.error(f"Schema migrations failed: {e}", exc_info=True)
+
+    # Register the scrape-time metrics collector (DB pool, worker queues, per-source
+    # resolve health). Done here rather than at import so merely importing the app
+    # (a test, scripts/export_openapi.py) never wires up something that reads the DB.
+    observability.install_state_collector()
+    if not observability.PROMETHEUS_AVAILABLE:
+        logger.info("prometheus_client not installed; /metrics is inert (503)")
 
     # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
     # that already exist). Lets the operator reach the /admin dashboard without
@@ -504,7 +524,13 @@ app.add_exception_handler(RateLimitExceeded, _voiced_rate_limit_handler)
 # Defined BEFORE the CORS middleware below so CORS remains the outermost layer and
 # its headers are attached even to the 401 we return here (browsers need that to
 # surface the error instead of an opaque CORS failure).
-_PUBLIC_EXACT = {"/", "/lumi", "/health", "/config", "/openapi.json", "/docs", "/redoc"}
+#   * /metrics, whitelisted here ONLY so a Prometheus scrape carrying
+#     METRICS_TOKEN reaches the handler; the route is not public, it enforces its
+#     own token-or-admin check (see web/routes/metrics.py) and denies by default
+#     when no token is configured.
+_PUBLIC_EXACT = {
+    "/", "/lumi", "/health", "/config", "/openapi.json", "/docs", "/redoc", "/metrics",
+}
 _PUBLIC_PREFIXES = (
     "/auth/",
     "/kofi/webhook",
@@ -708,6 +734,96 @@ class LumiHeaderMiddleware:
 # Added after CORS so CORS stays outermost; this only appends response headers and
 # never buffers, so the NDJSON stream is unaffected.
 app.add_middleware(LumiHeaderMiddleware)
+
+
+class RequestContextMiddleware:
+    """Mint a request id, bind it for logging, and record the HTTP metrics.
+
+    Pure-ASGI for the same reason as the two middlewares above: BaseHTTPMiddleware
+    wraps the response in an anyio stream, which would buffer the progressive
+    NDJSON /watch body and stall playback until the slowest scraper finished. This
+    one only reads the request scope and inspects the response *start* message; the
+    body messages pass through untouched.
+
+    Three things happen here:
+
+    * ``X-Request-ID`` is taken from the request (a reverse proxy may already have
+      set one) or minted, then bound to a ContextVar so every log line emitted
+      while handling this request carries it. It is echoed back on the response so
+      a user can quote it in a bug report.
+    * Latency is measured to ``http.response.start`` (headers), NOT to the last
+      body byte, so /watch's multi-second stream doesn't swamp the histogram. The
+      streaming side has its own crimson_watch_* metrics.
+    * The route *template* is used as the metric label, never the raw path. See
+      ``observability.route_label``: labelling by path would mint one timeseries
+      per episode.
+
+    Added last, so it is the OUTERMOST middleware: a request that the login wall
+    rejects still gets an id and is still counted. Note the consequence for the
+    route label: the wall short-circuits before routing, so every 401 it returns
+    lands in the ``__unmatched__`` bucket rather than under its real route. That is
+    the desirable direction, since it means unauthenticated traffic cannot mint
+    label values at all.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        request_id = ""
+        for name, value in scope.get("headers", []):
+            if name == b"x-request-id":
+                request_id = observability.clean_request_id(value.decode("latin-1"))
+                break
+        if not request_id:
+            request_id = observability.new_request_id()
+
+        scope.setdefault("state", {})["request_id"] = request_id
+        token = observability.set_request_id(request_id)
+
+        method = observability.method_label(scope.get("method"))
+        started = time.monotonic()
+        observability.track_in_progress(method, 1)
+        recorded = False
+
+        async def send_wrapper(message):
+            nonlocal recorded
+            if message["type"] == "http.response.start" and not recorded:
+                recorded = True
+                headers = message.setdefault("headers", [])
+                headers.append((b"x-request-id", request_id.encode("latin-1")))
+                # scope["route"] is set by the router during dispatch, so by the
+                # time the response starts flowing back out through here it is
+                # available. On a 404 there is no route and the label collapses to
+                # a single bucket.
+                observability.record_http_request(
+                    method,
+                    observability.route_label(scope),
+                    message.get("status", 0),
+                    time.monotonic() - started,
+                )
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            if not recorded:
+                # No response ever started: the client hung up mid-request, or the
+                # app raised before sending. Recorded as 499 (nginx's
+                # client-closed-request) so the in-progress gauge below can't drift
+                # upward forever on a flaky mobile connection.
+                observability.record_http_request(
+                    method, observability.route_label(scope), 499,
+                    time.monotonic() - started,
+                )
+            observability.track_in_progress(method, -1)
+            observability.reset_request_id(token)
+
+
+app.add_middleware(RequestContextMiddleware)
 
 # --- ROUTERS ----------------------------------------------------------------
 # Engine routers first (their prefixes — /account, /admin, /supporters, /changelog,

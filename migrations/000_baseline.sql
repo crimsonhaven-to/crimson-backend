@@ -1,0 +1,32 @@
+-- 000_baseline.sql
+--
+-- The baseline marker. Deliberately a no-op.
+--
+-- The schema that existed before this migration runner was introduced is still
+-- owned by the per-engine init_db() functions (account_engine/db.py,
+-- metadata_engine/db_handler.py, cache_engine/db.py, local_engine/db.py,
+-- download_engine/db.py, apikey_engine/db.py, supporters_engine/db.py,
+-- telemetry_engine/db.py, account_engine/audit.py). Those run first at startup
+-- and are idempotent, so they remain the source of truth for the baseline and
+-- were NOT transcribed into this directory: doing that would have risked a
+-- divergence between a long-lived production database and a freshly created one,
+-- which is exactly the failure this system exists to prevent.
+--
+-- This file therefore only establishes version 0 so that:
+--   * `schema_migrations` has a row from the very first boot, which makes
+--     "unmigrated" and "migrated to 0" distinguishable from "table missing",
+--   * the runner's ordering, checksum and drift machinery is exercised on every
+--     deploy rather than lying dormant until the first real migration.
+--
+-- FROM HERE ON: every schema change goes in a new numbered file in this
+-- directory, NOT into another `ADD COLUMN IF NOT EXISTS` line in an init_db().
+--
+-- Conventions:
+--   * Name files NNN_short_description.sql, numbered in strictly ascending order.
+--   * Never edit a file that has already been applied anywhere. The runner
+--     checksums applied files and logs loudly on drift. Write a new migration.
+--   * Each file runs inside the migration transaction, so statements that cannot
+--     run in a transaction block (e.g. CREATE INDEX CONCURRENTLY) do not belong
+--     here; do those by hand during a maintenance window.
+
+SELECT 1;

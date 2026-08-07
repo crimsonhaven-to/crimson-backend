@@ -24,6 +24,7 @@ from core.db_pool import pool_stats
 from core.http_client import http_client
 from core.version import PROCESS_STARTED_AT, VERSION
 from core import source_health
+from core import migrations
 import resolvers as _resolvers_pkg
 from core.private_sources import discover_resolve_grants
 from resolvers import ALL_RESOLVERS, _crimson_proxy
@@ -79,6 +80,7 @@ async def admin_system_info() -> Dict:
     # Uses refresh_health (not bare probe_bases) so opening the dashboard also
     # updates the routing health cache that drives automatic failover in proxy_url.
     proxy_hosts = await _crimson_proxy.refresh_health()
+    schema_state = await run_in_threadpool(migrations.status)
 
     flags = {
         "require_login": bool(getattr(Config, "REQUIRE_LOGIN", False)),
@@ -124,6 +126,11 @@ async def admin_system_info() -> Dict:
             "hosts": proxy_hosts,
         },
         "db_pool": pool,
+        # Live schema state (not the boot-time snapshot /health serves): reports
+        # `pending` files present in this image but unrecorded in this database,
+        # and `drift` for any applied migration whose file was edited afterwards.
+        # See core/migrations.py.
+        "schema": schema_state,
         "cache": {
             "enabled": bool(cache_enabled),
             "targets_enabled": len(cache_targets),

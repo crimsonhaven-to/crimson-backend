@@ -1,0 +1,141 @@
+# Private Prometheus for the Crimsonhaven backend fleet.
+#
+# Deployed as its OWN stack, joining the API stack's existing overlay network as
+# an external network. That is deliberate: adding it to docker-stack.yml would
+# make every `docker stack deploy` of the API touch the monitoring service too,
+# and a metrics server going down during a backend rollout is exactly the moment
+# you want it up. Separate stack, separate lifecycle, shared network.
+#
+# See README.md in this directory for the full walkthrough. Short version:
+#
+#   printf '%s' "$METRICS_TOKEN" | docker secret create crimson_metrics_token -
+#   docker config create crimson_prometheus_yml deploy/prometheus/prometheus.yml
+#   docker stack deploy -c deploy/prometheus/docker-stack.prometheus.yml crimson-metrics
+#
+# Then point the backend at it and redeploy the API stack:
+#
+#   PROMETHEUS_URL=http://prometheus:9090
+#
+# NOTHING here is published to the internet. Prometheus has no authentication of
+# its own and its query API can read every metric the fleet exports, so it is
+# reachable only from inside crimson_net (which is how the backend reaches it) and
+# from an SSH tunnel if you want its own web UI.
+version: "3.8"
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.7.3
+
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # The dashboard offers a 30 day range, so keep at least that much or the
+      # longest range draws a chart that starts partway across. The admin UI reads
+      # this back through /api/v1/status/flags and says so when the two disagree.
+      - --storage.tsdb.retention.time=45d
+      # A ceiling as well as a time limit, so a traffic spike cannot fill the disk.
+      # Whichever limit is hit first wins.
+      - --storage.tsdb.retention.size=8GB
+      - --web.listen-address=0.0.0.0:9090
+      # No web.external-url and no published port: this is not meant to be browsed
+      # from outside. The admin dashboard reads it through the backend's
+      # /admin/metrics/* endpoints, which are behind require_admin.
+      #
+      # Off by default; stated explicitly so nobody turns it on by accident (it
+      # exposes unauthenticated /-/reload and /-/quit on a port the whole overlay
+      # can reach). Prometheus 3.x parses booleans with kingpin, so the negative
+      # form is `--no-<flag>`: writing `--web.enable-lifecycle=false` makes it
+      # treat "false" as a stray positional and exit 1 on boot.
+      - --no-web.enable-lifecycle
+
+    configs:
+      - source: crimson_prometheus_yml
+        target: /etc/prometheus/prometheus.yml
+
+    secrets:
+      # Read by prometheus.yml's credentials_file. The SAME value as the backend's
+      # METRICS_TOKEN, or every scrape gets a 401 and the charts stay empty.
+      - source: crimson_metrics_token
+        target: metrics_token
+        # prom/prometheus runs as uid 65534 (nobody), not root, so the default
+        # 0444 is fine but the ownership has to let nobody read it.
+        uid: "65534"
+        gid: "65534"
+        mode: 0400
+
+    volumes:
+      - prometheus_data:/prometheus
+
+    healthcheck:
+      # The image is distroless-ish (no curl, no wget), but it ships promtool.
+      test: ["CMD", "promtool", "check", "healthy", "--url=http://127.0.0.1:9090"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # Let it flush its head block to disk instead of being killed mid-write; an
+    # unclean shutdown costs a slow WAL replay on the next start.
+    stop_grace_period: 60s
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          # The TSDB is a local volume, so this must land on the same node every
+          # time or it starts over with an empty database. Pin it to a specific
+          # host (override PROMETHEUS_NODE) rather than leaving it to the
+          # scheduler. Manager role alone is NOT enough with several managers.
+          - node.hostname == ${PROMETHEUS_NODE:?set PROMETHEUS_NODE to the host that keeps the metrics volume}
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        # stop-first: two Prometheus processes must never hold the same TSDB
+        # directory at once. start-first would briefly overlap them and the new
+        # one would fail to acquire the lock file.
+        order: stop-first
+        failure_action: rollback
+        monitor: 30s
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+      resources:
+        limits:
+          cpus: "1.00"
+          # Roughly 3 GB of headroom for the head block plus query working set.
+          # A fleet this size (a handful of replicas, a few hundred series each)
+          # sits far below it; raise it if you add scrape targets.
+          memory: 1024M
+        reservations:
+          cpus: "0.10"
+          memory: 256M
+
+    networks:
+      - crimson_net
+
+configs:
+  crimson_prometheus_yml:
+    external: true
+
+secrets:
+  crimson_metrics_token:
+    external: true
+
+volumes:
+  prometheus_data:
+    driver: local
+
+networks:
+  # The API stack's network, already created by `docker stack deploy -c
+  # docker-stack.yml crimson`. Referenced rather than created so both stacks
+  # share one overlay and the backend can reach http://prometheus:9090.
+  # Production names it crimson_crimson_net (stack `crimson` + network
+  # `crimson_net`); confirm with `docker network ls --filter driver=overlay`.
+  crimson_net:
+    external: true
+    name: ${CRIMSON_NETWORK:-crimson_crimson_net}

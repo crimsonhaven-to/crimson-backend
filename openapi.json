@@ -3,7 +3,7 @@
   "info": {
     "title": "Anime Streaming API",
     "description": "API for streaming anime with multi-season support",
-    "version": "18.0.0"
+    "version": "18.1.6"
   },
   "paths": {
     "/auth/challenge": {
@@ -1648,6 +1648,231 @@
         }
       }
     },
+    "/admin/security/stats": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Security Stats",
+        "description": "Security metrics for the dashboard: 24h tiles (failed logins, invite\nrejections, rate-limit trips, distinct offending IPs), a zero-filled per-day\nevent series, per-type totals, top offending IPs and the most-targeted\nidentities over the last ``days`` days.",
+        "operationId": "security_stats_admin_security_stats_get",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 90,
+              "minimum": 1,
+              "description": "Window for the chart/aggregates",
+              "default": 14,
+              "title": "Days"
+            },
+            "description": "Window for the chart/aggregates"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/security/events": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Security Events",
+        "description": "The raw ledger, newest first, filterable — the drill-down behind every\nnumber /admin/security/stats shows.",
+        "operationId": "security_events_admin_security_events_get",
+        "parameters": [
+          {
+            "name": "event_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to one event type",
+              "title": "Event Type"
+            },
+            "description": "Filter to one event type"
+          },
+          {
+            "name": "outcome",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "success / failure / info",
+              "title": "Outcome"
+            },
+            "description": "success / failure / info"
+          },
+          {
+            "name": "ip",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exact client IP",
+              "title": "Ip"
+            },
+            "description": "Exact client IP"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Substring match on identity / IP",
+              "title": "Search"
+            },
+            "description": "Substring match on identity / IP"
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 2160,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only events from the last N hours",
+              "title": "Hours"
+            },
+            "description": "Only events from the last N hours"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/admin/users": {
       "get": {
         "tags": [
@@ -1893,6 +2118,110 @@
             }
           }
         ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/broadcast-email": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Broadcast Email Status",
+        "description": "Everything the E-Mail sender panel needs up front: whether SMTP is\nconfigured at all (the form greys out when it isn't), how many accounts a\nsend would reach, and the live/last run's progress.",
+        "operationId": "broadcast_email_status_admin_broadcast_email_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Send Broadcast Email",
+        "description": "Queue the broadcast and return immediately; poll GET /admin/broadcast-email\nfor progress. Refused cleanly (not a 500) when SMTP isn't configured, when a\nsend is already running, or when there's nobody to email.",
+        "operationId": "send_broadcast_email_admin_broadcast_email_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BroadcastEmail"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -3688,6 +4017,173 @@
         }
       }
     },
+    "/admin/metrics/panels": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Metrics Panels",
+        "description": "What the history section can draw, and whether it can draw anything at all.\n\n``available: false`` is the normal answer for a deploy without Prometheus, and\nthe dashboard degrades to the live snapshot rather than showing errors, so this\nis a plain fact about the environment and not a failure.",
+        "operationId": "metrics_panels_admin_metrics_panels_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/metrics/series": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Metrics Series",
+        "description": "One panel's timeseries.\n\nThe rate limit is generous because opening the tab fires one of these per\npanel, and changing the range refires all of them; it is here to stop a stuck\nclient looping on Prometheus, not to pace normal use.",
+        "operationId": "metrics_series_admin_metrics_series_get",
+        "parameters": [
+          {
+            "name": "panel",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Panel id from /admin/metrics/panels",
+              "title": "Panel"
+            },
+            "description": "Panel id from /admin/metrics/panels"
+          },
+          {
+            "name": "range",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Range id from /admin/metrics/panels",
+              "default": "6h",
+              "title": "Range"
+            },
+            "description": "Range id from /admin/metrics/panels"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/metrics/targets": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Metrics Targets",
+        "description": "The replicas Prometheus is scraping, so an empty chart can be told apart\nfrom a scraper that has lost the fleet.",
+        "operationId": "metrics_targets_admin_metrics_targets_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/kofi/webhook": {
       "post": {
         "tags": [
@@ -4467,6 +4963,248 @@
               "title": "S"
             },
             "description": "signature"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/iptv/browse": {
+      "get": {
+        "tags": [
+          "iptv"
+        ],
+        "summary": "Iptv Browse",
+        "description": "The browse facets: categories + countries (with channel counts) and the\ncatalogue total. Drives the Live TV hub's filter chips.",
+        "operationId": "iptv_browse_iptv_browse_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/iptv/channels": {
+      "get": {
+        "tags": [
+          "iptv"
+        ],
+        "summary": "Iptv Channels",
+        "description": "Paged channel cards, filtered by category/country and/or a search term.",
+        "operationId": "iptv_channels_iptv_channels_get",
+        "parameters": [
+          {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          },
+          {
+            "name": "country",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Country"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 60,
+              "title": "Page Size"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/iptv/channel/{channel_id}": {
+      "get": {
+        "tags": [
+          "iptv"
+        ],
+        "summary": "Iptv Channel",
+        "description": "Full channel detail for the watch page — every known stream, best\nquality first, each with its signed same-origin proxy path.",
+        "operationId": "iptv_channel_iptv_channel__channel_id__get",
+        "parameters": [
+          {
+            "name": "channel_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Channel Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/iptv_proxy": {
+      "get": {
+        "tags": [
+          "iptv"
+        ],
+        "summary": "Iptv Proxy",
+        "description": "Signed same-origin relay for IPTV playlists + segments.\n\nPublic (hls.js can't attach the login-wall bearer cross-origin) but never an\nopen relay: the URL *and* the header overrides are HMAC-signed, and the\nfetch runs through the SSRF-guarded client (untrusted hosts + redirects).\nPlaylists come back rewritten so every sub-resource flows through here too.",
+        "operationId": "iptv_proxy_iptv_proxy_get",
+        "parameters": [
+          {
+            "name": "u",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Upstream URL (signed)",
+              "title": "U"
+            },
+            "description": "Upstream URL (signed)"
+          },
+          {
+            "name": "s",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "HMAC signature",
+              "title": "S"
+            },
+            "description": "HMAC signature"
+          },
+          {
+            "name": "r",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Upstream Referer (covered by the signature)",
+              "default": "",
+              "title": "R"
+            },
+            "description": "Upstream Referer (covered by the signature)"
+          },
+          {
+            "name": "a",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Upstream User-Agent (covered by the signature)",
+              "default": "",
+              "title": "A"
+            },
+            "description": "Upstream User-Agent (covered by the signature)"
           }
         ],
         "responses": {
@@ -6356,6 +7094,33 @@
         },
         "type": "object",
         "title": "BackfillTrigger"
+      },
+      "BroadcastEmail": {
+        "properties": {
+          "subject": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Subject"
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Message"
+          },
+          "verified_only": {
+            "type": "boolean",
+            "title": "Verified Only",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "subject",
+          "message"
+        ],
+        "title": "BroadcastEmail"
       },
       "CacheSettingsUpdate": {
         "properties": {

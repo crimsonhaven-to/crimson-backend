@@ -165,7 +165,9 @@ class LocalScraper(BaseAnimeScraper):
         if not norm_titles:
             return None
 
-        roots = _store.enabled_roots()
+        # TTL-cached, but a cache miss is a real DB round-trip and this runs inside
+        # the /watch fan-out, so keep it off the event loop like the listing below.
+        roots = await asyncio.to_thread(_store.enabled_roots)
         # Directory listing is blocking I/O — keep it off the event loop.
         candidates = await asyncio.to_thread(self._find_show_dirs, roots, norm_titles)
         if not candidates:

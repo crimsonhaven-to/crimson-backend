@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 from scrapers import ALL_SCRAPERS
 from resolvers import ALL_RESOLVERS
 from core.http_client import http_client
+from core import observability
 from core.contracts import (
     build_done_line,
     build_meta_line,
@@ -48,6 +49,12 @@ async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episo
     if media_type == "movie" and not getattr(scraper_class, "SUPPORTS_MOVIES", False):
         return []
     scraper = scraper_class()
+    # Per-scraper timing + outcome. The three outcomes are distinct failures worth
+    # telling apart on a dashboard: "empty" is a source that answered but found
+    # nothing (a title-matching miss, or it went dark), "error" is a source that
+    # threw (markup rotation, network). Recording is best-effort and cannot raise.
+    timer = observability.Timer()
+    outcome = "error"
     try:
         media_ctx = {
             "tmdb_id": tmdb_id,
@@ -57,12 +64,18 @@ async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episo
         }
         slug = await scraper.search_anime(media_ctx)
         if not slug:
+            outcome = "empty"
             return []
-        return await scraper.get_episode_embeds(slug, episode_num, season_num)
+        embeds = await scraper.get_episode_embeds(slug, episode_num, season_num)
+        outcome = "embeds" if embeds else "empty"
+        return embeds
     except Exception as e:
         logger.error(f"Scraper error for {scraper_class.__name__}: {e}")
         return []
     finally:
+        observability.record_scraper_run(
+            scraper_class.__name__, outcome, timer.lap()
+        )
         await scraper.close()
 
 
@@ -93,8 +106,20 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                 break
 
         if matched_resolver:
+            # Time the resolve hop specifically (not the post-processing below), so
+            # crimson_resolve_duration_seconds measures the upstream and nothing else.
+            # ``recorded`` keeps a later failure in the formatting code from being
+            # counted a second time as a resolver error.
+            timer = observability.Timer()
+            recorded = False
             try:
                 resolved = await matched_resolver.resolve(embed_url)
+                observability.record_resolve(
+                    matched_resolver.source_name,
+                    "ok" if resolved else "empty",
+                    timer.lap(),
+                )
+                recorded = True
                 # A resolver may return a LIST of already-formed stream dicts
                 # ({"url", "source", "type", optional "language"/"subtitles"}) when
                 # one marker fans out to many variants (ScreenScape: a server's
@@ -208,6 +233,10 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
                 # it entirely instead of emitting a broken "(Error)" iframe — that
                 # placeholder used to surface as a dead source (e.g. Movish, which
                 # fails fast and so raced to the top of the list). Just log it.
+                if not recorded:
+                    observability.record_resolve(
+                        matched_resolver.source_name, "error", timer.lap()
+                    )
                 logger.error(f"Resolver error for {matched_resolver.source_name}: {e}")
                 continue
         else:
@@ -249,6 +278,10 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
     the TMDB show title. ``base_url`` (the backend's public base) is threaded into stream
     resolution so the proxy sources can emit an absolute iframe URL.
     """
+    # Started here rather than at the fan-out below so "time to first stream"
+    # measures what the viewer actually waits through, metadata fetch included.
+    watch_timer = observability.Timer()
+
     anilist_data = {}
     if anilist_id:
         async with http_client() as client:
@@ -275,6 +308,7 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
         ep_info = await _season_episode_info(tmdb_id, season_number)
         air_date = (ep_info.get("air_dates") or {}).get(episode_number)
         if _is_future_air_date(air_date):
+            observability.record_watch(media_type, "unaired", 0, watch_timer.lap())
             yield _ndjson(build_unaired_line(
                 air_date=air_date,
                 title=title,
@@ -367,19 +401,39 @@ async def stream_watch_response(tmdb_id: int, season_number: int, episode_number
     finisher = asyncio.create_task(_finish())
 
     count = 0
+    first_stream: Optional[float] = None
+    recorded = False
     try:
         while True:
             stream = await queue.get()
             if stream is None:  # sentinel: all scrapers finished
                 break
             count += 1
+            if first_stream is None:
+                # The number that matters most operationally: how long the viewer
+                # stared at a spinner before ANY source became playable.
+                first_stream = watch_timer.lap()
             # Shape (incl. the cacheTicket-only-when-present rule) lives in
             # core.contracts so it can't drift from the client/crimson-sources.
             yield _ndjson(build_stream_line(stream))
+        # Recorded before the done line is yielded, so a consumer that goes away
+        # at the very end still leaves an accurate sample behind.
+        observability.record_watch(
+            media_type, "streams" if count else "empty",
+            count, watch_timer.lap(), first_stream,
+        )
+        recorded = True
         yield _ndjson(build_done_line(count))
     finally:
         # If the client disconnects mid-stream the generator is closed here —
         # cancel the still-running tasks so they don't leak (no-op if done).
+        if not recorded:
+            # The viewer navigated away (or picked a source and stopped reading)
+            # before the fan-out finished. Counted separately so an abandonment
+            # rate never gets mistaken for a failure rate.
+            observability.record_watch(
+                media_type, "abandoned", count, watch_timer.lap(), first_stream,
+            )
         finisher.cancel()
         for w in workers:
             w.cancel()

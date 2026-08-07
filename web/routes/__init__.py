@@ -11,6 +11,7 @@ from web.routes.metadata import router as metadata_router
 from web.routes.watch import router as watch_router
 from web.routes.proxies import router as proxies_router
 from web.routes.local_library import router as local_library_router
+from web.routes.metrics import router as metrics_router
 
 # Order matters: watch_router must be included before metadata_router so the
 # literal-segment /watch/movie/{tmdb_id} is registered ahead of the 2-segment
@@ -27,6 +28,9 @@ all_routers = [
     # paths (/local-library, /local-overview, /search/local, /watch-local, /local_art)
     # don't overlap any of the above, so ordering here is not load-bearing.
     local_library_router,
+    # The Prometheus scrape endpoint. One route (/metrics), schema-hidden, and it
+    # enforces its own token/admin auth. No path overlap, so it goes last.
+    metrics_router,
 ]
 
 __all__ = ["all_routers"]

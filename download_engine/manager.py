@@ -128,6 +128,25 @@ class DownloadManager:
             self._poller = None
         self._started = False
 
+    def worker_stats(self) -> dict:
+        """Queue depth by status, for the /metrics collector.
+
+        Unlike the cache worker's in-process queue, this one lives entirely in the
+        ``download_jobs`` table (aria2 runs in its own container and outlives the
+        worker), so these counts are CLUSTER-wide: every replica reports the same
+        numbers. BLOCKING (one grouped COUNT), so callers must be off the event
+        loop; the collector already runs in a threadpool."""
+        by_status = {}
+        try:
+            raw = self._store.stats()
+            # stats() returns the per-status counts flat alongside total_bytes;
+            # split them so the collector can label by status without inventing a
+            # "total_bytes" status.
+            by_status = {k: v for k, v in raw.items() if k != "total_bytes"}
+        except Exception as e:
+            logger.debug(f"download worker stats unavailable: {e}")
+        return {"running": self._started, "by_status": by_status}
+
     # ---------------------------------------------------------------- loop
     async def _poll(self) -> None:
         while True:
