@@ -54,6 +54,17 @@ def _proxy_secret_state() -> Optional[bool]:
     return True if _has("PROXY_SECRET") else None
 
 
+def _prometheus_state() -> Optional[bool]:
+    """Whether the optional prometheus-client dependency made it into this build.
+    Imported lazily so a diagnostics helper never drags the metrics module into an
+    import cycle."""
+    try:
+        from core.observability import PROMETHEUS_AVAILABLE
+        return PROMETHEUS_AVAILABLE
+    except Exception:
+        return False
+
+
 FEATURES: List[Feature] = [
     Feature("TMDB metadata (required)", lambda: _has("TMDB_API_KEY"),
             "set TMDB_API_KEY — the app will not start without it"),
@@ -87,6 +98,16 @@ FEATURES: List[Feature] = [
             "set SIGNUP_INVITE_CODE for a reusable invite (bot mints single-use)"),
     Feature("Admin seed", lambda: _has("ADMIN_EMAILS"),
             "set ADMIN_EMAILS (comma-separated) to seed the first admin"),
+    # prometheus-client is an OPTIONAL import (see core/observability.py), so this
+    # line reports a property of the build rather than of the environment: it is the
+    # only place a stripped image announces that /metrics will answer 503.
+    Feature("Prometheus metrics support", _prometheus_state,
+            "prometheus-client is not installed in this build; /metrics answers 503"),
+    Feature("Metrics scrape token", lambda: _has("METRICS_TOKEN"),
+            "set METRICS_TOKEN for a Prometheus scrape; without it /metrics is "
+            "reachable only with an admin session"),
+    Feature("JSON log format", lambda: os.getenv("LOG_FORMAT", "plain").strip().lower() == "json",
+            "LOG_FORMAT=json emits one JSON object per line (default is the plain format)"),
     Feature("Fribb mapping resync (this replica)", lambda: _flag_on("RUN_DB_SYNC", True),
             "RUN_DB_SYNC=false on serving replicas; true on exactly one"),
     Feature("Server-side cache worker (this replica)", lambda: _flag_on("RUN_CACHE_WORKER", True),

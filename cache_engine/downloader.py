@@ -193,6 +193,20 @@ class DownloadManager:
         self._workers = []
         self._started = False
 
+    def worker_stats(self) -> dict:
+        """This replica's remux worker state, for the /metrics collector.
+
+        Purely in-process (no DB, no lock), so it is safe to call from a scrape.
+        On an api replica the worker never started and every number is 0, which is
+        the correct answer rather than a missing one: only the RUN_CACHE_WORKER
+        service does the downloading."""
+        return {
+            "running": self._started,
+            "queued": self._queue.qsize() if self._queue is not None else 0,
+            "inflight": len(self._inflight),
+            "slots": MAX_CONCURRENT,
+        }
+
     # ------------------------------------------------------------------ gate
     async def _cacheable(self, stream: dict) -> bool:
         """Shared cacheability gate: caching is on, ffmpeg is present, and the stream

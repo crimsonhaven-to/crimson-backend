@@ -17,6 +17,7 @@ import orjson
 
 from core.config import Config
 from core.db_pool import get_connection
+from core import observability
 
 logger = logging.getLogger("crimson.cache")
 
@@ -45,13 +46,19 @@ _local_cache: Dict[str, Tuple[float, object]] = {}
 
 
 def _local_get(key: str):
+    # Hit/miss is counted WITHOUT the cache key as a label: keys include per-search
+    # and per-title values, so labelling by key would be unbounded cardinality. The
+    # ratio per tier is the operationally useful number anyway.
     hit = _local_cache.get(key)
     if not hit:
+        observability.record_cache_lookup("l1", False)
         return None
     expiry, value = hit
     if expiry < time.monotonic():
         _local_cache.pop(key, None)
+        observability.record_cache_lookup("l1", False)
         return None
+    observability.record_cache_lookup("l1", True)
     return value
 
 
@@ -74,7 +81,9 @@ async def get_cached_response(cache_key: str) -> Optional[Dict]:
                 return orjson.loads(row["response_json"]) if row else None
         
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _query)
+        row = await loop.run_in_executor(None, _query)
+        observability.record_cache_lookup("l2", row is not None)
+        return row
     except Exception as e:
         logger.error(f"Cache retrieval error for key {cache_key}: {e}")
         return None

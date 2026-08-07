@@ -221,7 +221,7 @@ property, which is the reason the suite is fast and runs anywhere today.
 
 ## 5. Operational metrics and correlatable logs
 
-**Status:** `[ ]` not started
+**Status:** `[x]` done
 
 ### The problem
 
@@ -247,10 +247,47 @@ the admin UI with no time series, so only "now" is visible and never a trend.
    buffering, so the NDJSON stream stays unbuffered.
 3. JSON log formatting so the Swarm logs are queryable.
 
-**Risk:** low to medium. The middleware must stay pure-ASGI and non-buffering, or
-it will break progressive playback. `/metrics` must not be public: source success
-rates and pool internals are operational intelligence and should sit behind the
-same gate as the admin dashboard.
+### Landmines (checked, must be respected)
+
+1. **Label cardinality.** Labelling HTTP metrics by `scope["path"]` would mint a
+   timeseries per episode of per show, which is unbounded in exactly the dimension
+   this backend is largest in. `observability.route_label` uses the route
+   *template* (`scope["route"].path_format`) and collapses everything unrouted into
+   a single `__unmatched__` bucket, so a scanner probing random URLs cannot grow
+   the export. The same applies to the per-source telemetry gauge: `source` there
+   is client-supplied text from the beacon, not a closed vocabulary, so the
+   collector exports only the top 25 by volume (`_TELEMETRY_TOP_N`).
+2. **The middleware must not buffer.** `BaseHTTPMiddleware` collects the response
+   body, which would hold every `/watch` NDJSON line until the slowest scraper
+   finished. `RequestContextMiddleware` is pure-ASGI and touches only
+   `http.response.start`.
+3. **`/metrics` must not be public.** It is whitelisted on the login wall only so a
+   token-carrying scrape can reach the handler; the route then enforces its own
+   check and denies by default when no `METRICS_TOKEN` is set.
+
+### What was built
+
+* `core/observability.py`: the request-id ContextVar, the metric definitions in a
+  private registry, the recording helpers, and a scrape-time collector that reads
+  the DB pool, worker queues and per-source resolve health from the modules that
+  already own them. `prometheus_client` is an **optional import**: absent it, every
+  helper is a no-op and `/metrics` answers 503, so the dependency can never stop
+  the backend from booting.
+* `core/logging_setup.py`: replaces the `logging.basicConfig` call. Default output
+  is byte-compatible with the old format, plus `[req=<id>]` when a request is in
+  scope. `LOG_FORMAT=json` switches to one JSON object per line.
+* `RequestContextMiddleware` (`api.py`), added last so it is outermost: mints or
+  adopts `X-Request-ID`, binds it for logging, echoes it back, and records the HTTP
+  metrics.
+* Instrumentation in `web/pipeline.py` (per-scraper and per-resolver duration plus
+  outcome, `/watch` time-to-first-stream and fan-out duration) and
+  `core/response_cache.py` (L1/L2 hit ratio).
+* `worker_stats()` on both download managers, and `METRICS_TOKEN` / `LOG_FORMAT` /
+  the prometheus build flag added to the startup config report.
+
+**Risk as built:** low. Additive; the only pre-existing behaviour touched is the
+log format (unchanged by default) and the login-wall whitelist (one entry, and the
+route behind it is closed by default).
 
 ---
 
