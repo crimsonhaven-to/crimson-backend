@@ -57,8 +57,9 @@ and the `/mw` key scoping: a closed vocabulary the server controls.
   docker network ls --filter driver=overlay
   ```
 
-  It is usually `crimson-api_crimson_net` (the stack name plus the network name).
-  If yours differs, pass it as `CRIMSON_NETWORK` in step 5.
+  Production is `crimson_crimson_net` (stack `crimson` plus network `crimson_net`),
+  which is the built-in default. If yours differs, pass it as `CRIMSON_NETWORK`
+  in step 5.
 
 * **`METRICS_TOKEN` is set on the backend.** Without it, `/metrics` is reachable
   only with an admin session and every scrape gets a 401. If you have not set one:
@@ -97,9 +98,9 @@ Both are immutable in Swarm. To change either later, create a new one with a
 version suffix (`crimson_prometheus_yml_v2`), point the stack file at it, and
 redeploy.
 
-**Check the service names in `prometheus.yml` first.** It assumes your API stack
-is named `crimson-api`, so it looks for `tasks.crimson-api_api` and friends. If you
-deployed under another stack name, edit those lines before creating the config.
+**Check the service names in `prometheus.yml` first.** It looks for
+`tasks.crimson_api` and friends, because production deploys the stack as
+`crimson`. A wrong prefix is not an error, it silently discovers nothing.
 Confirm with:
 
 ```bash
@@ -122,12 +123,11 @@ docker node ls
 ## 5. Deploy
 
 ```bash
-PROMETHEUS_NODE=server10 \
+PROMETHEUS_NODE=crimsonswarm01 \
 docker stack deploy -c deploy/prometheus/docker-stack.prometheus.yml crimson-metrics
 ```
 
-Add `CRIMSON_NETWORK=...` in front if your overlay is not
-`crimson-api_crimson_net`.
+Add `CRIMSON_NETWORK=...` in front if your overlay is not `crimson_crimson_net`.
 
 Watch it come up:
 
@@ -144,7 +144,7 @@ This is the step that saves the confusion later. From the node running Prometheu
 
 ```bash
 # The container has no curl, so ask through a throwaway one on the same network.
-docker run --rm --network crimson-api_crimson_net curlimages/curl:latest \
+docker run --rm --network crimson_crimson_net curlimages/curl:latest \
   -s 'http://prometheus:9090/api/v1/targets?state=any' \
   | grep -o '"health":"[a-z]*"' | sort | uniq -c
 ```
@@ -184,7 +184,7 @@ PROMETHEUS_URL=http://crimson-metrics_prometheus:9090
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `PROMETHEUS_URL` | *(unset)* | Enables the History section. Unset disables it cleanly. |
-| `PROMETHEUS_JOB` | `crimson-api` | Must equal `job_name` in `prometheus.yml`. Every panel filters on it. |
+| `PROMETHEUS_JOB` | `crimson-api` | The scrape JOB name, not the stack name. Must equal `job_name` in `prometheus.yml`; every panel filters on it. |
 | `PROMETHEUS_TIMEOUT` | `12` | Seconds a single panel query may take. |
 
 ---
@@ -243,7 +243,7 @@ in the stack file (which would put it on the ingress mesh and therefore on every
 node), run a throwaway attached container when you want it:
 
 ```bash
-docker run --rm -it --network crimson-api_crimson_net -p 127.0.0.1:9090:9090 \
+docker run --rm -it --network crimson_crimson_net -p 127.0.0.1:9090:9090 \
   alpine/socat TCP-LISTEN:9090,fork TCP:prometheus:9090
 ```
 

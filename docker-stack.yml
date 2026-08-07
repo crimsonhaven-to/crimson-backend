@@ -60,6 +60,18 @@ services:
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
+      # --- Observability (optional) --------------------------------------------
+      # METRICS_TOKEN is the shared secret a Prometheus scrape presents as a
+      # bearer to /metrics. Unset leaves /metrics reachable only with an admin
+      # session, which is the safe default: forgetting it makes the endpoint MORE
+      # closed, never open. It must be IDENTICAL to the crimson_metrics_token
+      # Swarm secret the scraper reads, or every scrape 401s.
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
+      # Points the Admin > Metrics History charts at the private Prometheus. Only
+      # this service needs it (the workers below serve no ingress and answer no
+      # /admin route). Unset => the tab shows the live snapshot only, no charts.
+      # See deploy/prometheus/README.md.
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-}
       # ShowBox/Febbox direct-file source. Like Jellyfin it disables itself when
       # unset (no FEBBOX_UI_TOKEN => is_configured() False => the source never
       # surfaces). Supplied via crimson.env on the manager. Optional region cookie.
@@ -187,6 +199,9 @@ services:
       # api-sync serves no ingress and has no NAS mount; it never downloads.
       - RUN_CACHE_WORKER=false
       - RUN_DOWNLOAD_WORKER=false
+      # Scraped like every other replica: this is the process whose resync memory
+      # profile you most want a chart of. No PROMETHEUS_URL, it answers no /admin.
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
@@ -263,6 +278,9 @@ services:
       - RUN_CACHE_WORKER=true
       # This is the CACHE worker, not the aria2 download worker.
       - RUN_DOWNLOAD_WORKER=false
+      # Scraped so crimson_cache_worker_queue_depth/inflight have a real source.
+      # On the api replicas those gauges are always 0; only this one does the work.
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
       # Source env the replayed proxies may need on this worker's own loopback
       # (a cached Jellyfin/ShowBox stream is pulled back through these proxies).
       - JELLYFIN_URL=${JELLYFIN_URL:-}
@@ -408,6 +426,10 @@ services:
       - RUN_DOWNLOAD_WORKER=true
       - ARIA2_RPC_URL=${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
       - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET}
+      # Scraped so the crimson_download_jobs gauge has a source. That gauge is
+      # CLUSTER-wide (it reads the shared jobs table), which is exactly why the
+      # panel behind it uses max() and never sum().
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
       # Downloader tuning (defaults baked in; uncomment to override).
       # - DOWNLOAD_MAX_ACTIVE=3          # simultaneous downloads
       # - DOWNLOAD_POLL_INTERVAL=5       # seconds between aria2 status polls

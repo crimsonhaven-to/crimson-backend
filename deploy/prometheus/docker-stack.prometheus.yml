@@ -40,7 +40,13 @@ services:
       # No web.external-url and no published port: this is not meant to be browsed
       # from outside. The admin dashboard reads it through the backend's
       # /admin/metrics/* endpoints, which are behind require_admin.
-      - --web.enable-lifecycle=false
+      #
+      # Off by default; stated explicitly so nobody turns it on by accident (it
+      # exposes unauthenticated /-/reload and /-/quit on a port the whole overlay
+      # can reach). Prometheus 3.x parses booleans with kingpin, so the negative
+      # form is `--no-<flag>`: writing `--web.enable-lifecycle=false` makes it
+      # treat "false" as a stray positional and exit 1 on boot.
+      - --no-web.enable-lifecycle
 
     configs:
       - source: crimson_prometheus_yml
@@ -126,8 +132,10 @@ volumes:
 
 networks:
   # The API stack's network, already created by `docker stack deploy -c
-  # docker-stack.yml crimson-api`. Referenced rather than created so both stacks
+  # docker-stack.yml crimson`. Referenced rather than created so both stacks
   # share one overlay and the backend can reach http://prometheus:9090.
+  # Production names it crimson_crimson_net (stack `crimson` + network
+  # `crimson_net`); confirm with `docker network ls --filter driver=overlay`.
   crimson_net:
     external: true
-    name: ${CRIMSON_NETWORK:-crimson-api_crimson_net}
+    name: ${CRIMSON_NETWORK:-crimson_crimson_net}

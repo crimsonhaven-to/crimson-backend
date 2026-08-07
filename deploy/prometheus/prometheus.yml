@@ -27,14 +27,15 @@ scrape_configs:
   # because every panel in core/prom_query.py filters on it.
   - job_name: crimson-api
     dns_sd_configs:
-      # The service names are <stack>_<service>. These assume the stack was
-      # deployed as `crimson-api` (docker stack deploy -c docker-stack.yml
-      # crimson-api). Rename them if your stack has a different name.
+      # Swarm names a service <stack>_<service>, and production deploys this stack
+      # as `crimson` (see deploy.sh on the manager), so the prefix is `crimson_`
+      # and NOT `crimson-api_`. Rename these if you deploy under another stack
+      # name; a wrong prefix is not an error, it just silently discovers nothing.
       - names:
-          - tasks.crimson-api_api
-          - tasks.crimson-api_api-sync
-          - tasks.crimson-api_cache-worker
-          - tasks.crimson-api_download-worker
+          - tasks.crimson_api
+          - tasks.crimson_api-sync
+          - tasks.crimson_cache-worker
+          - tasks.crimson_download-worker
         type: A
         port: 8000
         # Faster than the 30s default: Swarm reschedules tasks onto new IPs and a
