@@ -27,6 +27,20 @@ Text arrives as ``{"type": "text"}`` events. Tool calls are collected and
 delivered whole on the terminal ``{"type": "turn"}`` event, because a partially
 decoded tool argument object is not useful to anyone.
 
+Thought signatures
+------------------
+Gemini 3 stamps an opaque ``thoughtSignature`` on the response part its reasoning
+produced, and rejects the NEXT request with a 400 if that part comes back without
+it. Tool use is where this bites: the first call succeeds, then the second leg of
+the loop replays the model turn as history and fails, so the whole feature looks
+broken only once a tool is involved. The value is therefore carried through the
+neutral format on ``ToolCall.signature`` and ``Turn.signature`` and echoed back
+verbatim. It is provider bookkeeping and nothing else may read it.
+
+Signatures live only as long as the request that minted them. History reloaded
+from the database has none, which is fine: the requirement applies to a turn
+replayed inside one tool loop, and Anthropic has no equivalent concept at all.
+
 Prompt caching is requested on the Anthropic path by marking the last system
 block. The persona plus tool schemas come to roughly 1.8k tokens, which clears
 the 1024 minimum on Sonnet 5 and the 512 on Opus 5, but NOT the 4096 on Haiku
@@ -79,12 +93,26 @@ class ProviderError(RuntimeError):
 
 
 class ToolCall:
-    __slots__ = ("call_id", "name", "args")
+    """One requested tool invocation.
 
-    def __init__(self, call_id: str, name: str, args: Dict):
+    ``signature`` is opaque provider bookkeeping that must be echoed back
+    verbatim when this call is replayed as history. Gemini 3 attaches a
+    ``thoughtSignature`` to the part carrying a function call and HARD-ERRORS
+    (400) if the follow-up request has dropped it, which makes every tool-using
+    conversation fail on the second leg of the loop. Anthropic has no equivalent
+    and leaves this None. Nothing outside the provider that minted it may
+    interpret the value.
+    """
+
+    __slots__ = ("call_id", "name", "args", "signature")
+
+    def __init__(
+        self, call_id: str, name: str, args: Dict, signature: Optional[str] = None
+    ):
         self.call_id = call_id
         self.name = name
         self.args = args or {}
+        self.signature = signature
 
 
 class Usage:
@@ -99,12 +127,21 @@ class Usage:
 class Turn:
     """One provider round trip: what it said, what it wants to call, what it cost."""
 
-    __slots__ = ("text", "tool_calls", "usage")
+    __slots__ = ("text", "tool_calls", "usage", "signature")
 
-    def __init__(self, text: str, tool_calls: List[ToolCall], usage: Usage):
+    def __init__(
+        self,
+        text: str,
+        tool_calls: List[ToolCall],
+        usage: Usage,
+        signature: Optional[str] = None,
+    ):
         self.text = text
         self.tool_calls = tool_calls
         self.usage = usage
+        # A signature that arrived on a text part rather than a functionCall one.
+        # See ToolCall.signature; same contract, different part.
+        self.signature = signature
 
     @property
     def wants_tools(self) -> bool:
@@ -123,8 +160,17 @@ def user_msg(text: str) -> Msg:
     return {"role": "user", "text": text}
 
 
-def assistant_msg(text: str, tool_calls: Optional[List[ToolCall]] = None) -> Msg:
-    return {"role": "assistant", "text": text, "tool_calls": tool_calls or []}
+def assistant_msg(
+    text: str,
+    tool_calls: Optional[List[ToolCall]] = None,
+    signature: Optional[str] = None,
+) -> Msg:
+    return {
+        "role": "assistant",
+        "text": text,
+        "tool_calls": tool_calls or [],
+        "signature": signature,
+    }
 
 
 def tool_msg(call: ToolCall, result: Dict) -> Msg:
@@ -318,9 +364,19 @@ def _gemini_contents(messages: List[Msg]) -> List[Dict]:
         elif role == "assistant":
             parts: List[Dict] = []
             if msg.get("text"):
-                parts.append({"text": msg["text"]})
+                text_part = {"text": msg["text"]}
+                if msg.get("signature"):
+                    text_part["thoughtSignature"] = msg["signature"]
+                parts.append(text_part)
             for call in msg.get("tool_calls") or []:
-                parts.append({"functionCall": {"name": call.name, "args": call.args}})
+                fn_part: Dict = {"functionCall": {"name": call.name, "args": call.args}}
+                # Replaying a function call without the signature Gemini minted
+                # for it is a 400, not a soft warning, so this is load-bearing.
+                # Absent on history rebuilt from the database (only in-flight
+                # turns carry one) and on anything Anthropic produced.
+                if call.signature:
+                    fn_part["thoughtSignature"] = call.signature
+                parts.append(fn_part)
             if parts:
                 out.append({"role": "model", "parts": parts})
 
@@ -361,6 +417,7 @@ async def _gemini_stream(
     calls: List[ToolCall] = []
     usage = Usage()
     call_seq = 0
+    text_signature: Optional[str] = None
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -396,8 +453,20 @@ async def _gemini_stream(
 
                     for candidate in chunk.get("candidates") or []:
                         for part in (candidate.get("content") or {}).get("parts") or []:
+                            # Gemini 3 stamps an opaque thoughtSignature on the
+                            # part its reasoning produced and demands it back
+                            # unchanged when that part is replayed as history.
+                            # It has to be read here, per part, because the
+                            # stream is flattened into one string plus a list of
+                            # calls and the association is lost after that.
+                            signature = part.get("thoughtSignature")
                             if "text" in part and part["text"]:
                                 text_parts.append(part["text"])
+                                # First one wins: it belongs to the leading text
+                                # part, and the reply is replayed as a single
+                                # concatenated part.
+                                if signature and text_signature is None:
+                                    text_signature = signature
                                 yield {"type": "text", "text": part["text"]}
                             fn = part.get("functionCall")
                             if fn and fn.get("name"):
@@ -407,13 +476,19 @@ async def _gemini_stream(
                                 # and the ledger can key on something stable.
                                 calls.append(
                                     ToolCall(
-                                        f"gemini-{call_seq}", fn["name"], fn.get("args") or {}
+                                        f"gemini-{call_seq}",
+                                        fn["name"],
+                                        fn.get("args") or {},
+                                        signature,
                                     )
                                 )
     except httpx.HTTPError as exc:
         raise ProviderError("I could not reach my oracle. Try again shortly.") from exc
 
-    yield {"type": "turn", "turn": Turn("".join(text_parts), calls, usage)}
+    yield {
+        "type": "turn",
+        "turn": Turn("".join(text_parts), calls, usage, text_signature),
+    }
 
 
 # --- entry point ------------------------------------------------------------

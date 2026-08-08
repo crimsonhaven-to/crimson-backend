@@ -13,9 +13,12 @@ parts worth pinning here are the ones that break silently:
     behaviour instead of erroring.
 """
 
+import asyncio
+import functools
 import json
 import re
 
+import httpx
 import pytest
 
 from chat_engine import models, persona, providers, tools
@@ -255,6 +258,113 @@ def test_gemini_shaping_uses_the_model_role_and_function_parts():
         p for c in contents for p in c["parts"] if "functionResponse" in p
     )["functionResponse"]
     assert fn_resp["name"] == "recommend_titles"
+
+
+def _run_gemini_stream_over(chunks, monkeypatch=None):
+    """Drive ``_gemini_stream`` over a canned SSE body and return the final Turn.
+
+    Still no network: the real client is handed an httpx MockTransport, which
+    keeps the production request-shaping and response-parsing code in the test
+    rather than reimplementing a fake of it. asyncio.run avoids taking on
+    pytest-asyncio for a single generator.
+    """
+    body = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=body.encode("utf-8"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    patched = functools.partial(
+        httpx.AsyncClient, transport=httpx.MockTransport(handler)
+    )
+
+    async def drive():
+        turn = None
+        stream = providers._gemini_stream(
+            api_key="test-key",
+            model=models.resolve("gemini", models.DEFAULT_MODEL["gemini"]),
+            system="system",
+            messages=[providers.user_msg("hi")],
+            tools=tools.TOOL_SCHEMAS,
+        )
+        async for event in stream:
+            if event["type"] == "turn":
+                turn = event["turn"]
+        return turn
+
+    original = providers.httpx.AsyncClient
+    providers.httpx.AsyncClient = patched
+    try:
+        return asyncio.run(drive())
+    finally:
+        providers.httpx.AsyncClient = original
+
+
+def test_gemini_echoes_thought_signatures_back_on_replayed_parts():
+    """Gemini 3 rejects (400) a replayed functionCall part whose thoughtSignature
+    is missing, which breaks the second leg of every tool-using turn. The value is
+    opaque and must come back byte-identical."""
+    call = providers.ToolCall(
+        "gemini-1", "recommend_titles", {"limit": 3}, "SIG_FN"
+    )
+    contents = providers._gemini_contents(
+        [
+            providers.user_msg("Something to watch?"),
+            providers.assistant_msg("Let me look.", [call], "SIG_TEXT"),
+            providers.tool_msg(call, {"recommendations": []}),
+        ]
+    )
+    model_turn = next(c for c in contents if c["role"] == "model")
+    fn_part = next(p for p in model_turn["parts"] if "functionCall" in p)
+    assert fn_part["thoughtSignature"] == "SIG_FN"
+    text_part = next(p for p in model_turn["parts"] if "text" in p)
+    assert text_part["thoughtSignature"] == "SIG_TEXT"
+
+
+def test_gemini_omits_thought_signature_when_there_is_none():
+    """History rebuilt from the database has no signatures, and neither does
+    anything Anthropic produced. The key must be absent rather than null, since
+    an explicit null is a malformed part."""
+    call = providers.ToolCall("toolu_1", "recommend_titles", {"limit": 3})
+    contents = providers._gemini_contents(
+        [
+            providers.user_msg("hi"),
+            providers.assistant_msg("Try Overlord.", [call]),
+        ]
+    )
+    for content in contents:
+        for part in content["parts"]:
+            assert "thoughtSignature" not in part
+
+
+def test_gemini_stream_captures_signatures_per_part():
+    """The signature is read per streamed part, because the stream is flattened
+    into one text string plus a list of calls and the association is lost after."""
+    chunk = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"text": "Thinking.", "thoughtSignature": "SIG_TEXT"},
+                        {
+                            "functionCall": {
+                                "name": "recommend_titles",
+                                "args": {"limit": 3},
+                            },
+                            "thoughtSignature": "SIG_FN",
+                        },
+                    ]
+                }
+            }
+        ]
+    }
+    turn = _run_gemini_stream_over([chunk])
+    assert turn.signature == "SIG_TEXT"
+    assert [c.signature for c in turn.tool_calls] == ["SIG_FN"]
+    assert turn.tool_calls[0].name == "recommend_titles"
 
 
 def test_gemini_schema_uppercases_types_only():

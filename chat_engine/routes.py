@@ -276,7 +276,11 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(require
                 if not turn.wants_tools:
                     break
 
-                convo.append(providers.assistant_msg(turn.text, turn.tool_calls))
+                # turn.signature must ride along: Gemini rejects a replayed
+                # turn whose parts have lost the thought signatures it minted.
+                convo.append(
+                    providers.assistant_msg(turn.text, turn.tool_calls, turn.signature)
+                )
                 for call in turn.tool_calls:
                     result, action = await tools.dispatch(
                         call.name, call.args, user_id=user_id
