@@ -38,3 +38,16 @@ prometheus-client==0.26.0
 # Discord invite bot gateway client (see discord_bot/). Pure-Python (no Rust),
 # so it installs cleanly on python:3.14-slim; the C speedups are optional.
 websockets==15.0.1
+# Official Anthropic SDK, for the Claude side of Lumi's chatbot (see
+# chat_engine/providers.py). Pure-Python and it already depends on httpx, which
+# is pinned above, so it adds no compiler or native dependency.
+#
+# The Gemini side deliberately does NOT add google-genai: that path needs one
+# POST to a documented REST endpoint with an SSE body, which httpx already does,
+# and a second vendor SDK would be a large addition for very little. Both
+# providers are wrapped behind one interface either way.
+#
+# Imported OPTIONALLY, in the same spirit as prometheus-client above: chat_engine
+# degrades to "unconfigured" if the package is absent, so a stripped build still
+# boots and serves the rest of the API.
+anthropic==0.116.0

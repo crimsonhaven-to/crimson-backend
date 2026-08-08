@@ -375,6 +375,7 @@ class AccountStore:
             rows = conn.execute(
                 f"""
                 SELECT a.user_id, a.email, a.label, a.username, a.email_verified, a.is_admin,
+                       a.chat_enabled, a.chat_monthly_token_budget,
                        (a.public_key IS NOT NULL) AS has_mnemonic,
                        a.created_at, a.last_login_at,
                        (SELECT COUNT(*) FROM favorites f WHERE f.user_id = a.user_id) AS favorites_count,

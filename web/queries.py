@@ -122,12 +122,18 @@ def get_anime_entry(anilist_id: Optional[int]) -> Dict:
 
 
 def get_show_extras(tmdb_id: int) -> List[Dict]:
-    """Returns specials/OVAs/movies tied to a show (from tmdb_extras)."""
+    """Returns specials/OVAs/movies tied to a show (from tmdb_extras).
+
+    ``tmdb_movie_id`` is set only on films TMDB tracks as a standalone movie; it
+    is the frontend's routing signal, because those play through the movie watch
+    path rather than the show's season/episode one. Null everywhere else.
+    """
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT x.anilist_id, x.anime_type, e.title_romaji, e.title_english, e.start_year
+                SELECT x.anilist_id, x.anime_type, x.tmdb_movie_id,
+                       e.title_romaji, e.title_english, e.start_year
                 FROM tmdb_extras x
                 LEFT JOIN anime_entries e ON x.anilist_id = e.anilist_id
                 WHERE x.tmdb_id = %s
@@ -137,6 +143,28 @@ def get_show_extras(tmdb_id: int) -> List[Dict]:
     except Exception as e:
         logger.error(f"Database error in get_show_extras: {e}")
         return []
+
+
+def get_extra_movie_id(anilist_id: int) -> Optional[int]:
+    """The TMDB *movie* id of an extra, when it is a film TMDB tracks in its own
+    right. None for a special/OVA/ONA (and for anything that isn't an extra).
+
+    This is what tells the watch path to serve an extra through the movie
+    pipeline instead of building a season/episode URL a film has no page for.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT tmdb_movie_id FROM tmdb_extras "
+                "WHERE anilist_id = %s AND tmdb_movie_id IS NOT NULL LIMIT 1",
+                (anilist_id,)
+            )
+            row = cursor.fetchone()
+            return row["tmdb_movie_id"] if row else None
+    except Exception as e:
+        logger.error(f"Database error in get_extra_movie_id: {e}")
+        return None
 
 
 def get_show_info(tmdb_id: int) -> Dict:
@@ -170,8 +198,9 @@ def get_catalogue_items() -> List[Dict]:
 
     One row per AniList entry (every season / movie / OVA we have mapped), with
     its category (anime_type) and the ids the frontend needs to navigate
-    (anilist_id for /seasons, tmdb_id + season_number for /info & /watch).
-    Posters come from tmdb_shows where present (lazily populated, so often null)
+    (anilist_id for /seasons, tmdb_id + season_number for /info & /watch, or
+    tmdb_movie_id for a film that is its own TMDB entity). Posters come from
+    tmdb_shows / tmdb_movies where present (lazily populated, so often null)
     — we never hit TMDB here. Sorted by title.
     """
     try:
@@ -194,9 +223,15 @@ def get_catalogue_items() -> List[Dict]:
             cursor.execute("SELECT tmdb_id, poster_path FROM tmdb_shows")
             posters: Dict[int, Optional[str]] = {r["tmdb_id"]: r["poster_path"] for r in cursor.fetchall()}
 
+            # The same, for anime films keyed by their own TMDB *movie* id. A
+            # separate id space from tmdb_shows (the numbers overlap), hence a
+            # separate map rather than more rows in `posters`.
+            cursor.execute("SELECT tmdb_id, poster_path FROM tmdb_movies")
+            movie_posters: Dict[int, Optional[str]] = {r["tmdb_id"]: r["poster_path"] for r in cursor.fetchall()}
+
             cursor.execute(
                 """SELECT anilist_id, title_romaji, title_english, title_native,
-                          anime_type, start_year, genres
+                          anime_type, start_year, genres, tmdb_movie_id
                    FROM anime_entries"""
             )
             entries = cursor.fetchall()
@@ -216,7 +251,14 @@ def get_catalogue_items() -> List[Dict]:
             tmdb_id, season_number = season_map[aid]
         elif aid in extra_map:
             tmdb_id = extra_map[aid]
-        poster_path = posters.get(tmdb_id) if tmdb_id is not None else None
+        # An anime film TMDB tracks in its own right has no show to sit under, so
+        # it carries neither. It is still listable and playable through its own
+        # movie id, which the frontend routes on (see tmdb_movie_id below).
+        movie_id = e["tmdb_movie_id"]
+        if tmdb_id is None and movie_id is None:
+            continue  # unreachable entry: nothing the frontend could open
+        poster_path = (posters.get(tmdb_id) if tmdb_id is not None
+                       else movie_posters.get(movie_id))
         # genres is a JSON-encoded list (null for entries synced before genres
         # existed, or with no AniList genres); decode defensively to [].
         try:
@@ -233,6 +275,7 @@ def get_catalogue_items() -> List[Dict]:
             "year": e["start_year"],
             "tmdb_id": tmdb_id,
             "season_number": season_number,
+            "tmdb_movie_id": movie_id,
             "poster": _tmdb_img(poster_path) if poster_path else None,
         })
 

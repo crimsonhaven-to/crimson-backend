@@ -31,7 +31,13 @@ from metadata_engine.tmdb import fetch_tmdb_show, fetch_tmdb_movie
 
 from web.context import telemetry_store
 from web.pipeline import run_single_scraper, stream_watch_response
-from web.queries import get_anilist_id, get_movie_info, get_show_info, get_tmdb_season
+from web.queries import (
+    get_anilist_id,
+    get_extra_movie_id,
+    get_movie_info,
+    get_show_info,
+    get_tmdb_season,
+)
 from web.util import _STREAM_HEADERS, _public_base_url
 
 logger = logging.getLogger("crimson.watch")
@@ -575,14 +581,37 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
         raise HTTPException(status_code=404, detail="AniList ID not mapped")
 
     tmdb_id, season_number = mapping
+
+    # An extra that is a film in TMDB's own right (Overlord: The Sacred Kingdom)
+    # has a movie page, not an episode page. Serve it through the movie pipeline
+    # off its own id: the movie-capable sources can actually find it, and the
+    # cache keys itself in the movie namespace instead of colliding with an
+    # episode of the parent show.
+    if season_number is None:
+        movie_id = get_extra_movie_id(anilist_id)
+        if movie_id:
+            info = get_movie_info(movie_id)
+            return StreamingResponse(
+                stream_watch_response(movie_id, None, None, None,
+                                      info.get("title") if info else None,
+                                      base_url=_public_base_url(request),
+                                      media_type="movie"),
+                media_type="application/x-ndjson",
+                headers=_STREAM_HEADERS,
+            )
+
     # Serve the stream directly rather than 301-redirecting to the canonical
     # 3-segment route. A redirect is fatal on WebKit (all iOS browsers + Safari):
     # it drops the Authorization header when fetch() follows the redirect, so the
     # redirected request hits the login wall unauthenticated → 401 → the client
-    # clears the session and the user is bounced to the login wall. Extras
-    # (special/OVA/movie) have no numbered season — use season 1 for URL builders.
+    # clears the session and the user is bounced to the login wall.
+    #
+    # A remaining extra (special/OVA/ONA) has no numbered season, so it plays as
+    # season 0, the specials season TMDB and the streaming sites both use. It
+    # used to borrow season 1, which pointed every special at the first episode of
+    # the show proper and, worse, minted its cache ticket under that episode's key.
     return StreamingResponse(
-        stream_watch_response(tmdb_id, season_number if season_number is not None else 1,
+        stream_watch_response(tmdb_id, season_number if season_number is not None else 0,
                               episode_number, anilist_id,
                               base_url=_public_base_url(request)),
         media_type="application/x-ndjson",

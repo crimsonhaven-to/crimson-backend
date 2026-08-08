@@ -104,6 +104,19 @@ class Config:
     # Hour (server time, UTC in the container) the nightly DEMO_MODE reset runs at.
     DEMO_RESET_HOUR = int(os.getenv("DEMO_RESET_HOUR", "4"))
 
+    # --- Lumi, the chatbot (see chat_engine) -------------------------------
+    # ONLY the provider API keys live here. Everything else about the feature
+    # (whether it is on at all, which provider, which model, budgets, and the
+    # per-account grants) is operator state managed from the Admin dashboard and
+    # stored in chat_settings, so none of it needs a redeploy to change.
+    #
+    # Keys are deliberately NOT in the database: a dump of the accounts database
+    # should never contain billable credentials. The dashboard is told only
+    # whether a key is present, never its value. Set whichever provider you
+    # intend to use; the feature reports itself unconfigured without one.
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") or None
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or None
+
     # CORS Origins. Overridable via the ALLOWED_ORIGINS env var (comma-separated)
     # so the deploy can lock these down without a code change; falls back to the
     # built-in dev + crimsonhaven.to list.
