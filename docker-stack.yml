@@ -98,6 +98,16 @@ services:
       - SMTP_FROM=${SMTP_FROM:-}
       - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      # Lumi's oracles. Keys stay OUT of the settings table so a database dump
+      # never contains billable credentials — they MUST be listed here (Compose
+      # does NOT auto-inject crimson.env into the container) or the app sees them
+      # unset and /chat answers 503 "no oracle configured". Only the provider the
+      # operator selected in Admin -> Chat needs a key. Mind the `$`: writing
+      # {GEMINI_API_KEY:-} instead of ${GEMINI_API_KEY:-} passes that literal
+      # string through as the key, which reads as "present" to the feature gate
+      # and then fails every call with 400 API_KEY_INVALID.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       # CORS Proxy Stuff (optional)
       - CRIMSON_PROXY_BASE=${CRIMSON_PROXY_BASE:-}
       - CRIMSON_PROXY_SOURCES=${CRIMSON_PROXY_SOURCES:-}
