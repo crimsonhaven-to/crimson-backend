@@ -50,6 +50,11 @@ from download_engine import aria2 as download_aria2
 from download_engine import manager as download_manager
 from telemetry_engine import TelemetryStore
 from apikey_engine import store as apikey_store
+# The store, not the package: chat_engine/__init__ pulls in the chat routes,
+# which import account_engine.routes, and importing the leaf directly keeps this
+# module's import graph flat. chat_engine.db depends only on core.db_pool.
+from chat_engine.db import ChatStore
+from chat_engine.models import catalogue as chat_model_catalogue
 from . import audit, mailer
 from .db import AccountStore
 from .routes import require_user
@@ -60,6 +65,7 @@ local_store = LocalSourceStore()
 cache_store = CacheStore()
 download_store = DownloadStore()
 telemetry_store = TelemetryStore()
+chat_store = ChatStore()
 
 
 def _now_iso() -> str:
@@ -100,6 +106,9 @@ def _public_user(row: Optional[dict]) -> Optional[dict]:
     out.pop("session_expires_at", None)
     out["is_admin"] = bool(out.get("is_admin"))
     out["email_verified"] = bool(out.get("email_verified"))
+    # Lumi's chat grant. Deny-by-default, so a row predating the migration (or one
+    # the column was never written for) reads as False rather than None.
+    out["chat_enabled"] = bool(out.get("chat_enabled"))
     return out
 
 
@@ -300,6 +309,14 @@ async def security_events(
 class UserUpdate(BaseModel):
     is_admin: Optional[bool] = None
     email_verified: Optional[bool] = None
+    # Lumi's chat grant, and an optional per-account monthly token ceiling. The
+    # budget is tri-state on purpose: absent leaves it alone, a number sets it,
+    # and an explicit 0 freezes this user without revoking the grant. Clearing it
+    # back to the global default is a separate flag rather than null, because a
+    # JSON null is indistinguishable from an omitted field here.
+    chat_enabled: Optional[bool] = None
+    chat_monthly_token_budget: Optional[int] = Field(None, ge=0)
+    chat_budget_reset: Optional[bool] = None
 
 
 @router.get("/users")
@@ -336,6 +353,26 @@ async def update_user(request: Request, user_id: int, body: UserUpdate, user: di
         await run_in_threadpool(store.set_email_verified, user_id, body.email_verified)
         _audit_admin(request, user, "verified_set" if body.email_verified else "verified_cleared",
                      target_user_id=user_id, target=target.get("email"))
+
+    # Granting chat access is a spending decision, so it is audited exactly like
+    # the admin flag above rather than treated as a cosmetic preference.
+    if body.chat_enabled is not None and bool(target.get("chat_enabled")) != body.chat_enabled:
+        await run_in_threadpool(chat_store.set_chat_access, user_id, body.chat_enabled)
+        _audit_admin(request, user,
+                     "chat_granted" if body.chat_enabled else "chat_revoked",
+                     target_user_id=user_id, target=target.get("email"))
+
+    if body.chat_budget_reset:
+        await run_in_threadpool(chat_store.set_user_budget, user_id, None)
+        _audit_admin(request, user, "chat_budget_reset",
+                     target_user_id=user_id, target=target.get("email"))
+    elif body.chat_monthly_token_budget is not None:
+        await run_in_threadpool(
+            chat_store.set_user_budget, user_id, body.chat_monthly_token_budget
+        )
+        _audit_admin(request, user, "chat_budget_set",
+                     target_user_id=user_id, target=target.get("email"),
+                     budget=body.chat_monthly_token_budget)
 
     fresh = await run_in_threadpool(store.get_account, user_id)
     return {"success": True, "user": _public_user(fresh)}
@@ -1122,3 +1159,101 @@ async def metrics_targets(user: dict = Depends(require_admin)):
     if not prom_query.available():
         raise HTTPException(status_code=503, detail="No Prometheus is configured (set PROMETHEUS_URL)")
     return await prom_query.scrape_targets()
+
+
+# --- Lumi's chatbot --------------------------------------------------------
+# Operator control for chat_engine: whether the feature is on, which provider and
+# model answers, and what it has cost. Per-account grants are NOT here; they ride
+# on PATCH /users/{id} alongside the admin flag, because granting a person access
+# is a user-management action.
+#
+# API keys are deliberately absent from both the read and the write path. They
+# live in the environment (ANTHROPIC_API_KEY / GEMINI_API_KEY) so a database dump
+# never carries billable credentials; the dashboard is told only whether each one
+# is present.
+
+class ChatSettingsUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    provider: Optional[str] = Field(None, pattern="^(anthropic|gemini)$")
+    model: Optional[str] = None
+    monthly_token_budget: Optional[int] = Field(None, ge=0)
+    history_turns: Optional[int] = Field(None, ge=1, le=50)
+    max_tool_iterations: Optional[int] = Field(None, ge=1, le=10)
+
+
+def _chat_settings_payload() -> dict:
+    """Settings plus the environment facts the dashboard needs to render them."""
+    from chat_engine.routes import provider_key
+    from chat_engine.providers import ANTHROPIC_SDK_AVAILABLE
+
+    settings = chat_store.get_settings()
+    return {
+        "settings": settings,
+        "models": chat_model_catalogue(),
+        "keys": {
+            # Presence only. The values never leave the process.
+            "anthropic": bool(provider_key("anthropic")),
+            "gemini": bool(provider_key("gemini")),
+        },
+        "sdk": {"anthropic": ANTHROPIC_SDK_AVAILABLE},
+    }
+
+
+@router.get("/chat/settings")
+async def chat_settings(user: dict = Depends(require_admin)):
+    return await run_in_threadpool(_chat_settings_payload)
+
+
+@router.patch("/chat/settings")
+async def update_chat_settings(
+    request: Request, body: ChatSettingsUpdate, user: dict = Depends(require_admin)
+):
+    """Change provider, model, budgets or the master switch.
+
+    Switching the feature on without a key for the selected provider is rejected
+    rather than accepted-and-broken: the failure would otherwise only surface as
+    a 503 to whichever viewer opened the drawer first.
+    """
+    from chat_engine.routes import provider_key
+
+    patch = body.model_dump(exclude_none=True)
+    current = await run_in_threadpool(chat_store.get_settings)
+    target_provider = patch.get("provider", current["provider"])
+
+    if patch.get("enabled") and not provider_key(target_provider):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No API key configured for {target_provider}. Set it in the environment first.",
+        )
+
+    # A model id belonging to the other vendor is a mistake worth naming, rather
+    # than silently falling back to that provider's default at request time.
+    if "model" in patch:
+        from chat_engine.models import get_model
+
+        model = get_model(patch["model"])
+        if model is None:
+            raise HTTPException(status_code=400, detail=f"Unknown model '{patch['model'][:60]}'")
+        if model.provider != target_provider:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model.model_id}' belongs to {model.provider}, not {target_provider}",
+            )
+
+    await run_in_threadpool(chat_store.update_settings, patch, updated_by=user["user_id"])
+    _audit_admin(request, user, "chat_settings_updated", **patch)
+    return await run_in_threadpool(_chat_settings_payload)
+
+
+@router.get("/chat/usage")
+async def chat_usage(
+    user: dict = Depends(require_admin),
+    days: int = Query(30, ge=1, le=365, description="Aggregation window"),
+):
+    """Token and estimated-cost totals, plus the biggest spenders.
+
+    Cost is an estimate computed from published per-million rates at call time
+    (see chat_engine.models), not a figure from the provider's billing API, so it
+    tracks real spend closely but will not match a vendor invoice to the cent.
+    """
+    return await run_in_threadpool(chat_store.usage_overview, days)
