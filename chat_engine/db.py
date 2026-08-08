@@ -70,7 +70,11 @@ class ChatStore:
             }
         out = dict(row)
         out["enabled"] = bool(out.get("enabled"))
-        provider = out.get("provider") if out.get("provider") in PROVIDERS else "anthropic"
+        # Narrowed to a known provider string rather than trusted from the row: a
+        # hand-edited database should degrade to the default, not send an unknown
+        # provider name down the request path.
+        stored = out.get("provider")
+        provider = stored if isinstance(stored, str) and stored in PROVIDERS else "anthropic"
         out["provider"] = provider
         # Guards a provider switch that left the other vendor's model id stored.
         out["model"] = resolve(provider, out.get("model")).model_id

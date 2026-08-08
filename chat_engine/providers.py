@@ -52,7 +52,10 @@ from .models import ANTHROPIC, GEMINI, ChatModel
 try:
     import anthropic
 except ImportError:  # pragma: no cover - exercised only on a stripped build
-    anthropic = None
+    # Rebinding a module name to None is exactly the pattern an optional import
+    # needs, and the one thing mypy cannot express, so the narrowing is silenced
+    # here rather than working around it with a second sentinel name.
+    anthropic = None  # type: ignore[assignment]
 
 logger = logging.getLogger("crimson.chat.providers")
 
@@ -417,7 +420,10 @@ async def _gemini_stream(
 async def stream_turn(
     *,
     provider: str,
-    api_key: str,
+    # Optional on purpose: the caller reads it straight out of the environment,
+    # where "not configured" is a normal state. Rejecting it here, in Lumi's
+    # voice, beats making every call site prove it is set first.
+    api_key: Optional[str],
     model: ChatModel,
     system: str,
     messages: List[Msg],
