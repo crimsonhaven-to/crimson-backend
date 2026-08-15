@@ -66,6 +66,24 @@ bootstrap:
     - host    replication     replicator 10.0.0.0/8                scram-sha-256
 
 postgresql:
+  # Keep the local PgBouncer honest about this node's role after a role change.
+  # libpq (PG14+) decides "is this node writable?" from the startup parameters the
+  # server reports, and PgBouncer caches those from the first server connection it
+  # opened and replays them to new clients — so after a promotion or demotion the
+  # pooler on that node keeps advertising the role the node used to have, and the
+  # app's target_session_attrs=read-write either picks a demoted node or skips the
+  # real primary. See on-role-change.sh for the full story; it issues RECONNECT.
+  #
+  # The script lives in the pgdata bind mount (already mounted, see docker-compose.yml)
+  # rather than in a bind mount of its own, so it can be added to a RUNNING cluster with
+  # `patronictl reload` alone — no container recreate and no failover. On each host:
+  #
+  #   sudo install -o 999 -g 999 -m 0755 on-role-change.sh /srv/crimson-pgdata/
+  #   docker exec crimson-patroni-1 patronictl reload crimson-cluster <member> --force
+  callbacks:
+    on_role_change: /var/lib/postgresql/data/on-role-change.sh
+    on_start: /var/lib/postgresql/data/on-role-change.sh
+
   bin_dir: /usr/lib/postgresql/17/bin
   # The data directory lives in a sub-folder of the bind-mounted volume so a
   # mount-point `lost+found` (common on ext4 RAID arrays) never collides with it.
