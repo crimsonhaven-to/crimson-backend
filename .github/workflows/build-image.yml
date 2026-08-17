@@ -1,25 +1,21 @@
 name: Build and Deploy
 
-# Build the backend image and push it to the PRIVATE GitHub Container Registry
-# (GHCR), then roll it out to the Docker Swarm.
+# Build the backend image, push it to the PRIVATE GHCR, and roll it onto the swarm.
 #
-#   * push to `dev`         -> build + push ghcr.io/.../crimson-backend:dev
-#                              (and :dev-<sha>). No deploy.
-#   * a published Release   -> build + push :<tag> and :latest, then deploy that
-#                              immutable :<tag> to the swarm with a health-gated,
-#                              auto-rolling update. ALSO builds a separate, CLEAN
-#                              demo image (:demo / :demo-<tag>) — NO private source
-#                              overlay baked in — and rolls it onto the crimson-demo
-#                              stack (DEMO_MODE=1, sourceless). See build-demo below.
+#   * push to `dev`       -> build :dev + :dev-<sha>, then deploy :dev-<sha> to the
+#                            crimson-dev stack (see deploy-dev).
+#   * published Release   -> build :<tag> + :latest and deploy :<tag> to prod with a
+#                            health-gated rolling update. ALSO builds a separate
+#                            CLEAN demo image (no source overlay) and rolls it onto
+#                            the crimson-demo stack. See build-demo.
 #
-# The image is PRIVATE. Pull auth reaches the swarm nodes two ways:
-#   - CI push uses the ephemeral GITHUB_TOKEN (packages: write).
-#   - Runtime pulls use a durable `read:packages` login configured once on the
-#     manager (crimsonswarm01); `docker stack deploy --with-registry-auth` ships
-#     those credentials to every node so re-pulls survive reboots/reschedules.
+# Pull auth on the nodes: CI pushes with the ephemeral GITHUB_TOKEN, while runtime
+# pulls use a durable `read:packages` login set up once on the manager. `docker stack
+# deploy --with-registry-auth` ships those creds to every node, so re-pulls survive
+# reboots and reschedules.
 #
-# Runner: the single org-level self-hosted runner on the jumphost `server10`,
-# which has Docker + buildx and passwordless SSH to the swarm managers.
+# Runner: the org-level self-hosted runner on the jumphost `server10` (Docker +
+# buildx, passwordless SSH to the managers).
 
 on:
   push:
@@ -31,8 +27,8 @@ on:
   release:
     types: [published]
 
-# Never let two builds/deploys of the same ref run concurrently (a second
-# release must wait, not race the rolling update). Releases are not cancelled.
+# One build/deploy per ref at a time: a second release waits rather than racing the
+# rolling update. Never cancelled mid-flight.
 concurrency:
   group: crimson-backend-${{ github.ref }}
   cancel-in-progress: false
@@ -43,17 +39,13 @@ env:
   SWARM_MANAGER: crimsonswarm01
 
 jobs:
-  # Quality gate — MUST pass before anything is built or deployed. Runs the
-  # correctness linter (ruff pyflakes) + the fixture-based unit tests (pure
-  # parsing/crypto/signing logic; no network, no DB). Runs inside the exact prod
-  # base image (python:3.14-slim) so "it imports/installs in CI" == "it imports
+  # Quality gate: MUST pass before anything is built or deployed. Ruff correctness
+  # rules + the fixture-based unit tests (pure parsing/crypto/signing; no network,
+  # no DB). Runs inside the prod base image, so "it installs in CI" == "it imports
   # in the deployed container".
   gate:
     runs-on: [self-hosted]
     container: python:3.14-slim
-    # The container runs as root, so its checkout can clean any root-owned files a
-    # prior container run left, and the final step below hands the workspace back
-    # writable so the host-run `build` job can clean it (avoids EACCES on checkout).
     env:
       PIP_ROOT_USER_ACTION: ignore
     steps:
@@ -65,10 +57,10 @@ jobs:
           python -m pip install --upgrade pip --no-cache-dir
           pip install --no-cache-dir -r requirements-dev.txt
 
-      - name: Lint (ruff — correctness rules)
+      - name: Lint (ruff, correctness rules)
         run: ruff check .
 
-      - name: Type-check (mypy — informational, non-blocking)
+      - name: Type-check (mypy, informational)
         continue-on-error: true
         run: mypy . || true
 
@@ -77,9 +69,8 @@ jobs:
 
       - name: Hand the workspace back to the host runner
         if: always()
-        # This job's container writes files as root into the shared self-hosted
-        # workspace; make them world-writable so the next (host-run) job's checkout
-        # can delete them. Without this, `build`'s checkout fails with EACCES.
+        # This container writes as root into the shared self-hosted workspace, so
+        # without this the next (host-run) job's checkout fails with EACCES.
         run: chmod -R a+rwX "$GITHUB_WORKSPACE" || true
 
   build:
@@ -91,7 +82,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       deploy: ${{ steps.meta.outputs.deploy }}
-      # The exact, immutable tag to deploy (vX.Y.Z on release, dev-<sha> on dev).
+      # The immutable tag to deploy: vX.Y.Z on release, dev-<sha> on dev.
       image_tag: ${{ steps.meta.outputs.image_tag }}
     steps:
       - name: Checkout code
@@ -111,8 +102,8 @@ jobs:
             echo "version="         >> "$GITHUB_OUTPUT"
             echo "deploy=false"     >> "$GITHUB_OUTPUT"
             echo "tags=${IMAGE}:dev,${IMAGE}:dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-            # Deploy the immutable per-commit tag, not the rolling :dev, so the
-            # dev stack always rolls to exactly this build.
+            # Deploy the per-commit tag, not the rolling :dev, so the dev stack
+            # always rolls to exactly this build.
             echo "image_tag=dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
@@ -132,9 +123,9 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          # Optional build-time source overlay (see self-hosting docs): a clone URL
-          # and token passed as BuildKit secrets. Unset = empty = the build skips the
-          # overlay. Never baked into a layer.
+          # Optional build-time source overlay (see the self-hosting docs): a repo
+          # slug + token as BuildKit secrets, never baked into a layer. Commented out
+          # to match the Dockerfile's disabled overlay stage; uncomment BOTH to use it.
           # secrets: |
           #   sources_pat=${{ secrets.SOURCES_PAT }}
           #   sources_repo=${{ secrets.SOURCES_REPO }}
@@ -148,7 +139,7 @@ jobs:
     runs-on: [self-hosted]
     steps:
       # Checkout at the release tag so we ship THIS release's stack definition.
-      - name: Checkout release
+      - name: Checkout release tag
         uses: actions/checkout@v4
 
       - name: Ship stack file to the manager
@@ -161,10 +152,9 @@ jobs:
           ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" \
             "/home/raymond/crimson-deploy/deploy.sh '${{ needs.build.outputs.version }}'"
 
-  # Dev auto-deploy: a push to `dev` rolls the just-built dev-<sha> image onto the
-  # crimson-dev stack. Unlike the prod deploy this ships NO stack file — the dev
-  # docker-stack.yml lives only on the manager (~/dev-crimson-deploy/), bundling
-  # its own Postgres; CI just triggers its deploy.sh.
+  # Dev auto-deploy: a push to `dev` rolls the just-built dev-<sha> onto the
+  # crimson-dev stack. Unlike prod this ships NO stack file; the dev stack (bundling
+  # its own Postgres) lives on the manager and CI just triggers its deploy.sh.
   deploy-dev:
     needs: build
     if: ${{ github.event_name == 'push' }}
@@ -176,12 +166,11 @@ jobs:
             "/home/raymond/dev-crimson-deploy/deploy.sh '${{ needs.build.outputs.image_tag }}'"
 
   # --- Demo image: a CLEAN build with NO private source overlay -----------------
-  # Built only on a release, alongside the prod `build`. It deliberately OMITS the
-  # sources_pat/sources_repo BuildKit secrets, so the Dockerfile's private-sources
-  # stage is a no-op and NONE of secret-backend-sources is baked into the image. A
-  # SEPARATE buildcache ref (:democache) guarantees the clean build can never restore
-  # a source-bearing layer from the prod cache. The crimson-demo stack runs this with
-  # DEMO_MODE=1 + PRIVATE_SOURCES_ENABLED=0, so the demo resolves nothing.
+  # Release-only, alongside the prod `build`. It deliberately OMITS the
+  # sources_pat/sources_repo secrets, and its SEPARATE buildcache ref (:democache)
+  # guarantees it can never restore a source-bearing layer from the prod cache. The
+  # crimson-demo stack runs it with DEMO_MODE=1 + PRIVATE_SOURCES_ENABLED=0, so the
+  # demo resolves nothing.
   build-demo:
     needs: gate
     if: ${{ github.event_name == 'release' }}
@@ -213,22 +202,20 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push (CLEAN — no source overlay)
+      - name: Build and push (CLEAN, no source overlay)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          # NOTE: no `secrets:` block on purpose — without sources_pat/sources_repo the
-          # Dockerfile skips the overlay clone, so the demo image carries none of the
-          # private backend sources. Its own buildcache ref keeps it source-free.
+          # No `secrets:` block on purpose: never add one here, or the demo image
+          # starts carrying private backend sources.
           cache-from: type=registry,ref=${{ env.IMAGE }}:democache
           cache-to: type=registry,ref=${{ env.IMAGE }}:democache,mode=max
 
-  # Demo auto-deploy on release: roll the just-built demo-<tag> image onto the
-  # crimson-demo stack. Like the dev deploy it ships NO stack file — the demo
-  # docker-stack.yml lives only on the manager (~/demo-crimson-deploy/), bundling its
-  # own Postgres and the DEMO_MODE env; CI just triggers its deploy.sh.
+  # Demo auto-deploy on release: roll the just-built demo-<tag> onto the crimson-demo
+  # stack. Like the dev deploy it ships NO stack file; that stack (with its own
+  # Postgres and the DEMO_MODE env) lives on the manager.
   deploy-demo:
     needs: build-demo
     if: ${{ github.event_name == 'release' }}
