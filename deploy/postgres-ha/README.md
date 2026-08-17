@@ -60,6 +60,7 @@ You want all three.
 | `Dockerfile.patroni` | builds the PostgreSQL 17 + Patroni + pgBackRest image |
 | `patroni.yml` | cluster-wide Patroni config (identical on every host) |
 | `init-app-db.sh` | creates the `crimson` app role + database on first bootstrap |
+| `on-role-change.sh` | Patroni callback — makes the co-located PgBouncer re-read this node's role after a promotion or demotion (see §6e) |
 | `.env.example` | per-host settings — copy to `.env` and edit on each host |
 | `pgbackrest/pgbackrest.conf` | backup + WAL-archive configuration |
 | `pgbackrest/backup-if-leader.sh` | cron-friendly "back up only if I'm the primary" |
@@ -184,6 +185,30 @@ You want something like:
 
 One `Leader`, two `Replica`, all `running`, lag ~0. **That's a working HA
 cluster.** Tip: `alias pctl='docker compose exec patroni patronictl -c /etc/patroni/patroni.yml'`.
+
+**6e. Install the role-change callback on each host.** Without it, the co-located
+PgBouncer keeps advertising the role a node *used* to have after a failover, and the
+app's `target_session_attrs=read-write` either picks a demoted node or skips the real
+primary. `on-role-change.sh` fixes that by issuing `RECONNECT` the moment the role
+changes — see `deploy/pgbouncer/README.md` §12 for the mechanism.
+
+It lives in the pgdata bind mount (already mounted by `docker-compose.yml`) rather than
+a bind mount of its own, so it can also be added to an **already-running** cluster with
+nothing more than a reload — no container recreate and no failover:
+
+```bash
+# on each DB host, from this directory
+sudo install -o 999 -g 999 -m 0755 on-role-change.sh /srv/crimson-pgdata/
+docker exec crimson-patroni-1 patronictl reload crimson-cluster "$(hostname)" --force
+```
+
+Harmless to run before the pooler exists — the script logs and exits 0 if it cannot
+reach PgBouncer. Verify it after your first switchover: the promoted node's Patroni log
+should carry a line like
+
+```
+[on-role-change] action=on_role_change role=primary: pgbouncer :6432 server connections recycled (attempt 1)
+```
 
 ---
 
