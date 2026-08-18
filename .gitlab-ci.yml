@@ -94,9 +94,10 @@ gate:
 .buildx_setup:
   before_script:
     # docker/setup-buildx-action has no GitLab equivalent. The shell runner keeps
-    # its builder between jobs, so create it only if it isn't there already; the
-    # docker-container driver is what makes the registry-backed cache work.
-    - docker buildx inspect crimson >/dev/null 2>&1 || docker buildx create --name crimson --driver docker-container
+    # its builder between jobs, so the create is a no-op after the first run (and
+    # is ignored if a concurrent job won the race); the docker-container driver is
+    # what makes the registry-backed cache work.
+    - docker buildx create --name crimson --driver docker-container 2>/dev/null || true
     - docker buildx use crimson
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
 
