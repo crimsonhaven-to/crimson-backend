@@ -97,7 +97,11 @@ gate:
     # its builder between jobs, so the create is a no-op after the first run (and
     # is ignored if a concurrent job won the race); the docker-container driver is
     # what makes the registry-backed cache work.
-    - docker buildx create --name crimson --driver docker-container 2>/dev/null || true
+    # network=host matters: BuildKit runs in its own container and would otherwise
+    # resolve registry.ramon.moe through public DNS to the Cloudflare Tunnel, whose
+    # 100MB request body cap rejects large layers with a 413. On the host network it
+    # picks up /etc/hosts, which points the registry at the LAN address instead.
+    - docker buildx create --name crimson --driver docker-container --driver-opt network=host 2>/dev/null || true
     - docker buildx use crimson
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
 
