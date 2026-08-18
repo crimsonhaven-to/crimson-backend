@@ -1,38 +1,5 @@
 # GitLab CI/CD — translated from .github/workflows/build-image.yml, which is left
 # in place so the project still builds on GitHub.
-#
-# Build the backend image and push it to the PRIVATE GitLab Container Registry,
-# then roll it out to the Docker Swarm.
-#
-#   * push to `dev`   -> build + push registry.ramon.moe/.../crimson-backend:dev
-#                        (and :dev-<sha>), then roll the crimson-dev stack.
-#   * a v* tag        -> build + push :<tag> and :latest, then deploy that
-#                        immutable :<tag> to the swarm with a health-gated,
-#                        auto-rolling update. ALSO builds a separate, CLEAN demo
-#                        image (:demo / :demo-<tag>) — NO private source overlay
-#                        baked in — and rolls it onto the crimson-demo stack
-#                        (DEMO_MODE=1, sourceless). See build-demo below.
-#
-# The image is PRIVATE: this project's container registry is set to "Only project
-# members", independent of the repository being public. Pull auth reaches the swarm
-# nodes two ways:
-#   - CI push uses the ephemeral CI_REGISTRY_PASSWORD (the job token).
-#   - Runtime pulls use a durable read_registry deploy token configured once on the
-#     manager (crimsonswarm01); `docker stack deploy --with-registry-auth` ships
-#     those credentials to every node so re-pulls survive reboots/reschedules.
-#
-# Runner: `crimsonrunner`, the base-OS shell runner on the jumphost server10, which
-# has Docker + buildx and passwordless SSH to the swarm managers. The quality gate
-# runs on the containerised `docker` runner instead — it needs no host access.
-#
-# Two deliberate differences from the GitHub original:
-#   * GitHub fired the production path on a *published Release*; GitLab has no such
-#     pipeline trigger, so production is driven by pushing a v* tag. Create the
-#     GitLab release from that tag afterwards if you want release notes.
-#   * GitHub's `paths-ignore: '**.md'` has no GitLab counterpart and a `changes:`
-#     allowlist over this many top-level packages would silently skip a deploy the
-#     day a new package appears. Doc-only commits to `dev` therefore rebuild. If
-#     that becomes annoying, push docs to a branch and merge without a dev commit.
 
 stages:
   - gate
@@ -63,16 +30,7 @@ default:
     - if: $CI_COMMIT_TAG =~ /^v/
     - if: $CI_COMMIT_BRANCH == "dev"
 
-# Quality gate — MUST pass before anything is built or deployed. Runs the
-# correctness linter (ruff pyflakes) + the fixture-based unit tests (pure
-# parsing/crypto/signing logic; no network, no DB). Runs inside the exact prod
-# base image (python:3.14-slim) so "it imports/installs in CI" == "it imports
-# in the deployed container".
-#
-# On GitHub this ran as a `container:` job on the self-hosted runner and had to
-# chmod the shared workspace back to the host user afterwards. Here it is an
-# ordinary containerised job on the docker runner with its own throwaway
-# workspace, so that hand-back step is gone.
+# Quality gate
 gate:
   extends: .dev_or_release
   stage: gate
@@ -93,14 +51,6 @@ gate:
 
 .buildx_setup:
   before_script:
-    # docker/setup-buildx-action has no GitLab equivalent. The shell runner keeps
-    # its builder between jobs, so the create is a no-op after the first run (and
-    # is ignored if a concurrent job won the race); the docker-container driver is
-    # what makes the registry-backed cache work.
-    # network=host matters: BuildKit runs in its own container and would otherwise
-    # resolve registry.ramon.moe through public DNS to the Cloudflare Tunnel, whose
-    # 100MB request body cap rejects large layers with a 413. On the host network it
-    # picks up /etc/hosts, which points the registry at the LAN address instead.
     - docker buildx create --name crimson --driver docker-container --driver-opt network=host 2>/dev/null || true
     - docker buildx use crimson
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
@@ -217,9 +167,7 @@ build-demo:
       dotenv: demo.env
 
 # Demo auto-deploy on release: roll the just-built demo-<tag> image onto the
-# crimson-demo stack. Like the dev deploy it ships NO stack file — the demo
-# docker-stack.yml lives only on the manager (~/demo-crimson-deploy/), bundling its
-# own Postgres and the DEMO_MODE env; CI just triggers its deploy.sh.
+# crimson-demo stack. Like the dev deploy it ships NO stack file.
 deploy-demo:
   extends: .release
   stage: deploy
