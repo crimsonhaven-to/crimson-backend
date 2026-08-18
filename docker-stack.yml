@@ -34,7 +34,7 @@ services:
   # `replicas` below. Schema init is concurrency-safe (db_pool.lock_schema_init),
   # so multiple replicas can boot simultaneously without racing on DDL.
   api:
-    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
@@ -197,7 +197,7 @@ services:
   # wasting bandwidth and contending on the shared DB. No published port: it does
   # not serve ingress traffic, it only keeps the DB fresh for the api replicas.
   api-sync:
-    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
@@ -275,7 +275,7 @@ services:
   # dedupes. Needs the NAS mount (it writes the files) and the same source env the
   # proxies it replays through require (e.g. Jellyfin token injection).
   cache-worker:
-    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
@@ -424,7 +424,7 @@ services:
   # second ever runs). Needs the SAME media NAS mount as aria2 + api (it does the
   # move), and the ARIA2_* env pointing at the sidecar.
   download-worker:
-    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
@@ -502,7 +502,7 @@ services:
   # fights the first (and would double-mint). With DISCORD_BOT_TOKEN unset the
   # process just logs "disabled" and idles, so it's harmless to leave deployed.
   discord-bot:
-    image: ${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
     command: ["python", "-m", "discord_bot"]
 
     # Disable the image's baked-in HEALTHCHECK (it probes http://127.0.0.1:8000/
@@ -584,7 +584,7 @@ services:
     command:
       - |
         set -eu
-        IMAGE="ghcr.io/crimsonhaven-to/crimson-backend"
+        IMAGE="registry.ramon.moe/crimsonhaven-to/crimson-backend"
         KEEP=3
         echo "[pruner] $(hostname): keeping newest ${KEEP} release tags of ${IMAGE}"
         # Numeric key sort (newest first) instead of `sort -V`, which busybox
@@ -619,7 +619,7 @@ services:
     environment:
       # Pinned to the rolled-out image ref so the spec — and thus the one-shot
       # task — changes on every release, re-triggering the prune fleet-wide.
-      - PRUNE_RELEASE=${CRIMSON_API_IMAGE:-ghcr.io/crimsonhaven-to/crimson-backend:latest}
+      - PRUNE_RELEASE=${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
     # Talk to the node's own daemon to list/remove its local images.
     volumes:
