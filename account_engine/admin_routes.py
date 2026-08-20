@@ -2,21 +2,9 @@
 Admin API — a dashboard surface for accounts flagged ``is_admin``.
 
 Everything here lives under ``/admin`` and is gated by ``require_admin`` (a valid
-session whose account has the admin flag — see account_engine.db). The site-wide
+session whose account has the admin flag, see account_engine.db). The site-wide
 login wall already blocks unauthenticated access; this adds the admin check on
 top, so a normal signed-in user gets a 403, not a 401.
-
-Capabilities (mirrors what the user asked for):
-  * user management        — list / search, toggle admin & verified, revoke
-                             sessions, delete accounts,
-  * invite codes           — mint single-use invite tokens (same table the
-                             Discord bot uses, see discord_bot/), list the
-                             ledger, revoke unused ones,
-  * metadata resync        — trigger a forced AniList<->TMDB Fribb resync in the
-                             background (the same rebuild metadata_engine.resync
-                             runs), with live status,
-  * health / stats         — account-system + content (mapping) aggregates for a
-                             dashboard.
 
 The heavy mapping resync depends on the ``MappingDatabaseEngine`` that lives in
 api.py, so rather than import it here (circular), api.py injects an async handler

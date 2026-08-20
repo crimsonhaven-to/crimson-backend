@@ -1,16 +1,16 @@
 """
-Account storage (PostgreSQL) — accounts, sessions, login challenges, favorites
+Account storage (PostgreSQL). Accounts, sessions, login challenges, favorites
 and watch progress.
 
 The account tables share one PostgreSQL database with the mapping tables (see
 db_pool), but a Fribb resync only DELETEs the three mapping tables, so user data
-is never touched by a sync — the historical reason these lived in a separate
+is never touched by a sync. The historical reason these lived in a separate
 SQLite file no longer applies. All access goes through the shared connection
 pool (``db_pool.get_connection``).
 
 Identity model (see account_engine.ed25519 / README): an account *is* an Ed25519
-public key. The server stores only that public key — never the mnemonic, never a
-password, never the private key. Possession is proven per-login by signing a
+public key. The server stores only that public key, 
+never the private key. Possession is proven per-login by signing a
 one-time challenge. Sessions are opaque random bearer tokens, stored only as a
 SHA-256 hash so a DB leak can't be replayed.
 """
