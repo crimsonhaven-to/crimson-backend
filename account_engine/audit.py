@@ -13,7 +13,7 @@ full disk / dropped DB can degrade the *log*, never a login. Reads power the
 admin dashboard's Security tab (see admin_routes: /admin/security/*).
 
 Privacy: raw client IPs and the *attempted* identity (email, or a mnemonic key
-prefix — never the full key, never a password or token) are stored; the
+prefix, never the full key, never a password or token) are stored; the
 scheduler prunes rows past ``SECURITY_EVENTS_RETENTION_DAYS`` (default 90), which
 is the privacy mechanism for a private, members-only site.
 """

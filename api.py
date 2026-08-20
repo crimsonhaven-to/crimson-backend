@@ -65,6 +65,7 @@ from apikey_engine import store as apikey_store
 from supporters_engine import router as supporters_router, store as supporters_store
 from changelog_engine import router as changelog_router, service as changelog_service
 from recommend_engine import router as recommend_router
+from chat_engine import router as chat_router, store as chat_store
 from subtitles_engine import router as subtitles_router, service as subtitles_service
 from skiptimes_engine import router as skiptimes_router
 from manga_engine import manga_router
@@ -192,6 +193,30 @@ async def lifespan(app: FastAPI):
         _purge_expired,
         trigger=IntervalTrigger(hours=6),
         id="purge_expired_job",
+        replace_existing=True,
+    )
+
+    # Lumi's chat retention: drop conversations untouched for 30 days and usage
+    # ledger rows past 180 (see chat_engine.db). Grouped with the purge above
+    # rather than pinned to the RUN_DB_SYNC replica because, like the other
+    # retention sweeps, it is an idempotent DELETE by timestamp: several replicas
+    # running it on their own clocks costs a redundant no-op query, not
+    # correctness.
+    def _prune_chat():
+        try:
+            removed = chat_store.prune()
+            if removed["conversations"] or removed["usage"]:
+                logger.info(
+                    f"Chat prune: {removed['conversations']} conversation(s), "
+                    f"{removed['usage']} usage row(s)"
+                )
+        except Exception as e:
+            logger.error(f"Chat prune failed: {e}")
+
+    scheduler.add_job(
+        _prune_chat,
+        trigger=IntervalTrigger(hours=12),
+        id="chat_prune_job",
         replace_existing=True,
     )
 
@@ -846,6 +871,12 @@ app.include_router(changelog_router)
 # "What to watch next" — genre-based recommendations derived from the viewer's
 # favorites + watch history (read-only, additive; see recommend_engine).
 app.include_router(recommend_router)
+
+# Lumi's chatbot. Gated three ways (session, feature switch, per-account grant)
+# and deny-by-default, so mounting it does not expose anything until an admin
+# both switches it on and grants an account access from the dashboard. Its tools
+# are thin wrappers over the recommendation / account engines above.
+app.include_router(chat_router)
 
 # OpenSubtitles-backed external subtitle tracks for the player. /subtitles is
 # authed (search, no quota spent); /subtitles_proxy is public + signed (the

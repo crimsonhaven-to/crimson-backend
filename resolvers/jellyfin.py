@@ -8,7 +8,7 @@ via env (see .env.example):
     JELLYFIN_USERNAME=crimson
     JELLYFIN_PASSWORD=...                           # may be empty
 
-Flow (mirrors the Movish / VidKing Test proxy pattern):
+Flow:
 
     scraper  -> finds the Series by TMDB id (ProviderIds) / title, then the
                 episode item, and emits  crimson-jellyfin:{itemId}
@@ -25,8 +25,6 @@ The proxy (``proxy_fetch`` below) injects the Jellyfin access token **server
 side** on every upstream request and strips it from the HLS playlists it serves,
 so the token never reaches the browser. Because everything is fetched by the
 backend, the Jellyfin server can stay private/LAN-only and needs no CORS.
-
-See [[movish-player-internals]] for the proxy pattern this mirrors.
 """
 
 import asyncio

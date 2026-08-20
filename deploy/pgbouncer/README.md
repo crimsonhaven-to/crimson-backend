@@ -323,6 +323,28 @@ under peak load (clients queueing for a backend). After editing, `docker compose
 | App errors after §9 mentioning **prepared statement** | something set `DB_PREPARE_THRESHOLD` to a number. Unset it (default = disabled) and redeploy. |
 | `SHOW POOLS` shows `cl_waiting` climbing | real load exceeded the pool — raise `default_pool_size` (still keep it well under Postgres' 100), restart bouncers. |
 | After a failover, brief connection errors | expected and self-healing: libpq drops, reconnects, and finds the new leader's bouncer within seconds (same as the direct setup). |
+| After a failover, **`session is read-only`** from every host, or writes failing with `cannot execute ... in a read-only transaction` | **not** self-healing within a useful time — see "Why a pooler goes stale" below. Confirm `on-role-change.sh` is installed (`postgres-ha/README.md` §6e); to clear it right now, `docker exec crimson-patroni-1 /var/lib/postgresql/data/on-role-change.sh manual leader crimson`, or restart the pooler. |
+
+### Why a pooler goes stale after a failover
+
+This one bites hard, because it makes *every* host look wrong at once. From
+PostgreSQL 14 on, libpq no longer asks "are you writable?" on each connection — it
+reads the startup parameters the server reports (`in_hot_standby`). PgBouncer caches
+those from the server connection it opened first and replays them to new clients, so
+after a role change the pooler on a node keeps advertising the role that node **used
+to** have:
+
+- on the **demoted** node it still claims to be writable, libpq picks it, and every
+  write fails with `cannot execute ... in a read-only transaction`;
+- on the **promoted** node it still claims to be read-only, libpq skips the real
+  primary, and the whole multi-host URL fails with `session is read-only`.
+
+That is [pgbouncer#859](https://github.com/pgbouncer/pgbouncer/issues/859), still open.
+`server_lifetime` (600s) eventually recycles the connections, but ten minutes of failed
+writes is an outage, not self-healing. The fix is the Patroni `on_role_change` callback
+in `postgres-ha/on-role-change.sh`, which issues `RECONNECT` at the moment the role
+changes — it drops no clients, and it covers unplanned failovers as well as planned
+switchovers.
 
 That's it — you've decoupled API scaling from the Postgres connection limit, kept
 your no-VIP failover, and didn't touch a single row. 🩸

@@ -1,5 +1,9 @@
 name: Build and Deploy
 
+# Important: This is purely for others to use. Ever since my account (4G0NYY) was 
+# nuked off of Github, I have no use for this anymore. If you do use this, ensure 
+# it's up to date, as I will no longer maintain this file. 
+
 # Build the backend image and push it to the PRIVATE GitHub Container Registry
 # (GHCR), then roll it out to the Docker Swarm.
 #

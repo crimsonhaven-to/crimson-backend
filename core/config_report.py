@@ -94,6 +94,13 @@ FEATURES: List[Feature] = [
             "set DISCORD_BOT_TOKEN + DISCORD_OWNER_ID"),
     Feature("Ko-fi supporters webhook", lambda: _has("KOFI_VERIFICATION_TOKEN"),
             "set KOFI_VERIFICATION_TOKEN to ingest Ko-fi events"),
+    # Reports only whether a provider key exists, which is the part that needs an
+    # env var. Whether Lumi is actually awake, which provider answers and who may
+    # talk to her are database-backed operator settings (Admin -> Lumi / Users),
+    # so a key alone does not mean the feature is live.
+    Feature("Lumi chatbot key", lambda: _has("ANTHROPIC_API_KEY") or _has("GEMINI_API_KEY"),
+            "set ANTHROPIC_API_KEY or GEMINI_API_KEY, then switch Lumi on in "
+            "Admin -> Lumi and grant members access in Admin -> Users"),
     Feature("Invite-gated signup", lambda: _has("SIGNUP_INVITE_CODE"),
             "set SIGNUP_INVITE_CODE for a reusable invite (bot mints single-use)"),
     Feature("Admin seed", lambda: _has("ADMIN_EMAILS"),

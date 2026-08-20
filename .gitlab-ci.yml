@@ -1,0 +1,181 @@
+# GitLab CI/CD — translated from .github/workflows/build-image.yml, which is left
+# in place so the project still builds on GitHub.
+
+stages:
+  - gate
+  - build
+  - deploy
+
+variables:
+  IMAGE: $CI_REGISTRY_IMAGE
+  # The swarm manager the deploy is driven against (reachable from the runner).
+  # The runner runs as the `gitlab-runner` user, so the login user is explicit here.
+  SWARM_MANAGER: raymond@crimsonswarm01
+
+# Never let two builds/deploys of the same ref run concurrently (a second release
+# must wait, not race the rolling update).
+default:
+  interruptible: false
+
+.dev_push:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+.release:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+
+.dev_or_release:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+# Quality gate
+gate:
+  extends: .dev_or_release
+  stage: gate
+  tags: [docker]
+  image: python:3.14-slim
+  variables:
+    PIP_ROOT_USER_ACTION: ignore
+  script:
+    - echo "Install dev + runtime deps"
+    - python -m pip install --upgrade pip --no-cache-dir
+    - pip install --no-cache-dir -r requirements-dev.txt
+    - echo "Lint (ruff — correctness rules)"
+    - ruff check .
+    - echo "Type-check (mypy — informational, non-blocking)"
+    - mypy . || true
+    - echo "Unit tests (pytest)"
+    - pytest
+
+.buildx_setup:
+  before_script:
+    - docker buildx create --name crimson --driver docker-container --driver-opt network=host 2>/dev/null || true
+    - docker buildx use crimson
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+build:
+  extends:
+    - .dev_or_release
+    - .buildx_setup
+  stage: build
+  tags: [crimsonrunner]
+  needs: [gate]
+  resource_group: crimson-backend-$CI_COMMIT_REF_NAME
+  script:
+    - |
+      set -eu
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VER="$CI_COMMIT_TAG"
+        echo "VERSION=${VER}"    >> build.env
+        echo "DEPLOY=true"       >> build.env
+        TAGS="--tag ${IMAGE}:${VER} --tag ${IMAGE}:latest"
+        echo "IMAGE_TAG=${VER}"  >> build.env
+      else
+        SHORT_SHA="$(git rev-parse --short HEAD)"
+        echo "VERSION="          >> build.env
+        echo "DEPLOY=false"      >> build.env
+        TAGS="--tag ${IMAGE}:dev --tag ${IMAGE}:dev-${SHORT_SHA}"
+        # Deploy the immutable per-commit tag, not the rolling :dev, so the
+        # dev stack always rolls to exactly this build.
+        echo "IMAGE_TAG=dev-${SHORT_SHA}" >> build.env
+      fi
+      echo "Building ${TAGS}"
+      # Optional build-time source overlay (see self-hosting docs): a clone URL
+      # and token passed as BuildKit secrets. Unset = empty = the build skips the
+      # overlay. Never baked into a layer. To enable, add SOURCES_PAT/SOURCES_REPO
+      # as masked CI/CD variables and uncomment the two --secret lines.
+      docker buildx build \
+        --push \
+        $TAGS \
+        --cache-from "type=registry,ref=${IMAGE}:buildcache" \
+        --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max" \
+        .
+      #   --secret id=sources_pat,env=SOURCES_PAT \
+      #   --secret id=sources_repo,env=SOURCES_REPO \
+  artifacts:
+    reports:
+      # The GitHub job outputs, carried the GitLab way.
+      dotenv: build.env
+
+deploy:
+  extends: .release
+  stage: deploy
+  tags: [crimsonrunner]
+  needs: [build]
+  resource_group: crimson-prod
+  environment:
+    name: production
+    url: https://crimsonhaven.to
+  script:
+    # Checked out at the release tag, so we ship THIS release's stack definition.
+    - echo "Ship stack file to the manager"
+    - scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new docker-stack.yml "${SWARM_MANAGER}:/home/raymond/crimson-deploy/docker-stack.yml"
+    - echo "Deploy to the swarm"
+    - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/crimson-deploy/deploy.sh '${VERSION}'"
+
+# Dev auto-deploy: a push to `dev` rolls the just-built dev-<sha> image onto the
+# crimson-dev stack. Unlike the prod deploy this ships NO stack file — the dev
+# docker-stack.yml lives only on the manager (~/dev-crimson-deploy/), bundling
+# its own Postgres; CI just triggers its deploy.sh.
+deploy-dev:
+  extends: .dev_push
+  stage: deploy
+  tags: [crimsonrunner]
+  needs: [build]
+  resource_group: crimson-dev
+  environment:
+    name: dev
+    url: https://dev.crimsonhaven.to
+  script:
+    - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/dev-crimson-deploy/deploy.sh '${IMAGE_TAG}'"
+
+# --- Demo image: a CLEAN build with NO private source overlay -----------------
+# Built only on a release tag, alongside the prod `build`. It deliberately OMITS the
+# sources_pat/sources_repo BuildKit secrets, so the Dockerfile's private-sources
+# stage is a no-op and NONE of secret-backend-sources is baked into the image. A
+# SEPARATE buildcache ref (:democache) guarantees the clean build can never restore
+# a source-bearing layer from the prod cache. The crimson-demo stack runs this with
+# DEMO_MODE=1 + PRIVATE_SOURCES_ENABLED=0, so the demo resolves nothing.
+build-demo:
+  extends:
+    - .release
+    - .buildx_setup
+  stage: build
+  tags: [crimsonrunner]
+  needs: [gate]
+  resource_group: crimson-backend-demo
+  script:
+    - |
+      set -eu
+      VER="$CI_COMMIT_TAG"
+      # Deploy the immutable per-release demo tag, not the rolling :demo.
+      echo "DEMO_IMAGE_TAG=demo-${VER}" >> demo.env
+      # NOTE: no --secret flags on purpose — without sources_pat/sources_repo the
+      # Dockerfile skips the overlay clone, so the demo image carries none of the
+      # private backend sources. Its own buildcache ref keeps it source-free.
+      docker buildx build \
+        --push \
+        --tag "${IMAGE}:demo" \
+        --tag "${IMAGE}:demo-${VER}" \
+        --cache-from "type=registry,ref=${IMAGE}:democache" \
+        --cache-to "type=registry,ref=${IMAGE}:democache,mode=max" \
+        .
+  artifacts:
+    reports:
+      dotenv: demo.env
+
+# Demo auto-deploy on release: roll the just-built demo-<tag> image onto the
+# crimson-demo stack. Like the dev deploy it ships NO stack file.
+deploy-demo:
+  extends: .release
+  stage: deploy
+  tags: [crimsonrunner]
+  needs: [build-demo]
+  resource_group: crimson-demo
+  environment:
+    name: demo
+    url: https://demo.crimsonhaven.to
+  script:
+    - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/demo-crimson-deploy/deploy.sh '${DEMO_IMAGE_TAG}'"

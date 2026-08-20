@@ -19,6 +19,23 @@ to). We trust that field for real TV seasons and split everything else off:
 Collisions on a (tmdb_id, season_number) slot are resolved deterministically
 (prefer a real TV entry, then the lowest AniList id). ``overrides.json`` is
 applied last and always wins -- the single maintenance lever for the long tail.
+
+Reaching the specials/movies Fribb hides
+----------------------------------------
+``themoviedb_id.tv`` alone loses most of a franchise's side content, in two ways:
+
+1. A film TMDB tracks as a standalone movie carries ``{"movie": [id]}`` and no
+   ``tv`` key, so it has no show to group under. When such an entry repeats the
+   parent's ``tvdb_id`` (Overlord: The Sacred Kingdom does) we attach it to that
+   show via a tvdb_id -> tmdb_id map built from the entries that carry both, and
+   keep its own TMDB *movie* id so it can be played through the movie route. A
+   film with no parent still becomes an ``anime_entries`` row so the catalogue
+   can list it.
+2. Roughly a third of the dataset carries no external id at all -- Fribb offers
+   no key whatsoever to tie those to a show. AniList does: the ``relations``
+   edges of the ids we *have* mapped name them directly. So the bulk metadata
+   fetch also pulls relations, and side-content edges (see ``_EXTRA_RELATIONS`` /
+   ``_EXTRA_FORMATS``) off any of a show's mapped entries become extras of it.
 """
 
 import asyncio
@@ -35,6 +52,18 @@ from core.db_pool import get_connection, lock_schema_init
 
 _THIS_DIR = Path(__file__).resolve().parent
 
+# Which AniList relation edges count as "side content of this show".
+# SIDE_STORY/SUMMARY/SPECIAL are the specials, recap films and shorts; PARENT
+# catches an entry that points *up* at the main series; ALTERNATIVE covers the
+# re-cut/theatrical versions. Deliberately excluded: SEQUEL/PREQUEL (a season or
+# a show of its own), CHARACTER (crossovers -- Isekai Quartet is not an Overlord
+# special), ADAPTATION/SOURCE (the novel/manga), and OTHER (too noisy).
+_EXTRA_RELATIONS = {"SIDE_STORY", "SUMMARY", "SPECIAL", "PARENT", "ALTERNATIVE"}
+
+# ...and only when the related entry is itself side content. This is the filter
+# that keeps a SIDE_STORY edge pointing at a full TV series out of the extras.
+_EXTRA_FORMATS = {"SPECIAL", "OVA", "ONA", "MOVIE"}
+
 
 class MappingDatabaseEngine:
     MAPPING_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
@@ -47,8 +76,13 @@ class MappingDatabaseEngine:
     # startDate), so the batch size must stay <= floor(500/11) = 45 or the whole
     # chunk 400s ("Max query complexity should be 500 but got 550"). 50 used to
     # squeak by at exactly 500 *before* the genres field was added (~10/alias);
-    # genres pushed it to 550. 40 keeps a comfortable margin (~440).
-    ANILIST_CHUNK_SIZE = 40
+    # genres pushed it to 550. 40 kept a comfortable margin (~440).
+    # The relations block (the only route to the specials Fribb has no id for)
+    # roughly doubles the per-alias cost to ~22: measured, 25 aliases is rejected
+    # at 550 and 20 lands at ~440. Same margin, half the batch, twice the chunks
+    # (~340 instead of ~170 on a full resync -- a couple of extra minutes on a
+    # background job).
+    ANILIST_CHUNK_SIZE = 20
     ANILIST_CHUNK_DELAY = 0.7  # seconds between chunks (rate-limit friendly)
 
     def __init__(self, db_name: str = "anime_mappings.db", tmdb_api_key: Optional[str] = None):
@@ -79,6 +113,24 @@ class MappingDatabaseEngine:
         if isinstance(raw, dict):
             return MappingDatabaseEngine._safe_int(raw.get("tv"))
         return MappingDatabaseEngine._safe_int(raw)
+
+    @staticmethod
+    def _tmdb_movie_id(item: Dict[str, Any]) -> Optional[int]:
+        """Extract the TMDB *movie* id from a Fribb entry, if it has one.
+
+        A film TMDB tracks in its own right carries ``{"movie": [1014505]}`` (a
+        list -- Fribb emits one id per part for split releases; we take the
+        first) instead of a ``tv`` key. Kept alongside the parent show so the
+        entry can be played through the TMDB movie route rather than being
+        squeezed into a season/episode URL that does not exist.
+        """
+        raw = item.get("themoviedb_id")
+        if not isinstance(raw, dict):
+            return None
+        movie = raw.get("movie")
+        if isinstance(movie, list):
+            movie = movie[0] if movie else None
+        return MappingDatabaseEngine._safe_int(movie)
 
     @staticmethod
     def _tmdb_season(item: Dict[str, Any]) -> Optional[int]:
@@ -130,7 +182,8 @@ class MappingDatabaseEngine:
                     anime_type    TEXT,
                     start_year    INTEGER,
                     genres        TEXT,
-                    last_synced   TEXT
+                    last_synced   TEXT,
+                    tmdb_movie_id INTEGER
                 )
                 """
             )
@@ -259,9 +312,10 @@ class MappingDatabaseEngine:
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tmdb_extras (
-                    tmdb_id    INTEGER,
-                    anilist_id INTEGER NOT NULL,
-                    anime_type TEXT,
+                    tmdb_id       INTEGER,
+                    anilist_id    INTEGER NOT NULL,
+                    anime_type    TEXT,
+                    tmdb_movie_id INTEGER,
                     PRIMARY KEY (tmdb_id, anilist_id),
                     FOREIGN KEY (anilist_id) REFERENCES anime_entries(anilist_id)
                 )
@@ -332,7 +386,13 @@ class MappingDatabaseEngine:
     # ------------------------------------------------------------------ #
     async def _fetch_anilist_metadata_bulk(self, anilist_ids: List[int]) -> Dict[int, Dict]:
         """
-        Fetch titles/format for many AniList ids using aliased GraphQL queries.
+        Fetch titles/format/relations for many AniList ids using aliased GraphQL
+        queries.
+
+        The ``relations`` block is what recovers the side content Fribb carries no
+        id for. Each edge's node already brings its own format/title/year, so an
+        extra discovered this way needs no second lookup pass -- see
+        ``_relation_extras``.
 
         Non-fatal: a failing chunk is logged and skipped so the mapping can still
         be built (titles are best-effort; scrapers fetch titles live at watch time).
@@ -347,7 +407,10 @@ class MappingDatabaseEngine:
                 query_parts = [
                     f"a{idx}: Media(id: {aid}, type: ANIME) {{ "
                     f"id idMal format genres title {{ romaji english native }} "
-                    f"startDate {{ year }} }}"
+                    f"startDate {{ year }} "
+                    f"relations {{ edges {{ relationType node {{ "
+                    f"id format title {{ romaji english native }} "
+                    f"startDate {{ year }} }} }} }} }}"
                     for idx, aid in enumerate(chunk)
                 ]
                 query = "query { " + " ".join(query_parts) + " }"
@@ -392,6 +455,127 @@ class MappingDatabaseEngine:
                 await asyncio.sleep(self.ANILIST_CHUNK_DELAY)
 
         return results
+
+    # ------------------------------------------------------------------ #
+    # Grouping
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _group_by_show(cls, anime_data: List[Dict[str, Any]]):
+        """Bucket the Fribb dataset by the TMDB show each entry belongs to.
+
+        Returns ``(groups, movie_id_by_anilist, orphan_movies)``:
+
+        * ``groups``              -> {tmdb_tv_id: [entry, ...]}
+        * ``movie_id_by_anilist`` -> {anilist_id: TMDB movie id} for the films that
+                                     have one, whether or not they found a parent
+        * ``orphan_movies``       -> films with a movie id and no parent show; they
+                                     still deserve a catalogue row of their own
+
+        The grouping key is ``themoviedb_id.tv`` where present. Where it is not, a
+        film that repeats its parent series' ``tvdb_id`` is attached to whatever
+        TMDB show that tvdb series resolves to. Such an entry is side content by
+        definition (a real season always carries its own ``themoviedb_id.tv``), so
+        it never claims a season slot: its season is forced to None, which lands it
+        in tmdb_extras.
+        """
+        # tvdb_id -> TMDB tv id, learned from the entries that carry both. First
+        # writer wins: a tvdb series maps to exactly one TMDB show.
+        tvdb_to_tmdb: Dict[int, int] = {}
+        for item in anime_data:
+            tvdb_id = cls._safe_int(item.get("tvdb_id"))
+            tmdb_id = cls._tmdb_tv_id(item)
+            if tvdb_id and tmdb_id:
+                tvdb_to_tmdb.setdefault(tvdb_id, tmdb_id)
+
+        groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        movie_id_by_anilist: Dict[int, int] = {}
+        orphan_movies: set = set()
+
+        for item in anime_data:
+            anilist_id = cls._safe_int(item.get("anilist_id"))
+            if not anilist_id:
+                continue
+            movie_id = cls._tmdb_movie_id(item)
+            if movie_id:
+                movie_id_by_anilist.setdefault(anilist_id, movie_id)
+
+            tmdb_id = cls._tmdb_tv_id(item)
+            attached_by_tvdb = False
+            if not tmdb_id:
+                tmdb_id = tvdb_to_tmdb.get(cls._safe_int(item.get("tvdb_id")))
+                attached_by_tvdb = tmdb_id is not None
+
+            if not tmdb_id:
+                # Nothing to hang it off. A standalone film is still listable and
+                # playable through its own movie id; anything else is left to the
+                # AniList relations pass.
+                if movie_id:
+                    orphan_movies.add(anilist_id)
+                continue
+
+            groups[tmdb_id].append(
+                {
+                    "anilist_id": anilist_id,
+                    "season_number": None if attached_by_tvdb else cls._tmdb_season(item),
+                    "mal_id": cls._safe_int(item.get("mal_id")),
+                    "type": (item.get("type") or "TV").upper(),
+                }
+            )
+
+        return groups, movie_id_by_anilist, orphan_movies
+
+    # ------------------------------------------------------------------ #
+    # Relation-derived extras
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _relation_extras(season_rows: List[tuple], extra_rows: List[tuple],
+                         al_metadata: Dict[int, Dict]) -> List[tuple]:
+        """Find each show's side content among the AniList relations of the
+        entries already mapped to it.
+
+        Roughly a third of the Fribb dataset carries no external id at all, so
+        those entries can never be grouped onto a show by id. AniList names them:
+        Overlord's "Shikkoku no Senshi" film and the Ple Ple Pleiades specials are
+        all SUMMARY/SIDE_STORY edges of ids we *do* map.
+
+        Walks one hop out from every mapped member of a show (a season or an
+        existing extra), which is what picks up a film hanging off a later season
+        rather than off season 1. It deliberately does not walk the discovered
+        entries in turn: their own relations were never fetched, and following
+        them would drift into neighbouring franchises.
+
+        Returns ``(tmdb_id, anilist_id, format, node)`` tuples for the *new*
+        extras only; ``node`` is the AniList edge node, reused as that entry's
+        metadata so no second fetch is needed.
+        """
+        members: Dict[int, List[int]] = defaultdict(list)
+        for tmdb_id, _season, anilist_id in season_rows:
+            members[tmdb_id].append(anilist_id)
+        for tmdb_id, anilist_id, *_rest in extra_rows:
+            members[tmdb_id].append(anilist_id)
+
+        # An id that already owns a season slot somewhere is a series in its own
+        # right; never re-file it as somebody's special.
+        season_ids = {anilist_id for _t, _s, anilist_id in season_rows}
+        claimed = {(tmdb_id, anilist_id) for tmdb_id, anilist_id, *_r in extra_rows}
+
+        found: List[tuple] = []
+        for tmdb_id, member_ids in members.items():
+            for member_id in member_ids:
+                relations = (al_metadata.get(member_id) or {}).get("relations") or {}
+                for edge in relations.get("edges") or []:
+                    if (edge or {}).get("relationType") not in _EXTRA_RELATIONS:
+                        continue
+                    node = edge.get("node") or {}
+                    node_id = MappingDatabaseEngine._safe_int(node.get("id"))
+                    node_format = node.get("format")
+                    if not node_id or node_format not in _EXTRA_FORMATS:
+                        continue
+                    if node_id in season_ids or (tmdb_id, node_id) in claimed:
+                        continue
+                    claimed.add((tmdb_id, node_id))
+                    found.append((tmdb_id, node_id, node_format, node))
+        return found
 
     # ------------------------------------------------------------------ #
     # Overrides
@@ -465,26 +649,13 @@ class MappingDatabaseEngine:
                 print(f"[DB Engine] Download failed: {e}")
                 return "failed"
 
-        # 1. Group Fribb entries by TMDB tv id.
-        groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-        for item in anime_data:
-            anilist_id = self._safe_int(item.get("anilist_id"))
-            tmdb_id = self._tmdb_tv_id(item)
-            if not anilist_id or not tmdb_id:
-                continue
-            groups[tmdb_id].append(
-                {
-                    "anilist_id": anilist_id,
-                    "season_number": self._tmdb_season(item),
-                    "mal_id": self._safe_int(item.get("mal_id")),
-                    "type": (item.get("type") or "TV").upper(),
-                }
-            )
+        # 1. Group Fribb entries by the TMDB show they belong to.
+        groups, movie_id_by_anilist, orphan_movies = self._group_by_show(anime_data)
 
         # 2. Resolve season slots vs. extras per show.
         season_rows: List[tuple] = []   # (tmdb_id, season_number, anilist_id)
-        extra_rows: List[tuple] = []    # (tmdb_id, anilist_id, anime_type)
-        all_anilist_ids: set = set()
+        extra_rows: List[tuple] = []    # (tmdb_id, anilist_id, anime_type, tmdb_movie_id)
+        all_anilist_ids: set = set(orphan_movies)
         entry_type: Dict[int, str] = {}  # anilist_id -> Fribb type (fallback)
 
         def _better(candidate: Dict, current: Optional[Dict]) -> bool:
@@ -526,7 +697,8 @@ class MappingDatabaseEngine:
             for snum, entry in chosen.items():
                 season_rows.append((tmdb_id, snum, entry["anilist_id"]))
             for entry in leftovers:
-                extra_rows.append((tmdb_id, entry["anilist_id"], entry["type"]))
+                extra_rows.append((tmdb_id, entry["anilist_id"], entry["type"],
+                                   movie_id_by_anilist.get(entry["anilist_id"])))
 
         if not season_rows and not extra_rows:
             print("[DB Engine] No mappings parsed from dataset; aborting (DB left intact).")
@@ -535,6 +707,18 @@ class MappingDatabaseEngine:
         # 3. Enrich with AniList titles (best-effort).
         print(f"[DB Engine] Fetching AniList metadata for {len(all_anilist_ids)} ids...")
         al_metadata = await self._fetch_anilist_metadata_bulk(sorted(all_anilist_ids))
+
+        # 3b. Extras Fribb has no id for, named by AniList relations instead.
+        relation_rows = self._relation_extras(season_rows, extra_rows, al_metadata)
+        for tmdb_id, anilist_id, _fmt, node in relation_rows:
+            extra_rows.append((tmdb_id, anilist_id, _fmt, movie_id_by_anilist.get(anilist_id)))
+            # The edge's node carries format/title/year already, so a newly
+            # discovered entry needs no second AniList round-trip.
+            if anilist_id not in all_anilist_ids:
+                all_anilist_ids.add(anilist_id)
+                al_metadata.setdefault(anilist_id, node)
+        if relation_rows:
+            print(f"[DB Engine] AniList relations added {len(relation_rows)} extra(s).")
 
         # 4. Build anime_entries rows.
         now = self._now()
@@ -554,6 +738,7 @@ class MappingDatabaseEngine:
                     (meta.get("startDate") or {}).get("year"),
                     json.dumps(genres) if genres else None,
                     now,
+                    movie_id_by_anilist.get(aid),
                 )
             )
 
@@ -584,8 +769,8 @@ class MappingDatabaseEngine:
                     """
                     INSERT INTO anime_entries
                         (anilist_id, mal_id, title_romaji, title_english, title_native,
-                         anime_type, start_year, genres, last_synced)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         anime_type, start_year, genres, last_synced, tmdb_movie_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (anilist_id) DO NOTHING
                     """,
                     entry_rows,
@@ -596,7 +781,8 @@ class MappingDatabaseEngine:
                     season_rows,
                 )
                 cursor.executemany(
-                    "INSERT INTO tmdb_extras (tmdb_id, anilist_id, anime_type) VALUES (%s, %s, %s) "
+                    "INSERT INTO tmdb_extras (tmdb_id, anilist_id, anime_type, tmdb_movie_id) "
+                    "VALUES (%s, %s, %s, %s) "
                     "ON CONFLICT (tmdb_id, anilist_id) DO NOTHING",
                     extra_rows,
                 )
