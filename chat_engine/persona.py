@@ -1,25 +1,20 @@
 """
 Lumi's system prompt.
 
-The voice already exists in ``core.lumi`` as the header quips, blessings and
-voiced error lines that surface across the API. This module is that same
-character rewritten as instructions a model can hold a conversation in, so the
-chatbot sounds like the mascot the rest of the product already established
-rather than a second, unrelated assistant wearing her name.
+The voice already exists in ``core.lumi`` as the quips and voiced errors that
+surface across the API. This is that same character rewritten as instructions a
+model can hold a conversation in, so the chatbot sounds like the established
+mascot rather than a second assistant wearing her name.
 
-Prompt construction notes
--------------------------
-``SYSTEM_PROMPT`` is a frozen constant. It never interpolates a timestamp, user
-id or any other per-request value, because it is the cached prefix: anything
-volatile in here would change the prompt bytes on every call and silently
-disable prompt caching for the whole conversation (see the caching notes in
-providers.py). Per-user context is injected as a separate, uncached block after
-the history instead.
+``SYSTEM_PROMPT`` is a frozen constant. It interpolates no timestamp or user id,
+because it is the cached prefix: anything volatile would change the prompt bytes
+every call and silently disable caching for the whole conversation. Per-user
+context goes in a separate uncached block after the history instead.
 
-The house style rules below are load-bearing rather than decorative. The em dash
-ban in particular is an explicit product requirement, so it is stated in the
-prompt AND asserted in the test suite, since a model will drift back toward its
-default punctuation habits over a long conversation.
+The house style rules are load-bearing rather than decorative. The em dash ban is
+an explicit product requirement, so it is both stated here and asserted in the
+tests, since a model drifts back toward its default punctuation over a long
+conversation.
 """
 
 from __future__ import annotations
@@ -100,16 +95,14 @@ def build_context_block(
     recent: List[Dict],
     top_genres: List[str],
 ) -> Optional[str]:
-    """A small, per-request block of grounding facts about this viewer.
+    """A per-request block of grounding facts about this viewer.
 
-    Deliberately NOT part of ``SYSTEM_PROMPT``: it changes per user and per
-    session, so folding it into the cached prefix would invalidate the cache on
-    every request. It is sent as its own message after the history instead, where
-    it costs a few hundred tokens and invalidates nothing.
+    Kept out of ``SYSTEM_PROMPT`` because it changes per session, and folding it
+    into the cached prefix would invalidate the cache every request. Sent as its
+    own message after the history instead.
 
-    Kept intentionally thin. It exists so Lumi can open with something personal
-    without spending a tool call, not so she can answer history questions from
-    it. Anything beyond a passing reference should go through ``watch_progress``.
+    Deliberately thin: it exists so Lumi can open with something personal without
+    spending a tool call, not so she can answer history questions from it.
     """
     lines: List[str] = []
     if username:
@@ -130,9 +123,8 @@ def build_context_block(
     return "Context about the viewer you are speaking to:\n" + "\n".join(lines)
 
 
-# Shown by the client the first time a viewer opens the drawer, before any
-# request is made. Static so an empty panel still has her voice in it, and so a
-# provider outage does not leave the drawer blank.
+# Shown before any request is made, so an empty panel still has her voice in it
+# and a provider outage does not leave the drawer blank.
 GREETINGS = (
     "You rang. Speak, and I shall consider being helpful.",
     "The Archives are open to you. What are we watching?",

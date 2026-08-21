@@ -1,12 +1,12 @@
 """
 Chat storage: operator settings, conversations, and the usage ledger.
 
-No ``init_db()`` here on purpose. The schema lives entirely in
-``migrations/002_lumi_chat.sql`` per the convention 000_baseline.sql sets out, so
-this module only reads and writes tables the migration runner has already made.
+No ``init_db()`` on purpose. The schema lives in ``migrations/002_lumi_chat.sql``
+per the convention 000_baseline.sql sets out, so this only reads and writes tables
+the migration runner has already made.
 
-Everything is synchronous psycopg against the shared pool, matching the other
-stores. Callers are async, so they wrap these in ``run_in_threadpool``.
+Synchronous psycopg against the shared pool, like the other stores, so async
+callers wrap these in ``run_in_threadpool``.
 """
 
 from __future__ import annotations
@@ -22,13 +22,12 @@ from .models import DEFAULT_MODEL, PROVIDERS, resolve
 
 logger = logging.getLogger("crimson.chat.db")
 
-# Threads untouched for this long are pruned. Long enough that "carry on from
-# yesterday" works, short enough that the table stays small and old watch habits
-# do not linger indefinitely.
+# Long enough that "carry on from yesterday" works, short enough that the table
+# stays small and old watch habits do not linger.
 CONVERSATION_TTL_DAYS = 30
 
 # The ledger is what the dashboard charts, so it outlives the conversations it
-# describes. Still bounded, because it is per provider call and grows fastest.
+# describes. Still bounded, since it grows fastest of anything here.
 USAGE_TTL_DAYS = 180
 
 
@@ -53,9 +52,8 @@ class ChatStore:
     def get_settings(self) -> Dict:
         """The single operator settings row, normalised.
 
-        Falls back to a sane default set if the row is somehow missing, so a
-        half-applied migration degrades to "feature off" rather than a 500 on
-        every request.
+        Falls back to defaults if the row is missing, so a half-applied migration
+        degrades to "feature off" rather than a 500 on every request.
         """
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM chat_settings WHERE id = 1").fetchone()
@@ -70,9 +68,8 @@ class ChatStore:
             }
         out = dict(row)
         out["enabled"] = bool(out.get("enabled"))
-        # Narrowed to a known provider string rather than trusted from the row: a
-        # hand-edited database should degrade to the default, not send an unknown
-        # provider name down the request path.
+        # Narrowed rather than trusted, so a hand-edited database degrades to the
+        # default instead of sending an unknown provider down the request path.
         stored = out.get("provider")
         provider = stored if isinstance(stored, str) and stored in PROVIDERS else "anthropic"
         out["provider"] = provider
@@ -119,7 +116,7 @@ class ChatStore:
             )
 
     def set_user_budget(self, user_id: int, budget: Optional[int]) -> None:
-        """Per-user monthly token ceiling. None restores the global default."""
+        """Per-user monthly token ceiling; None restores the global default."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE accounts SET chat_monthly_token_budget = %s WHERE user_id = %s",
@@ -132,9 +129,9 @@ class ChatStore:
     ) -> int:
         """Resolve a conversation id, creating one when absent.
 
-        A conversation id from another account resolves to a NEW conversation
-        rather than raising, so a stale id in a browser tab cannot be used to
-        probe for, or read, someone else's thread.
+        An id belonging to another account resolves to a new conversation rather
+        than raising, so a stale browser tab cannot probe for someone else's
+        thread.
         """
         now = _iso(_now())
         with self._connect() as conn:
@@ -183,7 +180,7 @@ class ChatStore:
     def history(self, conversation_id: int, user_id: int, turns: int) -> List[Dict]:
         """The last ``turns`` exchanges, oldest first.
 
-        ``turns`` counts exchanges, not rows, so the limit is doubled. This is the
+        Counts exchanges rather than rows, hence the doubled limit. This is the
         main control on how input cost grows over a long conversation.
         """
         with self._connect() as conn:
@@ -253,9 +250,8 @@ class ChatStore:
     def tokens_this_month(self, user_id: int) -> int:
         """Total billable tokens this calendar month, for budget enforcement.
 
-        Cached reads are counted. They cost a tenth as much but they are still
-        consumption, and a budget that ignored them would drift from the cost
-        chart sitting next to it in the dashboard.
+        Cached reads count. They cost a tenth as much but are still consumption,
+        and ignoring them would drift from the cost chart beside it.
         """
         with self._connect() as conn:
             row = conn.execute(
@@ -266,7 +262,7 @@ class ChatStore:
         return int(row["n"] or 0)
 
     def effective_budget(self, user: Dict, settings: Dict) -> int:
-        """This account's monthly ceiling: its own if set, else the global one."""
+        """This account's ceiling: its own if set, else the global one."""
         own = user.get("chat_monthly_token_budget")
         if own is not None:
             return int(own)
@@ -320,9 +316,8 @@ class ChatStore:
     def prune(self) -> Dict:
         """Drop stale conversations and ancient ledger rows.
 
-        Registered on the same scheduler as the other nightly maintenance, on the
-        RUN_DB_SYNC replica only, so it runs once per cluster rather than once
-        per container. Messages go with their conversation via ON DELETE CASCADE.
+        Scheduled on the sync replica only, so it runs once per cluster rather
+        than once per container. Messages cascade with their conversation.
         """
         conv_cutoff = _iso(_now() - timedelta(days=CONVERSATION_TTL_DAYS))
         usage_cutoff = _iso(_now() - timedelta(days=USAGE_TTL_DAYS))
