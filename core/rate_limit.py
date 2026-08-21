@@ -1,21 +1,16 @@
 """
-Shared rate limiter (slowapi) for the abuse-prone endpoints.
+Shared slowapi rate limiter for the abuse-prone endpoints.
 
-Lives in its own tiny module so both ``api.py`` and ``account_engine.routes`` can
-import the *same* ``Limiter`` instance without a circular import (api.py already
-imports the account router).
+Its own module so api.py and account_engine.routes get the *same* ``Limiter``
+without a circular import.
 
-Keyed on the client IP. Behind our reverse proxy uvicorn runs with
-``--proxy-headers --forwarded-allow-ips=*``, so ``request.client.host`` reflects
-the real ``X-Forwarded-For`` client rather than the proxy's address — per-user
-limiting therefore works in production.
+Keyed on client IP. uvicorn runs with ``--proxy-headers``, so that is the real
+X-Forwarded-For client rather than the proxy's address.
 
-Storage is in-memory **per replica** by default — a deliberate, dependency-free
-baseline that already blunts the two real abuse vectors: hammering the expensive
-``/watch`` scraper fan-out (turning us into a scraping/DoS amplifier) and flooding
-``/auth/challenge`` to grow the challenges table. For exact global limits across a
-multi-replica Swarm, point slowapi at a shared Redis via ``RATE_LIMIT_STORAGE_URI``
-(e.g. ``redis://redis:6379``).
+Storage is in-memory per replica by default: a dependency-free baseline that
+already blunts the two real abuse vectors, hammering the expensive /watch fan-out
+and flooding /auth/challenge to grow the challenges table. For exact limits
+across a Swarm, point ``RATE_LIMIT_STORAGE_URI`` at a shared Redis.
 """
 
 import os
@@ -23,10 +18,9 @@ import os
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-# headers_enabled stays False: slowapi can only inject X-RateLimit-* headers when
-# every decorated endpoint also declares a ``response: Response`` parameter, and
-# turning it on without that raises at request time. Enforcement (the 429 with
-# Retry-After) works regardless; we just don't advertise the running counter.
+# headers_enabled stays False: slowapi can only inject X-RateLimit-* headers if
+# every decorated endpoint declares a ``response: Response`` parameter, and
+# without that it raises at request time. The 429 still fires either way.
 limiter = Limiter(
     key_func=get_remote_address,
     storage_uri=os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),

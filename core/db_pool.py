@@ -1,44 +1,29 @@
 """
 Shared PostgreSQL connection pool (psycopg 3).
 
-This replaces the per-file SQLite connections the backend used to open. Both the
-metadata mapping engine and the account engine now talk to a single PostgreSQL
-database through one process-wide pool, so a multi-replica / Docker Swarm deploy
-can point every container at the same external database — no shared-volume,
-single-writer gymnastics, every container identical (the Infrastructure-as-Code
-goal that SQLite-on-a-volume could not satisfy).
+The mapping engine and the account engine share one database through one
+process-wide pool, so every replica in a Swarm deploy points at the same external
+database and the containers stay identical. That is what SQLite on a volume could
+not offer.
 
-One database for both concerns
-------------------------------
-The mapping tables (``anime_entries`` / ``tmdb_*`` / ``api_cache`` / ``sync_meta``)
-used to live in their own SQLite file, deliberately separate from the accounts
-file, because a Fribb resync wipes the mapping wholesale and would have taken
-user data with it. Under PostgreSQL the resync only DELETEs the three mapping
-tables inside one transaction — it never touches the account tables — so the
-historical reason to keep them physically apart is gone and a single pooled
-database is simpler and cheaper to pool.
+Both concerns share a database because a Fribb resync only DELETEs the three
+mapping tables inside one transaction and never touches the account tables. The
+historical reason to keep them in separate files no longer applies.
 
-Configuration (read lazily on first use, i.e. after ``load_dotenv()``)
-----------------------------------------------------------------------
-``DATABASE_URL``   full libpq URL; takes precedence when set, e.g.
-                   ``postgresql://crimson:crimson@localhost:5432/crimson``
-otherwise assembled from the discrete parts:
-``POSTGRES_HOST`` (localhost), ``POSTGRES_PORT`` (5432), ``POSTGRES_DB`` (crimson),
-``POSTGRES_USER`` (crimson), ``POSTGRES_PASSWORD`` (crimson).
-Pool sizing: ``DB_POOL_MIN`` (1), ``DB_POOL_MAX`` (10). Startup wait for the DB
-to accept connections: ``DB_CONNECT_TIMEOUT`` seconds (30).
+Configuration, read lazily on first use so ``load_dotenv()`` has run:
 
-``DB_PREPARE_THRESHOLD`` controls psycopg's server-side prepared statements.
-psycopg auto-prepares a statement after it's been used a few times
-(``prepare_threshold``, default 5). Those prepared statements do NOT survive
-PgBouncer's *transaction* pooling — a later EXECUTE can land on a different
-Postgres backend than the one that ran PREPARE — so the documented production
-topology (the app behind a transaction-mode PgBouncer; see deploy/pgbouncer)
-needs them OFF. We therefore default ``prepare_threshold`` to ``None`` (disabled);
-the queries here are short and simple, so the lost plan-caching is negligible,
-and this is correct whether or not a pooler is in front. Set
-``DB_PREPARE_THRESHOLD`` to an integer (e.g. ``5``) to re-enable it when
-connecting straight to Postgres with no pooler.
+``DATABASE_URL``    full libpq URL, taking precedence when set
+otherwise assembled from ``POSTGRES_HOST`` (localhost), ``POSTGRES_PORT`` (5432),
+``POSTGRES_DB`` / ``POSTGRES_USER`` / ``POSTGRES_PASSWORD`` (all crimson).
+Sizing is ``DB_POOL_MIN`` (1) and ``DB_POOL_MAX`` (10); startup waits
+``DB_CONNECT_TIMEOUT`` seconds (30) for the DB to accept connections.
+
+``DB_PREPARE_THRESHOLD`` defaults to disabled. psycopg auto-prepares a statement
+after a few uses, but prepared statements do not survive PgBouncer's transaction
+pooling, where a later EXECUTE can land on a different backend than the PREPARE.
+Since the documented topology puts the app behind a transaction-mode PgBouncer,
+off is correct either way and these queries are simple enough that the lost plan
+caching is negligible. Set an integer to re-enable it for a direct connection.
 """
 
 from __future__ import annotations
@@ -52,25 +37,22 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-# Process-wide singleton pool, created on first use (double-checked locking so a
-# burst of concurrent first-callers from the FastAPI thread pool only build one).
+# Created on first use, double-checked so a burst of concurrent first callers
+# from the thread pool only builds one.
 _pool: Optional[ConnectionPool] = None
 _lock = threading.Lock()
 
-# Advisory-lock key shared by every init_db() that creates schema. `CREATE TABLE
-# / INDEX IF NOT EXISTS` is NOT safe under catalog contention — several replicas
-# booting at once race and one crashes with "tuple concurrently updated" /
-# "duplicate key ... pg_type_typname_nsp_index". Each init_db takes
-# pg_advisory_xact_lock(SCHEMA_INIT_LOCK) as its first statement so simultaneous
-# boots serialize (the loser waits, then runs the DDL as a harmless no-op). It's
-# transaction-scoped, so it auto-releases when the init_db transaction commits.
+# Shared by every init_db() that creates schema. `CREATE TABLE IF NOT EXISTS` is
+# not safe under catalog contention: replicas booting together race and one dies
+# with "tuple concurrently updated". Taking this lock first serializes them, and
+# the loser then runs the DDL as a harmless no-op. Transaction-scoped, so it
+# releases when init_db commits.
 SCHEMA_INIT_LOCK = 0x6372736E  # "crsn"
 
 
 def lock_schema_init(conn) -> None:
-    """Take the cluster-wide schema-init advisory lock on ``conn``'s current
-    transaction. Call this first inside an init_db() ``with get_connection()``
-    block so concurrent replica startups don't race on DDL."""
+    """Take the schema-init advisory lock on ``conn``'s transaction. Call it first
+    inside an init_db() block so concurrent replica startups don't race on DDL."""
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_INIT_LOCK,))
 
 
@@ -87,12 +69,8 @@ def _dsn() -> str:
 
 
 def _prepare_threshold() -> Optional[int]:
-    """psycopg ``prepare_threshold`` for pooled connections (see module docstring).
-
-    Defaults to ``None`` (auto-prepare disabled) so the app is safe behind a
-    transaction-mode PgBouncer. ``DB_PREPARE_THRESHOLD`` may set an integer to
-    re-enable it for a direct (pooler-less) Postgres connection.
-    """
+    """psycopg ``prepare_threshold`` for pooled connections; see the module
+    docstring for why it defaults to disabled."""
     raw = os.getenv("DB_PREPARE_THRESHOLD")
     if raw is None or raw.strip().lower() in ("", "none", "disabled", "off"):
         return None
@@ -103,10 +81,9 @@ def _prepare_threshold() -> Optional[int]:
 
 
 def get_pool() -> ConnectionPool:
-    """Return the shared pool, opening it on first call.
+    """The shared pool, opened on first call.
 
-    ``dict_row`` is set pool-wide so every borrowed connection yields dict rows
-    (``row["col"]``) — the closest drop-in for the old ``sqlite3.Row`` access.
+    ``dict_row`` is set pool-wide so every borrowed connection yields dict rows.
     """
     global _pool
     if _pool is None:
@@ -118,16 +95,15 @@ def get_pool() -> ConnectionPool:
                     max_size=int(os.getenv("DB_POOL_MAX", "10")),
                     kwargs={
                         "row_factory": dict_row,
-                        # OFF by default so transaction-mode PgBouncer is safe;
-                        # see _prepare_threshold / the module docstring.
+                        # Off by default so transaction-mode PgBouncer is safe.
                         "prepare_threshold": _prepare_threshold(),
                     },
                     name="crimson",
                     open=False,
                 )
                 pool.open()
-                # Block briefly so a cold start surfaces an unreachable DB as a
-                # clear error here rather than as a confusing first-request 500.
+                # Block briefly so a cold start reports an unreachable DB here
+                # rather than as a confusing first-request 500.
                 pool.wait(timeout=float(os.getenv("DB_CONNECT_TIMEOUT", "30")))
                 _pool = pool
     return _pool
@@ -136,33 +112,26 @@ def get_pool() -> ConnectionPool:
 def get_connection():
     """Borrow a pooled connection as a context manager.
 
-    Usage mirrors the old ``sqlite3`` style::
-
-        with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(...)
-
-    On a clean exit the transaction is committed; on an exception it is rolled
-    back; either way the connection returns to the pool (psycopg_pool semantics).
+    A clean exit commits the transaction and an exception rolls it back; either
+    way the connection returns to the pool.
     """
     return get_pool().connection()
 
 
 @contextmanager
 def connection() -> Iterator[psycopg.Connection]:
-    """Same as :func:`get_connection` but as a generator context manager, handy
-    where an explicit ``with connection() as conn`` reads better."""
+    """:func:`get_connection` as a generator context manager, where the explicit
+    ``with connection() as conn`` reads better."""
     with get_pool().connection() as conn:
         yield conn
 
 
 def pool_stats() -> dict:
-    """Live pool utilisation + configured bounds, for the admin dashboard.
+    """Live pool utilisation and configured bounds, for the admin dashboard.
 
-    Merges psycopg_pool's own counters (``get_stats()`` — pool size, how many
-    connections are currently handed out, how many requests are queued waiting for
-    one, etc.) with the configured min/max so the dashboard can show headroom.
-    Best-effort: returns ``{"available": False}`` if the pool isn't open yet."""
+    Merges psycopg_pool's own counters with the configured min/max so the
+    dashboard can show headroom. Reports ``available: False`` if the pool is not
+    open yet."""
     if _pool is None:
         return {"available": False}
     try:
@@ -186,7 +155,7 @@ def pool_stats() -> dict:
 
 
 def close_pool() -> None:
-    """Close the pool (called on application shutdown)."""
+    """Close the pool; called on application shutdown."""
     global _pool
     if _pool is not None:
         _pool.close()
