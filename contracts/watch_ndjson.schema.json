@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://crimsonhaven.to/contracts/watch_ndjson/v1",
   "title": "Crimson /watch NDJSON line",
-  "description": "One line of the /watch line-delimited JSON stream. Discriminated on `type`. Generated from core/contracts.py — do not edit by hand.",
+  "description": "One line of the /watch line-delimited JSON stream. Discriminated on `type`. Generated from core/contracts.py; do not edit by hand.",
   "oneOf": [
     {
       "type": "object",

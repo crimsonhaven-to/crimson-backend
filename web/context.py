@@ -1,10 +1,8 @@
 """Process-wide singletons shared by the routes, the pipeline and the lifespan.
 
-These used to be module-level globals in ``api.py``. They live here now so the
-route/handler modules and ``api.py``'s lifespan can all reach the *same* instances
-without importing ``api.py`` (which would be circular). Nothing here opens a
-connection or touches the network at import time — the stores are schema-init'd in
-``api.py``'s lifespan exactly as before.
+Here rather than in api.py so every module reaches the *same* instances without a
+circular import. Nothing opens a connection or touches the network at import
+time; the stores are schema-init'd in api.py's lifespan.
 """
 
 from core.config import Config
@@ -15,37 +13,31 @@ from cache_engine.db import CacheStore
 from download_engine.db import DownloadStore
 from telemetry_engine import TelemetryStore
 
-# Mapping/metadata engine (storage is the shared PostgreSQL pool; see db_pool).
+# Mapping/metadata engine, stored in the shared pool.
 db_engine = MappingDatabaseEngine(tmdb_api_key=Config.TMDB_API_KEY)
 
-# Admin-managed local media sources (the "Local" direct-play source). The store is
-# schema-init'd in lifespan; the scraper/resolver read the enabled roots directly
-# via their own LocalSourceStore (the enabled-roots cache is class-wide).
+# The "Local" direct-play source. Schema-init'd in lifespan; the scraper and
+# resolver read enabled roots via their own store, whose cache is class-wide.
 local_source_store = LocalSourceStore()
 
-# Server-side video cache (downloads played episodes to a NAS target and replays
-# them as a named source). Schema-init'd + download manager started in lifespan;
-# the scraper/resolver/proxy read enabled targets via their own CacheStore.
+# Downloads played episodes to a NAS target and replays them as a named source.
+# Schema-init'd and started in lifespan.
 cache_store = CacheStore()
 
-# Admin download queue (aria2-backed background downloads landing under a
-# download-enabled local source's crimson-downloads/ dir). Schema-init'd in
-# lifespan; only the RUN_DOWNLOAD_WORKER replica runs the poll worker.
+# aria2-backed downloads landing under a download-enabled source's
+# crimson-downloads/ dir. Only the RUN_DOWNLOAD_WORKER replica polls.
 download_store = DownloadStore()
 
-# Anonymous per-source resolve telemetry (client beacons -> daily aggregates).
-# Restores the source-success visibility lost when resolving moved client-side.
+# Client beacons aggregated daily, restoring the source-success visibility lost
+# when resolving moved client-side.
 telemetry_store = TelemetryStore()
 
 
 def get_db_connection():
     """Borrow a pooled PostgreSQL connection as a context manager.
 
-    Returns the pool's connection context manager, so the existing
-    ``with get_db_connection() as conn:`` call sites keep working unchanged: the
-    transaction commits on a clean exit (rolls back on error) and the connection
-    returns to the pool. FastAPI serves these synchronous DB calls from its thread
-    pool, and the pool is thread-safe, so many workers (and replicas) can share the
-    same external database concurrently.
+    Commits on a clean exit, rolls back on error, and returns the connection to
+    the pool. FastAPI serves these synchronous calls from its thread pool and the
+    pool is thread-safe, so many workers can share one database concurrently.
     """
     return get_pool().connection()

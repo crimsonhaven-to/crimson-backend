@@ -1,22 +1,21 @@
-"""Local library surface: browse / search / play the operator's on-disk media.
+"""Local library surface: browse, search and play the operator's on-disk media.
 
-The Index gained a second view ("Local") alongside anime; these endpoints feed it
-and its search + playback, all keyed by the opaque path token local_engine already
-uses (no DB, derived from disk on demand):
+These feed the Index's "Local" view, all keyed by the opaque path token
+local_engine derives from disk on demand, with no DB of their own:
 
-  * ``GET /local-library``          — the browsable list of local titles (gzip,
-    cached). Returns ``enabled: false`` (not a 404) when no local source is on, so
-    the frontend can simply hide the Local view.
-  * ``GET /local-overview/{token}`` — one title's detail: metadata + episodes
-    (show) or a single play descriptor (movie). Filename-only titles are enriched
-    live against TMDB here (best effort, cached).
-  * ``GET /search/local``           — filename/title search, shaped like the other
-    /search/* surfaces (``suggestions`` tagged ``kind: "local"``).
-  * ``GET /watch-local/{token}``     — the /watch NDJSON contract for one local
-    file, so the player reuses the exact same source pipeline.
-  * ``GET /local_art``               — PUBLIC + signed poster/cover image proxy.
+  * ``GET /local-library``          the browsable list, gzipped and cached. Reports
+    ``enabled: false`` rather than 404ing when no source is on, so the frontend
+    can just hide the view.
+  * ``GET /local-overview/{token}`` one title's detail: metadata and episodes, or
+    a play descriptor for a movie. Filename-only titles are enriched against TMDB
+    here, best-effort and cached.
+  * ``GET /search/local``           title search, shaped like the other /search/*
+    surfaces.
+  * ``GET /watch-local/{token}``    the /watch NDJSON contract for one file, so
+    the player reuses the same source pipeline.
+  * ``GET /local_art``              public, signed poster image proxy.
 
-All of these no-op cleanly (empty / 404) unless a local source is enabled.
+All no-op cleanly unless a local source is enabled.
 """
 
 import asyncio
@@ -53,12 +52,12 @@ logger = logging.getLogger("crimson.local_library")
 
 router = APIRouter()
 
-# In-process cache of the scanned library. Short TTL: the disk can change under
-# us, but a scan is the expensive part so we don't want to walk it on every hit.
+# Short TTL: the disk can change under us, but the scan is the expensive part and
+# should not run on every hit.
 _ITEMS_KEY = "local-library:v1"
 _ITEMS_TTL = 60
-# Per-title TMDB enrichment cache (poster/overview/genres borrowed for a
-# filename-only title). Longer TTL — a title's TMDB match is stable.
+# Poster and genres borrowed for a filename-only title. Longer TTL, since a
+# title's TMDB match is stable.
 _ENRICH_TTL = 6 * 3600
 
 
@@ -75,17 +74,16 @@ def _enrich_key(token: str) -> str:
 
 
 def _is_placeholder_title(item: Dict) -> bool:
-    """True when the item's title is a stand-in the scanner couldn't resolve to a
-    human name — an empty title, or the ``TMDB <id>`` placeholder a cache-style
-    ``tmdb-<id>`` folder gets until enrichment supplies the real one."""
+    """True when the title is a stand-in the scanner could not resolve: empty, or
+    the ``TMDB <id>`` placeholder a ``tmdb-<id>`` folder carries until enriched."""
     title = (item.get("title") or "").strip()
     return (not title) or title.startswith("TMDB ")
 
 
 def _apply_cached_enrichment(item: Dict) -> Dict:
-    """Overlay any cached TMDB enrichment (title/poster/genres/…) onto a list item,
-    without making a network call. On-disk metadata wins — except the title, which the
-    enrichment replaces when the scanner only had a placeholder (a ``tmdb-<id>`` folder)."""
+    """Overlay cached TMDB enrichment onto a list item, with no network call.
+    On-disk metadata wins, except for a title the scanner only had a placeholder
+    for."""
     enrich = _local_get(_enrich_key(item["id"]))
     if not enrich:
         return item
@@ -99,10 +97,12 @@ def _apply_cached_enrichment(item: Dict) -> Dict:
 
 
 async def _fetch_enrichment(client, item: Dict) -> Dict:
-    """Fetch TMDB enrichment for one item. When the item already carries a tmdb_id
-    (e.g. a cache ``tmdb-<id>`` folder), resolve it **by id** (exact — title included);
-    otherwise fall back to a title search (poster/genres only, keeping the item's own
-    title). Returns {} on any miss. Never raises here — callers cache the result."""
+    """Fetch TMDB enrichment for one item.
+
+    An item carrying a tmdb_id resolves by id, which is exact and includes the
+    title; otherwise a title search supplies poster and genres only, keeping the
+    item's own title. Returns {} on a miss and never raises, since callers cache
+    the result."""
     tmdb_id = item.get("tmdb_id")
     is_movie = item.get("media_kind") == "movie"
     if tmdb_id:
@@ -119,7 +119,7 @@ async def _fetch_enrichment(client, item: Dict) -> Dict:
             "description": item.get("description") or data.get("overview"),
             "tmdb_id": tmdb_id,
         }
-    # No id — best-effort title search (leaves the item's parsed title in place).
+    # No id, so a title search, leaving the item's parsed title in place.
     title = (item.get("title") or "").strip()
     if not title:
         return {}
@@ -139,17 +139,16 @@ async def _fetch_enrichment(client, item: Dict) -> Dict:
 
 
 def _wants_enrichment(item: Dict) -> bool:
-    """Whether an item would benefit from a TMDB lookup (missing a real title, poster
-    or genres). A fully-resolved on-disk title with art skips it."""
+    """Whether an item is missing a real title, poster or genres. A fully resolved
+    on-disk title with art skips the lookup."""
     if _is_placeholder_title(item):
         return True
     return not item.get("poster") or not item.get("genres")
 
 
 async def _ensure_enriched(item: Dict) -> None:
-    """Populate the per-item enrichment cache once (id lookup or title search), so a
-    later _apply_cached_enrichment has something to overlay. Best-effort + cached
-    (including a cached empty result, so a miss isn't retried every request)."""
+    """Populate the enrichment cache once so a later _apply_cached_enrichment has
+    something to overlay. A miss caches empty, so it is not retried every request."""
     if _local_get(_enrich_key(item["id"])) is not None:
         return
     enrich: Dict = {}
@@ -163,11 +162,11 @@ async def _ensure_enriched(item: Dict) -> None:
 
 
 async def _enrich_id_items(items: List[Dict]) -> None:
-    """Batch-enrich (bounded concurrency) the list items that carry a tmdb_id and are
-    still missing a real title/art — i.e. the cache's ``tmdb-<id>`` folders. Only
-    id-keyed items are enriched here (exact + cheap + cached); title-search enrichment
-    stays lazy on the overview to avoid a search fan-out per list load. Uncached
-    misses cache an empty result so this doesn't re-fetch every browse."""
+    """Batch-enrich, with bounded concurrency, the items carrying a tmdb_id that
+    still lack a real title or art.
+
+    Only id-keyed items, which are exact and cheap. Title-search enrichment stays
+    lazy on the overview, to avoid a search fan-out on every list load."""
     need = [
         it for it in items
         if it.get("tmdb_id") and _wants_enrichment(it)
@@ -194,8 +193,7 @@ async def _enrich_id_items(items: List[Dict]) -> None:
 
 
 def _breakdowns(items: List[Dict]) -> Dict:
-    """Kind + genre counts over the whole library, for the Local view's filter chips
-    (mirrors /catalogue's categories/genres)."""
+    """Kind and genre counts over the library, for the view's filter chips."""
     kinds: Dict[str, int] = {}
     genres: Dict[str, int] = {}
     for it in items:
@@ -211,18 +209,17 @@ def _breakdowns(items: List[Dict]) -> Dict:
 
 @router.get("/local-library")
 async def get_local_library(request: Request):
-    """Browsable list of local titles for the Index's "Local" view. Gzip-compressed
-    when the client accepts it; ``enabled: false`` when no local source is on."""
+    """The browsable list of local titles. Gzipped when the client accepts it, and
+    ``enabled: false`` when no source is on."""
     if not local_is_configured():
         return _gzip_json(request, {
             "success": True, "enabled": False,
             "count": 0, "total": 0, "items": [], "kinds": [], "genres": [],
         })
     items = await run_in_threadpool(_cached_items)
-    # Resolve real titles/art for id-carrying titles (the cache's tmdb-<id> folders)
-    # by their TMDB id — bounded + cached, so this is a one-time cost per title.
+    # Bounded and cached, so this is a one-time cost per title.
     await _enrich_id_items(items)
-    # Overlay all cached enrichment (the batch above + any from prior overview views).
+    # The batch above, plus anything earlier overview views warmed.
     view = [_apply_cached_enrichment(it) for it in items]
     breakdown = _breakdowns(view)
     return _gzip_json(request, {
@@ -238,8 +235,8 @@ async def get_local_library(request: Request):
 
 @router.get("/local-overview/{token}")
 async def get_local_overview(token: str):
-    """One local title's detail: metadata + episodes (show) or a play descriptor
-    (movie). 404 when the token doesn't resolve inside a currently enabled root."""
+    """One title's detail: metadata and episodes, or a play descriptor for a movie.
+    404 when the token does not resolve inside a currently enabled root."""
     if not local_is_configured():
         raise HTTPException(status_code=404, detail="Local library not enabled")
     item = await run_in_threadpool(get_library_item, token)
@@ -252,19 +249,19 @@ async def get_local_overview(token: str):
 
 @router.get("/local-browse")
 async def get_local_browse(token: Optional[str] = Query(None, description="Directory token; omit for the source-root level")):
-    """Folder-navigation view of the local library: the immediate children of one
-    directory (or the enabled source roots when ``token`` is omitted). ``title``
-    entries carry the same poster/metadata shape as the list — with cached TMDB
-    enrichment overlaid so identified folders show a real tile — while ``folder`` and
-    ``file`` entries are the raw-filesystem fallback for media that never resolved to a
-    title. 404 when ``token`` doesn't resolve inside a currently enabled root."""
+    """Folder navigation: the immediate children of one directory, or the enabled
+    roots when ``token`` is omitted.
+
+    ``title`` entries carry the list's poster shape with cached enrichment
+    overlaid, so identified folders show a real tile, while ``folder`` and ``file``
+    entries are the raw-filesystem fallback for media that never resolved."""
     if not local_is_configured():
         raise HTTPException(status_code=404, detail="Local library not enabled")
     view = await run_in_threadpool(browse_dir, token)
     if view is None:
         raise HTTPException(status_code=404, detail="Folder not found")
-    # Overlay any cached enrichment on title entries so identified folders show real
-    # art/titles (no network here — reuses what the list/overview warmed).
+    # So identified folders show real art. No network: this reuses what the list
+    # and overview already warmed.
     view["entries"] = [
         {**e, **{k: v for k, v in _apply_cached_enrichment(e).items() if k not in ("type",)}}
         if e.get("type") == "title" else e
@@ -275,15 +272,15 @@ async def get_local_browse(token: Optional[str] = Query(None, description="Direc
 
 @router.get("/search/local")
 async def search_local(query_name: str = Query(..., min_length=1, description="Local title/filename to search")):
-    """Search the local library by title/filename. Shaped like the other /search/*
-    surfaces: ``suggestions`` tagged ``kind: "local"`` so the unified search can
-    route a hit to the local overview. Empty (not an error) when disabled."""
+    """Search the library by title or filename, shaped like the other /search/*
+    surfaces so unified search can route a hit to the local overview. Returns
+    empty rather than an error when disabled."""
     if not local_is_configured():
         return {"success": True, "query": query_name, "count": 0, "suggestions": []}
     items = await run_in_threadpool(_cached_items)
-    # Match against the ENRICHED titles (no network) so a cache-style ``tmdb-<id>``
-    # title is findable by its real name once the Local view has warmed its cache —
-    # not just by the "TMDB <id>" placeholder.
+    # Against the enriched titles, with no network, so a ``tmdb-<id>`` title is
+    # findable by its real name once the view has warmed its cache, rather than
+    # only by the placeholder.
     enriched = [_apply_cached_enrichment(it) for it in items]
     matches = search_library(query_name, items=enriched, limit=20)
     suggestions = [
@@ -302,9 +299,9 @@ async def search_local(query_name: str = Query(..., min_length=1, description="L
 
 @router.get("/watch-local/{token}")
 async def watch_local(request: Request, token: str, title: Optional[str] = Query(None)):
-    """Streaming link(s) for one local file as the same progressive NDJSON the TMDB
-    /watch routes emit — so the player reuses the identical source pipeline. Emits a
-    ``meta`` line, at most one ``stream`` line (the local file), then ``done``."""
+    """Streaming links for one local file, as the same progressive NDJSON the TMDB
+    /watch routes emit, so the player reuses one source pipeline. Emits ``meta``,
+    at most one ``stream`` line, then ``done``."""
     if not local_is_configured():
         raise HTTPException(status_code=404, detail="Local library not enabled")
 

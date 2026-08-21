@@ -1,53 +1,40 @@
 """
 Anthropic and Gemini behind one streaming, tool-calling interface.
 
-The rest of the engine speaks a single neutral message format (see ``Msg``) and
-never learns which vendor answered. That is what makes the provider an operator
-dropdown rather than a redeploy: routes.py builds the same conversation either
-way and the settings row decides who receives it.
+The rest of the engine speaks one neutral message format and never learns which
+vendor answered. That is what makes the provider an operator dropdown rather than
+a redeploy.
 
-Why the two clients are built differently
------------------------------------------
-Anthropic goes through the official ``anthropic`` SDK, which is the supported
-path and handles retries, streaming state and typed errors for us. Gemini goes
-through plain httpx against the REST endpoint, because the alternative is adding
-a second heavy SDK to an image that pins every dependency deliberately, and the
-Gemini surface we need here is one POST with an SSE body. Both are wrapped so
-callers cannot tell.
+Anthropic goes through the official SDK, which handles retries, streaming state
+and typed errors. Gemini goes through plain httpx against the REST endpoint,
+because the surface needed here is one POST with an SSE body and the alternative
+is a second heavy SDK in a deliberately pinned image.
 
-Transport notes
----------------
-Both paths are async generators rather than callback-driven coroutines. That is
-deliberate: a callback cannot yield out of the caller's generator frame, so a
-callback design would buffer the whole reply and hand it over at the end, which
-is exactly the streaming this feature exists to provide. Emitting events instead
-lets routes.py forward each delta to the client the moment it arrives.
-
-Text arrives as ``{"type": "text"}`` events. Tool calls are collected and
-delivered whole on the terminal ``{"type": "turn"}`` event, because a partially
-decoded tool argument object is not useful to anyone.
+Both paths are async generators rather than callback-driven: a callback cannot
+yield out of the caller's frame, so it would buffer the whole reply and hand it
+over at the end, which is precisely the streaming this feature exists to provide.
+Text arrives as ``text`` events; tool calls are collected and delivered whole on
+the terminal ``turn`` event, since a half-decoded argument object helps nobody.
 
 Thought signatures
 ------------------
-Gemini 3 stamps an opaque ``thoughtSignature`` on the response part its reasoning
-produced, and rejects the NEXT request with a 400 if that part comes back without
-it. Tool use is where this bites: the first call succeeds, then the second leg of
-the loop replays the model turn as history and fails, so the whole feature looks
-broken only once a tool is involved. The value is therefore carried through the
-neutral format on ``ToolCall.signature`` and ``Turn.signature`` and echoed back
-verbatim. It is provider bookkeeping and nothing else may read it.
+Gemini 3 stamps an opaque ``thoughtSignature`` on the part its reasoning produced
+and rejects the next request with a 400 if that part returns without it. Tool use
+is where this bites: the first call succeeds, then the second leg of the loop
+replays the turn as history and fails, so the feature looks broken only once a
+tool is involved. The value therefore rides the neutral format and is echoed back
+verbatim. It is provider bookkeeping; nothing else may read it.
 
-Signatures live only as long as the request that minted them. History reloaded
-from the database has none, which is fine: the requirement applies to a turn
-replayed inside one tool loop, and Anthropic has no equivalent concept at all.
+Signatures live only as long as the request that minted them, so history reloaded
+from the database has none. That is fine: the requirement applies to a turn
+replayed inside one tool loop, and Anthropic has no equivalent concept.
 
 Prompt caching is requested on the Anthropic path by marking the last system
-block. The persona plus tool schemas come to roughly 1.8k tokens, which clears
-the 1024 minimum on Sonnet 5 and the 512 on Opus 5, but NOT the 4096 on Haiku
-4.5, where the marker is accepted and silently does nothing. Gemini's implicit
-caching needs no request-side flag. This is the reason ``SYSTEM_PROMPT`` is
-frozen: a timestamp in there would change the prefix bytes every call and turn
-every cache read into a cache write.
+block. The persona plus tool schemas come to roughly 1.8k tokens, clearing the
+minimum on every model but Haiku 4.5, where the marker is accepted and silently
+does nothing. Gemini's implicit caching needs no flag. This is why
+``SYSTEM_PROMPT`` is frozen: a timestamp there would turn every cache read into a
+cache write.
 """
 
 from __future__ import annotations
@@ -60,48 +47,44 @@ import httpx
 
 from .models import ANTHROPIC, GEMINI, ChatModel
 
-# Optional, mirroring how prometheus-client is treated: a stripped build with no
-# anthropic package still boots and serves the whole API, and only reports the
-# Anthropic provider as unavailable. The Gemini path needs nothing extra.
+# Optional, like prometheus-client: a stripped build still boots and serves the
+# whole API, reporting only this provider as unavailable.
 try:
     import anthropic
-except ImportError:  # pragma: no cover - exercised only on a stripped build
-    # Rebinding a module name to None is exactly the pattern an optional import
-    # needs, and the one thing mypy cannot express, so the narrowing is silenced
-    # here rather than working around it with a second sentinel name.
+except ImportError:  # pragma: no cover - only on a stripped build
+    # Rebinding a module name to None is the pattern an optional import needs and
+    # the one thing mypy cannot express, so it is silenced rather than worked
+    # around with a second sentinel name.
     anthropic = None  # type: ignore[assignment]
 
 logger = logging.getLogger("crimson.chat.providers")
 
 ANTHROPIC_SDK_AVAILABLE = anthropic is not None
 
-# Chat replies are short by design (the persona asks for two or three sentences),
-# so this is a generous ceiling rather than a target. It also bounds the cost of
-# a model that decides to monologue.
+# The persona asks for two or three sentences, so this is a ceiling rather than a
+# target. It also bounds the cost of a model that decides to monologue.
 MAX_OUTPUT_TOKENS = 2048
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # Events yielded by the streaming generators:
 #   {"type": "text", "text": str}   incremental reply text
-#   {"type": "turn", "turn": Turn}  terminal, exactly once, with tool calls + usage
+#   {"type": "turn", "turn": Turn}  terminal, once, with tool calls and usage
 Event = Dict
 
 
 class ProviderError(RuntimeError):
-    """A provider call failed in a way the caller should surface to the viewer."""
+    """A provider call failed in a way the viewer should be told about."""
 
 
 class ToolCall:
     """One requested tool invocation.
 
-    ``signature`` is opaque provider bookkeeping that must be echoed back
-    verbatim when this call is replayed as history. Gemini 3 attaches a
-    ``thoughtSignature`` to the part carrying a function call and HARD-ERRORS
-    (400) if the follow-up request has dropped it, which makes every tool-using
-    conversation fail on the second leg of the loop. Anthropic has no equivalent
-    and leaves this None. Nothing outside the provider that minted it may
-    interpret the value.
+    ``signature`` is opaque provider bookkeeping, echoed back verbatim when this
+    call is replayed as history. Gemini 3 hard-errors with a 400 if the follow-up
+    request has dropped it, which fails every tool-using conversation on the
+    second leg of the loop. Anthropic leaves it None, and nothing outside the
+    provider that minted it may interpret the value.
     """
 
     __slots__ = ("call_id", "name", "args", "signature")
@@ -125,7 +108,7 @@ class Usage:
 
 
 class Turn:
-    """One provider round trip: what it said, what it wants to call, what it cost."""
+    """One round trip: what it said, what it wants to call, what it cost."""
 
     __slots__ = ("text", "tool_calls", "usage", "signature")
 
@@ -139,8 +122,8 @@ class Turn:
         self.text = text
         self.tool_calls = tool_calls
         self.usage = usage
-        # A signature that arrived on a text part rather than a functionCall one.
-        # See ToolCall.signature; same contract, different part.
+        # Arrived on a text part rather than a functionCall one. Same contract as
+        # ToolCall.signature.
         self.signature = signature
 
     @property
@@ -181,10 +164,9 @@ def tool_msg(call: ToolCall, result: Dict) -> Msg:
 def _anthropic_messages(messages: List[Msg]) -> List[Dict]:
     """Neutral history to Anthropic content blocks.
 
-    Tool results have to be batched: several tool_result blocks belonging to one
-    assistant turn must arrive in a SINGLE user message. Splitting them across
-    messages is accepted by the API but trains the model out of making parallel
-    calls, so consecutive tool messages are coalesced here.
+    Tool results must be batched: several blocks from one assistant turn have to
+    arrive in a single user message. Splitting them is accepted by the API but
+    trains the model out of making parallel calls, so they are coalesced here.
     """
     out: List[Dict] = []
     pending_results: List[Dict] = []
@@ -247,8 +229,8 @@ async def _anthropic_stream(
     request: Dict = {
         "model": model.model_id,
         "max_tokens": MAX_OUTPUT_TOKENS,
-        # A list rather than a bare string so the cache breakpoint can be
-        # attached. Tools render before system, so this one marker covers both.
+        # A list rather than a bare string, so the cache breakpoint can attach.
+        # Tools render before system, so this one marker covers both.
         "system": [
             {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
         ],
@@ -263,9 +245,8 @@ async def _anthropic_stream(
         ],
     }
 
-    # Sampling parameters are rejected outright on the current models, so none are
-    # sent; the persona does the steering instead. Depth is controlled by effort,
-    # which the older Haiku tier does not accept at all.
+    # The current models reject sampling parameters outright, so the persona does
+    # the steering and depth rides on effort, which older Haiku will not accept.
     if model.supports_thinking:
         request["thinking"] = {"type": "adaptive"}
     if model.supports_effort:
@@ -294,9 +275,9 @@ async def _anthropic_stream(
     usage = Usage(
         input_tokens=final.usage.input_tokens or 0,
         output_tokens=final.usage.output_tokens or 0,
-        # Cache writes bill above the base rate and reads below it. Only reads are
-        # tracked here; a write is rare (once per prefix change) and counting it
-        # as a normal input token slightly over-reports rather than under.
+        # Writes bill above the base rate and reads below it. Only reads are
+        # tracked: a write happens once per prefix change, and counting it as a
+        # normal input token over-reports rather than under.
         cached_tokens=getattr(final.usage, "cache_read_input_tokens", 0) or 0,
     )
     yield {"type": "turn", "turn": Turn("".join(text_parts), calls, usage)}
@@ -313,9 +294,8 @@ def _friendly_error(status: int) -> str:
 
 
 # --- Gemini -----------------------------------------------------------------
-# Gemini's function declarations take an OpenAPI schema whose `type` is a proto
-# enum, so the values must be upper case. Everything else in our schema subset
-# (properties, required, description, enum, items) carries over unchanged.
+# Function declarations take an OpenAPI schema whose `type` is a proto enum, so
+# those values must be upper case. The rest of the subset carries over unchanged.
 def _gemini_schema(node):
     if isinstance(node, dict):
         out = {}
@@ -334,8 +314,8 @@ def _gemini_contents(messages: List[Msg]) -> List[Dict]:
     """Neutral history to Gemini ``contents``.
 
     Gemini calls the assistant role "model" and carries tool results as a
-    functionResponse part on a user turn. As on the Anthropic path, consecutive
-    tool results are coalesced into one turn.
+    functionResponse part on a user turn. Consecutive results coalesce, as on the
+    Anthropic path.
     """
     out: List[Dict] = []
     pending: List[Dict] = []
@@ -370,10 +350,9 @@ def _gemini_contents(messages: List[Msg]) -> List[Dict]:
                 parts.append(text_part)
             for call in msg.get("tool_calls") or []:
                 fn_part: Dict = {"functionCall": {"name": call.name, "args": call.args}}
-                # Replaying a function call without the signature Gemini minted
-                # for it is a 400, not a soft warning, so this is load-bearing.
-                # Absent on history rebuilt from the database (only in-flight
-                # turns carry one) and on anything Anthropic produced.
+                # Replaying a call without the signature Gemini minted is a 400,
+                # not a soft warning. Absent on history rebuilt from the database
+                # and on anything Anthropic produced.
                 if call.signature:
                     fn_part["thoughtSignature"] = call.signature
                 parts.append(fn_part)
@@ -440,8 +419,7 @@ async def _gemini_stream(
                     except json.JSONDecodeError:
                         continue
 
-                    # Usage is cumulative and repeated on every chunk, so the last
-                    # one seen is the total for the call.
+                    # Cumulative and repeated per chunk, so the last is the total.
                     meta = chunk.get("usageMetadata") or {}
                     if meta:
                         cached = int(meta.get("cachedContentTokenCount") or 0)
@@ -453,27 +431,23 @@ async def _gemini_stream(
 
                     for candidate in chunk.get("candidates") or []:
                         for part in (candidate.get("content") or {}).get("parts") or []:
-                            # Gemini 3 stamps an opaque thoughtSignature on the
-                            # part its reasoning produced and demands it back
-                            # unchanged when that part is replayed as history.
-                            # It has to be read here, per part, because the
-                            # stream is flattened into one string plus a list of
-                            # calls and the association is lost after that.
+                            # Read per part, because the stream is flattened into
+                            # one string plus a list of calls and the association
+                            # is lost after that.
                             signature = part.get("thoughtSignature")
                             if "text" in part and part["text"]:
                                 text_parts.append(part["text"])
-                                # First one wins: it belongs to the leading text
-                                # part, and the reply is replayed as a single
-                                # concatenated part.
+                                # First wins: it belongs to the leading text part,
+                                # and the reply replays as one concatenated part.
                                 if signature and text_signature is None:
                                     text_signature = signature
                                 yield {"type": "text", "text": part["text"]}
                             fn = part.get("functionCall")
                             if fn and fn.get("name"):
                                 call_seq += 1
-                                # Gemini does not mint call ids; the pairing is by
-                                # name. One is synthesised so the neutral format
-                                # and the ledger can key on something stable.
+                                # Gemini pairs by name rather than minting ids, so
+                                # one is synthesised for the neutral format and
+                                # the ledger to key on.
                                 calls.append(
                                     ToolCall(
                                         f"gemini-{call_seq}",
@@ -495,9 +469,8 @@ async def _gemini_stream(
 async def stream_turn(
     *,
     provider: str,
-    # Optional on purpose: the caller reads it straight out of the environment,
-    # where "not configured" is a normal state. Rejecting it here, in Lumi's
-    # voice, beats making every call site prove it is set first.
+    # Optional on purpose, since "not configured" is a normal state. Rejecting it
+    # here in Lumi's voice beats making every call site prove it is set.
     api_key: Optional[str],
     model: ChatModel,
     system: str,
@@ -506,8 +479,8 @@ async def stream_turn(
 ) -> AsyncIterator[Event]:
     """One round trip to whichever provider the operator selected.
 
-    Yields ``text`` events as they arrive and exactly one terminal ``turn``
-    event. Raises ProviderError for anything the viewer should be told about.
+    Yields ``text`` events as they arrive and exactly one terminal ``turn``.
+    Raises ProviderError for anything the viewer should be told about.
     """
     if not api_key:
         raise ProviderError(

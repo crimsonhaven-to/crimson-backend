@@ -1,16 +1,13 @@
-"""Same-origin stream proxies for the operator-owned sources + the backend player.
+"""Same-origin stream proxies for the operator-owned sources, plus the player.
 
-Several sources hand the player a same-origin proxy path instead of a raw CDN URL,
-because the CDN gates segments on a Referer/Origin/UA/ASN the viewer's browser
-can't satisfy (or serves no usable CORS). Every proxy ends the same way: turn the
-resolver ``proxy_fetch`` result (status, content_type, headers, payload) into the
-right response — buffered bytes for a rewritten HLS playlist, a streamed body
-(Range/length headers forwarded) for a media segment.
+Several sources hand the player a same-origin proxy path rather than a raw CDN
+URL, because the CDN gates segments on a Referer, UA or ASN the viewer's browser
+cannot satisfy, or serves no usable CORS. Every proxy ends the same way: turn the
+resolver's ``proxy_fetch`` result into the right response, buffered bytes for a
+rewritten HLS playlist or a streamed body with Range forwarded for a segment.
 
-These are the ONLY stream proxies the base backend serves (third-party source
-proxies were removed with their scrapers). The optional build-time overlay's
-proxies are registered separately in ``api.py`` (schema-hidden, name-derived), and
-reuse ``_proxy_response`` from here.
+These are the only stream proxies a base build serves. The overlay's are
+registered separately in api.py and reuse ``_proxy_response`` from here.
 """
 
 import logging
@@ -42,11 +39,11 @@ router = APIRouter()
 
 
 def _proxy_response(status, content_type, headers, payload, *, forward_bytes_headers=False):
-    """Shape a resolver ``proxy_fetch`` result into a Response/StreamingResponse.
+    """Shape a resolver ``proxy_fetch`` result into a Response.
 
-    ``payload`` is either rewritten ``bytes`` (an HLS playlist) or an async byte
-    iterator (a streamed media segment). Bytes responses don't forward upstream
-    headers unless ``forward_bytes_headers`` is set (Jellyfin needs them)."""
+    ``payload`` is either rewritten bytes for an HLS playlist or an async byte
+    iterator for a streamed segment. Bytes responses forward upstream headers only
+    under ``forward_bytes_headers``, which Jellyfin needs."""
     if isinstance(payload, (bytes, bytearray)):
         return Response(
             content=payload,
@@ -59,14 +56,14 @@ def _proxy_response(status, content_type, headers, payload, *, forward_bytes_hea
     )
 
 
-# --- JELLYFIN PROXY ("jellyfin" source) ---
+# --- JELLYFIN PROXY ---
 @router.api_route("/jellyfin_proxy/{path:path}", methods=["GET", "POST"])
 async def jellyfin_proxy(request: Request, path: str):
-    """Authenticated reverse proxy to the user's Jellyfin server. Injects the
-    access token server-side (so it never reaches the browser) and rewrites HLS
-    playlists to flow back through this proxy; media segments / direct files are
-    streamed straight through with Range passthrough. Configured via the
-    JELLYFIN_* env vars (see resolvers.jellyfin)."""
+    """Authenticated reverse proxy to the user's Jellyfin server.
+
+    Injects the access token server-side so it never reaches the browser, and
+    rewrites HLS playlists to flow back through this proxy. Segments and direct
+    files stream through with Range passthrough."""
     body = await request.body() if request.method == "POST" else None
     try:
         result = await jellyfin_proxy_fetch(
@@ -81,27 +78,24 @@ async def jellyfin_proxy(request: Request, path: str):
     except httpx.RequestError as e:
         logger.error(f"Jellyfin proxy upstream error for {path}: {e}")
         raise HTTPException(status_code=502, detail="Upstream fetch failed")
-    # Jellyfin forwards upstream headers on buffered (playlist) responses too.
+    # Jellyfin needs upstream headers on buffered playlist responses too.
     return _proxy_response(*result, forward_bytes_headers=True)
 
 
-# A client-offload overlay source's same-origin subtitle/stream proxy (the signed
-# /<name>_proxy for SRT->WebVTT + any HLS it relays) is NOT wired here — it's
-# auto-registered by api.py's _register_overlay_stream_proxies when the build-time
-# overlay ships a module with a ``proxy_fetch``. So this committed file names no
-# overlay source; a base build serves only the operator-owned proxies below.
+# An overlay source's own proxy is not wired here: api.py auto-registers it when
+# the build ships a module with a ``proxy_fetch``. So this file names no overlay
+# source, and a base build serves only the operator-owned proxies below.
 
 
-# --- LOCAL SOURCE PROXY ("Local" source: admin-registered dirs / NAS) ---
+# --- LOCAL SOURCE PROXY (admin-registered dirs / NAS) ---
 @router.get("/local_proxy/{token}")
 async def local_proxy(token: str):
     """Stream a browser-playable file from an admin-registered local source.
 
-    ``token`` is an opaque base64url of the absolute path the LocalScraper found.
-    ``safe_resolve`` maps it back to a real file ONLY when it currently lives
-    inside an *enabled* source root (path traversal / symlink escapes / disabled
-    sources all resolve to None → 404), re-checked on every request. Starlette's
-    FileResponse handles HTTP Range requests, so the player can seek."""
+    ``token`` is an opaque base64url of the path the scraper found.
+    ``safe_resolve`` maps it back only when it currently sits inside an *enabled*
+    root, re-checked every request, so traversal, symlink escapes and disabled
+    sources all 404. FileResponse handles Range, so the player can seek."""
     real_path = await run_in_threadpool(local_safe_resolve, token)
     if not real_path:
         raise HTTPException(status_code=404, detail="Not found")
@@ -110,16 +104,14 @@ async def local_proxy(token: str):
 
 @router.get("/local_hls/{token}/{resource}")
 async def local_hls(token: str, resource: str):
-    """On-the-fly HLS for a transcodable Local file (mkv/avi/ts/…) whose source has
-    encoding enabled — the non-direct-play counterpart of /local_proxy.
+    """On-the-fly HLS for a transcodable Local file, the counterpart of
+    /local_proxy for anything that will not direct-play.
 
-    ``resource`` is either the VOD playlist (``master.m3u8``/``media.m3u8``) or a
-    segment (``seg{n}.ts``). ``safe_resolve_transcode`` re-validates on EVERY request
-    that the token maps to a transcodable file inside a *currently enabled* source
-    root with **encoding on** — so disabling the source (or just its encoding) instantly
-    404s its transcode streams, exactly like /local_proxy for direct play. Gated by the
-    login wall (NOT a public prefix), so the player must carry the session token; the
-    bytes never leave this host's library unauthenticated."""
+    ``resource`` is the VOD playlist or a segment. Every request re-validates that
+    the token maps to a transcodable file inside a currently enabled root with
+    encoding on, so disabling either instantly 404s its transcode streams. Gated
+    by the login wall rather than a public prefix, so the bytes never leave this
+    host unauthenticated."""
     real_path = await run_in_threadpool(local_safe_resolve_transcode, token)
     if not real_path:
         raise HTTPException(status_code=404, detail="Not found")
@@ -153,13 +145,12 @@ async def local_art(
     f: str = Query(..., description="base64url path token of a local artwork file"),
     s: str = Query(..., description="HMAC signature"),
 ):
-    """Serve a poster/cover image discovered next to a local title.
+    """Serve a poster or cover image found next to a local title.
 
-    PUBLIC (an ``<img>`` can't carry the login-wall bearer), so the ``f`` path token
-    is HMAC-signed — a forged/unsigned token is rejected. ``safe_resolve_art`` then
-    re-validates on every request that it maps to a real image file inside a
-    *currently enabled* source root (traversal/symlink escapes / disabled sources
-    all 404), exactly like /local_proxy for video."""
+    Public, because an ``<img>`` cannot carry the login-wall bearer, so the path
+    token is HMAC-signed and a forged one is rejected. Every request then
+    re-validates that it maps to a real image inside a currently enabled root,
+    exactly like /local_proxy does for video."""
     real_path = await run_in_threadpool(local_safe_resolve_art, f, s)
     if not real_path:
         raise HTTPException(status_code=404, detail="Not found")
@@ -174,28 +165,27 @@ async def local_art(
 async def cache_proxy(token: str):
     """Stream a server-side-cached episode straight off the NAS.
 
-    ``token`` is an opaque base64url of the cached file's absolute path.
-    ``cache_safe_resolve`` maps it back to a real file ONLY when it currently
-    lives inside an *enabled* cache target (traversal/symlink escapes / disabled
-    targets all 404), re-checked per request. FileResponse handles Range so the
-    player can seek. Mirrors /local_proxy."""
+    Mirrors /local_proxy: the token maps back to a file only while it sits inside
+    an *enabled* cache target, re-checked per request, and Range is handled so the
+    player can seek."""
     real_path = await run_in_threadpool(cache_safe_resolve, token)
     if not real_path:
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(real_path, media_type=cache_media_type(real_path))
 
 
-# --- BACKEND-HOSTED PLAYER (Crimson-themed hls.js/mp4 player) ---
+# --- BACKEND-HOSTED PLAYER ---
 @router.get("/player")
 async def player(
     src: str = Query(..., description="Same-origin stream path to play"),
     stream_type: str = Query("", alias="type", description="hls or mp4 (inferred if omitted)"),
     title: str = Query("", description="Optional title"),
 ):
-    """Serve a Crimson-themed player for a same-origin proxied stream. Resolvers
-    that return a raw hls/mp4 stream (e.g. Jellyfin) wrap it in this page so the
-    frontend can iframe it like any other source. ``src`` is restricted to
-    same-origin relative paths to prevent embedding arbitrary external content."""
+    """A themed player page for a same-origin proxied stream.
+
+    Resolvers returning a raw hls/mp4 stream wrap it in this page so the frontend
+    can iframe it like any other source. ``src`` is restricted to same-origin
+    relative paths, so it cannot embed arbitrary external content."""
     if not is_safe_src(src):
         raise HTTPException(status_code=400, detail="Invalid src (must be a same-origin path)")
     html = render_player(src=src, stream_type=stream_type, title=title)

@@ -1,24 +1,18 @@
 """
 The catalogue of models an operator may select, with pricing and capabilities.
 
-Why a hand-maintained table
----------------------------
-Two reasons. First, cost: the usage ledger records an estimated price per call,
-and that needs published per-million rates the API itself does not return.
-Second, capability skew: the request shape is not uniform across models even
-within one provider (Haiku 4.5 rejects the effort parameter that Sonnet 5 wants;
-prompt caching has a different minimum prefix on every model), so providers.py
-needs somewhere to look those facts up rather than branching on model id strings
-scattered through the call path.
+Hand-maintained for two reasons. Cost: the usage ledger records an estimated
+price per call, which needs published per-million rates the API does not return.
+And capability skew: the request shape is not uniform even within one provider,
+so providers.py needs somewhere to look those facts up rather than branching on
+model id strings scattered through the call path.
 
-Keeping this list short is deliberate. It is an operator dropdown, not a mirror
-of every model each vendor sells. The three per provider span budget, default and
-quality so there is an obvious answer at each price point.
+The list is deliberately short. It is an operator dropdown, not a mirror of every
+model a vendor sells, and the three per provider span budget, default and quality.
 
-Prices are USD per million tokens, current as of 2026-08-08. They only affect the
-cost ESTIMATE shown in the dashboard; a stale number here never changes what a
-provider actually bills, so this table drifting is a reporting bug rather than a
-billing one.
+Prices are USD per million tokens, current as of 2026-08-08. They affect only the
+dashboard's estimate, never what a provider bills, so drift here is a reporting
+bug rather than a billing one.
 """
 
 from __future__ import annotations
@@ -35,13 +29,12 @@ class ChatModel:
     """One selectable model.
 
     ``cache_min_tokens`` is the smallest prefix the provider will actually cache.
-    A prefix below it is not an error, it simply never becomes a cache entry, so
+    A shorter prefix is not an error; it simply never becomes a cache entry, so
     this is the difference between caching working and silently doing nothing.
-    Lumi's stable prefix (persona plus tool schemas) is roughly 1.8k tokens,
-    which clears every model here except Haiku 4.5.
+    Lumi's stable prefix is roughly 1.8k tokens, clearing every model but Haiku.
 
-    ``supports_effort`` and ``supports_thinking`` gate the two request fields
-    that hard-error when sent to a model that does not take them.
+    ``supports_effort`` and ``supports_thinking`` gate the two request fields that
+    hard-error on a model that does not take them.
     """
 
     def __init__(
@@ -70,11 +63,10 @@ class ChatModel:
         self.note = note
 
     def cost_micros(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> int:
-        """Estimated cost of one call in USD millionths.
+        """Estimated cost of one call, in USD millionths.
 
-        Cached tokens are billed at the provider's reduced read rate and are
-        counted separately from ``input_tokens``, matching how both providers
-        report usage (the cached count is not included in the uncached count).
+        Cached tokens bill at the reduced read rate and count separately from
+        ``input_tokens``, matching how both providers report usage.
         """
         fresh = max(0, input_tokens)
         dollars = (
@@ -85,7 +77,7 @@ class ChatModel:
         return int(round(dollars * 1_000_000))
 
     def public(self) -> Dict:
-        """Shape sent to the admin dashboard for the model dropdown."""
+        """Shape sent to the dashboard's model dropdown."""
         return {
             "id": self.model_id,
             "provider": self.provider,
@@ -96,9 +88,9 @@ class ChatModel:
         }
 
 
-# Anthropic. Sonnet 5 is the default for the whole feature: persona fidelity and
-# correct tool arguments are exactly where the cheaper tiers get sloppy, and at
-# a handful of users the difference between these three is a few dollars a month.
+# Sonnet 5 is the default: persona fidelity and correct tool arguments are exactly
+# where the cheaper tiers get sloppy, and at this scale the difference between the
+# three is a few dollars a month.
 _ANTHROPIC_MODELS = [
     ChatModel(
         "claude-sonnet-5", ANTHROPIC, "Claude Sonnet 5",
@@ -115,16 +107,16 @@ _ANTHROPIC_MODELS = [
     ChatModel(
         "claude-haiku-4-5", ANTHROPIC, "Claude Haiku 4.5",
         1.00, 5.00, 0.10,
-        # 4096 is genuinely the minimum here, and Lumi's prefix does not reach it,
-        # so prompt caching never engages on this model. Flagged in the note
-        # because it makes Haiku less of a saving than the sticker price implies.
+        # Lumi's prefix does not reach this minimum, so prompt caching never
+        # engages here, making Haiku less of a saving than its sticker price
+        # implies. Hence the note.
         cache_min_tokens=4096, supports_effort=False, supports_thinking=False,
         note="Cheapest. Prompt caching does not engage at Lumi's prompt size.",
     ),
 ]
 
-# Gemini. Model ids verified against ai.google.dev on 2026-08-08. The 2.0 family
-# is shut down and is deliberately absent.
+# Model ids verified against ai.google.dev on 2026-08-08. The 2.0 family is shut
+# down and deliberately absent.
 _GEMINI_MODELS = [
     ChatModel(
         "gemini-3.6-flash", GEMINI, "Gemini 3.6 Flash",
@@ -160,16 +152,15 @@ def models_for(provider: str) -> List[ChatModel]:
 
 
 def catalogue() -> Dict[str, List[Dict]]:
-    """Every selectable model grouped by provider, for the dashboard dropdown."""
+    """Every selectable model, grouped by provider, for the dropdown."""
     return {p: [m.public() for m in models_for(p)] for p in PROVIDERS}
 
 
 def resolve(provider: str, model_id: Optional[str]) -> ChatModel:
-    """The model to actually use, falling back to the provider default.
+    """The model to use, falling back to the provider default.
 
-    Guards the case where an operator switches provider while a model id from the
-    other provider is still stored: rather than sending an Anthropic id to Google
-    and getting an opaque 404, fall back to the new provider's default.
+    Guards an operator switching provider while the other vendor's model id is
+    still stored: better the new provider's default than an opaque 404.
     """
     model = MODELS.get(model_id or "")
     if model is None or model.provider != provider:

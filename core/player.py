@@ -1,16 +1,13 @@
 """
-Backend-hosted video player page (served at GET /player).
+Backend-hosted video player page, served at GET /player.
 
-A minimal, ad-free, Crimson-red themed player for direct streams that aren't a
-self-contained embed (e.g. the Jellyfin HLS/MP4 streams from our /jellyfin_proxy).
-The frontend plays "iframe" sources well but only shows a link for raw hls/mp4,
-so resolvers can wrap their stream in ``/player?type=hls&src=/jellyfin_proxy/...``
-and hand the frontend a normal iframe instead.
+The frontend plays iframe sources well but only links raw hls/mp4, so a resolver
+can wrap its stream in ``/player?type=hls&src=/jellyfin_proxy/...`` and hand the
+frontend a normal iframe instead.
 
-The player and the stream are served from the *same* (backend) origin, so hls.js
-fetches the playlist/segments same-origin — no CORS needed. ``src`` is restricted
-to same-origin relative paths (see ``is_safe_src``) so this can't be abused to
-embed arbitrary external content.
+Player and stream share the backend origin, so hls.js fetches segments
+same-origin and needs no CORS. ``src`` is restricted to same-origin relative
+paths so this can't be used to embed arbitrary external content.
 """
 
 import json
@@ -21,7 +18,7 @@ PLAYER_COLOR_DEFAULT = "C20000"  # Crimson red, matching the other sources.
 
 
 def is_safe_src(src: str) -> bool:
-    """Only allow same-origin relative stream paths ("/jellyfin_proxy/..")."""
+    """Only same-origin relative stream paths, e.g. "/jellyfin_proxy/..".."""
     return bool(src) and src.startswith("/") and not src.startswith("//")
 
 
@@ -81,11 +78,11 @@ _TEMPLATE = Template(
 
 def render_player(src: str, stream_type: str = "", title: str = "", poster: str = "",
                   color: str = PLAYER_COLOR_DEFAULT) -> str:
-    """Render the player HTML for a (same-origin) stream URL."""
+    """Render the player HTML for a same-origin stream URL."""
     if not stream_type:
         stream_type = "hls" if ".m3u8" in src.lower() else "mp4"
     safe_color = "".join(c for c in (color or "") if c in "0123456789abcdefABCDEF") or PLAYER_COLOR_DEFAULT
-    # json.dumps safely escapes src/type for embedding in the JS context.
+    # json.dumps escapes src/type safely for the JS context.
     cfg = json.dumps({"src": src, "type": stream_type})
     return _TEMPLATE.safe_substitute(
         title=escape(title or "Crimson Player"),

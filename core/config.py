@@ -1,28 +1,25 @@
 """
-Central application configuration.
+Central application configuration: every env-driven knob plus the TMDB auth
+headers. Lives here rather than in api.py so any module can import its settings
+without a circular import back through the app.
 
-Holds the ``Config`` class (all env-driven knobs) and the TMDB auth headers,
-moved out of ``api.py`` so every module — the app, the shared HTTP client, the
-metadata fetchers — imports its settings from one place instead of reaching back
-into ``api.py`` (which would be a circular import).
-
-``load_dotenv()`` runs at import time, before ``Config`` reads the environment,
-because ``Config``'s class body calls ``os.getenv`` as it's defined. It's
-idempotent, so ``api.py`` calling it again is harmless.
+``load_dotenv()`` runs at import time because ``Config``'s class body calls
+``os.getenv`` as it is defined. It is idempotent, so api.py calling it again is
+harmless.
 """
 
 import os
 
 from dotenv import load_dotenv
 
-# Load environment variables before Config reads them below.
+# Must run before Config's class body reads the environment below.
 load_dotenv()
 
 
 class Config:
     TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-    # Mapping + accounts now live in PostgreSQL; the connection is configured via
-    # DATABASE_URL / POSTGRES_* and pooled in db_pool (no per-process DB path).
+    # Mapping and accounts live in PostgreSQL, configured via DATABASE_URL /
+    # POSTGRES_* and pooled in db_pool.
     CACHE_TTL_SECONDS = 86400  # 24 hours
     TRENDING_CACHE_TTL_SECONDS = 21600  # 6 hours
     MAX_CONCURRENT_REQUESTS = 10
@@ -30,96 +27,73 @@ class Config:
     MAX_RETRIES = 3
     RETRY_BACKOFF_FACTOR = 1.0
 
-    # Only the replica with this set to true runs the periodic Fribb resync.
-    # The sync rebuilds the mapping tables wholesale, so running it on every
-    # replica is wasteful — keep it enabled on exactly one replica (see README
-    # "Deploying to Docker Swarm").
+    # The sync rebuilds the mapping tables wholesale, so keep this on exactly one
+    # replica. See README, "Deploying to Docker Swarm".
     RUN_DB_SYNC = os.getenv("RUN_DB_SYNC", "true").lower() not in ("0", "false", "no")
 
     # --- Non-anime metadata maintenance (tmdb_shows / tmdb_movies) ----------
-    # The non-anime show/movie tables are written lazily (on open + from search/
-    # trending). These knobs keep them fresh and, optionally, pre-seed them.
-    # ALL of this heavy work is pinned to the single RUN_DB_SYNC replica (the
-    # api-sync container that already owns the Fribb resync) so exactly one
-    # container ever churns this much metadata — the serving replicas never do.
+    # These tables are written lazily on open and from search. All the heavy work
+    # below is pinned to the single RUN_DB_SYNC replica, so exactly one container
+    # ever churns this much metadata.
     #
-    # Nightly staleness refresh: there is no upstream (unlike the Fribb dataset) to
-    # tell us when a TMDB row changed, so the catalogue is swept in slices. Every
-    # night at METADATA_REFRESH_HOUR the oldest 1/METADATA_REFRESH_BUCKETS of each
-    # table is re-pulled from TMDB; over a full cycle (default 14 nights) every row
-    # is refreshed, then it repeats. Freshly-opened rows sort last, so they're
-    # naturally skipped until they age to the front again.
+    # Nothing upstream tells us when a TMDB row changed, unlike the Fribb dataset,
+    # so the catalogue is swept in slices: each night the oldest
+    # 1/METADATA_REFRESH_BUCKETS of each table is re-pulled, refreshing everything
+    # over a full cycle. Freshly opened rows sort last and age to the front.
     METADATA_REFRESH_BUCKETS = int(os.getenv("METADATA_REFRESH_BUCKETS", "14"))
     METADATA_REFRESH_HOUR = int(os.getenv("METADATA_REFRESH_HOUR", "4"))  # 0-23, server local time
     #
-    # Catalogue backfill: page TMDB discover to pre-populate the tables beyond what's
-    # been browsed. Off by default (demand-driven fill is enough for most installs).
-    # Can be kicked off from the Admin dashboard at any time — the request is queued
-    # in the DB and drained by api-sync — or run once at startup via the flag below.
-    # Paced between pages to stay rate-limit + WAL/replication friendly.
+    # Catalogue backfill pages TMDB discover to pre-populate the tables beyond
+    # what has been browsed. Off by default, since demand-driven fill suffices for
+    # most installs. Can also be queued from the Admin dashboard. Paced between
+    # pages to stay rate-limit and replication friendly.
     RUN_METADATA_BACKFILL = os.getenv("RUN_METADATA_BACKFILL", "false").lower() in ("1", "true", "yes")
     METADATA_BACKFILL_PAGES = int(os.getenv("METADATA_BACKFILL_PAGES", "100"))
 
-    # Only the dedicated cache-worker service runs the background ffmpeg download
-    # loop; the api/api-sync replicas just mint cache tickets and claim pending
-    # rows (the DB row is the job queue, so a download survives an api redeploy).
-    # Defaults true so a single-container (docker-compose) deploy still caches
-    # without extra config; the Swarm stack sets it false on api/api-sync and true
-    # on cache-worker. The DB claim dedupes if more than one process runs it.
+    # Only the cache-worker runs the ffmpeg download loop; api replicas just mint
+    # tickets and claim rows. The DB row is the queue, so a download survives an
+    # api redeploy, and the claim dedupes if more than one process runs it.
+    # Defaults true so a single-container deploy still caches without extra config.
     RUN_CACHE_WORKER = os.getenv("RUN_CACHE_WORKER", "true").lower() not in ("0", "false", "no")
 
-    # Only the dedicated download-worker service runs the aria2 poll loop (submit +
-    # progress + publish); the api/api-sync replicas just write pending download rows
-    # and issue pause/resume/cancel straight to the aria2 sidecar. Same rationale as
-    # RUN_CACHE_WORKER: the DB row is the queue, so a download survives an api
-    # redeploy and the begin_submit claim dedupes if more than one process runs it.
-    # Defaults true so a single-container (docker-compose) deploy downloads without
-    # extra config; the Swarm stack sets it false on api/api-sync and true on the
-    # download-worker.
+    # Same rationale as RUN_CACHE_WORKER: only the download-worker runs the aria2
+    # poll loop, while api replicas write pending rows and issue pause/resume
+    # straight to the sidecar.
     RUN_DOWNLOAD_WORKER = os.getenv("RUN_DOWNLOAD_WORKER", "true").lower() not in ("0", "false", "no")
 
-    # Emails promoted to admin on startup (comma-separated). Seeds the first
-    # admin so the /admin dashboard is reachable without hand-editing the DB;
-    # afterwards admins can promote others from the dashboard itself. Only takes
-    # effect for accounts that already exist (it never creates one).
+    # Seeds the first admin so /admin is reachable without hand-editing the DB;
+    # after that admins promote each other from the dashboard. Only applies to
+    # accounts that already exist, and never creates one.
     ADMIN_EMAILS = [
         e.strip() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
     ]
 
-    # Site-wide login wall. When true (default) every content endpoint requires a
-    # valid session bearer token (see the require_login middleware); a small set
-    # of paths — auth, health, the signed stream proxies/player that media
-    # elements load without headers, and the Ko-fi webhook — stay public. Set to
-    # false to revert to a fully open API.
+    # When true every content endpoint requires a session bearer token. A few
+    # paths stay public: auth, health, the Ko-fi webhook, and the signed stream
+    # proxies that media elements load without headers.
     REQUIRE_LOGIN = os.getenv("REQUIRE_LOGIN", "true").lower() not in ("0", "false", "no")
 
-    # Demo deployment switch (e.g. demo.crimsonhaven.to). When true: the signup
-    # invite gate is bypassed so anyone can register, and all non-admin account data
-    # (accounts, sessions, favorites, watch progress, invites, challenges) is wiped
-    # nightly so an open-signup demo can't grow without bound. Admin accounts (seeded
-    # from ADMIN_EMAILS) survive the reset. Off by default — a normal deploy is
-    # unaffected. A demo is expected to run with NO sources configured (nothing
-    # resolves), so the only growth is text rows, capped by the nightly reset.
+    # Bypasses the signup invite gate and wipes all non-admin account data
+    # nightly, so an open-signup demo can't grow without bound. Admins survive the
+    # reset. A demo runs with no sources configured, so the only growth is text
+    # rows, which the nightly reset caps.
     DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes", "on")
-    # Hour (server time, UTC in the container) the nightly DEMO_MODE reset runs at.
+    # Hour the nightly reset runs at, in server time (UTC in the container).
     DEMO_RESET_HOUR = int(os.getenv("DEMO_RESET_HOUR", "4"))
 
     # --- Lumi, the chatbot (see chat_engine) -------------------------------
-    # ONLY the provider API keys live here. Everything else about the feature
-    # (whether it is on at all, which provider, which model, budgets, and the
-    # per-account grants) is operator state managed from the Admin dashboard and
-    # stored in chat_settings, so none of it needs a redeploy to change.
+    # Only the provider API keys live here. Everything else about the feature is
+    # operator state in chat_settings, managed from the dashboard, so changing it
+    # needs no redeploy.
     #
-    # Keys are deliberately NOT in the database: a dump of the accounts database
-    # should never contain billable credentials. The dashboard is told only
-    # whether a key is present, never its value. Set whichever provider you
-    # intend to use; the feature reports itself unconfigured without one.
+    # Keys stay out of the database so a dump of it never carries billable
+    # credentials; the dashboard is told only whether a key is present. Set
+    # whichever provider you intend to use.
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") or None
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or None
 
-    # CORS Origins. Overridable via the ALLOWED_ORIGINS env var (comma-separated)
-    # so the deploy can lock these down without a code change; falls back to the
-    # built-in dev + crimsonhaven.to list.
+    # Overridable via ALLOWED_ORIGINS so a deploy can lock these down without a
+    # code change.
     _DEFAULT_ORIGINS = [
         "https://crimsonhaven.to",
         "https://www.crimsonhaven.to",
@@ -136,7 +110,6 @@ class Config:
 
 Config.validate()
 
-# TMDB Headers
 TMDB_HEADERS = {
     "Authorization": f"Bearer {Config.TMDB_API_KEY}",
     "accept": "application/json",

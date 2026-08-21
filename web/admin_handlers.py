@@ -1,12 +1,10 @@
-"""Handlers the admin router pulls in via dependency injection.
+"""Handlers the admin router pulls in by injection.
 
-These are NOT routes — they're the runtime/system snapshot, the source-health
-probe sweep, and the forced metadata resync, wired into ``account_engine``'s admin
-router by ``api.py`` (``set_system_handler`` / ``set_source_health_handler`` /
-``set_resync_handler``). They live here rather than in ``admin_routes`` because
-they read the VERSION, the scraper/resolver registries, the warm pool and the
-scrape pipeline — and here rather than in ``api.py`` to keep the assembler thin.
-Every DB-touching call hops the threadpool so we never block the event loop.
+Not routes: the runtime snapshot, the source-health probe sweep and the forced
+metadata resync, which api.py wires into account_engine's admin router. They sit
+here rather than in admin_routes because they read VERSION, the registries, the
+warm pool and the scrape pipeline, and here rather than in api.py to keep the
+assembler thin. Every DB call hops the threadpool, so the event loop never blocks.
 """
 
 import asyncio
@@ -42,9 +40,8 @@ logger = logging.getLogger("crimson.admin")
 
 
 # --- forced metadata resync -------------------------------------------------
-# The admin "trigger metadata resync" endpoint runs the same forced Fribb rebuild
-# as metadata_engine.resync, but in-process on the live db_engine (warm pool,
-# MVCC-safe single transaction). Injected so admin_routes doesn't import the engine.
+# The same forced Fribb rebuild as metadata_engine.resync, but in-process on the
+# live db_engine, so it gets the warm pool and one MVCC-safe transaction.
 async def forced_resync() -> None:
     await db_engine.sync_database_async(force=True)
 
@@ -64,8 +61,8 @@ def _human_duration(seconds: float) -> str:
 
 
 async def admin_system_info() -> Dict:
-    """A rich runtime snapshot for one replica: version + uptime, registry sizes,
-    capability flags, DB-pool utilisation, and the server-side cache aggregate."""
+    """One replica's runtime snapshot: version and uptime, registry sizes,
+    capability flags, pool utilisation and the cache aggregate."""
     pool = await run_in_threadpool(pool_stats)
     cache_enabled = await run_in_threadpool(cache_store.get_enabled)
     cache_stats = await run_in_threadpool(cache_store.stats)
@@ -75,10 +72,9 @@ async def admin_system_info() -> Dict:
     download_enabled = sum(1 for s in local_sources if s.get("download_enabled") and s.get("enabled"))
     download_stats = await run_in_threadpool(download_store.stats)
     aria2_ok = await download_aria2.is_available()
-    # Live-ping the external CORS proxies (if any) so the dashboard shows which
-    # are up. Cheap GET / health check per host; off entirely when unconfigured.
-    # Uses refresh_health (not bare probe_bases) so opening the dashboard also
-    # updates the routing health cache that drives automatic failover in proxy_url.
+    # Shows the dashboard which external CORS proxies are up. refresh_health
+    # rather than bare probe_bases, so opening the dashboard also updates the
+    # routing cache that drives automatic failover in proxy_url.
     proxy_hosts = await _crimson_proxy.refresh_health()
     schema_state = await run_in_threadpool(migrations.status)
 
@@ -95,9 +91,8 @@ async def admin_system_info() -> Dict:
         "github_token_set": bool(os.getenv("GITHUB_TOKEN")),
         "crimson_proxy_enabled": _crimson_proxy.is_enabled(),
     }
-    # Overlay-contributed dashboard flags (e.g. a client-offload source's readiness
-    # badge). A base build discovers none, so the flag is simply absent and the
-    # frontend badge reads falsy — the public backend names no overlay source.
+    # A base build discovers none, so the flag is absent and the frontend badge
+    # reads falsy. The public backend names no overlay source.
     for _desc in discover_resolve_grants(_resolvers_pkg):
         for _flag, _probe in (_desc.get("admin_flags") or {}).items():
             try:
@@ -126,10 +121,9 @@ async def admin_system_info() -> Dict:
             "hosts": proxy_hosts,
         },
         "db_pool": pool,
-        # Live schema state (not the boot-time snapshot /health serves): reports
-        # `pending` files present in this image but unrecorded in this database,
-        # and `drift` for any applied migration whose file was edited afterwards.
-        # See core/migrations.py.
+        # Live state, unlike the boot-time snapshot /health serves: `pending` is
+        # files in this image but unrecorded here, `drift` an applied migration
+        # whose file was edited afterwards.
         "schema": schema_state,
         "cache": {
             "enabled": bool(cache_enabled),
@@ -146,19 +140,18 @@ async def admin_system_info() -> Dict:
 
 
 # --- source health ----------------------------------------------------------
-# Probe every external scrape source against a known canary title (the real
-# search→embeds pipeline, so green == would actually play), and report the
-# operator-provided library sources' configuration. Results are cached for a few
-# minutes so flipping to the dashboard tab doesn't re-hammer every upstream; the
-# dashboard's "Re-probe" button passes force=True.
+# Probes every external source against a canary title through the real
+# search-to-embeds pipeline, so green means it would actually play, and reports
+# the library sources' configuration. Cached for a few minutes so opening the tab
+# does not re-hammer every upstream; "Re-probe" passes force=True.
 _SOURCE_HEALTH_TTL = float(os.getenv("SOURCE_HEALTH_TTL", "300"))
 _source_health_cache: Dict[str, object] = {"at": 0.0, "data": None}
 _source_health_lock = asyncio.Lock()
 
 
 async def _probe_scrape_source(scraper_class, anilist_data: Dict) -> Dict:
-    """End-to-end probe of one external source against the canary. Returns a row
-    with status (ok/empty/error/disabled), latency, embed count and a human note."""
+    """End-to-end probe of one source against the canary, returning its status,
+    latency, embed count and a readable note."""
     name = scraper_class.__name__
     meta = source_health.meta_for(name)
     entry = {
@@ -173,7 +166,7 @@ async def _probe_scrape_source(scraper_class, anilist_data: Dict) -> Dict:
     }
     gate = meta.get("env_gate")
     if gate and not os.getenv(gate):
-        entry.update(status="disabled", detail=f"{gate} not configured — source is dormant")
+        entry.update(status="disabled", detail=f"{gate} not configured, source is dormant")
         return entry
 
     c = source_health.CANARY
@@ -197,9 +190,9 @@ async def _probe_scrape_source(scraper_class, anilist_data: Dict) -> Dict:
 
 
 async def _probe_library_sources() -> List[Dict]:
-    """Config/occupancy status for the operator-provided sources (cache, local,
-    Jellyfin). These only hold what the operator added, so they're reported by
-    'is it set up and does it hold anything' rather than the canary probe."""
+    """Status for the operator-provided sources. They hold only what the operator
+    added, so they report whether they are set up and non-empty rather than
+    running the canary probe."""
     out: List[Dict] = []
 
     cache_enabled = await run_in_threadpool(cache_store.get_enabled)
@@ -250,8 +243,8 @@ async def _probe_library_sources() -> List[Dict]:
 
 
 async def _do_source_health() -> Dict:
-    """Run the full probe sweep: shared canary metadata once, then every scrape
-    source concurrently, plus the library sources. Assembles the summary tally."""
+    """The full sweep: canary metadata once, then every scrape source
+    concurrently, plus the library sources, with a summary tally."""
     anilist_data: Dict = {}
     try:
         async with http_client() as client:
@@ -275,7 +268,7 @@ async def _do_source_health() -> Dict:
     summary = {"total": len(sources)}
     for s in sources:
         summary[s["status"]] = summary.get(s["status"], 0) + 1
-    # Latency stats over the scrape probes that actually ran.
+    # Over the scrape probes that actually ran.
     lats = [s["latency_ms"] for s in scrape_results if s.get("latency_ms") is not None]
     summary["avg_latency_ms"] = round(sum(lats) / len(lats)) if lats else None
     summary["slowest_ms"] = max(lats) if lats else None
@@ -288,8 +281,8 @@ async def _do_source_health() -> Dict:
 
 
 async def admin_source_health(force: bool = False) -> Dict:
-    """Cached wrapper around the probe sweep (TTL ``SOURCE_HEALTH_TTL``). The lock
-    collapses a thundering herd of dashboard loads into a single sweep."""
+    """Cached wrapper around the probe sweep. The lock collapses a herd of
+    dashboard loads into a single sweep."""
     now = time.monotonic()
     cached = _source_health_cache.get("data")
     if not force and cached and (now - float(_source_health_cache["at"]) < _SOURCE_HEALTH_TTL):

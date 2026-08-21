@@ -21,7 +21,7 @@ def main():
             cursor.execute(f"SELECT COUNT(*) AS n FROM {table}")
             print(f"{table:>14}: {cursor.fetchone()['n']} rows")
 
-        # Show a few multi-season examples (proof the collapse bug is fixed).
+        # A few multi-season examples, proving seasons don't collapse.
         print("\nSample multi-season shows (tmdb_id -> seasons):")
         cursor.execute("""
             SELECT tmdb_id, COUNT(*) AS season_count
