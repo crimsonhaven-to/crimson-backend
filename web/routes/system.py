@@ -1,7 +1,6 @@
 """Unauthenticated system endpoints: root greeting, Lumi's shrine, config, health.
 
-All four are whitelisted on the login wall (see ``api.py``'s ``_PUBLIC_EXACT``).
-Lifted verbatim from ``api.py``.
+All four are whitelisted on the login wall; see api.py's ``_PUBLIC_EXACT``.
 """
 
 import logging
@@ -30,7 +29,7 @@ router = APIRouter()
 
 @router.get("/")
 async def root():
-    """API root endpoint"""
+    """API root."""
     return {
         "version": VERSION,
         "message": "Hehe, you found me, Luminas Crimsonveil, the eternal empress of this realm. Be proud, little mortal. ✨",
@@ -39,9 +38,8 @@ async def root():
 
 @router.get("/lumi")
 async def lumi_blessing():
-    """A little shrine to the empress. Returns a random royal blessing — used by
-    the frontend's Konami-code secret page and anyone curious enough to find it.
-    Public (whitelisted on the login wall) so Lumi greets even the uninvited."""
+    """A little shrine to the empress, behind the frontend's Konami-code page.
+    Public, so Lumi greets even the uninvited."""
     return {
         "empress": lumi.EMPRESS,
         "title": lumi.TITLE,
@@ -52,23 +50,20 @@ async def lumi_blessing():
 
 @router.get("/config")
 async def public_config():
-    """Public, unauthenticated feature flags the frontend needs *before* login.
+    """Feature flags the frontend needs *before* login.
 
-    Notably ``demo_mode``: on a demo deployment the login page drops the invite-code
-    requirement (signup is open) and can show a "data resets nightly" hint. Booleans
-    only — no secrets, counts, or paths leak through this (it's reachable without a
-    session, whitelisted in _PUBLIC_EXACT)."""
-    # Whether the manga reading surface is enabled (MANGA_ENABLED); the frontend
-    # hides its trending row / search results / routes when off. Imported lazily so
-    # /config never hard-depends on the manga engine loading.
+    Notably ``demo_mode``, which drops the login page's invite-code requirement.
+    Booleans only: this is reachable without a session, so no secrets, counts or
+    paths may leak through it."""
+    # The frontend hides its trending row, results and routes when off. Imported
+    # lazily so /config never hard-depends on the manga engine loading.
     try:
         from manga_engine.provider import manga_enabled as _manga_enabled
         manga_enabled = _manga_enabled()
     except Exception:
         manga_enabled = False
 
-    # Whether the Live TV surface is enabled (IPTV_ENABLED, default on); drives
-    # the frontend's nav entry + /live routes. Lazy import for the same reason
+    # Drives the frontend's nav entry and /live routes. Lazy for the same reason
     # as the manga flag above.
     try:
         from iptv_engine import enabled as _iptv_enabled
@@ -81,20 +76,18 @@ async def public_config():
         "require_login": Config.REQUIRE_LOGIN,
         "manga_enabled": manga_enabled,
         "live_tv_enabled": live_tv_enabled,
-        # Whether any local media source is enabled — drives the Index's "Local"
-        # view toggle + the local search surface on the frontend (both hidden when
-        # off). local_is_configured() is a cached, DB-backed check.
+        # Drives the Index's "Local" toggle and search surface, both hidden when
+        # off. A cached, DB-backed check.
         "local_library_enabled": local_is_configured(),
     }
 
 
 def _entries_count() -> int:
-    """The mapping-table row count behind /health's ``entries_count``.
+    """The row count behind /health's ``entries_count``.
 
-    Split out as a plain sync function so the route can hand it to a worker
-    thread: it is a real Postgres round-trip (through PgBouncer in production),
-    and the Swarm healthcheck fires it every 30s per replica. Running it inline on
-    the event loop would stall any /watch NDJSON stream sharing that worker."""
+    A plain sync function so the route can hand it to a worker thread. It is a
+    real Postgres round-trip and the healthcheck fires it every 30s per replica,
+    so running it inline would stall any /watch stream sharing that worker."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) AS n FROM anime_entries")
@@ -103,7 +96,7 @@ def _entries_count() -> int:
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Liveness and readiness for the Swarm healthcheck."""
     try:
         count = await run_in_threadpool(_entries_count)
 
@@ -111,15 +104,12 @@ async def health_check():
             "status": "healthy",
             "database": "connected",
             "entries_count": count,
-            # Where the boot-time Fribb mapping sync is up to. The initial sync runs
-            # in the background now, so on a cold single-replica boot this reports
-            # {"phase": "running"} while /health already answers healthy; it settles
-            # to "up_to_date" / "done" (or "disabled" on a non-sync replica).
+            # The initial sync runs in the background, so a cold boot reports
+            # "running" while /health already answers healthy, then settles.
             "mapping_sync": sync_status.snapshot(),
-            # Schema version this replica booted at, from the startup snapshot (no
-            # DB hit, since this probe fires every 30s per replica). Makes a
-            # version-skewed replica visible to an uptime check instead of only
-            # surfacing as a request-time error. See core/migrations.py.
+            # From the startup snapshot, so no DB hit on a probe this frequent.
+            # Makes a version-skewed replica visible to an uptime check rather
+            # than only as a request-time error.
             "schema": migrations.cached_status(),
             "scrapers_available": len(ALL_SCRAPERS),
             "resolvers_available": len(ALL_RESOLVERS),
@@ -127,8 +117,8 @@ async def health_check():
             "local_sources_configured": local_is_configured()
         }
     except Exception as e:
-        # Log the real cause server-side; don't leak DB/internal detail to an
-        # unauthenticated probe. Surface specifics only when DEBUG is set.
+        # Logged in full server-side, but an unauthenticated probe sees detail
+        # only under DEBUG.
         logger.error(f"Health check failed: {e}", exc_info=True)
         return JSONResponse(
             status_code=503,
