@@ -1,24 +1,19 @@
 """
-Pure-Python Ed25519 (RFC 8032) — no native dependencies.
+Pure-Python Ed25519 (RFC 8032), vendored to avoid native dependencies.
 
-Why vendored: the deploy image is ``python:3.14-slim`` with only ``gcc`` (no
-Rust), so ``cryptography`` can't be guaranteed to build and ``PyNaCl`` adds a
-libsodium build step — both fragile on a bleeding-edge CPython. Account auth
-needs exactly one primitive server-side: **verify an Ed25519 signature against a
-public key**. That's small and stable enough to vendor the canonical RFC 8032
-reference (using the C-accelerated built-in ``pow`` for the field arithmetic so
-it's fast enough — a verify is a handful of milliseconds, and logins are rare).
+The deploy image is ``python:3.14-slim`` with no Rust toolchain, so
+``cryptography`` and ``PyNaCl`` are both fragile to build there. The server
+needs exactly one primitive, verifying a signature, which is small and stable
+enough to vendor from the RFC reference. Field arithmetic goes through the
+built-in ``pow`` so a verify costs a few milliseconds.
 
-The server only ever calls :func:`verify`. :func:`public_key_from_seed` and
-:func:`sign` are the client side of the contract — they exist so the test suite
-can act as a client, and as the executable spec the frontend must match:
+Only :func:`verify` runs server-side. :func:`public_key_from_seed` and
+:func:`sign` are the client half of the contract, kept here so the test suite
+can act as a client and as the spec the frontend must match:
 
     seed32  = <32 bytes>                      # BIP39: first 32 bytes of the seed
     pubkey  = public_key_from_seed(seed32)    # == @noble/ed25519 getPublicKey
     sig     = sign(message, seed32)           # == @noble/ed25519 sign
-
-See ``account_engine`` package docs / README for the full client derivation
-spec (BIP39 mnemonic -> seed -> seed[:32] -> this).
 """
 
 import hashlib
@@ -68,7 +63,7 @@ def _edwards_add(P, Q):
 
 
 def _scalarmult(P, e: int):
-    """Double-and-add (iterative, so no recursion-depth limits)."""
+    """Double-and-add, iterative to avoid recursion limits."""
     Q = (0, 1)  # neutral element
     while e > 0:
         if e & 1:
@@ -146,8 +141,7 @@ def _decodepoint(s: bytes):
 
 
 def verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
-    """Verify a 64-byte Ed25519 signature. Returns False on any malformed input
-    rather than raising, so callers can treat it as a plain boolean check."""
+    """Verify a 64-byte signature. False on malformed input rather than raising."""
     try:
         if len(signature) != 64 or len(public_key) != 32:
             return False

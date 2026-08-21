@@ -1,24 +1,13 @@
 """
-Transactional email for the email+password sign-in path (verification + password
-reset links).
+Transactional email: verification and password reset links.
 
-Pure stdlib (``smtplib`` + ``email.message``) so it adds no dependency on the
-``python:3.14-slim`` image. Configuration is env-driven (see .env.example):
+Pure stdlib so it adds no dependency to the slim image. Configured entirely
+from SMTP_* plus FRONTEND_BASE_URL; see .env.example for the full list. An
+unset SMTP_HOST disables emailing.
 
-    SMTP_HOST            e.g. mail.infomaniak.com   (unset => emailing disabled)
-    SMTP_PORT            default 587
-    SMTP_SECURITY        starttls (default) | ssl | none
-    SMTP_USER            login user (optional; defaults to SMTP_FROM)
-    SMTP_PASSWORD        login password
-    SMTP_FROM            envelope/From address      (defaults to SMTP_USER)
-    SMTP_FROM_NAME       display name, default "CrimsonHaven"
-    FRONTEND_BASE_URL    used to build the links, e.g. https://crimsonhaven.to
-
-``send_email`` is synchronous and blocking; callers invoke it through Starlette's
-threadpool (``run_in_threadpool``) so it never stalls the event loop. It fails
-soft — a misconfiguration or SMTP error is logged and returns False rather than
-raising into the request — so registration still succeeds even if mail is down
-(the user can use "resend verification" once mail is fixed).
+Sending is blocking, so callers go through ``run_in_threadpool``. It fails soft:
+an SMTP error is logged and returns False rather than raising, so registration
+still succeeds while mail is down and the user can ask for a resend later.
 """
 
 import html
@@ -47,8 +36,8 @@ def _from_address() -> str:
 
 @contextmanager
 def _connection():
-    """A logged-in SMTP connection per the env config. Raises on any failure
-    (missing config, connect/auth error) — callers decide how soft to fail."""
+    """A logged-in SMTP connection. Raises on any failure; callers decide how
+    soft to fail."""
     host = os.getenv("SMTP_HOST")
     if not host:
         raise RuntimeError("SMTP_HOST unset")
@@ -83,17 +72,16 @@ def _build_message(to: str, subject: str, text: str, html_body: str | None = Non
 
 
 def send_email(to: str, subject: str, text: str, html: str | None = None) -> bool:
-    """Send one message. Returns True on success, False (logged) on any failure
-    or when SMTP isn't configured."""
+    """Send one message. False, with a log line, on failure or missing config."""
     if not is_configured():
-        logger.warning("[mailer] SMTP_HOST unset — skipping email to %s (%r)", to, subject)
+        logger.warning("[mailer] SMTP_HOST unset, skipping email to %s (%r)", to, subject)
         return False
     try:
         with _connection() as server:
             server.send_message(_build_message(to, subject, text, html))
         logger.info("[mailer] sent %r to %s", subject, to)
         return True
-    except Exception as e:  # noqa: BLE001 — fail soft, never break the request
+    except Exception as e:  # noqa: BLE001 - fail soft, never break the request
         logger.error("[mailer] failed sending to %s: %s", to, e)
         return False
 
@@ -170,8 +158,7 @@ def send_reset_email(to: str, token: str) -> bool:
 
 # --- admin broadcast ---------------------------------------------------------
 def _broadcast_bodies(message: str, username: str | None) -> tuple[str, str]:
-    """(text, html) for one broadcast recipient: the admin's plaintext message,
-    personalised with the account's display name when they've set one."""
+    """(text, html) for one recipient, personalised when they set a display name."""
     greeting = f"Greetings, {username}." if username else "Greetings, mortal."
     text = f"{greeting}\n\n{message}"
     body = html.escape(message).replace("\n", "<br>")
@@ -185,15 +172,13 @@ def _broadcast_bodies(message: str, username: str | None) -> tuple[str, str]:
 
 
 def send_broadcast(recipients: list[dict], subject: str, message: str, progress=None) -> dict:
-    """Send the admin's plaintext ``message`` to every recipient (dicts with
-    ``email`` + optional ``username``) over ONE SMTP connection. Fails soft per
-    recipient (one bad address doesn't abort the rest) and entirely (a dead/
-    unconfigured server yields sent=0, not an exception). ``progress``, if given,
-    is called as progress(sent, failed) after each attempt so the caller can
-    surface live status. Blocking — run through a threadpool."""
+    """Send ``message`` to every recipient over one SMTP connection. Fails soft
+    per recipient, so one bad address doesn't abort the rest, and overall, so a
+    dead server yields sent=0 rather than an exception. ``progress`` is called as
+    progress(sent, failed) after each attempt. Blocking; run in a threadpool."""
     sent, failed = 0, 0
     if not is_configured():
-        logger.warning("[mailer] SMTP_HOST unset — broadcast %r skipped", subject)
+        logger.warning("[mailer] SMTP_HOST unset, broadcast %r skipped", subject)
         return {"sent": 0, "failed": len(recipients)}
     try:
         with _connection() as server:
@@ -202,12 +187,12 @@ def send_broadcast(recipients: list[dict], subject: str, message: str, progress=
                 try:
                     server.send_message(_build_message(r["email"], subject, text, html_body))
                     sent += 1
-                except Exception as e:  # noqa: BLE001 — skip the bad address, keep going
+                except Exception as e:  # noqa: BLE001 - skip the bad address, keep going
                     logger.error("[mailer] broadcast to %s failed: %s", r.get("email"), e)
                     failed += 1
                 if progress:
                     progress(sent, failed)
-    except Exception as e:  # noqa: BLE001 — connection/auth died; the rest never sent
+    except Exception as e:  # noqa: BLE001 - connection died, the rest never sent
         logger.error("[mailer] broadcast %r aborted: %s", subject, e)
         failed = len(recipients) - sent
         if progress:

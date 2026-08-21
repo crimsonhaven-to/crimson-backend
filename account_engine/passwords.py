@@ -1,19 +1,13 @@
 """
 Password hashing for the email+password sign-in path.
 
-Constraints that shaped this:
+PBKDF2-HMAC-SHA256 via stdlib ``hashlib``, because the deploy image has no
+compiler toolchain for ``argon2-cffi`` / ``bcrypt`` (same reason ed25519 is
+vendored). Hashes are self-describing (``algo$iterations$salt$hash``) so the
+iteration count can be raised without invalidating existing rows, with
+``needs_rehash`` flagging older ones at next login.
 
-  * The image is ``python:3.14-slim`` with **no Rust/compiler toolchain**, so the
-    usual ``argon2-cffi`` / ``bcrypt`` / ``passlib`` stack (native wheels) is off
-    the table — same reason ed25519 is vendored pure-Python here. ``hashlib`` is
-    stdlib (OpenSSL-backed) and always present, so we use PBKDF2-HMAC-SHA256.
-  * Hashes are stored self-describing (``algo$iterations$salt$hash``, all
-    base64) so the iteration count can be raised later without invalidating
-    existing rows — ``needs_rehash`` flags older hashes on next login.
-
-PBKDF2 at the OWASP-recommended 600k iterations costs ~0.2–0.4s; callers run
-``hash_password`` / ``verify_password`` in a threadpool (see routes) so the
-event loop is never blocked.
+A hash costs roughly 0.2 to 0.4s, so callers run these in a threadpool.
 """
 
 import base64
@@ -22,13 +16,12 @@ import hmac
 import secrets
 
 ALGORITHM = "pbkdf2_sha256"
-# OWASP 2023 floor for PBKDF2-HMAC-SHA256. Bump deliberately; stored hashes carry
-# their own iteration count so a bump only triggers a transparent rehash on login.
+# OWASP 2023 floor. Stored hashes carry their own count, so raising this only
+# triggers a transparent rehash at next login.
 ITERATIONS = 600_000
 SALT_BYTES = 16
 
-# Sanity bounds so an absurdly long password can't be used as a CPU-DoS vector
-# (PBKDF2 cost scales with the input length the HMAC has to chew through).
+# Bounded so an absurdly long password can't become a CPU-DoS vector.
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 128
 
@@ -49,8 +42,7 @@ def hash_password(password: str, *, iterations: int = ITERATIONS) -> str:
 
 
 def verify_password(password: str, encoded: str) -> bool:
-    """Constant-time check of ``password`` against a stored hash. Never raises —
-    a malformed/empty stored hash simply returns False."""
+    """Constant-time check against a stored hash. A malformed hash returns False."""
     if not encoded:
         return False
     try:
@@ -67,8 +59,8 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def needs_rehash(encoded: str) -> bool:
-    """True if a stored hash uses an older algorithm/iteration count and should be
-    transparently re-hashed (call after a successful ``verify_password``)."""
+    """True if the hash is outdated and should be re-hashed. Call after a
+    successful ``verify_password``."""
     try:
         algorithm, iters_s, _, _ = encoded.split("$")
         return algorithm != ALGORITHM or int(iters_s) < ITERATIONS
