@@ -176,6 +176,6 @@ deploy-demo:
   resource_group: crimson-demo
   environment:
     name: demo
-    url: https://demo.crimsonhaven.to
+    url: https://demo.crimsonhaven.org
   script:
     - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/demo-crimson-deploy/deploy.sh '${DEMO_IMAGE_TAG}'"

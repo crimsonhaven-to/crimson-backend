@@ -1,4 +1,4 @@
-# Demo deployment (e.g. demo.crimsonhaven.to) — a deliberately "weak" instance:
+# Demo deployment (e.g. demo.crimsonhaven.org) — a deliberately "weak" instance:
 #
 #   * DEMO_MODE=1            -> signup is OPEN (the invite gate is bypassed) and all
 #                              non-admin account data (accounts, sessions, favorites,
@@ -59,7 +59,7 @@ services:
       # Seed an admin so you can still reach /admin on the demo (survives the reset).
       # - ADMIN_EMAILS=you@example.com
       # Lock CORS to the demo frontend origin.
-      # - ALLOWED_ORIGINS=https://demo.crimsonhaven.to
+      # - ALLOWED_ORIGINS=https://demo.crimsonhaven.org
       #
       # Deliberately UNSET on a demo (leaving every source inert):
       #   JELLYFIN_*, FEBBOX_*, OPENSUBTITLES_*, CRIMSON_PROXY_BASE
