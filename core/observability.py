@@ -1,32 +1,25 @@
 """Operational metrics and the per-request correlation id.
 
-Two things live here, because they are the same concern seen from two angles:
+Both live here because they are one concern from two angles: Prometheus counters
+recorded from the hot paths plus a scrape-time collector reading live gauges from
+the modules that own them, and a short per-request token carried in a
+``ContextVar`` so every log line correlates and ``X-Request-ID`` maps a user
+report to an exact set of lines.
 
-* **Metrics** (Prometheus): counters/histograms recorded from the hot paths, plus a
-  scrape-time collector that reads the live gauges (DB pool, worker queues, source
-  success rates) straight from the modules that already own them.
-* **The request id**: a short token minted per request, carried in a ``ContextVar``
-  so every log line emitted while handling that request can be correlated, and
-  echoed back as ``X-Request-ID`` so a user report ("playback broke at 20:15")
-  maps to an exact set of log lines.
+Three load-bearing properties:
 
-Three properties this module is built around, all of them load-bearing:
+1. ``prometheus_client`` is an optional import. Without it every recording helper
+   is a no-op and ``/metrics`` answers 503, because a metrics dependency must
+   never stop the backend booting or serving.
+2. Nothing here may raise into a caller. These sit inside the /watch fan-out and
+   the resolver loop, so every public entry point swallows its own exceptions.
+3. Label cardinality is bounded. Every label value comes from a fixed vocabulary
+   or is explicitly capped, since an unbounded label is how a metrics endpoint
+   becomes an outage. See ``route_label`` and ``_TELEMETRY_TOP_N``.
 
-1. **``prometheus_client`` is an optional import.** If it is missing, every
-   recording helper degrades to a no-op and ``/metrics`` answers 503. A metrics
-   dependency must never be able to stop the backend from booting or serving.
-2. **Nothing here may raise into a caller.** These helpers sit inside the /watch
-   fan-out and the resolver loop. A broken counter must never break playback, so
-   every public entry point swallows its own exceptions.
-3. **Label cardinality is bounded on purpose.** Every label value is either from a
-   fixed vocabulary or explicitly capped. See ``route_label`` (which uses the route
-   *template*, never the raw path) and ``_TELEMETRY_TOP_N``. An unbounded label is
-   how a metrics endpoint turns into an outage.
-
-The metrics live in a private ``CollectorRegistry`` rather than the process-global
-default one. That keeps the export self-contained, and means re-importing this
-module (as a test may) builds a fresh registry instead of raising a duplicate
-timeseries error.
+Metrics live in a private ``CollectorRegistry``, not the process-global one, so
+the export stays self-contained and a re-import builds a fresh registry instead
+of raising a duplicate timeseries error.
 """
 
 from __future__ import annotations
@@ -61,23 +54,21 @@ except Exception:  # pragma: no cover - exercised only on a stripped install
 
 
 # --- request id -------------------------------------------------------------
-# Set by RequestContextMiddleware (api.py) for the duration of one request. A
-# ContextVar (not a global) so concurrent requests can't see each other's id, and
-# so it survives the two ways work leaves the handler: run_in_threadpool copies
-# the context into the worker thread, and asyncio.create_task copies it into the
-# background task (which is what carries the id into the warmup + cache jobs).
+# A ContextVar rather than a global, so concurrent requests can't see each
+# other's id and it survives both ways work leaves the handler:
+# run_in_threadpool copies the context into the worker thread, and
+# asyncio.create_task copies it into background jobs like warmup and cache.
 _request_id: ContextVar[str] = ContextVar("crimson_request_id", default="")
 
-# Request ids may arrive from a reverse proxy, so they are untrusted input that
-# ends up in log lines and a response header. Restrict hard to an opaque token
-# rather than trying to sanitize something structured.
+# Ids may arrive from a reverse proxy, so they are untrusted input bound for log
+# lines and a response header. Restricted to an opaque token rather than trying
+# to sanitize something structured.
 _ID_SAFE = re.compile(r"[^A-Za-z0-9_.:-]")
 _ID_MAX_LEN = 64
 
 
 def new_request_id() -> str:
-    """A fresh short correlation id (16 hex chars: greppable, still collision-safe
-    at any request rate this backend will ever see)."""
+    """A fresh correlation id: short enough to grep, wide enough to stay unique."""
     return uuid.uuid4().hex[:16]
 
 
@@ -115,9 +106,8 @@ def current_request_id() -> str:
 _KNOWN_METHODS = frozenset(
     ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 )
-# The label used when a request matched no route (404s, and every path a scanner
-# invents). Without this collapse, one scanner would mint a new timeseries per
-# probed URL and the export would grow without bound.
+# For requests that matched no route. Without this collapse one scanner would
+# mint a timeseries per probed URL and the export would grow without bound.
 UNMATCHED_ROUTE = "__unmatched__"
 
 
@@ -144,14 +134,14 @@ def route_label(scope: dict) -> str:
 
 
 # --- metric definitions -----------------------------------------------------
-# Everything below is guarded by PROMETHEUS_AVAILABLE. When the dependency is
-# absent the names simply don't exist and the record_* helpers return early.
+# All guarded by PROMETHEUS_AVAILABLE: without the dependency these names do not
+# exist and the record_* helpers return early.
 
 if PROMETHEUS_AVAILABLE:
     REGISTRY = CollectorRegistry(auto_describe=True)
 
-    # Process/platform/GC stats. ProcessCollector reads /proc, so it exports
-    # nothing on a non-Linux dev box and everything in the container; both are fine.
+    # ProcessCollector reads /proc, so it exports nothing on a non-Linux dev box
+    # and everything in the container. Both are fine.
     for _default in (ProcessCollector, PlatformCollector, GCCollector):
         try:
             _default(registry=REGISTRY)
@@ -166,11 +156,9 @@ if PROMETHEUS_AVAILABLE:
     )
     HTTP_DURATION = Histogram(
         "crimson_http_request_duration_seconds",
-        # Deliberately time-to-headers, not time-to-last-byte: /watch is a
-        # progressive NDJSON stream that stays open for as long as the slowest
-        # scraper runs, and mixing that into the general latency histogram would
-        # make every percentile meaningless. The streaming side is measured
-        # separately by the crimson_watch_* metrics below.
+        # Time-to-headers, not time-to-last-byte: /watch streams for as long as
+        # the slowest scraper runs, and mixing that in would make every percentile
+        # meaningless. The streaming side has its own crimson_watch_* metrics.
         "Seconds from request start to response headers (NOT to last byte).",
         ("method", "route"),
         buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
@@ -246,8 +234,8 @@ if PROMETHEUS_AVAILABLE:
 
 
 # --- recording helpers ------------------------------------------------------
-# Every one of these is called from a hot path and must be inert on failure. The
-# broad excepts are intentional: a metrics bug is not allowed to break playback.
+# All called from hot paths and inert on failure. The broad excepts are
+# deliberate: a metrics bug must not break playback.
 
 
 def record_http_request(method: str, route: str, status: int, duration: float) -> None:
@@ -320,10 +308,10 @@ def record_cache_lookup(tier: str, hit: bool) -> None:
 
 
 class Timer:
-    """Monotonic stopwatch. ``with Timer() as t: ...`` then read ``t.elapsed``.
+    """Monotonic stopwatch: ``with Timer() as t: ...`` then read ``t.elapsed``.
 
-    Used instead of bare ``time.monotonic()`` pairs so an early ``return`` or a
-    raised exception inside an instrumented block still yields a duration."""
+    Used instead of bare ``time.monotonic()`` pairs so an early return or a raised
+    exception still yields a duration."""
 
     __slots__ = ("_start", "elapsed")
 
@@ -344,22 +332,18 @@ class Timer:
 
 
 # --- scrape-time collector --------------------------------------------------
-# Live values that are already owned by another module (pool counters, queue
-# depths, the telemetry table). Reading them at scrape time rather than polling
-# them on a timer means there is no background job to keep alive, and the numbers
-# are exactly as fresh as the scrape.
+# Values already owned by other modules. Reading them at scrape time instead of
+# polling on a timer means no background job to keep alive, and numbers exactly
+# as fresh as the scrape.
 
-# Cap on how many distinct sources the telemetry gauge exports. The
-# resolve_telemetry table is fed by a CLIENT beacon, and a source name there is
-# client-supplied text (capped at 80 chars, but not to a fixed vocabulary). A
-# hostile client could therefore invent unlimited source names; without this cap
-# each one would become a permanent timeseries. top_stats() already orders by
-# volume, so the busiest real sources always survive the slice.
+# resolve_telemetry is fed by a client beacon, so a source name there is
+# client-supplied text with no fixed vocabulary. Without this cap a hostile
+# client could mint unlimited permanent timeseries. top_stats() orders by volume,
+# so the busiest real sources survive the slice.
 _TELEMETRY_TOP_N = 25
 
-# The telemetry gauge is the only part of the collector that hits the database.
-# Prometheus scrapes far more often than these daily aggregates change, so the
-# result is memoized for a scrape interval or two.
+# The only part of the collector that hits the database. Prometheus scrapes far
+# more often than these daily aggregates change, so it is memoized.
 _TELEMETRY_TTL = 60.0
 _telemetry_cache: Tuple[float, list] = (0.0, [])
 
@@ -380,9 +364,9 @@ def _telemetry_rows() -> list:
 class CrimsonStateCollector:
     """Exports live subsystem state at scrape time.
 
-    Each section is independently try/excepted: a database outage must degrade the
-    export to "the DB gauges are missing", not to a 500 on /metrics that blinds
-    the operator at exactly the moment they need it most."""
+    Each section is independently excepted, so a database outage degrades the
+    export to missing DB gauges rather than a 500 that blinds the operator at
+    exactly the moment they need it."""
 
     def collect(self):  # noqa: C901 - a flat list of independent sections
         if not PROMETHEUS_AVAILABLE:
@@ -458,8 +442,8 @@ class CrimsonStateCollector:
             pass
 
         # --- background workers ---------------------------------------------
-        # Only the dedicated worker replicas actually run these; on an api replica
-        # they report 0, which is correct rather than missing.
+        # Only worker replicas run these; on an api replica they report 0, which
+        # is correct rather than missing.
         try:
             from cache_engine.downloader import manager as cache_manager
 
@@ -525,8 +509,8 @@ class CrimsonStateCollector:
 
 
 def install_state_collector() -> None:
-    """Register the scrape-time collector. Called once from the lifespan, so an
-    import of this module (a test, a script) never touches the DB by itself."""
+    """Register the scrape-time collector. Called once from the lifespan, so
+    merely importing this module never touches the DB."""
     if not PROMETHEUS_AVAILABLE:
         return
     try:

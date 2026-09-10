@@ -1,41 +1,38 @@
 """
 Metadata mapping engine.
 
-Builds the PostgreSQL mapping between TMDB tv ids and AniList ids using the
-Fribb anime-lists dataset (https://github.com/Fribb/anime-lists) enriched with
-AniList titles. Storage is the shared connection pool (see db_pool).
+Builds the PostgreSQL mapping between TMDB tv ids and AniList ids from the Fribb
+anime-lists dataset, enriched with AniList titles.
 
 Design
 ------
-TMDB groups an anime as one "show" with numbered seasons. AniList gives every
-cour/season/OVA/movie its own id. Fribb provides, per AniList entry, the parent
-``themoviedb_id.tv`` plus ``season.tmdb`` (the TMDB season number that entry maps
-to). We trust that field for real TV seasons and split everything else off:
+TMDB groups an anime as one show with numbered seasons, while AniList gives every
+cour, OVA and movie its own id. Fribb provides, per AniList entry, the parent
+``themoviedb_id.tv`` plus the TMDB season it maps to. That field is trusted for
+real TV seasons and everything else is split off:
 
-* ``tmdb_seasons``  -> one AniList id per (tmdb_id, season_number) for season >= 1
-* ``tmdb_extras``   -> every other entry tied to the show (specials/OVAs/movies,
-                       plus the losers of a season collision) so nothing is lost
+* ``tmdb_seasons``  one AniList id per (tmdb_id, season_number), season >= 1
+* ``tmdb_extras``   every other entry tied to the show, plus the losers of a
+                    season collision, so nothing is lost
 
-Collisions on a (tmdb_id, season_number) slot are resolved deterministically
-(prefer a real TV entry, then the lowest AniList id). ``overrides.json`` is
-applied last and always wins -- the single maintenance lever for the long tail.
+Collisions on a season slot resolve deterministically: a real TV entry first,
+then the lowest AniList id. ``overrides.json`` is applied last and always wins,
+the single maintenance lever for the long tail.
 
-Reaching the specials/movies Fribb hides
-----------------------------------------
-``themoviedb_id.tv`` alone loses most of a franchise's side content, in two ways:
+Reaching the specials and movies Fribb hides
+--------------------------------------------
+``themoviedb_id.tv`` alone loses most of a franchise's side content, two ways:
 
-1. A film TMDB tracks as a standalone movie carries ``{"movie": [id]}`` and no
-   ``tv`` key, so it has no show to group under. When such an entry repeats the
-   parent's ``tvdb_id`` (Overlord: The Sacred Kingdom does) we attach it to that
-   show via a tvdb_id -> tmdb_id map built from the entries that carry both, and
-   keep its own TMDB *movie* id so it can be played through the movie route. A
-   film with no parent still becomes an ``anime_entries`` row so the catalogue
-   can list it.
-2. Roughly a third of the dataset carries no external id at all -- Fribb offers
-   no key whatsoever to tie those to a show. AniList does: the ``relations``
-   edges of the ids we *have* mapped name them directly. So the bulk metadata
-   fetch also pulls relations, and side-content edges (see ``_EXTRA_RELATIONS`` /
-   ``_EXTRA_FORMATS``) off any of a show's mapped entries become extras of it.
+1. A film TMDB tracks as a standalone movie carries a movie id and no ``tv`` key,
+   so it has no show to group under. When such an entry repeats its parent's
+   ``tvdb_id``, it is attached through a tvdb_id -> tmdb_id map built from the
+   entries carrying both, keeping its own movie id so it plays through the movie
+   route. A film with no parent still gets an ``anime_entries`` row, so the
+   catalogue can list it.
+2. Roughly a third of the dataset carries no external id at all, so Fribb offers
+   no key to tie those to a show. AniList does: the ``relations`` edges of the ids
+   already mapped name them directly. So the bulk fetch also pulls relations, and
+   side-content edges off any mapped entry become extras of that show.
 """
 
 import asyncio
@@ -52,16 +49,15 @@ from core.db_pool import get_connection, lock_schema_init
 
 _THIS_DIR = Path(__file__).resolve().parent
 
-# Which AniList relation edges count as "side content of this show".
-# SIDE_STORY/SUMMARY/SPECIAL are the specials, recap films and shorts; PARENT
-# catches an entry that points *up* at the main series; ALTERNATIVE covers the
-# re-cut/theatrical versions. Deliberately excluded: SEQUEL/PREQUEL (a season or
-# a show of its own), CHARACTER (crossovers -- Isekai Quartet is not an Overlord
-# special), ADAPTATION/SOURCE (the novel/manga), and OTHER (too noisy).
+# Which relation edges count as side content. SIDE_STORY, SUMMARY and SPECIAL are
+# the specials, recap films and shorts; PARENT catches an entry pointing up at the
+# main series; ALTERNATIVE covers re-cuts. Excluded on purpose: SEQUEL and PREQUEL
+# (a season or a show in its own right), CHARACTER (crossovers), ADAPTATION and
+# SOURCE (the novel), and OTHER (too noisy).
 _EXTRA_RELATIONS = {"SIDE_STORY", "SUMMARY", "SPECIAL", "PARENT", "ALTERNATIVE"}
 
-# ...and only when the related entry is itself side content. This is the filter
-# that keeps a SIDE_STORY edge pointing at a full TV series out of the extras.
+# ...and only when the related entry is itself side content, which keeps a
+# SIDE_STORY edge pointing at a full TV series out of the extras.
 _EXTRA_FORMATS = {"SPECIAL", "OVA", "ONA", "MOVIE"}
 
 
@@ -70,33 +66,22 @@ class MappingDatabaseEngine:
     ANILIST_API_URL = "https://graphql.anilist.co"
     OVERRIDES_PATH = _THIS_DIR / "overrides.json"
 
-    # AniList bulk-fetch tuning.
-    # AniList caps GraphQL query complexity at 500. Each aliased Media costs ~11
-    # complexity with the fields we request (id/idMal/format/genres/title/
-    # startDate), so the batch size must stay <= floor(500/11) = 45 or the whole
-    # chunk 400s ("Max query complexity should be 500 but got 550"). 50 used to
-    # squeak by at exactly 500 *before* the genres field was added (~10/alias);
-    # genres pushed it to 550. 40 kept a comfortable margin (~440).
-    # The relations block (the only route to the specials Fribb has no id for)
-    # roughly doubles the per-alias cost to ~22: measured, 25 aliases is rejected
-    # at 550 and 20 lands at ~440. Same margin, half the batch, twice the chunks
-    # (~340 instead of ~170 on a full resync -- a couple of extra minutes on a
-    # background job).
+    # AniList caps query complexity at 500, and the relations block (the only
+    # route to the specials Fribb has no id for) costs ~22 per aliased Media. So
+    # 25 aliases is rejected at 550 while 20 lands at ~440. Raising this without
+    # re-measuring will 400 the whole chunk.
     ANILIST_CHUNK_SIZE = 20
-    ANILIST_CHUNK_DELAY = 0.7  # seconds between chunks (rate-limit friendly)
+    ANILIST_CHUNK_DELAY = 0.7  # rate-limit friendly
 
     def __init__(self, db_name: str = "anime_mappings.db", tmdb_api_key: Optional[str] = None):
-        # db_name is retained for call-site compatibility but ignored: storage is
-        # now the shared PostgreSQL pool, configured via DATABASE_URL (see db_pool).
+        # Ignored; kept for call-site compatibility. Storage is the shared pool.
         self.db_name = db_name
         self.tmdb_api_key = tmdb_api_key or os.getenv("TMDB_API_KEY")
 
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
+    # --- helpers ------------------------------------------------------- #
     @staticmethod
     def _safe_int(value: Any) -> Optional[int]:
-        """Best-effort conversion to int, returning None on failure."""
+        """Best-effort int, else None."""
         if value is None:
             return None
         try:
@@ -108,7 +93,7 @@ class MappingDatabaseEngine:
 
     @staticmethod
     def _tmdb_tv_id(item: Dict[str, Any]) -> Optional[int]:
-        """Extract the TMDB *tv* id from a Fribb entry (dict or scalar form)."""
+        """The TMDB tv id from a Fribb entry, in dict or scalar form."""
         raw = item.get("themoviedb_id")
         if isinstance(raw, dict):
             return MappingDatabaseEngine._safe_int(raw.get("tv"))
@@ -116,13 +101,12 @@ class MappingDatabaseEngine:
 
     @staticmethod
     def _tmdb_movie_id(item: Dict[str, Any]) -> Optional[int]:
-        """Extract the TMDB *movie* id from a Fribb entry, if it has one.
+        """The TMDB movie id from a Fribb entry, if it has one.
 
-        A film TMDB tracks in its own right carries ``{"movie": [1014505]}`` (a
-        list -- Fribb emits one id per part for split releases; we take the
-        first) instead of a ``tv`` key. Kept alongside the parent show so the
-        entry can be played through the TMDB movie route rather than being
-        squeezed into a season/episode URL that does not exist.
+        A film TMDB tracks in its own right carries a movie id list, one per part
+        for split releases, instead of a ``tv`` key. Kept alongside the parent show
+        so it plays through the movie route rather than being squeezed into a
+        season/episode URL that does not exist.
         """
         raw = item.get("themoviedb_id")
         if not isinstance(raw, dict):
@@ -134,7 +118,7 @@ class MappingDatabaseEngine:
 
     @staticmethod
     def _tmdb_season(item: Dict[str, Any]) -> Optional[int]:
-        """Extract the TMDB season number Fribb assigns to this entry."""
+        """The TMDB season number Fribb assigns to this entry."""
         season = item.get("season")
         if isinstance(season, dict):
             return MappingDatabaseEngine._safe_int(season.get("tmdb"))
@@ -145,21 +129,18 @@ class MappingDatabaseEngine:
         return datetime.now(timezone.utc).isoformat()
 
     def _connect(self):
-        # Borrow a pooled PostgreSQL connection (dict rows; the transaction is
-        # committed on a clean `with` exit and rolled back on exception). MVCC
-        # means the wholesale resync's readers see the pre-DELETE snapshot until
-        # the rebuild transaction commits — no "database is locked" contention.
+        # Commits on a clean exit, rolls back on exception. MVCC means readers see
+        # the pre-DELETE snapshot until a rebuild commits, so a wholesale resync
+        # never contends with them.
         return get_connection()
 
-    # ------------------------------------------------------------------ #
-    # Schema
-    # ------------------------------------------------------------------ #
+    # --- schema -------------------------------------------------------- #
     def init_db(self):
         """Create the schema (idempotent) and drop obsolete tables."""
         with self._connect() as conn:
             cursor = conn.cursor()
 
-            # Serialize DDL across replicas (see db_pool.lock_schema_init).
+            # Serialize DDL across replicas.
             lock_schema_init(conn)
 
             cursor.execute(
@@ -188,9 +169,8 @@ class MappingDatabaseEngine:
                 """
             )
 
-            # Backfill the genres column on DBs created before it existed
-            # (CREATE TABLE IF NOT EXISTS won't add columns to an existing table).
-            # Stays null until the next sync rebuild repopulates anime_entries.
+            # CREATE TABLE IF NOT EXISTS won't add a column to an existing table.
+            # Stays null until the next sync rebuild repopulates the table.
             cursor.execute("ALTER TABLE anime_entries ADD COLUMN IF NOT EXISTS genres TEXT")
 
             cursor.execute(
@@ -209,27 +189,20 @@ class MappingDatabaseEngine:
                 """
             )
 
-            # Backfill the genres column on DBs created before it existed (the anime
-            # genres twin of anime_entries.genres). Stored as a JSON list of genre
-            # names, lazily populated by /show* (fetch_tmdb_show); null until then.
+            # A JSON list of genre names, lazily populated by fetch_tmdb_show.
             cursor.execute("ALTER TABLE tmdb_shows ADD COLUMN IF NOT EXISTS genres TEXT")
-            # TMDB popularity score, carried by discover/search/overview payloads.
-            # tmdb_shows had no score column, so the /catalogue/shows browse orders
-            # by it (popular first, NULLS LAST) — null on pre-existing rows until a
-            # backfill/refresh repopulates them.
+            # The /catalogue/shows browse orders by this. Null on pre-existing rows
+            # until a backfill or refresh repopulates them.
             cursor.execute("ALTER TABLE tmdb_shows ADD COLUMN IF NOT EXISTS popularity DOUBLE PRECISION")
-            # When a row was last (re)written from TMDB. Drives the periodic
-            # staleness refresher (metadata_engine.maintenance); NULL on pre-existing
-            # rows so they sort oldest-first and get refreshed before anything else.
+            # Drives the staleness refresher. NULL on pre-existing rows, so they
+            # sort oldest-first and are refreshed before anything else.
             cursor.execute("ALTER TABLE tmdb_shows ADD COLUMN IF NOT EXISTS last_updated TIMESTAMP")
-            # Refresher reads the oldest rows; index keeps that ORDER BY cheap.
+            # Keeps the refresher's ORDER BY cheap.
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_shows_last_updated ON tmdb_shows(last_updated)")
 
-            # General (non-anime) MOVIES, keyed by their TMDB *movie* id. Wholly
-            # separate from tmdb_shows (TMDB *tv* ids) — the two id spaces overlap
-            # numerically, so movies live in their own table. Lazily populated by
-            # the /movie* endpoints (fetch_tmdb_movie), exactly like tmdb_shows;
-            # the Fribb anime resync never touches it (additive, resync-safe).
+            # Separate from tmdb_shows because the tv and movie id spaces overlap
+            # numerically. Lazily populated like tmdb_shows, and never touched by
+            # the Fribb resync.
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tmdb_movies (
@@ -250,29 +223,24 @@ class MappingDatabaseEngine:
                 """
             )
 
-            # Backfill genres on pre-existing tmdb_movies (see tmdb_shows above);
-            # JSON list of genre names, lazily populated by fetch_tmdb_movie.
+            # As for tmdb_shows above.
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS genres TEXT")
-            # TMDB popularity score — the /catalogue/movies browse default order
-            # (popular first). Distinct from vote_average (rating); null until a
-            # backfill/refresh repopulates pre-existing rows.
+            # The /catalogue/movies default order. Distinct from vote_average.
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS popularity DOUBLE PRECISION")
-            # Richer movie fields that fetch_tmdb_movie already pulls from TMDB but
-            # previously only lived in the api_cache JSON — now persisted so the
-            # table can be queried/sorted by them (and survives a cache miss).
+            # Persisted rather than left in the api_cache JSON, so the table can be
+            # sorted by them and they survive a cache miss.
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS runtime INTEGER")
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS vote_average DOUBLE PRECISION")
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS status TEXT")
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS original_title TEXT")
-            # Staleness-refresh bookkeeping, mirroring tmdb_shows above.
+            # Staleness bookkeeping, mirroring tmdb_shows above.
             cursor.execute("ALTER TABLE tmdb_movies ADD COLUMN IF NOT EXISTS last_updated TIMESTAMP")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_movies_last_updated ON tmdb_movies(last_updated)")
 
-            # Catalogue-backfill job queue. The admin "Start Backfill" button runs on
-            # a serving replica that can't reach the portless api-sync container, so
-            # the request is written here as a row and the single RUN_DB_SYNC replica
-            # claims + runs it (the same DB-as-queue pattern cache_engine uses). One
-            # row per request; status walks requested -> running -> done|failed.
+            # The admin button runs on a serving replica that cannot reach the
+            # portless api-sync container, so the request is written here and the
+            # sync replica claims it. The same DB-as-queue pattern cache_engine
+            # uses. Status walks requested -> running -> done|failed.
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS metadata_backfill_jobs (
@@ -289,13 +257,13 @@ class MappingDatabaseEngine:
                 )
                 """
             )
-            # The drainer claims the oldest still-'requested' row; index that probe.
+            # Indexes the drainer's probe for the oldest 'requested' row.
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_backfill_jobs_status_req "
                 "ON metadata_backfill_jobs(status, requested_at)"
             )
 
-            # One AniList id per real TMDB season (season_number >= 1).
+            # One AniList id per real TMDB season.
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tmdb_seasons (
@@ -308,7 +276,7 @@ class MappingDatabaseEngine:
                 """
             )
 
-            # Specials / OVAs / movies (and season-collision losers) tied to a show.
+            # Specials, OVAs, movies and season-collision losers tied to a show.
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tmdb_extras (
@@ -332,12 +300,12 @@ class MappingDatabaseEngine:
                 """
             )
 
-            # Indexes for the reverse (anilist -> tmdb) lookups.
+            # For the reverse anilist -> tmdb lookups.
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_seasons_anilist ON tmdb_seasons(anilist_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_extras_anilist ON tmdb_extras(anilist_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tmdb_extras_show ON tmdb_extras(tmdb_id)")
 
-            # Drop tables from earlier schema iterations if a persisted DB still has them.
+            # From earlier schema iterations, if a persisted DB still has them.
             for legacy in ("show_groups", "group_members", "mappings", "season_groups"):
                 cursor.execute(f"DROP TABLE IF EXISTS {legacy}")
 
@@ -352,15 +320,12 @@ class MappingDatabaseEngine:
         except Exception:
             return 0
 
-    # ------------------------------------------------------------------ #
-    # Update detection
-    # ------------------------------------------------------------------ #
+    # --- update detection ---------------------------------------------- #
     async def _check_needs_update(self, client: httpx.AsyncClient) -> Optional[str]:
-        """
-        Return the ETag to sync against, or None if already up-to-date.
+        """The ETag to sync against, or None when already up to date.
 
-        If the local DB is empty we always resync (self-heals a wiped DB even
-        when the upstream ETag has not changed).
+        An empty local DB always resyncs, which self-heals a wiped DB even when
+        the upstream ETag has not moved.
         """
         with self._connect() as conn:
             cursor = conn.cursor()
@@ -373,7 +338,7 @@ class MappingDatabaseEngine:
             new_etag = response.headers.get("ETag")
         except Exception as e:
             print(f"[DB Engine] Update check failed: {e}")
-            # Fall back to syncing if we have nothing locally.
+            # Sync anyway if there is nothing locally.
             return "force-empty-db" if self._entry_count() == 0 else None
 
         if current_etag and current_etag == new_etag and self._entry_count() > 0:
@@ -381,21 +346,16 @@ class MappingDatabaseEngine:
 
         return new_etag or "force-empty-db"
 
-    # ------------------------------------------------------------------ #
-    # AniList metadata
-    # ------------------------------------------------------------------ #
+    # --- AniList metadata ---------------------------------------------- #
     async def _fetch_anilist_metadata_bulk(self, anilist_ids: List[int]) -> Dict[int, Dict]:
-        """
-        Fetch titles/format/relations for many AniList ids using aliased GraphQL
-        queries.
+        """Titles, format and relations for many AniList ids, via aliased queries.
 
-        The ``relations`` block is what recovers the side content Fribb carries no
-        id for. Each edge's node already brings its own format/title/year, so an
-        extra discovered this way needs no second lookup pass -- see
-        ``_relation_extras``.
+        The ``relations`` block recovers the side content Fribb carries no id for.
+        Each edge's node brings its own format, title and year, so an extra found
+        this way needs no second lookup.
 
-        Non-fatal: a failing chunk is logged and skipped so the mapping can still
-        be built (titles are best-effort; scrapers fetch titles live at watch time).
+        Non-fatal: a failing chunk is logged and skipped, since titles are
+        best-effort and scrapers fetch them live at watch time.
         """
         results: Dict[int, Dict] = {}
         chunk_size = self.ANILIST_CHUNK_SIZE
@@ -434,11 +394,9 @@ class MappingDatabaseEngine:
                     body = {}
 
                 if response.status_code != 200:
-                    # GraphQL may still return partial data with a non-200; we try
-                    # to use it below. Surface AniList's actual error messages
-                    # though — a swallowed 400 (e.g. "Max query complexity should
-                    # be 500 but got 550") otherwise silently drops the whole
-                    # chunk's titles + genres with no clue why.
+                    # A non-200 may still carry partial data, used below. Surface
+                    # AniList's own error messages though: a swallowed complexity
+                    # 400 otherwise drops the whole chunk's titles with no clue why.
                     errs = body.get("errors") if isinstance(body, dict) else None
                     detail = "; ".join(
                         str(e.get("message", e)) for e in errs[:3]
@@ -456,30 +414,23 @@ class MappingDatabaseEngine:
 
         return results
 
-    # ------------------------------------------------------------------ #
-    # Grouping
-    # ------------------------------------------------------------------ #
+    # --- grouping ------------------------------------------------------ #
     @classmethod
     def _group_by_show(cls, anime_data: List[Dict[str, Any]]):
         """Bucket the Fribb dataset by the TMDB show each entry belongs to.
 
-        Returns ``(groups, movie_id_by_anilist, orphan_movies)``:
+        Returns ``(groups, movie_id_by_anilist, orphan_movies)``, where the second
+        maps every film that has a movie id, parent or not, and the third holds the
+        films with no parent, which still deserve a catalogue row.
 
-        * ``groups``              -> {tmdb_tv_id: [entry, ...]}
-        * ``movie_id_by_anilist`` -> {anilist_id: TMDB movie id} for the films that
-                                     have one, whether or not they found a parent
-        * ``orphan_movies``       -> films with a movie id and no parent show; they
-                                     still deserve a catalogue row of their own
-
-        The grouping key is ``themoviedb_id.tv`` where present. Where it is not, a
-        film that repeats its parent series' ``tvdb_id`` is attached to whatever
-        TMDB show that tvdb series resolves to. Such an entry is side content by
-        definition (a real season always carries its own ``themoviedb_id.tv``), so
-        it never claims a season slot: its season is forced to None, which lands it
-        in tmdb_extras.
+        The key is ``themoviedb_id.tv`` where present. Where it is not, a film
+        repeating its parent series' ``tvdb_id`` attaches to whatever show that
+        resolves to. Such an entry is side content by definition, since a real
+        season always carries its own ``themoviedb_id.tv``, so its season is forced
+        to None and it lands in tmdb_extras.
         """
-        # tvdb_id -> TMDB tv id, learned from the entries that carry both. First
-        # writer wins: a tvdb series maps to exactly one TMDB show.
+        # Learned from the entries carrying both. First writer wins, since a tvdb
+        # series maps to exactly one TMDB show.
         tvdb_to_tmdb: Dict[int, int] = {}
         for item in anime_data:
             tvdb_id = cls._safe_int(item.get("tvdb_id"))
@@ -506,9 +457,9 @@ class MappingDatabaseEngine:
                 attached_by_tvdb = tmdb_id is not None
 
             if not tmdb_id:
-                # Nothing to hang it off. A standalone film is still listable and
-                # playable through its own movie id; anything else is left to the
-                # AniList relations pass.
+                # Nothing to hang it off. A standalone film is still listable
+                # through its own movie id; anything else waits for the relations
+                # pass.
                 if movie_id:
                     orphan_movies.add(anilist_id)
                 continue
@@ -524,29 +475,24 @@ class MappingDatabaseEngine:
 
         return groups, movie_id_by_anilist, orphan_movies
 
-    # ------------------------------------------------------------------ #
-    # Relation-derived extras
-    # ------------------------------------------------------------------ #
+    # --- relation-derived extras --------------------------------------- #
     @staticmethod
     def _relation_extras(season_rows: List[tuple], extra_rows: List[tuple],
                          al_metadata: Dict[int, Dict]) -> List[tuple]:
-        """Find each show's side content among the AniList relations of the
-        entries already mapped to it.
+        """Find each show's side content among the AniList relations of the entries
+        already mapped to it.
 
-        Roughly a third of the Fribb dataset carries no external id at all, so
-        those entries can never be grouped onto a show by id. AniList names them:
-        Overlord's "Shikkoku no Senshi" film and the Ple Ple Pleiades specials are
-        all SUMMARY/SIDE_STORY edges of ids we *do* map.
+        Roughly a third of the Fribb dataset carries no external id, so those
+        entries can never be grouped by id. AniList names them: a franchise's recap
+        films and specials are SUMMARY or SIDE_STORY edges of ids that *are* mapped.
 
-        Walks one hop out from every mapped member of a show (a season or an
-        existing extra), which is what picks up a film hanging off a later season
-        rather than off season 1. It deliberately does not walk the discovered
-        entries in turn: their own relations were never fetched, and following
-        them would drift into neighbouring franchises.
+        Walks one hop out from every mapped member of a show, which is what picks
+        up a film hanging off a later season rather than season 1. It deliberately
+        does not walk the discovered entries in turn: their own relations were
+        never fetched, and following them would drift into neighbouring franchises.
 
-        Returns ``(tmdb_id, anilist_id, format, node)`` tuples for the *new*
-        extras only; ``node`` is the AniList edge node, reused as that entry's
-        metadata so no second fetch is needed.
+        Returns tuples for the new extras only, carrying the edge node so it can be
+        reused as that entry's metadata with no second fetch.
         """
         members: Dict[int, List[int]] = defaultdict(list)
         for tmdb_id, _season, anilist_id in season_rows:
@@ -554,8 +500,8 @@ class MappingDatabaseEngine:
         for tmdb_id, anilist_id, *_rest in extra_rows:
             members[tmdb_id].append(anilist_id)
 
-        # An id that already owns a season slot somewhere is a series in its own
-        # right; never re-file it as somebody's special.
+        # An id that already owns a season slot is a series in its own right, so
+        # never re-file it as somebody's special.
         season_ids = {anilist_id for _t, _s, anilist_id in season_rows}
         claimed = {(tmdb_id, anilist_id) for tmdb_id, anilist_id, *_r in extra_rows}
 
@@ -577,11 +523,9 @@ class MappingDatabaseEngine:
                     found.append((tmdb_id, node_id, node_format, node))
         return found
 
-    # ------------------------------------------------------------------ #
-    # Overrides
-    # ------------------------------------------------------------------ #
+    # --- overrides ----------------------------------------------------- #
     def _load_overrides(self) -> Dict[int, Dict[int, int]]:
-        """Load overrides.json -> {tmdb_id: {season_number: anilist_id}}."""
+        """Load overrides.json into {tmdb_id: {season_number: anilist_id}}."""
         if not self.OVERRIDES_PATH.exists():
             return {}
         try:
@@ -605,21 +549,17 @@ class MappingDatabaseEngine:
                 parsed[tmdb_id] = season_map
         return parsed
 
-    # ------------------------------------------------------------------ #
-    # Sync
-    # ------------------------------------------------------------------ #
+    # --- sync ---------------------------------------------------------- #
     async def sync_database_async(self, force: bool = False) -> str:
         """Download the Fribb dataset and rebuild the mapping tables.
 
-        ``force=True`` rebuilds even when the upstream ETag is unchanged — used by
-        the manual `python -m metadata_engine.resync` trigger to backfill after a
-        schema change (e.g. the genres column) without waiting for Fribb to move.
+        ``force`` rebuilds even when the upstream ETag is unchanged, which is how
+        the manual resync backfills after a schema change without waiting for
+        Fribb to move.
 
-        Returns an outcome string so callers (the boot-time background sync in
-        ``api.py``) can tell what actually happened without re-deriving it:
-        ``"up_to_date"`` (ETag matched a non-empty DB, nothing rebuilt),
-        ``"synced"`` (tables rebuilt + committed), ``"empty"`` (upstream parsed to
-        no mappings — DB left intact), or ``"failed"`` (download/rollback error).
+        Returns an outcome string so callers need not re-derive what happened:
+        ``"up_to_date"``, ``"synced"``, ``"empty"`` (upstream parsed to no
+        mappings, DB intact) or ``"failed"``.
         """
         self.init_db()
 
@@ -630,9 +570,8 @@ class MappingDatabaseEngine:
                 if not force:
                     print("[DB Engine] Mappings already up-to-date.")
                     return "up_to_date"
-                # Forced rebuild despite a matching ETag. Capture the current ETag
-                # so sync_meta stays in step and the next scheduled check doesn't
-                # see a phantom change and resync again.
+                # Capture the current ETag so sync_meta stays in step and the next
+                # scheduled check doesn't see a phantom change.
                 try:
                     head = await client.head(self.MAPPING_URL, follow_redirects=True)
                     new_etag = head.headers.get("ETag") or "forced-resync"
@@ -652,7 +591,7 @@ class MappingDatabaseEngine:
         # 1. Group Fribb entries by the TMDB show they belong to.
         groups, movie_id_by_anilist, orphan_movies = self._group_by_show(anime_data)
 
-        # 2. Resolve season slots vs. extras per show.
+        # 2. Resolve season slots against extras, per show.
         season_rows: List[tuple] = []   # (tmdb_id, season_number, anilist_id)
         extra_rows: List[tuple] = []    # (tmdb_id, anilist_id, anime_type, tmdb_movie_id)
         all_anilist_ids: set = set(orphan_movies)
@@ -686,7 +625,7 @@ class MappingDatabaseEngine:
                 else:
                     leftovers.append(entry)
 
-            # Fallback: a show with no season>=1 slot but a TV entry -> make it season 1.
+            # A show with no season slot but a TV entry becomes season 1.
             if not chosen:
                 tv_entries = [e for e in leftovers if e["type"] == "TV"]
                 if tv_entries:
@@ -704,7 +643,7 @@ class MappingDatabaseEngine:
             print("[DB Engine] No mappings parsed from dataset; aborting (DB left intact).")
             return "empty"
 
-        # 3. Enrich with AniList titles (best-effort).
+        # 3. Enrich with AniList titles, best-effort.
         print(f"[DB Engine] Fetching AniList metadata for {len(all_anilist_ids)} ids...")
         al_metadata = await self._fetch_anilist_metadata_bulk(sorted(all_anilist_ids))
 
@@ -712,8 +651,7 @@ class MappingDatabaseEngine:
         relation_rows = self._relation_extras(season_rows, extra_rows, al_metadata)
         for tmdb_id, anilist_id, _fmt, node in relation_rows:
             extra_rows.append((tmdb_id, anilist_id, _fmt, movie_id_by_anilist.get(anilist_id)))
-            # The edge's node carries format/title/year already, so a newly
-            # discovered entry needs no second AniList round-trip.
+            # The node already carries format, title and year.
             if anilist_id not in all_anilist_ids:
                 all_anilist_ids.add(anilist_id)
                 al_metadata.setdefault(anilist_id, node)
@@ -752,9 +690,8 @@ class MappingDatabaseEngine:
             season_rows = [(t, s, a) for (t, s), a in season_map.items()]
             print(f"[DB Engine] Applied overrides for {len(overrides)} show(s).")
 
-        # 6. Commit atomically; never wipe to nothing. The whole rebuild runs in
-        # one transaction (the `with` block commits on success, rolls back on
-        # error). Children are deleted before parents to satisfy the FKs, then
+        # 6. One transaction, so a failure never wipes the tables to nothing.
+        # Children are deleted before parents to satisfy the foreign keys, then
         # parents are inserted before children for the same reason.
         committed = False
         catalogue_cache_purged = 0
@@ -791,14 +728,11 @@ class MappingDatabaseEngine:
                     "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                     (new_etag,),
                 )
-                # Invalidate the cached /catalogue response so this rebuild's
-                # titles/format/genres show up immediately instead of being masked
-                # by the stale cache (api_cache TTL is 6h). Done in the SAME
-                # transaction as the rebuild, so the cache is dropped iff the
-                # rebuild commits. The LIKE matches any cache version
-                # (catalogue:v2 and any future bump). Only the DB-level (L2) cache
-                # is reachable from here; the api replicas' in-process (L1) caches
-                # expire on their own short TTL (minutes) and then refill from DB.
+                # Without this the rebuild's titles stay masked by the cached
+                # /catalogue for up to 6h. In the same transaction, so the cache is
+                # dropped if and only if the rebuild commits, and the LIKE matches
+                # any future cache-version bump. Only the L2 cache is reachable
+                # here; each replica's L1 expires on its own short TTL.
                 cursor.execute(
                     "DELETE FROM api_cache WHERE cache_key LIKE %s",
                     ("catalogue:%",),
@@ -809,7 +743,7 @@ class MappingDatabaseEngine:
             print(f"[DB Engine] Sync failed, rolled back: {e}")
 
         if committed:
-            # Keep this print ASCII-only: some consoles (Windows cp1252) raise on emoji.
+            # ASCII only: some consoles raise on emoji.
             print(
                 f"[DB Engine] Sync complete. "
                 f"entries={len(entry_rows)} seasons={len(season_rows)} extras={len(extra_rows)} "
@@ -817,8 +751,7 @@ class MappingDatabaseEngine:
             )
             return "synced"
 
-        # Rebuild transaction rolled back (see the except above) — the previous
-        # snapshot is still live thanks to MVCC.
+        # The transaction rolled back, so MVCC keeps the previous snapshot live.
         return "failed"
 
 

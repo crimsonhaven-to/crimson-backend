@@ -1,18 +1,12 @@
 """
-Account storage (PostgreSQL). Accounts, sessions, login challenges, favorites
-and watch progress.
+Account storage (PostgreSQL): accounts, sessions, login challenges, favorites
+and watch progress. Shares the mapping tables' database (see db_pool), but a
+Fribb resync only touches the mapping tables, so user data survives it.
 
-The account tables share one PostgreSQL database with the mapping tables (see
-db_pool), but a Fribb resync only DELETEs the three mapping tables, so user data
-is never touched by a sync. The historical reason these lived in a separate
-SQLite file no longer applies. All access goes through the shared connection
-pool (``db_pool.get_connection``).
-
-Identity model (see account_engine.ed25519 / README): an account *is* an Ed25519
-public key. The server stores only that public key, 
-never the private key. Possession is proven per-login by signing a
-one-time challenge. Sessions are opaque random bearer tokens, stored only as a
-SHA-256 hash so a DB leak can't be replayed.
+Identity model (see account_engine.ed25519): an account *is* an Ed25519 public
+key. Only the public key is stored, never the mnemonic or private key, and
+possession is proven per-login by signing a one-time challenge. Session tokens
+are stored as SHA-256 hashes so a DB leak can't be replayed.
 """
 
 import hashlib
@@ -29,9 +23,8 @@ CHALLENGE_TTL = timedelta(minutes=5)
 VERIFY_TOKEN_TTL = timedelta(hours=24)   # email verification link
 RESET_TOKEN_TTL = timedelta(hours=1)     # password reset link
 
-# Soft per-account row caps. An authenticated account can otherwise insert an
-# unbounded number of distinct item_keys (one row each), bloating the DB. Updates
-# to an existing key are always allowed; only growth past the cap is rejected.
+# Soft per-account row caps: an account could otherwise insert unbounded
+# distinct item_keys. Updates to existing keys pass; only growth is capped.
 MAX_FAVORITES_PER_USER = 2000
 MAX_PROGRESS_PER_USER = 5000
 
@@ -55,21 +48,18 @@ def _hash_token(raw: str) -> str:
 class AccountStore:
     """Thin PostgreSQL data layer for the account system.
 
-    Methods are synchronous psycopg calls borrowing from the shared pool,
-    matching the rest of this backend (api.py calls the DB synchronously from its
-    async handlers via the thread pool); the volumes are tiny and per-request, so
-    this is fine. Timestamps are kept as ISO-8601 ``TEXT`` so the lexicographic
-    ``expires_at`` comparisons that gate sessions/challenges stay correct.
+    Methods are synchronous psycopg calls off the shared pool; callers run them in
+    a thread pool. Timestamps are ISO-8601 ``TEXT`` so the lexicographic
+    ``expires_at`` comparisons gating sessions and challenges stay correct.
     """
 
     def __init__(self, db_path: Optional[str] = None):
-        # db_path is retained for call-site compatibility but ignored: storage is
-        # now the shared PostgreSQL pool, configured via DATABASE_URL (see db_pool).
+        # Ignored; kept for call-site compatibility. Storage is the shared pool.
         self._explicit_path = db_path
 
     # -- connection / schema --------------------------------------------
     def _connect(self):
-        # Borrow a pooled connection (dict rows, transaction committed on exit).
+        # Pooled connection: dict rows, commits on exit.
         return get_connection()
 
     def init_db(self) -> None:
@@ -95,40 +85,28 @@ class AccountStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
-                -- Email+password identity. Added alongside the original Ed25519
-                -- mnemonic identity (see module docstring): an account now has a
-                -- public_key OR an email (or, in principle, both). public_key is
-                -- therefore nullable, and the email columns are added in-place on
-                -- already-deployed databases via the ALTERs below.
+                -- Email+password identity alongside the Ed25519 one: an account
+                -- has a public_key OR an email, so public_key is nullable. The
+                -- ALTERs upgrade already-deployed databases in place.
                 ALTER TABLE accounts ALTER COLUMN public_key DROP NOT NULL;
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email          TEXT;
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS password_hash  TEXT;
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
-                -- Admin flag — gates the /admin dashboard (see admin_routes). Off by
-                -- default; the first admin is seeded from ADMIN_EMAILS at startup
-                -- (see bootstrap_admins) so the dashboard is reachable without
-                -- hand-editing the database.
+                -- Gates the /admin dashboard. The first admin is seeded from
+                -- ADMIN_EMAILS at startup (see bootstrap_admins).
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_admin       BOOLEAN NOT NULL DEFAULT FALSE;
-                -- Per-account client preferences (e.g. preferred dub/sub language
-                -- used to bias which stream source auto-plays). Stored as a small
-                -- JSON object in TEXT so new preference keys are a frontend-only
-                -- change. NULL/absent => the client falls back to its local default.
+                -- Client preferences as JSON in TEXT, so a new preference key is a
+                -- frontend-only change. NULL => the client uses its local default.
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS preferences    TEXT;
-                -- Optional display name ("Recommended for you, {username}"). Purely
-                -- cosmetic, user-editable from the preferences page; NOT used for
-                -- auth or login (those stay email / public_key). Non-unique on
-                -- purpose — it's a display name, not an identity. NULL => the
-                -- frontend falls back to a generic greeting.
+                -- Cosmetic display name. Never used for auth, and non-unique on
+                -- purpose: it is a display name, not an identity.
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS username       TEXT;
-                -- Case-insensitive email uniqueness (NULLs — the crypto accounts —
-                -- are allowed to coexist).
+                -- Case-insensitive email uniqueness; NULLs (crypto accounts) coexist.
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email
                     ON accounts (LOWER(email)) WHERE email IS NOT NULL;
 
-                -- One-time, single-use tokens emailed for verification / reset.
-                -- Only the SHA-256 hash is stored (the raw token lives only in the
-                -- link), mirroring how sessions are stored — a DB leak exposes no
-                -- usable token.
+                -- Single-use tokens emailed for verification / reset. Only the
+                -- SHA-256 hash is stored, so a DB leak exposes no usable token.
                 CREATE TABLE IF NOT EXISTS email_tokens (
                     token_hash TEXT PRIMARY KEY,
                     user_id    BIGINT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
@@ -145,12 +123,9 @@ class AccountStore:
                     expires_at TEXT NOT NULL
                 );
 
-                -- Single-use invite tokens minted by the Discord bot (see
-                -- discord_bot/). Unlike the shared, reusable SIGNUP_INVITE_CODE,
-                -- each of these can register exactly ONE account: registration
-                -- stamps used_at/used_by and a second attempt with the same code
-                -- fails. Kept as a ledger (used rows are never auto-deleted) so the
-                -- bot can show who consumed which invite.
+                -- Single-use invite tokens minted by the Discord bot. Unlike the
+                -- reusable SIGNUP_INVITE_CODE each registers exactly one account.
+                -- Used rows are kept as a ledger of who consumed which invite.
                 CREATE TABLE IF NOT EXISTS invite_tokens (
                     code        TEXT PRIMARY KEY,
                     created_by  TEXT,          -- discord user id that minted it
@@ -161,10 +136,9 @@ class AccountStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_invite_tokens_unused ON invite_tokens(used_at);
 
-                -- "favorites" doubles as the watchlists table: each row belongs to
-                -- a named list (list_name). The original single-tab behaviour is just
-                -- the default 'favorites' list, so legacy clients keep working. A show
-                -- may appear in several lists at once, hence list_name is in the PK.
+                -- Doubles as the watchlists table: each row belongs to a named list,
+                -- defaulting to 'favorites' so legacy clients keep working. A show may
+                -- sit in several lists, hence list_name in the primary key.
                 CREATE TABLE IF NOT EXISTS favorites (
                     user_id       BIGINT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
                     item_key      TEXT NOT NULL,
@@ -178,8 +152,8 @@ class AccountStore:
                     added_at      TEXT NOT NULL,
                     PRIMARY KEY (user_id, item_key, list_name)
                 );
-                -- In-place upgrade for databases created before watchlists existed:
-                -- add the column, then widen the primary key to include it (once).
+                -- In-place upgrade for pre-watchlist databases: add the column,
+                -- then widen the primary key to include it (once).
                 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS list_name TEXT NOT NULL DEFAULT 'favorites';
                 DO $$
                 BEGIN
@@ -214,12 +188,12 @@ class AccountStore:
                     updated_at       TEXT NOT NULL,
                     PRIMARY KEY (user_id, item_key)
                 );
-                -- In-place upgrade for DBs created before movies: lets a progress row
-                -- carry 'movie' so history can route back to /watch-movie. Additive.
+                -- Pre-movies upgrade: lets a row carry 'movie' so history can route
+                -- back to /watch-movie.
                 ALTER TABLE watch_progress ADD COLUMN IF NOT EXISTS media_type TEXT;
-                -- Local media (media_type='local') has no tmdb/anilist id; the on-disk
-                -- title's path token rides here so history can route back to
-                -- /local/{local_id} and the title's episodes dedup as one show. Additive.
+                -- Local media has no tmdb/anilist id, so the on-disk path token rides
+                -- here: history routes to /local/{local_id} and the title's episodes
+                -- dedup as one show.
                 ALTER TABLE watch_progress ADD COLUMN IF NOT EXISTS local_id TEXT;
                 CREATE INDEX IF NOT EXISTS idx_progress_user ON watch_progress(user_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_progress_status ON watch_progress(user_id, status);
@@ -263,8 +237,7 @@ class AccountStore:
 
     # -- preferences ----------------------------------------------------
     def get_preferences(self, user_id: int) -> Dict:
-        """The account's stored client preferences as a dict (``{}`` when unset or
-        unparseable). Stored as a JSON object in the ``preferences`` TEXT column."""
+        """Stored client preferences as a dict; ``{}`` when unset or unparseable."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT preferences FROM accounts WHERE user_id = %s", (user_id,)
@@ -278,8 +251,7 @@ class AccountStore:
         return data if isinstance(data, dict) else {}
 
     def set_preferences(self, user_id: int, preferences: Dict) -> Dict:
-        """Overwrite the account's preferences with ``preferences`` (a JSON-able
-        dict). Returns the stored dict."""
+        """Overwrite the account's preferences. Returns the stored dict."""
         blob = json.dumps(preferences, ensure_ascii=False)
         with self._connect() as conn:
             conn.execute(
@@ -299,7 +271,6 @@ class AccountStore:
 
     # -- admin ----------------------------------------------------------
     def set_admin(self, user_id: int, is_admin: bool) -> None:
-        """Flip an account's admin flag (used by the admin dashboard)."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE accounts SET is_admin = %s WHERE user_id = %s",
@@ -307,9 +278,8 @@ class AccountStore:
             )
 
     def bootstrap_admins(self, emails: List[str]) -> int:
-        """Promote the given emails to admin (idempotent). Seeds the first admin
-        from ADMIN_EMAILS at startup so the dashboard is reachable without DB
-        surgery; returns how many rows were newly promoted."""
+        """Promote the given emails to admin (idempotent). Returns how many rows
+        were newly promoted."""
         lowered = [e.strip().lower() for e in (emails or []) if e and e.strip()]
         if not lowered:
             return 0
@@ -328,19 +298,16 @@ class AccountStore:
             ).fetchone()["n"]
 
     def delete_account(self, user_id: int) -> bool:
-        """Delete an account and (via ON DELETE CASCADE) all its sessions,
-        favorites, progress and email tokens. Returns False if it didn't exist."""
+        """Delete an account; ON DELETE CASCADE clears its rows. False if unknown."""
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM accounts WHERE user_id = %s", (user_id,))
             return cur.rowcount > 0
 
     def wipe_demo_data(self) -> Dict[str, int]:
-        """DEMO_MODE nightly reset: delete every NON-admin account — cascading its
-        sessions, favorites, watch progress and email tokens via ON DELETE CASCADE —
-        plus all challenges and invite tokens. Admin accounts (seeded from
-        ADMIN_EMAILS) are preserved so the operator keeps dashboard access without a
-        restart (is_admin is only re-seeded at startup). Returns row counts, for
-        logging. Bounds the growth of an open-signup demo to a single day."""
+        """DEMO_MODE nightly reset: delete every non-admin account (cascading its
+        rows), plus all challenges and invite tokens. Admins are preserved because
+        is_admin is only re-seeded at startup, so wiping them would lock the
+        operator out until a restart. Returns row counts for logging."""
         with self._connect() as conn:
             accounts = conn.execute(
                 "DELETE FROM accounts WHERE is_admin = FALSE"
@@ -356,9 +323,9 @@ class AccountStore:
     def list_accounts(
         self, search: Optional[str] = None, limit: int = 50, offset: int = 0
     ) -> List[Dict]:
-        """Accounts (newest first) with per-user favorite / progress / active-session
-        counts, for the admin user table. Never returns password_hash. Optional
-        case-insensitive search over email / label / display name / numeric id."""
+        """Accounts (newest first) with favorite / progress / session counts for the
+        admin table. Never returns password_hash. Search is case-insensitive over
+        email, label, display name and numeric id."""
         params: list = []
         where = ""
         if search and search.strip():
@@ -406,11 +373,9 @@ class AccountStore:
             ).fetchone()["n"]
 
     def email_recipients(self, verified_only: bool = True) -> List[Dict]:
-        """Everyone an admin broadcast email can reach: accounts that signed up
-        with an email address (mnemonic-only accounts have none and are skipped),
-        with their optional display name for personalisation. ``verified_only``
-        additionally drops addresses that never clicked their verification link
-        (they may not even belong to the account holder)."""
+        """Everyone an admin broadcast can reach; mnemonic-only accounts have no
+        address and are skipped. ``verified_only`` also drops unverified addresses,
+        which may not belong to the account holder."""
         where = "email IS NOT NULL"
         if verified_only:
             where += " AND email_verified = TRUE"
@@ -449,7 +414,7 @@ class AccountStore:
 
     # -- email + password accounts --------------------------------------
     def get_account_by_email(self, email: str) -> Optional[Dict]:
-        """Look up an account by email (case-insensitive)."""
+        """Case-insensitive lookup by email."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM accounts WHERE LOWER(email) = LOWER(%s)", (email,)
@@ -488,9 +453,9 @@ class AccountStore:
 
     # -- email tokens (verification / password reset) -------------------
     def create_email_token(self, user_id: int, purpose: str, ttl: timedelta) -> str:
-        """Issue a single-use token for ``purpose`` ('verify' | 'reset'). Returns
-        the raw token (store only its hash). Any earlier token of the same purpose
-        for this user is invalidated so only the newest link works."""
+        """Issue a single-use token for ``purpose`` ('verify' | 'reset') and return
+        it raw. Earlier tokens of the same purpose are dropped so only the newest
+        link works."""
         raw = secrets.token_urlsafe(32)
         expires = _now() + ttl
         with self._connect() as conn:
@@ -506,9 +471,8 @@ class AccountStore:
         return raw
 
     def consume_email_token(self, raw_token: str, purpose: str) -> Optional[int]:
-        """Atomically validate + delete a token. Returns the user_id on success,
-        else None (unknown, wrong purpose, or expired). Single-use: the DELETE
-        rowcount gates consumption so the same link can't be replayed."""
+        """Atomically validate and delete a token; user_id on success, else None.
+        The DELETE rowcount gates consumption, so a link can't be replayed."""
         if not raw_token:
             return None
         token_hash = _hash_token(raw_token)
@@ -532,8 +496,7 @@ class AccountStore:
             return row["user_id"]
 
     def revoke_user_sessions(self, user_id: int) -> None:
-        """Drop every active session for an account (used after a password reset
-        so a leaked session can't outlive the credential change)."""
+        """Drop every session, so a leaked one can't outlive a password reset."""
         with self._connect() as conn:
             conn.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
 
@@ -541,11 +504,9 @@ class AccountStore:
     def create_invite_token(
         self, created_by: Optional[str] = None, ttl: Optional[timedelta] = None
     ) -> str:
-        """Mint a fresh single-use invite code and return it. ``created_by`` is the
-        Discord user id that requested it; ``ttl`` optionally expires the code (None
-        => never expires, only single-use). The code is a short, copy-pasteable hex
-        string the recipient types into the signup form's invite field."""
-        code = secrets.token_hex(8)  # 16 hex chars — unguessable but easy to paste
+        """Mint a single-use invite code. ``created_by`` is the Discord user id that
+        requested it; a ``ttl`` of None never expires (still single-use)."""
+        code = secrets.token_hex(8)  # unguessable but easy to paste
         expires = _iso(_now() + ttl) if ttl else None
         with self._connect() as conn:
             conn.execute(
@@ -556,9 +517,8 @@ class AccountStore:
         return code
 
     def invite_token_is_available(self, code: str) -> bool:
-        """True if ``code`` is a known invite token that is still unused and not
-        expired. Read-only pre-check for a clean error message; consumption is
-        gated authoritatively (and race-safely) by consume_invite_token."""
+        """Read-only pre-check for a clean error message. Consumption is gated
+        authoritatively and race-safely by consume_invite_token."""
         if not code:
             return False
         with self._connect() as conn:
@@ -576,10 +536,9 @@ class AccountStore:
         return True
 
     def consume_invite_token(self, code: str, used_by: Optional[str] = None) -> bool:
-        """Atomically burn a single-use invite token. Returns True only if it
-        existed, was unused, and had not expired. The ``used_at IS NULL`` guard in
-        the UPDATE makes this race-safe: two concurrent signups with the same code
-        contend on the row and only one UPDATE matches (rowcount 1)."""
+        """Burn a single-use invite token; True only if it existed, was unused and
+        had not expired. The ``used_at IS NULL`` guard makes it race-safe: two
+        concurrent signups contend on the row and only one UPDATE matches."""
         if not code:
             return False
         now = _iso(_now())
@@ -597,9 +556,7 @@ class AccountStore:
             return cur.rowcount > 0
 
     def list_invite_tokens(self, include_used: bool = False, limit: int = 50) -> List[Dict]:
-        """Most-recently-minted invite tokens. By default only the unused ones
-        (what the bot's 'list' command shows); include_used returns the full
-        ledger."""
+        """Newest invite tokens; unused only unless ``include_used``."""
         with self._connect() as conn:
             if include_used:
                 rows = conn.execute(
@@ -615,8 +572,8 @@ class AccountStore:
             return [dict(r) for r in rows]
 
     def revoke_invite_token(self, code: str) -> bool:
-        """Delete an UNUSED invite token (the bot's 'revoke' command). Returns
-        False if the code is unknown or already used (used rows stay as a ledger)."""
+        """Delete an unused invite token. False if unknown or already used, since
+        used rows stay as a ledger."""
         if not code:
             return False
         with self._connect() as conn:
@@ -637,8 +594,7 @@ class AccountStore:
         return challenge, _iso(expires)
 
     def consume_challenge(self, challenge: str, public_key: str, purpose: str) -> bool:
-        """Atomically validate + delete a challenge. True only if it existed for
-        this public key + purpose and had not expired (single use)."""
+        """Validate and delete a challenge; true only if it matched and was fresh."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT public_key, purpose, expires_at FROM challenges WHERE challenge = %s",
@@ -646,11 +602,9 @@ class AccountStore:
             ).fetchone()
             if row is None:
                 return False
-            # Always delete (single-use), even if it turns out invalid/expired.
-            # Gate on rowcount: under concurrency two requests can both SELECT the
-            # row, but only the transaction whose DELETE actually removes it (the
-            # other races to 0 rows once the first commits) may consume it — so a
-            # captured (pk, challenge, signature) can't be replayed in parallel.
+            # Delete unconditionally and gate on rowcount: two concurrent requests
+            # can both SELECT the row, but only the one whose DELETE removes it may
+            # consume it, so a captured signature can't be replayed in parallel.
             cur = conn.execute("DELETE FROM challenges WHERE challenge = %s", (challenge,))
             if cur.rowcount == 0:
                 return False
@@ -664,8 +618,7 @@ class AccountStore:
 
     # -- sessions -------------------------------------------------------
     def create_session(self, user_id: int) -> Tuple[str, str]:
-        """Issue a session. Returns (raw_token, expires_at_iso); only the hash is
-        stored."""
+        """Issue a session as (raw_token, expires_at_iso). Only the hash is stored."""
         raw = secrets.token_urlsafe(32)
         expires = _now() + SESSION_TTL
         with self._connect() as conn:
@@ -706,16 +659,12 @@ class AccountStore:
             )
 
     # -- favorites / watchlists -----------------------------------------
-    # A "favorite" is a row in a named list (``list_name``). The default list is
-    # 'favorites', which reproduces the original single-tab behaviour; any other
-    # name is a custom watchlist (e.g. 'Todo', 'Done', 'Paused'). The same show
-    # may live in several lists at once.
+    # A favorite is a row in a named list. 'favorites' is the default; any other
+    # name is a custom watchlist. The same show may live in several lists.
     def upsert_favorite(self, user_id: int, fav: Dict, list_name: str = "favorites") -> Dict:
         with self._connect() as conn:
-            # Soft cap: reject only NEW keys past the limit; updates always pass.
-            # Done in the same transaction as the insert so it's race-free enough
-            # (a tiny concurrent overshoot is harmless for a storage guard). The cap
-            # is per account across all lists.
+            # Soft cap on new keys only; updates always pass. Same transaction as
+            # the insert, so a small concurrent overshoot is possible and harmless.
             exists = conn.execute(
                 "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
                 (user_id, fav["item_key"], list_name),
@@ -763,7 +712,7 @@ class AccountStore:
             return [dict(r) for r in rows]
 
     def list_watchlists(self, user_id: int) -> List[Dict]:
-        """Distinct list names for a user with each list's item count."""
+        """Distinct list names with each list's item count."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT list_name, COUNT(*) AS count FROM favorites WHERE user_id = %s "
@@ -775,13 +724,11 @@ class AccountStore:
     def bulk_upsert_favorites(
         self, user_id: int, items: List[Tuple[str, Dict]]
     ) -> Dict:
-        """Insert/update many favorites in a single transaction (for import).
+        """Insert/update many favorites in one transaction, for import.
 
-        ``items`` is a list of ``(list_name, fav)`` pairs where ``fav`` carries
-        item_key/tmdb_id/anilist_id/season_number/media_type/title/poster. New
-        keys are inserted only while the per-account cap (across all lists) has
-        room; keys that already exist always update (and don't count against the
-        cap). Returns ``{"imported", "skipped_quota"}``."""
+        ``items`` is a list of ``(list_name, fav)`` pairs. New keys are inserted
+        only while the per-account cap has room; existing keys always update.
+        Returns ``{"imported", "skipped_quota"}``."""
         imported = 0
         skipped_quota = 0
         now = _iso(_now())
@@ -817,8 +764,7 @@ class AccountStore:
         return {"imported": imported, "skipped_quota": skipped_quota}
 
     def clear_favorites(self, user_id: int) -> int:
-        """Delete every favorite in every list for a user (the 'replace' import
-        mode clears first). Returns how many rows were removed."""
+        """Delete every favorite in every list. Returns how many rows were removed."""
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM favorites WHERE user_id = %s", (user_id,))
             return cur.rowcount
@@ -859,8 +805,7 @@ class AccountStore:
     # -- watch progress -------------------------------------------------
     def upsert_progress(self, user_id: int, prog: Dict) -> Dict:
         with self._connect() as conn:
-            # Soft cap: reject only NEW keys past the limit; updates always pass
-            # (same-episode progress saves keep working at the cap).
+            # Soft cap on new keys only, so progress saves keep working at the cap.
             exists = conn.execute(
                 "SELECT 1 FROM watch_progress WHERE user_id = %s AND item_key = %s",
                 (user_id, prog["item_key"]),
@@ -920,7 +865,7 @@ class AccountStore:
 
     # -- maintenance ----------------------------------------------------
     def purge_expired(self) -> None:
-        """Drop expired sessions + challenges (cheap housekeeping)."""
+        """Drop expired sessions, challenges and email tokens."""
         now = _iso(_now())
         with self._connect() as conn:
             conn.execute("DELETE FROM sessions WHERE expires_at <= %s", (now,))

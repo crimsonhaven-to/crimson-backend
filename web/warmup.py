@@ -1,14 +1,12 @@
-"""Continue-watching warmup: pre-cache the NEXT episode after a progress save.
+"""Continue-watching warmup: pre-cache the next episode after a progress save.
 
-When a viewer saves progress on an episode, we look ahead to the NEXT one,
-scrape+resolve it in the background, and hand the source closest to their
-language/dub-sub preference to the cache engine — so by the time they hit "next"
-it's already remuxed onto the NAS and plays instantly. The progress-upsert route
-(account_engine) calls ``schedule_warmup`` via the injected handler; everything
-here is best-effort and fire-and-forget, and self-skips when caching is disabled.
+Looks ahead to the next episode, scrapes and resolves it in the background, and
+hands the source closest to the viewer's language preference to the cache engine.
+By the time they hit "next" it is already remuxed onto the NAS and plays
+instantly.
 
-Lifted verbatim from ``api.py``; ``api.py`` wires ``schedule_warmup`` into the
-account router with ``set_warmup_handler``.
+api.py wires ``schedule_warmup`` into the account router. Everything here is
+best-effort and fire-and-forget, and self-skips when caching is disabled.
 """
 
 import asyncio
@@ -31,28 +29,25 @@ from web.util import _is_future_air_date, _public_base_url
 
 logger = logging.getLogger("crimson.warmup")
 
-# Don't re-scrape the same next-episode on every progress tick: progress posts fire
-# every few seconds of playback, so collapse repeats for one (show, season, ep) into
-# a single scrape window. The cache engine's DB claim dedupes the actual download
-# regardless; this just spares the redundant scraping.
-_WARMUP_TTL = 900.0          # seconds — one warmup per next-episode per 15 min
-_WARMUP_MAX = 5000           # hard cap to bound memory
+# Progress posts fire every few seconds of playback, so repeats for one
+# (show, season, episode) collapse into a single scrape window. The cache engine's
+# DB claim dedupes the download regardless; this only spares redundant scraping.
+_WARMUP_TTL = 900.0          # one warmup per next-episode per 15 min
+_WARMUP_MAX = 5000           # bounds memory
 _warmup_seen: Dict[str, float] = {}
-# Strong refs to in-flight warmup tasks so the event loop doesn't GC them mid-run.
+# Strong refs, so the event loop doesn't GC an in-flight task mid-run.
 _warmup_tasks: set = set()
 
 
 async def _resolve_all_streams(tmdb_id: int, season_number: int, episode_number: int,
                                anilist_id: Optional[int], fallback_title: Optional[str],
                                base_url: str, media_type: str = "tv") -> List[Dict]:
-    """Collect every resolvable stream for one episode into a list — a
-    non-progressive sibling of ``stream_watch_response`` used by the warmup. Runs
-    all scrapers concurrently, resolves their embeds, dedupes by embed/URL, and
-    returns the streams. Best-effort: a failing scraper is skipped.
+    """Every resolvable stream for one episode, as a list: the non-progressive
+    sibling of ``stream_watch_response``. Runs all scrapers concurrently, resolves
+    their embeds and dedupes. A failing scraper is skipped.
 
-    The media-context build mirrors ``stream_watch_response`` (AniList metadata +
-    German-title synonyms for the no-AniList path) so the warmup resolves the same
-    sources the real /watch call would — kept deliberately in sync."""
+    The media context is built exactly as ``stream_watch_response`` does, so the
+    warmup resolves the same sources a real /watch call would. Keep them in sync."""
     anilist_data = {}
     if anilist_id:
         async with http_client() as client:
@@ -108,12 +103,12 @@ async def _resolve_all_streams(tmdb_id: int, season_number: int, episode_number:
 
 def _warmup_pick_best(streams: List[Dict], preferences: Optional[Dict]) -> Optional[Dict]:
     """Pick the stream the viewer would most likely auto-play, mirroring the
-    frontend ranker (crimson-client/src/streamUtils.js ``streamRank``): the
-    ranking is purely the viewer's language/dub-sub preference — there is NO
-    source-quality/provider priority. Lower (fewer mismatches) wins; ties, and the
-    no-preference case, fall back to list order (``min`` is stable, so the first —
-    i.e. earliest-resolved — stream wins), matching the client's arrival-order
-    fallback. Returns None for []."""
+    frontend's ``streamRank``.
+
+    Ranking is purely the viewer's language preference, with no source-quality or
+    provider priority. Fewer mismatches wins, and ties (including no preference)
+    fall back to list order: ``min`` is stable, so the earliest-resolved stream
+    wins, matching the client's arrival-order fallback."""
     prefs = preferences or {}
     pref_lang = (prefs.get("language") or "").strip().lower()
     pref_type = (prefs.get("type") or "").strip().lower()
@@ -136,19 +131,19 @@ def _warmup_pick_best(streams: List[Dict], preferences: Optional[Dict]) -> Optio
 
 async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: int,
                                episode_number: int, preferences: Optional[Dict]) -> None:
-    """Scrape+resolve the episode after the one just watched and hand the
-    preference-closest cacheable source to the cache engine. Fully best-effort;
-    never raises (it runs detached from the request)."""
+    """Scrape and resolve the episode after the one just watched, then hand the
+    preference-closest cacheable source to the cache engine. Never raises, since
+    it runs detached from the request."""
     try:
         if tmdb_id is None or season_number is None or episode_number is None:
             return
-        # Caching off? Resolving would be wasted work — bail before any scraping.
+        # With caching off, resolving is wasted work, so bail before scraping.
         if not await run_in_threadpool(cache_manager._store.get_enabled):
             return
 
         next_ep = int(episode_number) + 1
 
-        # TTL dedupe (see _warmup_seen): one warmup per next-episode per window.
+        # One warmup per next-episode per window; see _warmup_seen.
         now = time.monotonic()
         key = f"{tmdb_id}:{season_number}:{next_ep}"
         seen_until = _warmup_seen.get(key)
@@ -158,17 +153,17 @@ async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: in
             _warmup_seen.clear()
         _warmup_seen[key] = now + _WARMUP_TTL
 
-        # The next episode must actually exist in the season and already have aired.
+        # The next episode must exist in the season and have aired.
         info = await _season_episode_info(int(tmdb_id), int(season_number))
         air = info.get("air_dates") or {}
         if next_ep not in air:
-            return  # end of season (or unknown episode list) — nothing to warm
+            return  # end of season, or an unknown episode list
         if _is_future_air_date(air.get(next_ep)):
             return  # not out yet
 
-        # Resolve the AniList mapping the same way /watch does (same season as the
-        # episode just watched, so the mapping is identical). Falls back to a TMDB
-        # title for the title-based scrapers when the season isn't AniList-mapped.
+        # Resolved the same way /watch does, off the same season, so the mapping is
+        # identical. Falls back to a TMDB title for the title-based scrapers when
+        # the season is not AniList-mapped.
         anilist_id = get_anilist_id(int(tmdb_id), int(season_number))
         fallback_title = None
         if not anilist_id:
@@ -186,9 +181,8 @@ async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: in
             int(tmdb_id), int(season_number), next_ep, anilist_id,
             fallback_title, base_url=base_url, media_type="tv",
         )
-        # Only weigh sources the cache engine would actually accept (enabled +
-        # ffmpeg present + tappable, non-self URL) so we pick the best *cacheable*
-        # match rather than a source we'd silently fail to cache.
+        # Weigh only sources the cache engine would accept, so the pick is the
+        # best *cacheable* match rather than one we would silently fail to cache.
         cacheable = [s for s in streams if await cache_manager._cacheable(s)]
         best = _warmup_pick_best(cacheable, preferences)
         if not best:
@@ -213,10 +207,9 @@ async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: in
 
 def schedule_warmup(request: Request, *, tmdb_id: int, season_number: int,
                     episode_number: int, preferences: Optional[Dict]) -> None:
-    """Account router's warmup hook: fire the warmup as a detached background task
-    (keeping a strong ref so it isn't GC'd) and return immediately, so saving watch
-    progress is never delayed by it. The public base URL is captured from the
-    request here (where the forwarded-header logic lives) for the proxy sources."""
+    """The account router's hook: fire the warmup as a detached task and return
+    immediately, so saving progress is never delayed by it. The public base URL is
+    captured here, where the forwarded-header logic lives."""
     base_url = _public_base_url(request)
     task = asyncio.create_task(_warmup_next_episode(
         base_url=base_url, tmdb_id=tmdb_id, season_number=season_number,

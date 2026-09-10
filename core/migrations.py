@@ -1,54 +1,33 @@
 """
 Versioned schema migrations.
 
-Why this exists
----------------
-Before this module, the schema was defined by nine hand-rolled ``init_db()``
-functions holding ~53 DDL statements between them, and the accumulated
-``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` lines had become the schema's actual
-version history. That works right up until it doesn't: nothing could answer "does
-this database match this image?", there was no down path, no way to add a
-``NOT NULL`` or backfill data, and with Patroni HA plus rolling Swarm deploys a
-version-skewed replica stayed invisible until it threw at request time.
+Why this exists: the accumulated ``ALTER TABLE ... IF NOT EXISTS`` lines in the
+``init_db()`` functions had become the schema's real version history. Nothing
+could answer whether a database matched its image, there was no down path and no
+way to backfill, and under rolling deploys a version-skewed replica stayed
+invisible until it threw at request time.
 
-What this module does NOT do
----------------------------
-It deliberately does **not** take ownership of the existing schema. The
-``init_db()`` functions still run first at startup and are still idempotent, and
-their DDL was not transcribed into ``migrations/``. Transcribing it would have
-meant a freshly created database and a long-lived production database taking
-different code paths to (hopefully) the same schema, which is precisely the class
-of divergence this system is meant to prevent. So the baseline stays where it is
-and this runner owns everything from version 0 onward.
+It deliberately does not take ownership of the existing schema. The ``init_db()``
+functions still run first and stay idempotent, and their DDL was not transcribed
+into ``migrations/``: doing so would make a fresh database and a long-lived one
+take different paths to the same schema, which is the divergence this is meant to
+prevent. The baseline stays put and this runner owns version 0 onward.
 
-How it runs
------------
-``apply_pending()`` is called once per process at startup, AFTER every
-``init_db()``. It takes the same cluster-wide ``SCHEMA_INIT_LOCK`` advisory lock
-those functions take, so simultaneous replica boots serialize: the first replica
-applies, the rest wait and then find nothing pending.
+``apply_pending()`` runs once per process at startup, after every ``init_db()``,
+under the same ``SCHEMA_INIT_LOCK``, so simultaneous boots serialize and the
+losers find nothing pending. It all happens in one transaction: the lock is
+transaction-scoped, which is what makes "check what is applied, then apply the
+rest" atomic against another booting replica, and a failure rolls the whole batch
+back. The consequence is that statements which cannot run inside a transaction,
+notably ``CREATE INDEX CONCURRENTLY``, do not belong in a migration file.
 
-Everything happens in ONE transaction: the lock is transaction-scoped
-(``pg_advisory_xact_lock``), so holding it for the whole run is what makes
-"check what's applied, then apply the rest" atomic against another booting
-replica. A failing migration rolls the whole batch back and releases the lock,
-leaving the database exactly as it was. The practical consequence is that
-statements which cannot run inside a transaction block (notably
-``CREATE INDEX CONCURRENTLY``) do not belong in a migration file.
+Each applied file's SHA-256 is stored and re-checked at boot. A mismatch means an
+applied migration was edited afterwards, so some databases ran the old text. That
+is reported loudly and surfaced on ``/health``, but is not fatal: refusing to boot
+on a whitespace change would turn bookkeeping into an outage.
 
-Drift detection
----------------
-Each applied file's SHA-256 is stored. On every boot the runner re-hashes the
-files on disk and compares. A mismatch means an already-applied migration was
-edited after the fact, so some databases ran the old text and some would run the
-new one. That is reported loudly and surfaced on ``/health``, but it is
-deliberately **not** fatal: refusing to boot on a whitespace change would turn a
-bookkeeping problem into an outage.
-
-Ordering note
--------------
-Files are ordered by their numeric prefix, not lexicographically, so ``010_`` sorts
-after ``009_`` and a hypothetical ``0100_`` after ``099_``.
+Files order by numeric prefix rather than lexicographically, so ``010_`` sorts
+after ``009_``.
 """
 
 from __future__ import annotations
@@ -64,12 +43,11 @@ from core.db_pool import get_connection, lock_schema_init
 
 logger = logging.getLogger("crimson.migrations")
 
-# Where the .sql files live. Overridable so tests can point at a temp directory
-# without touching the real set.
+# Overridable so tests can point at a temp directory without touching the real set.
 DEFAULT_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 
-# NNN_name.sql -- at least three digits so the directory sorts sanely in a shell
-# listing too, and a restricted name charset so nothing odd reaches a log line.
+# NNN_name.sql: three digits so a shell listing sorts sanely too, and a restricted
+# charset so nothing odd reaches a log line.
 _FILENAME_RE = re.compile(r"^(\d{3,})_([A-Za-z0-9][A-Za-z0-9._-]*)\.sql$")
 
 
@@ -90,15 +68,14 @@ class Migration(NamedTuple):
 def checksum(sql: str) -> str:
     """SHA-256 of a migration's text, newline-normalised.
 
-    Normalising CRLF to LF matters: this repo is developed on Windows and built in
-    a Linux container, and a checkout with different line endings must not read as
-    drift."""
+    CRLF matters here: the repo is developed on Windows and built in a Linux
+    container, and differing line endings must not read as drift."""
     return hashlib.sha256(sql.replace("\r\n", "\n").encode("utf-8")).hexdigest()
 
 
 def _is_effectively_empty(sql: str) -> bool:
-    """True when a file holds only comments/whitespace. Postgres rejects an empty
-    query string, so such a file is skipped rather than executed."""
+    """True when a file holds only comments. Postgres rejects an empty query
+    string, so such a file is recorded rather than executed."""
     body = re.sub(r"--[^\n]*", "", sql)
     body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
     return not body.strip()
@@ -107,8 +84,8 @@ def _is_effectively_empty(sql: str) -> bool:
 def discover(directory: Optional[Path] = None) -> List[Migration]:
     """Every migration file on disk, ordered by numeric version.
 
-    Raises ``ValueError`` on a duplicate version number: two files claiming the
-    same version would apply in an arbitrary order, which is never intended."""
+    Raises ``ValueError`` on a duplicate version: two files claiming one version
+    would apply in arbitrary order, which is never intended."""
     directory = directory or migrations_dir()
     if not directory.is_dir():
         return []
@@ -164,18 +141,18 @@ def _applied_rows(conn) -> Dict[int, dict]:
     return {row["version"]: row for row in cur.fetchall()}
 
 
-# Snapshot of the last apply_pending() result, so /health can report the schema
-# version without adding a DB round-trip to a probe that fires every 30s per
-# replica. Migrations only run at startup, so this cannot go stale in-process.
+# Lets /health report the schema version without a DB round-trip on a probe that
+# fires every 30s per replica. Migrations only run at startup, so it cannot go
+# stale in-process.
 _last_status: Dict[str, object] = {"available": False}
 
 
 def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
     """Apply every migration not yet recorded, in version order.
 
-    Returns a summary dict (also cached for :func:`cached_status`). Safe to call on
-    every replica: the advisory lock serializes concurrent boots and an
-    already-applied migration is simply skipped."""
+    Returns a summary, also cached for :func:`cached_status`. Safe on every
+    replica: the advisory lock serializes boots and an applied migration is
+    skipped."""
     log = log or logger
 
     try:
@@ -186,8 +163,8 @@ def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
         return dict(_last_status)
 
     if not available:
-        # An empty directory in a *container* almost always means the COPY line is
-        # missing, which would otherwise look identical to "nothing to do".
+        # In a container this almost always means a missing COPY line, which
+        # would otherwise look identical to "nothing to do".
         log.warning(
             "No migration files found in %s. If this is a deployed container, the "
             "Dockerfile is missing its `COPY migrations ./migrations` line.",
@@ -199,8 +176,8 @@ def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
     applied_versions: set = set()
 
     with get_connection() as conn:
-        # Same lock the init_db()s take, for the same reason: DDL is not safe under
-        # catalog contention when several replicas boot at once.
+        # Same lock the init_db()s take: DDL is not safe under catalog contention
+        # when several replicas boot at once.
         lock_schema_init(conn)
         _ensure_table(conn)
         already = _applied_rows(conn)
@@ -267,11 +244,11 @@ def cached_status() -> Dict[str, object]:
 
 
 def status() -> Dict[str, object]:
-    """Live schema state, read from the database. Used by the admin dashboard.
+    """Live schema state, read from the database, for the admin dashboard.
 
-    Unlike :func:`cached_status` this costs a query, and it reports ``pending``
-    (files present in the image but not recorded in this database) which is the
-    signal that a replica is running ahead of or behind the schema."""
+    Unlike :func:`cached_status` this costs a query, and it reports ``pending``:
+    files in the image but not recorded here, which is the signal that a replica
+    is running ahead of or behind the schema."""
     try:
         available = discover()
     except ValueError as e:
@@ -310,8 +287,8 @@ def status() -> Dict[str, object]:
     }
 
 
-if __name__ == "__main__":  # pragma: no cover - operator convenience
-    # `python -m core.migrations` prints the live status without applying anything.
+if __name__ == "__main__":  # pragma: no cover
+    # Prints the live status without applying anything.
     import json
 
     logging.basicConfig(level=logging.INFO)

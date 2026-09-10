@@ -1,11 +1,9 @@
 """
-Local store for discovered TMDB metadata (the non-anime shows/movies surface),
-lifted out of api.py.
+Local store for discovered TMDB metadata: the non-anime shows and movies surface.
 
-Reads/writes the ``tmdb_shows`` / ``tmdb_movies`` tables and the ``tmdb_seasons``
-mapping (``get_first_anilist_ids``), and lazily persists discover/search results
-so they can later become recommendation candidates. The TMDB fetchers
-(metadata_engine.tmdb) are the callers.
+Reads and writes the ``tmdb_shows`` / ``tmdb_movies`` tables and the
+``tmdb_seasons`` mapping, and lazily persists discover and search results so they
+can later become recommendation candidates. The TMDB fetchers are the callers.
 """
 
 import json
@@ -18,11 +16,10 @@ logger = logging.getLogger("crimson.store")
 
 
 def get_first_anilist_ids(tmdb_ids: List[int]) -> Dict[int, int]:
-    """Map each tmdb_id -> its lowest-numbered season's anilist_id, in ONE query.
+    """Map each tmdb_id to its lowest-numbered season's anilist_id, in one query.
 
-    Replaces calling ``get_show_seasons`` once per search/trending result (an N+1
-    that borrowed a pooled connection per item). A tmdb_id with no mapped season
-    is simply absent from the result.
+    Replaces an N+1 that borrowed a pooled connection per search result. A tmdb_id
+    with no mapped season is simply absent.
     """
     if not tmdb_ids:
         return {}
@@ -38,7 +35,7 @@ def get_first_anilist_ids(tmdb_ids: List[int]) -> Dict[int, int]:
             )
             out: Dict[int, int] = {}
             for r in cursor.fetchall():
-                out.setdefault(r["tmdb_id"], r["anilist_id"])  # first = lowest season
+                out.setdefault(r["tmdb_id"], r["anilist_id"])  # first is lowest season
             return out
     except Exception as e:
         logger.error(f"Database error in get_first_anilist_ids: {e}")
@@ -46,13 +43,12 @@ def get_first_anilist_ids(tmdb_ids: List[int]) -> Dict[int, int]:
 
 
 def upsert_show_info(show: Dict) -> None:
-    """Persist TMDB show details fetched on demand (lazy population of tmdb_shows)."""
+    """Persist show details fetched on demand, lazily populating tmdb_shows."""
     if not show.get("tmdb_id"):
         return
     try:
-        # genres is a JSON list of names; only overwrite the stored value when the
-        # caller actually supplies one, so a later metadata refresh that omits it
-        # (e.g. the degraded path) doesn't blank out genres we already have.
+        # Only overwrite when the caller supplies genres, so a later refresh that
+        # omits them, such as the degraded path, cannot blank what is stored.
         genres = show.get("genres")
         genres_json = json.dumps(genres) if genres else None
         def _write():
@@ -84,9 +80,9 @@ def upsert_show_info(show: Dict) -> None:
 
 
 def upsert_movie_info(movie: Dict) -> None:
-    """Persist TMDB movie details fetched on demand (lazy population of
-    tmdb_movies), mirroring upsert_show_info. Used as the TMDB-down fallback for
-    /movie-overview + /watch/movie (a movie has no AniList entry to fall back on)."""
+    """Persist movie details fetched on demand, mirroring upsert_show_info. This
+    is the TMDB-down fallback for the movie routes, which have no AniList entry to
+    fall back on."""
     if not movie.get("tmdb_id"):
         return
     try:
@@ -94,10 +90,9 @@ def upsert_movie_info(movie: Dict) -> None:
         genres_json = json.dumps(genres) if genres else None
         def _write():
             with get_connection() as conn:
-                # runtime/vote_average/status/original_title come only from the full
-                # /movie/{id} fetch — a discover/search upsert omits them, so COALESCE
-                # to EXCLUDED-then-existing keeps a previously-fetched value rather
-                # than blanking it (same guard as genres).
+                # These come only from the full /movie/{id} fetch, so a discover
+                # upsert omits them and the COALESCE keeps any previously fetched
+                # value rather than blanking it. Same guard as genres.
                 conn.execute("""
                     INSERT INTO tmdb_movies
                         (tmdb_id, title, overview, poster_path, backdrop_path, release_date,
@@ -134,14 +129,13 @@ def upsert_movie_info(movie: Dict) -> None:
 
 
 def _genre_names(item: Dict, genre_map: Dict[int, str]) -> List[str]:
-    """Resolve a discover/search item's genre_ids to names via ``genre_map``."""
+    """Resolve an item's genre_ids to names via ``genre_map``."""
     return [genre_map[g] for g in (item.get("genre_ids") or []) if g in genre_map]
 
 
 def _persist_discovered_show(item: Dict, genre_map: Dict[int, str]) -> None:
-    """Lazily cache a discovered/searched non-anime show into tmdb_shows (title,
-    overview, art, genres) so it can later be a recommendation candidate without a
-    full overview open. Best-effort; mirrors fetch_tmdb_show's upsert."""
+    """Cache a discovered non-anime show, so it can become a recommendation
+    candidate without a full overview open. Best-effort."""
     if not item.get("id"):
         return
     upsert_show_info({
@@ -157,7 +151,7 @@ def _persist_discovered_show(item: Dict, genre_map: Dict[int, str]) -> None:
 
 
 def _persist_discovered_movie(item: Dict, genre_map: Dict[int, str]) -> None:
-    """Movie twin of _persist_discovered_show (caches into tmdb_movies)."""
+    """The movie twin of _persist_discovered_show."""
     if not item.get("id"):
         return
     upsert_movie_info({

@@ -1,12 +1,9 @@
-"""The Crimson backend's FastAPI assembler — the "brain, not pipe" entrypoint.
+"""The FastAPI assembler: the "brain, not pipe" entrypoint.
 
-This module used to be one ~3,500-line file holding the app, every route, the
-scrape/resolve pipeline, the DB helpers and the injected engine handlers. It is now
-the thin *assembler*: it creates the app, mounts the middleware (login wall + CORS +
-Lumi header), owns the lifespan (schedulers, DB init, warm caches), registers the
-optional build-time overlay's stream proxies, wires the exception handlers, and
-includes the routers from ``web.routes`` — the actual endpoints and logic live in
-the ``web`` package now (see ``web/__init__.py`` for the map).
+Creates the app, mounts the middleware (login wall, CORS, Lumi header), owns the
+lifespan (schedulers, DB init, warm caches), registers the optional overlay's
+stream proxies, wires the exception handlers and includes the routers. The
+endpoints and their logic live in the ``web`` package; see web/__init__.py.
 """
 
 import asyncio
@@ -77,9 +74,7 @@ from iptv_engine import (
 from metadata_engine import maintenance as metadata_maintenance
 from metadata_engine import sync_status
 
-# The HTTP layer — singletons, the injected engine handlers, and the routers. The
-# routes and their logic all live under the ``web`` package now; this file only
-# assembles them. (See web/__init__.py for the full map.)
+# The HTTP layer: singletons, injected engine handlers and routers.
 from web.context import (
     db_engine,
     local_source_store,
@@ -93,63 +88,57 @@ from web.admin_handlers import admin_source_health, admin_system_info, forced_re
 from web.routes import all_routers
 from web.routes.proxies import _proxy_response
 
-# Configure logging. Same output as the basicConfig this replaces, plus the
-# per-request correlation id when one is bound (and an opt-in JSON format via
-# LOG_FORMAT=json). See core/logging_setup.py.
+# Same output as a bare basicConfig, plus the per-request correlation id and an
+# opt-in JSON format. See core/logging_setup.py.
 logging_setup.configure(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# Load environment variables (defensive; core.config already loads its own).
+# Defensive: core.config already loads its own.
 load_dotenv()
 
 
-# --- LIFESPAN MANAGEMENT ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifecycle"""
-    # Startup
+    """Start the schedulers, databases and warm caches; drain them on shutdown."""
     logger.info("Starting up FastAPI application...")
 
-    # Log which optional, env-gated features are on/off (presence only, no secret
-    # values) so a "dark" source is diagnosable at a glance from the boot log.
+    # Presence only, never values, so a dark source is diagnosable from the boot
+    # log at a glance.
     config_report.log_report(logger)
 
-    # Open the shared HTTP client (kept warm for the whole process lifetime).
+    # Kept warm for the whole process lifetime.
     open_http_client()
 
-    # Initialize databases (idempotent — safe on every replica).
+    # Idempotent, so safe on every replica.
     db_engine.init_db()
-    account_store.init_db()  # account tables (untouched by mapping resyncs)
-    security_audit.init_db()  # security event ledger (resync-safe, additive)
-    apikey_store.init_db()  # movie-web bridge API keys (resync-safe)
-    supporters_store.init_db()  # Ko-fi supporters ledger (also resync-safe)
-    local_source_store.init_db()  # admin-managed local media sources (resync-safe)
-    cache_store.init_db()  # server-side video cache tables (resync-safe)
-    download_store.init_db()  # admin download queue (resync-safe)
-    telemetry_store.init_db()  # anonymous resolve telemetry (resync-safe)
+    # None of these tables are touched by a mapping resync.
+    account_store.init_db()
+    security_audit.init_db()
+    apikey_store.init_db()
+    supporters_store.init_db()
+    local_source_store.init_db()
+    cache_store.init_db()
+    download_store.init_db()
+    telemetry_store.init_db()
 
-    # Versioned schema migrations. Runs AFTER the init_db()s above, which still own
-    # the pre-migration baseline: this applies everything from version 0 onward.
-    # Takes the same cluster-wide advisory lock, so concurrent replica boots
-    # serialize (the first applies; the rest find nothing pending). Non-fatal by
-    # design: a migration failure is loud in the log and visible on /health, but
-    # it must not turn a bookkeeping problem into a boot loop across every replica.
+    # After the init_db()s, which still own the pre-migration baseline. Takes the
+    # same advisory lock, so concurrent boots serialize. Non-fatal by design: a
+    # failure is loud in the log and on /health, but must not turn a bookkeeping
+    # problem into a boot loop across every replica.
     try:
         migrations.apply_pending(logger)
     except Exception as e:
         logger.error(f"Schema migrations failed: {e}", exc_info=True)
 
-    # Register the scrape-time metrics collector (DB pool, worker queues, per-source
-    # resolve health). Done here rather than at import so merely importing the app
-    # (a test, scripts/export_openapi.py) never wires up something that reads the DB.
+    # Here rather than at import, so merely importing the app (a test, the openapi
+    # export) never wires up something that reads the DB.
     observability.install_state_collector()
     if not observability.PROMETHEUS_AVAILABLE:
         logger.info("prometheus_client not installed; /metrics is inert (503)")
 
-    # Seed admin accounts from ADMIN_EMAILS (idempotent; only promotes accounts
-    # that already exist). Lets the operator reach the /admin dashboard without
-    # editing the DB by hand. Safe on every replica.
+    # Idempotent, and only promotes accounts that already exist, so the operator
+    # reaches /admin without hand-editing the DB.
     if Config.ADMIN_EMAILS:
         try:
             promoted = account_store.bootstrap_admins(Config.ADMIN_EMAILS)
@@ -158,30 +147,27 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Admin bootstrap failed: {e}")
 
-    # One scheduler per replica. It always owns cheap housekeeping (expired
-    # session/challenge purge); the heavy Fribb mapping resync is added to it on
-    # exactly ONE replica (RUN_DB_SYNC).
+    # One per replica. It always owns the cheap housekeeping; the heavy Fribb
+    # resync is added on exactly one replica.
     scheduler = BackgroundScheduler()
 
-    # Housekeeping (every replica): consume_challenge / get_user_by_session already
-    # delete rows on access, but abandoned challenges (requested, never completed)
-    # would otherwise pile up until the next restart — sweep them periodically.
+    # Rows are already deleted on access, but a challenge that is requested and
+    # never completed would pile up until the next restart.
     def _purge_expired():
         try:
             account_store.purge_expired()
         except Exception as e:
             logger.error(f"Expired session/challenge purge failed: {e}")
-        # Also sweep expired api_cache rows. consume-on-read never deletes them,
-        # and every unique search query writes a row, so the table would grow
-        # unbounded otherwise.
+        # Consume-on-read never deletes these, and every unique search query
+        # writes one, so the table would grow unbounded.
         try:
             n = purge_expired_cache()
             if n:
                 logger.info(f"Purged {n} expired api_cache rows")
         except Exception as e:
             logger.error(f"Expired api_cache purge failed: {e}")
-        # Security-event retention (SECURITY_EVENTS_RETENTION_DAYS, default 90).
-        # Idempotent DELETE, so several replicas sweeping on their own clocks is fine.
+        # An idempotent DELETE, so several replicas sweeping on their own clocks
+        # is fine.
         try:
             n = security_audit.purge_old()
             if n:
@@ -196,12 +182,9 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
-    # Lumi's chat retention: drop conversations untouched for 30 days and usage
-    # ledger rows past 180 (see chat_engine.db). Grouped with the purge above
-    # rather than pinned to the RUN_DB_SYNC replica because, like the other
-    # retention sweeps, it is an idempotent DELETE by timestamp: several replicas
-    # running it on their own clocks costs a redundant no-op query, not
-    # correctness.
+    # Grouped with the purge above rather than pinned to one replica because, like
+    # the other retention sweeps, it is an idempotent DELETE by timestamp: extra
+    # replicas cost a redundant no-op query, not correctness.
     def _prune_chat():
         try:
             removed = chat_store.prune()
@@ -220,11 +203,9 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
-    # Changelog cache (every replica keeps its own in-process copy; ETag
-    # conditional requests keep the refresh near-free against GitHub's rate
-    # limit). Only active when a GITHUB_TOKEN is configured. The initial warm-up
-    # runs off the event loop so a slow/unreachable GitHub never delays startup;
-    # the periodic refresh runs in the scheduler's worker thread.
+    # Every replica keeps its own copy, and ETag conditional requests keep the
+    # refresh near-free against GitHub's rate limit. The initial warm-up runs off
+    # the event loop, so an unreachable GitHub never delays startup.
     if changelog_service.configured():
         async def _warm_changelog():
             try:
@@ -248,13 +229,11 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
         )
     else:
-        logger.info("GITHUB_TOKEN not set — /changelog will return 503 until configured")
+        logger.info("GITHUB_TOKEN not set, /changelog will return 503 until configured")
 
-    # Live TV catalogue (per-replica, like the changelog). The initial warm-up is
-    # a ~25 MB JSON pull from iptv-org's GitHub Pages, so it runs off the event
-    # loop and never delays startup; the interval refresh (upstream publishes
-    # daily) runs in the scheduler's worker thread. Routes also self-heal — they
-    # kick a background refresh when asked while cold/stale (see iptv_engine).
+    # Per replica, like the changelog. The warm-up is a ~25 MB JSON pull, so it
+    # runs off the event loop; upstream publishes daily, so the refresh interval
+    # matches. Routes also self-heal by kicking a refresh when asked while stale.
     if iptv_enabled():
         async def _warm_iptv():
             try:
@@ -278,12 +257,11 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
         )
     else:
-        logger.info("IPTV_ENABLED=false — the Live TV surface is dark")
+        logger.info("IPTV_ENABLED=false, the Live TV surface is dark")
 
-    # CORS-proxy health cache (every replica keeps its own, since each routes
-    # independently). Periodically probes every CRIMSON_PROXY_BASE host so proxy_url
-    # routes only to the ones that are up — automatic failover between the Cloudflare
-    # and Netlify deploys. Cheap (1–2 GETs per host); only runs when configured.
+    # Every replica keeps its own, since each routes independently. Probing every
+    # host lets proxy_url route only to the ones that are up, giving automatic
+    # failover between the deploys. A couple of GETs per host, when configured.
     if _crimson_proxy.is_enabled():
         async def _warm_proxy_health():
             try:
@@ -292,7 +270,7 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Initial proxy health probe failed (will retry on schedule): {e}")
 
-        asyncio.create_task(_warm_proxy_health())  # fire-and-forget; don't delay startup
+        asyncio.create_task(_warm_proxy_health())  # must not delay startup
 
         def _refresh_proxy_health():
             try:
@@ -307,21 +285,18 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
         )
     else:
-        logger.info("CRIMSON_PROXY_BASE not set — external CORS proxy disabled, /sign returns 503")
+        logger.info("CRIMSON_PROXY_BASE not set, external CORS proxy disabled, /sign returns 503")
 
     if subtitles_service.configured():
-        logger.info("OpenSubtitles configured — /subtitles is enabled")
+        logger.info("OpenSubtitles configured, /subtitles is enabled")
     else:
-        logger.info("OPENSUBTITLES_API_KEY not set — /subtitles will return 503 until configured")
+        logger.info("OPENSUBTITLES_API_KEY not set, /subtitles will return 503 until configured")
 
-    # DEMO_MODE nightly reset (demo.crimsonhaven.to). Signup is open (invite gate
-    # bypassed in account_engine.routes), so all non-admin account data is wiped each
-    # night to bound growth. Pinned to the single RUN_DB_SYNC replica so multiple
-    # replicas don't race the same DELETE; a demo normally runs one replica with
-    # RUN_DB_SYNC=true (the compose default).
+    # Signup is open in demo mode, so all non-admin data is wiped nightly to bound
+    # growth. Pinned to the single sync replica so replicas don't race the DELETE.
     if Config.DEMO_MODE:
         logger.warning(
-            "DEMO_MODE is ON — signup invite gate is bypassed; non-admin data resets "
+            "DEMO_MODE is ON: signup invite gate is bypassed, non-admin data resets "
             f"nightly at {Config.DEMO_RESET_HOUR:02d}:00 (server time)"
         )
         if Config.RUN_DB_SYNC:
@@ -339,27 +314,24 @@ async def lifespan(app: FastAPI):
                 replace_existing=True,
             )
         else:
-            logger.info("DEMO_MODE: this replica is not RUN_DB_SYNC — the nightly reset runs on the sync replica")
+            logger.info("DEMO_MODE: this replica is not RUN_DB_SYNC, the nightly reset runs on the sync replica")
 
-    # The Fribb resync rebuilds the mapping tables wholesale. In a multi-replica
-    # Swarm deploy only ONE replica should own it (RUN_DB_SYNC), otherwise every
-    # replica downloads + rebuilds in lockstep, wasting bandwidth and contending
-    # on the shared DB. Other replicas just serve from the synced DB.
+    # The resync rebuilds the mapping tables wholesale, so exactly one replica
+    # owns it. Otherwise every replica downloads and rebuilds in lockstep, wasting
+    # bandwidth and contending on the shared DB.
     if not Config.RUN_DB_SYNC:
-        logger.info("RUN_DB_SYNC is disabled — this replica will not run the mapping resync")
+        logger.info("RUN_DB_SYNC is disabled, this replica will not run the mapping resync")
         sync_status.set_phase("disabled", "RUN_DB_SYNC is off on this replica")
     else:
-        # Initial sync — fire-and-forget so uvicorn + /health come up immediately
-        # instead of blocking boot on Fribb's multi-minute download + AniList
-        # enrichment (which matters most in single-replica dev, where the one API
-        # container is also the sync replica). The up-to-date check lives inside
-        # sync_database_async: it HEADs the Fribb URL and, if the stored ETag still
-        # matches a non-empty DB, returns "up_to_date" without rebuilding — so a
-        # warm DB pays only a cheap conditional HEAD here, not a full resync.
+        # Fire-and-forget, so uvicorn and /health come up immediately rather than
+        # blocking boot on a multi-minute download and enrichment. That matters
+        # most in single-replica dev, where the one container is also the sync
+        # replica. sync_database_async HEADs the Fribb URL first and returns
+        # "up_to_date" when the stored ETag still matches a non-empty DB, so a warm
+        # DB pays only that conditional HEAD.
         #
-        # The work is pushed onto a worker thread (run_in_threadpool -> asyncio.run,
-        # the same shape the scheduled job uses) so the heavy synchronous DB writes
-        # never stall the event loop that's now serving requests.
+        # Pushed onto a worker thread, the same shape the scheduled job uses, so
+        # the heavy synchronous writes never stall the loop now serving requests.
         async def _initial_sync():
             sync_status.set_phase("running", "Fribb mapping sync started", started=True)
             try:
@@ -378,15 +350,15 @@ async def lifespan(app: FastAPI):
                 sync_status.set_phase("done", "Mapping tables rebuilt from Fribb", finished=True)
                 logger.info("Initial database sync completed (tables rebuilt)")
             else:
-                # "failed" / "empty" — sync_database_async already logged the cause;
-                # the previous DB snapshot is intact (MVCC / left-untouched).
+                # sync_database_async already logged the cause, and the previous
+                # snapshot is intact.
                 sync_status.set_phase("failed", result or "unknown outcome", finished=True)
                 logger.warning(f"Initial database sync did not rebuild (outcome={result})")
 
-        asyncio.create_task(_initial_sync())  # fire-and-forget; runs off the boot path
+        asyncio.create_task(_initial_sync())  # runs off the boot path
 
-        # Periodic sync. BackgroundScheduler runs jobs in a worker thread with no
-        # running event loop, so the job spins up its own.
+        # BackgroundScheduler runs jobs in a worker thread with no running event
+        # loop, so the job spins up its own.
         def _scheduled_sync():
             try:
                 asyncio.run(db_engine.sync_database_async())
@@ -400,15 +372,13 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
         )
 
-    # Non-anime metadata maintenance (tmdb_shows / tmdb_movies). ALL of it is pinned
-    # to the single RUN_DB_SYNC replica (api-sync), so exactly one container ever
-    # churns this much metadata. Three pieces:
-    #   1. a nightly slice refresh (no upstream tells us when TMDB changed, so the
-    #      catalogue is swept oldest-1/N each night, cycling over METADATA_REFRESH_BUCKETS);
-    #   2. a short-interval drainer for backfill jobs the Admin dashboard queues
-    #      (the button hits a portless-api-sync-unreachable serving replica, so the
-    #      request arrives via the metadata_backfill_jobs table);
-    #   3. an optional one-shot backfill at startup (RUN_METADATA_BACKFILL).
+    # All pinned to the single sync replica, so exactly one container churns this
+    # much metadata. Three pieces:
+    #   1. a nightly slice refresh, since nothing upstream reports a TMDB change,
+    #      so the catalogue is swept oldest-first over a full cycle of nights
+    #   2. a short-interval drainer for backfill jobs the dashboard queues, which
+    #      arrive through a table because the serving replica cannot reach api-sync
+    #   3. an optional one-shot backfill at startup
     if Config.RUN_DB_SYNC:
         def _nightly_metadata_refresh():
             try:
@@ -431,9 +401,9 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Backfill drain failed: {e}")
 
-        # Poll the queue often so an admin-triggered backfill starts promptly. A run
-        # can take minutes; APScheduler's default max_instances=1 skips overlapping
-        # ticks, so a long backfill won't stack.
+        # Polled often so an admin-triggered backfill starts promptly. A run can
+        # take minutes, but max_instances=1 skips overlapping ticks so they cannot
+        # stack.
         scheduler.add_job(
             _drain_backfill_queue,
             trigger=IntervalTrigger(minutes=1),
@@ -449,32 +419,30 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     logger.error(f"Startup metadata backfill failed: {e}")
 
-            asyncio.create_task(_run_backfill())  # fire-and-forget; paced internally
+            asyncio.create_task(_run_backfill())  # paced internally
 
     scheduler.start()
     logger.info("Background scheduler started")
     app.state.scheduler = scheduler
 
-    # Server-side video-cache download worker (background ffmpeg). Only the
-    # dedicated cache-worker service runs it (RUN_CACHE_WORKER); api/api-sync just
-    # mint tickets + claim pending rows. The job lives in Postgres (claim_download),
-    # so a download survives an api redeploy and any worker can drain the queue.
+    # Only the dedicated cache-worker runs the ffmpeg loop; api replicas just mint
+    # tickets and claim rows. The job lives in Postgres, so a download survives an
+    # api redeploy and any worker can drain the queue.
     if Config.RUN_CACHE_WORKER:
         await cache_manager.start_worker()
     else:
         logger.info(
-            "RUN_CACHE_WORKER disabled — this replica mints/claims cache rows but "
+            "RUN_CACHE_WORKER disabled, this replica mints/claims cache rows but "
             "does not download (the cache-worker service does)"
         )
 
-    # Background download worker (aria2 poll loop). Same split as the cache worker:
-    # only the dedicated download-worker service submits/polls; other replicas just
-    # write pending rows and issue pause/resume/cancel to the aria2 sidecar.
+    # The same split as the cache worker: only the download-worker submits and
+    # polls, while other replicas write pending rows and issue pause/resume.
     if Config.RUN_DOWNLOAD_WORKER:
         await download_manager.start_worker()
     else:
         logger.info(
-            "RUN_DOWNLOAD_WORKER disabled — this replica queues downloads but does "
+            "RUN_DOWNLOAD_WORKER disabled, this replica queues downloads but does "
             "not run the aria2 poll loop (the download-worker service does)"
         )
 
@@ -487,33 +455,32 @@ async def lifespan(app: FastAPI):
     if getattr(app.state, 'scheduler', None) is not None:
         app.state.scheduler.shutdown()
     await close_http_client()
-    close_pool()  # drain the PostgreSQL connection pool
+    close_pool()
     logger.info("Shutdown complete")
 
 
-# Create FastAPI app with lifespan
+# --- APP --------------------------------------------------------------------
 app = FastAPI(
     title="Anime Streaming API",
     description="API for streaming anime with multi-season support",
     version=VERSION,
     lifespan=lifespan,
-    # orjson encodes every plain `return {...}` endpoint several times faster than
-    # stdlib json. The hand-rolled streaming (NDJSON /watch) and gzip (/catalogue)
-    # responses build their own Response objects and are unaffected by this.
+    # Several times faster than stdlib json on every plain `return {...}`. The
+    # hand-rolled streaming and gzip responses build their own Response objects
+    # and are unaffected.
     default_response_class=ORJSONResponse,
 )
 
-# Rate limiting (slowapi). Registered on app.state so the @limiter.limit
-# decorators on the expensive/abusable endpoints take effect; the 429 handler
-# returns a clean JSON error with Retry-After.
+# Registered on app.state so the @limiter.limit decorators take effect. The 429
+# handler returns a clean JSON error with Retry-After.
 app.state.limiter = limiter
 
 
 async def _voiced_rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    """Like slowapi's default 429, but in Lumi's voice. Delegates to the original
-    to get the correct status + ``Retry-After``, then re-skins the body."""
-    # A tripped limiter is the strongest brute-force/flood signal we have — record
-    # it in the security ledger (fire-and-forget; see account_engine.audit).
+    """slowapi's 429 in Lumi's voice. Delegates to the original for the status and
+    ``Retry-After``, then re-skins the body."""
+    # A tripped limiter is the strongest flood signal available, so it goes in the
+    # security ledger.
     security_audit.log_event(
         "rate_limited", outcome="failure", request=request,
         detail={"path": request.url.path},
@@ -537,22 +504,22 @@ async def _voiced_rate_limit_handler(request: Request, exc: RateLimitExceeded):
 app.add_exception_handler(RateLimitExceeded, _voiced_rate_limit_handler)
 
 # --- SITE-WIDE LOGIN WALL ---------------------------------------------------
-# Everything is private unless explicitly whitelisted. The whitelist covers:
-#   * auth endpoints (you can't log in without them),
-#   * health/root (uptime probes),
-#   * the signed stream proxies + player — these are loaded directly by <iframe>/
-#     <video>/hls.js which can't attach an Authorization header; they're already
-#     HMAC-signed and you only get a working URL from an authenticated /watch call,
-#     so they're gated indirectly,
-#   * the Ko-fi webhook (called by Ko-fi, not a browser),
-#   * docs.
-# Defined BEFORE the CORS middleware below so CORS remains the outermost layer and
-# its headers are attached even to the 401 we return here (browsers need that to
-# surface the error instead of an opaque CORS failure).
-#   * /metrics, whitelisted here ONLY so a Prometheus scrape carrying
-#     METRICS_TOKEN reaches the handler; the route is not public, it enforces its
-#     own token-or-admin check (see web/routes/metrics.py) and denies by default
-#     when no token is configured.
+# Everything is private unless whitelisted. The whitelist covers:
+#   * auth endpoints, since you cannot log in without them
+#   * health and root, for uptime probes
+#   * the signed stream proxies and player, loaded directly by <iframe>, <video>
+#     and hls.js, none of which can attach an Authorization header. They are
+#     HMAC-signed and a working URL only comes from an authenticated /watch call,
+#     so they are gated indirectly
+#   * the Ko-fi webhook, called by Ko-fi rather than a browser
+#   * docs
+#   * /metrics, listed only so a scrape carrying METRICS_TOKEN reaches the
+#     handler. The route is not public: it enforces its own token-or-admin check
+#     and denies by default when no token is configured.
+#
+# Defined before the CORS middleware so CORS stays the outermost layer and its
+# headers reach even the 401 returned here, which browsers need in order to
+# surface the error instead of an opaque CORS failure.
 _PUBLIC_EXACT = {
     "/", "/lumi", "/health", "/config", "/openapi.json", "/docs", "/redoc", "/metrics",
 }
@@ -561,49 +528,41 @@ _PUBLIC_PREFIXES = (
     "/kofi/webhook",
     "/changelog",
     "/player",
-    # Operator-owned source proxies (the only stream proxies the backend still
-    # serves). Third-party source proxies were removed with their scrapers. Any
-    # overlay-contributed stream proxy is added to _DYNAMIC_PUBLIC_PREFIXES instead
-    # (see _register_overlay_stream_proxies), so this list names no overlay source.
+    # The only stream proxies the backend still serves. An overlay's goes into
+    # _DYNAMIC_PUBLIC_PREFIXES instead, so this list names no overlay source.
     "/jellyfin_proxy",
     "/cache_proxy",
-    # Local media: a <video> (direct play) and hls.js (transcode) load these
-    # cross-origin and CANNOT attach the login-wall bearer, exactly like /cache_proxy
-    # — so they must be public. Each maps an opaque path token back to a file ONLY
-    # inside a currently-enabled source root (safe_resolve / safe_resolve_transcode),
-    # re-checked per request, so being public doesn't widen what they can reach.
+    # A <video> and hls.js load these cross-origin and cannot attach the bearer,
+    # exactly like /cache_proxy, so they must be public. Each maps its path token
+    # back to a file only inside a currently enabled root, re-checked per request,
+    # so being public does not widen what they reach.
     "/local_proxy",
     "/local_hls",
-    # Local poster/cover art loads cross-origin in an <img> with no auth header;
-    # it's HMAC-signed instead (see local_engine.fs.art_proxy_url / the /local_art route).
+    # Loads cross-origin in an <img> with no auth header, so it is signed instead.
     "/local_art",
-    # The subtitle <track> loads cross-origin with no auth header (signed instead).
+    # The <track> loads cross-origin with no auth header, so it is signed instead.
     "/subtitles_proxy",
-    # The manga page <img> loads cross-origin with no auth header (signed instead) —
-    # same reasoning as /subtitles_proxy. Dormant (503) unless an operator build
-    # injects a manga provider; the public build resolves pages client-side. See
-    # manga_engine.
+    # Same reasoning as /subtitles_proxy. Dormant unless an operator build injects
+    # a manga provider; the public build resolves pages client-side.
     "/manga_proxy",
-    # Live TV playlists/segments: hls.js loads these cross-origin and can't carry
-    # the login-wall bearer — HMAC-signed instead (URL + header overrides), and the
-    # fetch runs through the SSRF-guarded client. See iptv_engine.
+    # hls.js loads these cross-origin and cannot carry the bearer, so they are
+    # signed instead and the fetch runs through the SSRF-guarded client.
     "/iptv_proxy",
     "/docs",
 )
 
-# Extra public path prefixes contributed at import time by the optional build-time
-# source overlay (empty in a base build). Their stream proxies are loaded cross-origin
-# by the player with no auth header (HMAC-signed instead), so they bypass the login
-# wall the same way the operator proxies above do. Kept separate + derived from the
-# overlaid module names so this committed file names no overlay source.
+# Contributed at import time by the optional overlay, and empty in a base build.
+# Its proxies are loaded cross-origin with no auth header and signed instead, so
+# they bypass the wall exactly as the operator proxies above do. Kept separate and
+# derived from module names, so this file names no overlay source.
 _DYNAMIC_PUBLIC_PREFIXES: tuple = ()
 
-# Tiny in-process cache of validated session tokens so the login wall doesn't add
-# a DB round-trip to every content request. A hit (the common case) skips the DB
-# entirely; entries are short-lived so a logout/expiry takes effect within the
-# TTL. Keyed by the token's SHA-256 (never the raw token).
-_SESSION_OK_TTL = 60.0          # seconds
-_SESSION_OK_MAX = 20_000        # hard cap to bound memory
+# Keeps the login wall from adding a DB round-trip to every content request. The
+# common case, a hit, skips the DB entirely, and entries are short-lived so a
+# logout takes effect within the TTL. Keyed by the token's SHA-256, never the raw
+# token.
+_SESSION_OK_TTL = 60.0
+_SESSION_OK_MAX = 20_000        # bounds memory
 _session_ok_cache: Dict[str, float] = {}
 
 
@@ -615,23 +574,22 @@ async def _session_is_valid(raw_token: str) -> bool:
     exp = _session_ok_cache.get(key)
     if exp is not None and exp > now:
         return True
-    # Cache miss — verify against the DB off the event loop.
+    # A miss verifies against the DB, off the event loop.
     user = await run_in_threadpool(account_store.get_user_by_session, raw_token)
     if user:
         if len(_session_ok_cache) >= _SESSION_OK_MAX:
-            _session_ok_cache.clear()  # cheap, bounded reset under abuse
+            _session_ok_cache.clear()  # cheap bounded reset under abuse
         _session_ok_cache[key] = now + _SESSION_OK_TTL
         return True
     _session_ok_cache.pop(key, None)
     return False
 
 
-# Same short-lived validity cache for movie-web bridge API keys (see apikey_engine).
-# Keyed by SHA-256 of the raw key; a hit skips the DB on the hot path. A cache miss
-# validates AND touches last_used_at, so that write happens at most once per key per
-# TTL rather than on every /mw request.
-_APIKEY_OK_TTL = 60.0           # seconds
-_APIKEY_OK_MAX = 5_000          # hard cap to bound memory
+# The same cache for bridge API keys. A miss both validates and touches
+# last_used_at, so that write happens at most once per key per TTL rather than on
+# every /mw request.
+_APIKEY_OK_TTL = 60.0
+_APIKEY_OK_MAX = 5_000          # bounds memory
 _apikey_ok_cache: Dict[str, float] = {}
 
 
@@ -646,7 +604,7 @@ async def _apikey_is_valid(raw_key: str) -> bool:
     ok = await run_in_threadpool(apikey_store.validate_and_touch, raw_key)
     if ok:
         if len(_apikey_ok_cache) >= _APIKEY_OK_MAX:
-            _apikey_ok_cache.clear()  # cheap, bounded reset under abuse
+            _apikey_ok_cache.clear()  # cheap bounded reset under abuse
         _apikey_ok_cache[key] = now + _APIKEY_OK_TTL
         return True
     _apikey_ok_cache.pop(key, None)
@@ -654,10 +612,11 @@ async def _apikey_is_valid(raw_key: str) -> bool:
 
 
 class LoginWallMiddleware:
-    """Pure-ASGI login wall. Implemented at the ASGI layer (not BaseHTTPMiddleware)
-    so it adds zero buffering to the progressive NDJSON /watch stream — it only
-    inspects the request scope, then either short-circuits with a 401 or passes
-    the untouched send/receive channels straight through."""
+    """Pure-ASGI login wall.
+
+    At the ASGI layer rather than BaseHTTPMiddleware, so it adds no buffering to
+    the progressive /watch stream: it inspects the request scope, then either
+    short-circuits with a 401 or passes the channels straight through."""
 
     def __init__(self, app):
         self.app = app
@@ -685,14 +644,13 @@ class LoginWallMiddleware:
             elif name == b"x-api-key":
                 api_key = value.decode("latin-1").strip()
 
-        # A normal signed-in session is accepted on every gated path.
+        # A signed-in session is accepted on every gated path.
         if token and await _session_is_valid(token):
             return await self.app(scope, receive, send)
 
-        # API keys are deliberately scoped to the movie-web bridge ONLY: a valid
-        # X-API-Key unlocks /mw* and nothing else (not /account, /admin, or the
-        # catalogue). That scoping is what lets an admin hand a key to the
-        # movie-web fork without it becoming a skeleton key for the whole backend.
+        # Keys are scoped to the bridge alone: a valid X-API-Key unlocks /mw* and
+        # nothing else. That is what lets an admin hand one to the movie-web fork
+        # without it becoming a skeleton key for the whole backend.
         if (
             (path == "/mw" or path.startswith("/mw/"))
             and api_key
@@ -711,11 +669,11 @@ class LoginWallMiddleware:
         await response(scope, receive, send)
 
 
-# Added BEFORE CORS so CORS stays the outermost layer and its headers are applied
-# even to the 401 this returns (the browser needs them to surface the error).
+# Before CORS, so CORS stays outermost and its headers reach even the 401 this
+# returns, which the browser needs in order to surface the error.
 app.add_middleware(LoginWallMiddleware)
 
-# CORS Middleware
+# --- CORS -------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=Config.ALLOWED_ORIGINS,
@@ -726,13 +684,12 @@ app.add_middleware(
 
 
 class LumiHeaderMiddleware:
-    """Stamp every response with Lumi's voice. Pure-ASGI (like the login wall) so
-    it only touches the response *start* message — it appends two headers and
-    never buffers the body, leaving the progressive NDJSON /watch stream untouched.
+    """Stamp every response with Lumi's voice.
 
-    ``X-Lumi`` carries a rotating, ASCII-only sarcastic quip (devtools easter egg);
-    ``X-Powered-By`` names the empress. Best-effort: a quip that somehow fails to
-    encode is simply dropped rather than breaking the response."""
+    Pure-ASGI like the login wall, so it touches only the response start message
+    and never buffers the body. ``X-Lumi`` carries a rotating ASCII quip and
+    ``X-Powered-By`` names the empress. A quip that fails to encode is dropped
+    rather than breaking the response."""
 
     def __init__(self, app):
         self.app = app
@@ -756,39 +713,32 @@ class LumiHeaderMiddleware:
         await self.app(scope, receive, send_wrapper)
 
 
-# Added after CORS so CORS stays outermost; this only appends response headers and
-# never buffers, so the NDJSON stream is unaffected.
+# After CORS, so CORS stays outermost. Appends headers only and never buffers.
 app.add_middleware(LumiHeaderMiddleware)
 
 
 class RequestContextMiddleware:
     """Mint a request id, bind it for logging, and record the HTTP metrics.
 
-    Pure-ASGI for the same reason as the two middlewares above: BaseHTTPMiddleware
-    wraps the response in an anyio stream, which would buffer the progressive
-    NDJSON /watch body and stall playback until the slowest scraper finished. This
-    one only reads the request scope and inspects the response *start* message; the
-    body messages pass through untouched.
+    Pure-ASGI for the same reason as the two above: BaseHTTPMiddleware wraps the
+    response in an anyio stream, which would buffer the /watch body and stall
+    playback until the slowest scraper finished.
 
     Three things happen here:
 
-    * ``X-Request-ID`` is taken from the request (a reverse proxy may already have
-      set one) or minted, then bound to a ContextVar so every log line emitted
-      while handling this request carries it. It is echoed back on the response so
-      a user can quote it in a bug report.
-    * Latency is measured to ``http.response.start`` (headers), NOT to the last
-      body byte, so /watch's multi-second stream doesn't swamp the histogram. The
-      streaming side has its own crimson_watch_* metrics.
-    * The route *template* is used as the metric label, never the raw path. See
-      ``observability.route_label``: labelling by path would mint one timeseries
-      per episode.
+    * ``X-Request-ID`` is taken from the request, since a reverse proxy may
+      already have set one, or minted, then bound to a ContextVar so every log
+      line from this request carries it. It is echoed back so a user can quote it.
+    * Latency is measured to the response headers, not the last body byte, so
+      /watch's multi-second stream does not swamp the histogram. The streaming
+      side has its own crimson_watch_* metrics.
+    * The route template is the metric label, never the raw path, which would mint
+      one timeseries per episode.
 
-    Added last, so it is the OUTERMOST middleware: a request that the login wall
-    rejects still gets an id and is still counted. Note the consequence for the
-    route label: the wall short-circuits before routing, so every 401 it returns
-    lands in the ``__unmatched__`` bucket rather than under its real route. That is
-    the desirable direction, since it means unauthenticated traffic cannot mint
-    label values at all.
+    Added last, so it is outermost and a request the login wall rejects still gets
+    an id and is still counted. The wall short-circuits before routing, so its
+    401s land in the ``__unmatched__`` bucket rather than their real route. That is
+    the desirable direction: unauthenticated traffic cannot mint label values.
     """
 
     def __init__(self, app):
@@ -820,10 +770,9 @@ class RequestContextMiddleware:
                 recorded = True
                 headers = message.setdefault("headers", [])
                 headers.append((b"x-request-id", request_id.encode("latin-1")))
-                # scope["route"] is set by the router during dispatch, so by the
-                # time the response starts flowing back out through here it is
-                # available. On a 404 there is no route and the label collapses to
-                # a single bucket.
+                # Set by the router during dispatch, so it is available by the
+                # time the response flows back through here. A 404 has no route
+                # and collapses to a single bucket.
                 observability.record_http_request(
                     method,
                     observability.route_label(scope),
@@ -836,10 +785,9 @@ class RequestContextMiddleware:
             await self.app(scope, receive, send_wrapper)
         finally:
             if not recorded:
-                # No response ever started: the client hung up mid-request, or the
-                # app raised before sending. Recorded as 499 (nginx's
-                # client-closed-request) so the in-progress gauge below can't drift
-                # upward forever on a flaky mobile connection.
+                # Nothing ever started: the client hung up, or the app raised
+                # before sending. Recorded as 499, nginx's client-closed-request,
+                # so the gauge below cannot drift upward forever.
                 observability.record_http_request(
                     method, observability.route_label(scope), 499,
                     time.monotonic() - started,
@@ -851,68 +799,57 @@ class RequestContextMiddleware:
 app.add_middleware(RequestContextMiddleware)
 
 # --- ROUTERS ----------------------------------------------------------------
-# Engine routers first (their prefixes — /account, /admin, /supporters, /changelog,
-# /recommendations, /subtitles, /skiptimes — are all distinct), then the core
-# routers from web.routes. Order is preserved from the old single-file api.py.
+# Engine routers first, since their prefixes are all distinct, then the core
+# routers from web.routes.
 
-# Account system (mnemonic/Ed25519 sign-in, favorites, watch progress).
+# Sign-in, favorites and watch progress.
 app.include_router(account_router)
 
-# Admin dashboard (user management, invite minting, metadata resync, stats).
 # Gated by require_admin on every route; the login wall already covers /admin.
 app.include_router(admin_router)
 
-# Ko-fi supporters (webhook ingest + public "Lumi's Loved Mortals" list).
+# Ko-fi webhook ingest and the public supporters list.
 app.include_router(supporters_router)
 
-# Public changelog (cached view of this repo's GitHub Releases).
+# A cached, public view of this repo's GitHub Releases.
 app.include_router(changelog_router)
 
-# "What to watch next" — genre-based recommendations derived from the viewer's
-# favorites + watch history (read-only, additive; see recommend_engine).
+# Genre-based recommendations from the viewer's favorites and watch history.
 app.include_router(recommend_router)
 
-# Lumi's chatbot. Gated three ways (session, feature switch, per-account grant)
-# and deny-by-default, so mounting it does not expose anything until an admin
-# both switches it on and grants an account access from the dashboard. Its tools
-# are thin wrappers over the recommendation / account engines above.
+# Gated three ways and deny-by-default, so mounting it exposes nothing until an
+# admin both switches it on and grants an account access. Its tools are thin
+# wrappers over the engines above.
 app.include_router(chat_router)
 
-# OpenSubtitles-backed external subtitle tracks for the player. /subtitles is
-# authed (search, no quota spent); /subtitles_proxy is public + signed (the
-# <track> can't carry auth) — see subtitles_engine + the _PUBLIC_PREFIXES entry.
+# External subtitle tracks. /subtitles is authed, while /subtitles_proxy is public
+# and signed because a <track> cannot carry auth.
 app.include_router(subtitles_router)
 
-# AniSkip-backed intro/outro skip timestamps for the anime player. /skiptimes is
-# authed (behind the login wall); anime-only (resolves anilist_id -> mal_id) and
-# best-effort — see skiptimes_engine.
+# Intro and outro skip timestamps. Authed, anime-only and best-effort.
 app.include_router(skiptimes_router)
 
-# Manga — the reading surface (AniList discovery; chapters/pages resolved in the
-# viewer's browser by crimson-sources, or by an injected private provider on an
-# operator build). Its /manga_proxy image relay is public + signed but dormant
-# without a provider (see _PUBLIC_PREFIXES); the rest is behind the login wall like
-# every other content route. Additive; anime/shows/movies are untouched.
+# The reading surface. Chapters and pages resolve in the viewer's browser, or via
+# an injected provider on an operator build. /manga_proxy is public and signed but
+# dormant without a provider; the rest sits behind the login wall.
 app.include_router(manga_router)
 
-# Live TV — a browsable catalogue of free-to-air broadcasts indexed by the
-# iptv-org project. Read-only and additive; browse/search/detail sit behind the
-# login wall, /iptv_proxy is public + signed (see iptv_engine + _PUBLIC_PREFIXES).
+# A read-only catalogue of free-to-air broadcasts indexed by iptv-org. Browse and
+# detail sit behind the login wall; /iptv_proxy is public and signed.
 app.include_router(iptv_router)
 
-# The core surface (system, discovery, watch, metadata, proxies) — see web.routes.
+# The core surface: system, discovery, watch, metadata and proxies.
 for _router in all_routers:
     app.include_router(_router)
 
 # --- ENGINE HANDLER INJECTION ----------------------------------------------
-# Several engine routers call back into logic that lives in the web layer (the heavy
-# TMDB/pipeline helpers), injected here so those engines don't import the pipeline
-# (or this module). Same dependency-injection pattern throughout.
+# Several engine routers call back into logic in the web layer, injected here so
+# those engines import neither the pipeline nor this module:
 #
-#   * the account router enriches watch-progress rows with next-episode hints and
-#     fires the continue-watching warmup;
-#   * the admin router runs the forced Fribb resync, the system snapshot, and the
-#     source-health probe sweep.
+#   * the account router enriches progress rows with next-episode hints and fires
+#     the continue-watching warmup
+#   * the admin router runs the forced resync, the system snapshot and the
+#     source-health sweep
 set_episode_enricher(_enrich_progress_rows)
 set_warmup_handler(schedule_warmup)
 set_resync_handler(forced_resync)
@@ -921,12 +858,10 @@ set_source_health_handler(admin_source_health)
 
 
 # --- OPTIONAL BUILD-TIME OVERLAY STREAM PROXIES -----------------------------
-# Optional same-origin stream relays for any overlaid module that ships a
-# ``proxy_fetch`` (present only when the build-time overlay added it). Each is
-# schema-hidden, with the HMAC verification / host allow-list living inside the
-# module's own ``proxy_fetch``. A base build has none, so nothing is added.
-# Routes are derived from the module names + the wiring shape from each fetch
-# signature, so this file names no overlaid source.
+# Same-origin relays for any overlaid module shipping a ``proxy_fetch``. Each is
+# schema-hidden, and the HMAC verification and host allow-list live inside that
+# module. A base build has none. Routes are derived from the module names and the
+# wiring from each fetch signature, so this file names no overlaid source.
 def _register_overlay_stream_proxies():
     global _DYNAMIC_PUBLIC_PREFIXES
 
@@ -1024,11 +959,11 @@ def _register_overlay_stream_proxies():
 _register_overlay_stream_proxies()
 
 
-# --- ERROR HANDLERS ---
+# --- ERROR HANDLERS ---------------------------------------------------------
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Custom HTTP exception handler. Keeps the real technical detail in ``error``
-    (the frontend may key on it) and adds Lumi's voiced ``message`` for the banner."""
+    """Keeps the real technical detail in ``error``, which the frontend may key on,
+    and adds Lumi's voiced ``message`` for the banner."""
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -1042,7 +977,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """Global exception handler"""
+    """Last-resort handler: logs the traceback and returns a voiced 500."""
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,

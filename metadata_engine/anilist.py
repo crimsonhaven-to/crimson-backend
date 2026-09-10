@@ -1,9 +1,8 @@
 """
-AniList metadata fetcher, lifted out of api.py.
+AniList metadata fetcher.
 
 GraphQL fetch of a title's AniList metadata (titles, synonyms, episodes, airing
-info), plus the tiny ``_empty`` coroutine api.py uses to gather an optional
-AniList fetch without branching.
+info), plus the manga equivalents that share the same endpoint and cache.
 """
 
 import asyncio
@@ -24,20 +23,18 @@ from core.response_cache import (
 logger = logging.getLogger("crimson.anilist")
 
 ANILIST_URL = "https://graphql.anilist.co"
-# Cap how long a single web request will block on an AniList Retry-After. AniList
-# can ask for 60s+ when rate-limiting; we won't hang a user request that long —
-# past this ceiling we give up and let the caller degrade (serve-stale / empty).
+# AniList can ask for 60s+ when rate-limiting, which is far too long to hang a
+# user request on. Past this ceiling the caller degrades instead.
 _MAX_RETRY_WAIT = 8.0
 
 
 async def _empty() -> Dict:
-    """A coroutine that resolves to ``{}`` — lets us ``asyncio.gather`` an
-    optional fetch (e.g. AniList when there's no mapping) without branching."""
+    """Resolves to ``{}``, so an optional fetch can be gathered without branching."""
     return {}
 
 
 def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
-    """Parse a Retry-After header (delta-seconds form, which AniList uses)."""
+    """Parse a Retry-After header in the delta-seconds form AniList uses."""
     raw = response.headers.get("Retry-After")
     if not raw:
         return None
@@ -54,17 +51,14 @@ async def anilist_post(
     *,
     timeout: Optional[float] = None,
 ) -> Optional[httpx.Response]:
-    """POST a GraphQL query to AniList with retry + backoff.
+    """POST a GraphQL query to AniList with retry and backoff.
 
-    AniList is frequently rate-limited (a degraded ~30 req/min ceiling → HTTP 429)
-    or transiently 5xx; a one-shot POST turns that blip into a hard failure and, on
-    the discovery hubs, a 503 or an empty grid. This retries 429 (honoring
-    Retry-After, capped at ``_MAX_RETRY_WAIT`` so a request never hangs) and
-    500/502/503/504 with exponential backoff, and retries network/timeout errors.
+    AniList is frequently rate-limited or transiently 5xx, and a one-shot POST
+    turns that blip into an empty discovery grid. Retries 429, honouring
+    Retry-After up to ``_MAX_RETRY_WAIT``, and 5xx with exponential backoff.
 
-    Returns the final ``httpx.Response`` — the successful one, or the last failing
-    one once retries are exhausted — so callers keep their existing status-code and
-    GraphQL-``errors[]`` handling unchanged. Re-raises the last network exception
+    Returns the final response, successful or not, so callers keep their existing
+    status-code and ``errors[]`` handling. Re-raises the last network exception
     only if no attempt ever produced a response.
     """
     payload: Dict = {"query": query}
@@ -112,10 +106,9 @@ async def anilist_post(
 
 
 async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> Dict:
-    """Fetch anime metadata from AniList"""
+    """Titles, synonyms, episodes and airing info for one AniList id."""
     cache_key = f"anilist:meta:{anilist_id}"
     
-    # Check cache
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         return cached_data
@@ -168,15 +161,14 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
         if response is None or response.status_code != 200:
             status = response.status_code if response is not None else "no response"
             logger.error(f"AniList API error: Status {status}")
-            # Outage → serve the last known good copy rather than a blank {} (which
-            # would 404 the overview / drop metadata from the watch pipeline).
+            # Serve the last known good copy rather than a blank {}, which would
+            # 404 the overview and drop metadata from the watch pipeline.
             return await get_stale_response(cache_key) or {}
 
         data = response.json()
         media = data.get("data", {}).get("Media", {})
         if not media: return {}
         
-        # Format streaming episodes
         raw_episodes = media.get("streamingEpisodes", [])
         formatted_episodes = []
         
@@ -188,7 +180,6 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
                 "url": ep.get("url")
             })
         
-        # Fallback to generated episode list if no streaming episodes
         if not formatted_episodes and media.get("episodes"):
             total_episodes = media.get("episodes")
             for i in range(1, total_episodes + 1):
@@ -201,8 +192,7 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
         
         result = {
             "anilist_id": media.get("id"),
-            # MyAnimeList id (AniList's idMal). Surfaced so the skip-intro feature
-            # can key AniSkip off it (see skiptimes_engine); additive field.
+            # Surfaced so the skip-intro feature can key AniSkip off it.
             "mal_id": media.get("idMal"),
             "title": media.get("title", {}).get("english") or media.get("title", {}).get("romaji"),
             "title_romaji": media.get("title", {}).get("romaji"),
@@ -220,7 +210,7 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
             "episodes_list": formatted_episodes
         }
         
-        # Cache the result (+ a long-lived shadow for serve-stale-on-error).
+        # Plus a long-lived shadow, for serve-stale-on-error.
         if result:
             await set_cached_response_shadowed(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
 
@@ -232,15 +222,13 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
 
 
 # --- MANGA (the reading surface) -------------------------------------------
-# AniList's ``MediaType`` already includes ``MANGA``, so the manga surface reuses
-# the exact same GraphQL endpoint + response cache as the anime metadata above —
-# only ``type: MANGA`` and the manga-specific fields (chapters/volumes instead of
-# episodes/airing) differ. Kept here beside the anime fetcher so all AniList logic
-# lives in one place. See manga_engine for how these feed the /manga routes.
+# AniList's ``MediaType`` includes ``MANGA``, so this reuses the same endpoint and
+# response cache as the anime metadata above; only the type and the
+# chapter/volume fields differ. Kept beside the anime fetcher so all AniList logic
+# lives in one place.
 
 def _manga_item(media: Dict) -> Dict:
-    """Project one AniList MANGA ``Media`` node onto the poster-card shape the
-    frontend rows + unified search consume (``kind: 'manga'``)."""
+    """Project one AniList ``Media`` node onto the frontend's poster-card shape."""
     title = media.get("title") or {}
     cover = media.get("coverImage") or {}
     score = media.get("averageScore")
@@ -256,10 +244,8 @@ def _manga_item(media: Dict) -> Dict:
 
 
 async def fetch_anilist_manga_metadata(client: httpx.AsyncClient, anilist_id: int) -> Dict:
-    """Full metadata for a single AniList MANGA entry (the manga overview page).
-
-    Cached like the anime fetcher. Returns ``{}`` on any miss/failure so a caller
-    can degrade gracefully."""
+    """Full metadata for one AniList manga entry, for the overview page. Cached
+    like the anime fetcher, and ``{}`` on any miss so callers degrade."""
     cache_key = f"anilist:manga:meta:{anilist_id}"
     cached_data = await get_cached_response(cache_key)
     if cached_data:
@@ -326,8 +312,7 @@ async def fetch_anilist_manga_metadata(client: httpx.AsyncClient, anilist_id: in
 
 
 async def search_anilist_manga(client: httpx.AsyncClient, query_name: str, per_page: int = 12) -> list:
-    """AniList MANGA search for the unified landing search — returns a list of
-    poster-card items (``kind: 'manga'``). Non-adult only by default."""
+    """Manga search for the unified landing search. Non-adult only by default."""
     graphql = """
     query ($search: String, $perPage: Int) {
       Page (page: 1, perPage: $perPage) {
@@ -353,11 +338,11 @@ async def search_anilist_manga(client: httpx.AsyncClient, query_name: str, per_p
 
 
 async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> dict:
-    """Trending AniList MANGA for the landing page's manga row.
+    """Trending manga for the landing page's row.
 
-    Returns ``{"items": [poster-cards], "stale": bool}``. Cached (the list is
-    identical for every viewer within the window); on an AniList outage it serves
-    the last known good copy tagged ``stale: True`` instead of an empty row.
+    Cached, since the list is identical for every viewer within the window. An
+    AniList outage serves the last known good copy tagged ``stale`` rather than an
+    empty row.
     """
     cache_key = f"anilist:manga:trending:{limit}"
     cached_data = await get_cached_response(cache_key)
@@ -392,28 +377,25 @@ async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> di
         )
         return {"items": result, "stale": False}
 
-    # Live fetch failed/empty → serve the last known good row if we have one.
+    # The live fetch failed, so serve the last known good row if there is one.
     stale = await get_stale_response(cache_key)
     if stale:
         return {"items": stale, "stale": True}
     return {"items": [], "stale": False}
 
 
-# --- Manga browse hub (live AniList; no DB table, so this cannot be local) ----
-# The manga twin of /catalogue/shows|movies, but paginated + live: there is no
-# manga table (see manga_engine docstring), so a genre/sort browse must hit
-# AniList directly. Cached per (genre, sort, page) in the response cache like
-# fetch_trending_manga. The frontend Manga hub drives page/sort/genre and appends
-# pages ("load more"), since the full corpus is far too large to ship at once.
+# --- Manga browse hub (live AniList, since there is no local table) ---------
+# The manga twin of the show and movie catalogues, but paginated and live: with
+# no manga table, a genre or sort browse must hit AniList directly. Cached per
+# (genre, sort, page). The frontend appends pages, since the corpus is far too
+# large to ship at once.
 
-# The anime browse hub shares this exact machinery (only ``type: ANIME`` differs):
-# the anime /catalogue is 6,800 mapped titles and slow to ship+render whole, so the
-# DEFAULT anime browse is this same fast, paginated, poster-rich AniList grid; the
-# full local catalogue stays a secondary "Archive" view.
+# The anime hub shares this machinery, differing only in the media type. The full
+# anime catalogue is slow to ship and render whole, so the default anime browse is
+# this same paginated grid and the local catalogue stays a secondary Archive view.
 
-# Friendly sort token -> AniList MediaSort enum. Trending is the default browse
-# order (matches the trending row); the rest give the hub its sort control. Shared
-# by the anime + manga catalogue browses (MediaSort applies to both media types).
+# Friendly sort token -> AniList MediaSort. Trending is the default, matching the
+# trending row. Shared by the anime and manga browses.
 _MEDIA_SORTS = {
     "trending": "TRENDING_DESC",
     "popular": "POPULARITY_DESC",
@@ -422,13 +404,13 @@ _MEDIA_SORTS = {
     "title": "TITLE_ROMAJI",
 }
 CATALOGUE_DEFAULT_SORT = "trending"
-# Back-compat alias (manga_engine + older imports referenced MANGA_DEFAULT_SORT).
+# Back-compat alias for older imports.
 MANGA_DEFAULT_SORT = CATALOGUE_DEFAULT_SORT
 
 
 async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
-    """AniList's genre vocabulary (shared anime/manga) for the browse hubs' filter
-    chips. Tiny and very stable, so cached aggressively (L1 + response cache)."""
+    """AniList's genre vocabulary, for the browse hubs' filter chips. Tiny and
+    very stable, so cached aggressively."""
     cache_key = "anilist:genres"
     local = _local_get(cache_key)
     if local is not None:
@@ -440,7 +422,7 @@ async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
     query = "query { GenreCollection }"
 
     async def _stale_genres() -> list:
-        """Last known good genre vocabulary (chips still render during an outage)."""
+        """The last known good vocabulary, so chips still render during an outage."""
         stale = await get_stale_response(cache_key)
         if stale and stale.get("genres"):
             _local_set(cache_key, stale["genres"])
@@ -471,12 +453,11 @@ async def _fetch_media_catalogue(
     page: int,
     per_page: int,
 ) -> Dict:
-    """One page of an AniList browse hub for ``media_type`` ('ANIME' | 'MANGA').
+    """One page of an AniList browse hub for ``media_type``.
 
-    ``Page.media(type: …)`` with an optional ``genre`` filter and a friendly
-    ``sort`` token; returns ``{items, page, has_next, total}`` where ``items`` are
-    poster cards tagged ``kind`` (so anime routes to /anime/{id}, manga to
-    /manga/{id}). Cached per (media_type, genre, sort, page)."""
+    Returns ``{items, page, has_next, total}``, where items are poster cards
+    tagged ``kind`` so each routes to its own pages. Cached per
+    (media_type, genre, sort, page)."""
     sort_enum = _MEDIA_SORTS.get(sort, _MEDIA_SORTS[CATALOGUE_DEFAULT_SORT])
     page = max(1, page)
     genre_key = (genre or "").casefold()
@@ -503,11 +484,10 @@ async def _fetch_media_catalogue(
     if genre:
         variables["genre"] = genre
 
-    # An upstream failure is distinct from a genuinely empty page. Rather than the
-    # bare "temporarily unavailable", first try to serve the last known good copy of
-    # THIS exact page (tagged `stale: True`); only if no shadow exists do we return
-    # `unavailable`, which the caller turns into a 503 (manga) or the local-DB
-    # fallback (anime). Never caches the failure, so it self-heals on retry.
+    # An upstream failure is distinct from a genuinely empty page, so try the last
+    # known good copy of this exact page first, tagged `stale`. Only with no shadow
+    # does it report `unavailable`, which the caller turns into a 503 or the
+    # local-DB fallback. The failure is never cached, so it self-heals on retry.
     async def _unavailable_or_stale() -> Dict:
         shadow = await get_stale_response(cache_key)
         if shadow:
@@ -524,9 +504,9 @@ async def _fetch_media_catalogue(
             logger.error(f"AniList {kind} browse error: Status {status}")
             return await _unavailable_or_stale()
         payload = response.json()
-        # AniList returns HTTP 200 even on failure, with the real error in `errors`
-        # (e.g. the whole API being disabled). Treat that as unavailable, not empty —
-        # and LOG it, so an outage leaves a breadcrumb instead of a silent blank grid.
+        # AniList returns HTTP 200 even on failure, with the real error in
+        # `errors`. That is unavailable rather than empty, and worth logging so an
+        # outage leaves a breadcrumb instead of a silently blank grid.
         if payload.get("errors"):
             msg = (payload["errors"][0] or {}).get("message", "unknown error")
             logger.warning(f"AniList {kind} browse GraphQL error: {msg}")
@@ -534,8 +514,7 @@ async def _fetch_media_catalogue(
         page_data = ((payload.get("data") or {}).get("Page") or {})
         info = page_data.get("pageInfo") or {}
         media = page_data.get("media") or []
-        # _manga_item is the generic AniList-media projection; only the `kind` tag
-        # differs between anime and manga, so re-tag it for anime.
+        # _manga_item is the generic projection; only the `kind` tag differs.
         items = []
         for m in media:
             if not m.get("id"):
@@ -566,7 +545,7 @@ async def fetch_manga_catalogue(
     page: int = 1,
     per_page: int = 30,
 ) -> Dict:
-    """One page of the manga browse hub — see _fetch_media_catalogue."""
+    """One page of the manga browse hub; see _fetch_media_catalogue."""
     return await _fetch_media_catalogue(client, "MANGA", "manga", genre, sort, page, per_page)
 
 
@@ -577,7 +556,6 @@ async def fetch_anime_catalogue(
     page: int = 1,
     per_page: int = 30,
 ) -> Dict:
-    """One page of the anime browse hub (the fast default view) — the anime twin of
-    fetch_manga_catalogue. Items are ``kind: 'anime'`` poster cards keyed by
-    anilist_id, so they route through the existing /anime/{anilist_id} pages."""
+    """One page of the anime browse hub, the fast default view and the twin of
+    fetch_manga_catalogue. Items are cards keyed by anilist_id."""
     return await _fetch_media_catalogue(client, "ANIME", "anime", genre, sort, page, per_page)

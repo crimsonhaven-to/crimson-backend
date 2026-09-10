@@ -1,8 +1,7 @@
-"""Pure DB read helpers over the mapping/catalogue tables.
+"""Read-only queries over the mapping and catalogue tables.
 
-Read-only queries against the shared PostgreSQL pool, lifted verbatim from
-``api.py``. They import only ``web.context.get_db_connection`` and the TMDB image
-helper, so they carry no app coupling and can be shared by every route module.
+These import only ``web.context.get_db_connection`` and the TMDB image helper, so
+they carry no app coupling and every route module can share them.
 """
 
 import json
@@ -17,7 +16,7 @@ logger = logging.getLogger("crimson.queries")
 
 
 def get_anilist_id(tmdb_id: int, season_number: int) -> Optional[int]:
-    """Query mapped AniList ID from TMDB ID and season"""
+    """The mapped AniList id for a TMDB id and season."""
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -33,11 +32,9 @@ def get_anilist_id(tmdb_id: int, season_number: int) -> Optional[int]:
 
 
 def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, Optional[int]]]:
-    """
-    Reverse lookup: returns (tmdb_id, season_number) for an anilist_id.
+    """Reverse lookup: (tmdb_id, season_number) for an anilist_id.
 
-    Falls back to tmdb_extras (specials/OVAs/movies), in which case
-    season_number is None.
+    Falls back to tmdb_extras, in which case season_number is None.
     """
     try:
         with get_db_connection() as conn:
@@ -50,7 +47,7 @@ def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, Optional[int]]]:
             if row:
                 return (row["tmdb_id"], row["season_number"])
 
-            # Not a numbered season — maybe a special/OVA/movie.
+            # Not a numbered season, so perhaps a special, OVA or movie.
             cursor.execute(
                 "SELECT tmdb_id FROM tmdb_extras WHERE anilist_id = %s LIMIT 1",
                 (anilist_id,)
@@ -63,12 +60,10 @@ def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, Optional[int]]]:
 
 
 def get_anime_genres(anilist_id: int) -> List[str]:
-    """Genres for a single anime, read from the local anime_entries DB.
+    """Genres for one anime, from the same local table the catalogue uses.
 
-    Same source the catalogue uses (genres is a JSON-encoded list, null for
-    entries synced before the column existed). Cheap single-row read so the
-    /overview endpoint can ship genres without an extra external API call.
-    Returns [] for non-anime / unknown ids.
+    A single-row read, so /overview ships genres without an external API call.
+    Returns [] for non-anime or unknown ids.
     """
     try:
         with get_db_connection() as conn:
@@ -89,7 +84,7 @@ def get_anime_genres(anilist_id: int) -> List[str]:
 
 
 def get_show_seasons(tmdb_id: int) -> List[Dict]:
-    """Returns all seasons with season_number, anilist_id, title_romaji, etc."""
+    """Every mapped season of a show, with its ids and titles."""
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -107,7 +102,7 @@ def get_show_seasons(tmdb_id: int) -> List[Dict]:
 
 
 def get_anime_entry(anilist_id: Optional[int]) -> Dict:
-    """Returns the anime_entries row (titles, type, year) for an anilist_id."""
+    """The anime_entries row for an anilist_id."""
     if not anilist_id:
         return {}
     try:
@@ -122,11 +117,11 @@ def get_anime_entry(anilist_id: Optional[int]) -> Dict:
 
 
 def get_show_extras(tmdb_id: int) -> List[Dict]:
-    """Returns specials/OVAs/movies tied to a show (from tmdb_extras).
+    """The specials, OVAs and movies tied to a show.
 
-    ``tmdb_movie_id`` is set only on films TMDB tracks as a standalone movie; it
-    is the frontend's routing signal, because those play through the movie watch
-    path rather than the show's season/episode one. Null everywhere else.
+    ``tmdb_movie_id`` is set only on films TMDB tracks as standalone movies, and
+    is the frontend's signal to route them through the movie watch path rather
+    than the show's season/episode one.
     """
     try:
         with get_db_connection() as conn:
@@ -146,11 +141,10 @@ def get_show_extras(tmdb_id: int) -> List[Dict]:
 
 
 def get_extra_movie_id(anilist_id: int) -> Optional[int]:
-    """The TMDB *movie* id of an extra, when it is a film TMDB tracks in its own
-    right. None for a special/OVA/ONA (and for anything that isn't an extra).
+    """The TMDB movie id of an extra that is a film in its own right, else None.
 
-    This is what tells the watch path to serve an extra through the movie
-    pipeline instead of building a season/episode URL a film has no page for.
+    Tells the watch path to serve the extra through the movie pipeline rather
+    than build a season/episode URL a film has no page for.
     """
     try:
         with get_db_connection() as conn:
@@ -168,7 +162,7 @@ def get_extra_movie_id(anilist_id: int) -> Optional[int]:
 
 
 def get_show_info(tmdb_id: int) -> Dict:
-    """Gets show info from tmdb_shows table."""
+    """The cached tmdb_shows row for a show."""
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -181,7 +175,7 @@ def get_show_info(tmdb_id: int) -> Dict:
 
 
 def get_movie_info(tmdb_id: int) -> Dict:
-    """Gets movie info from the tmdb_movies table (TMDB *movie* id keyed)."""
+    """The cached tmdb_movies row, keyed by TMDB movie id."""
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -194,38 +188,36 @@ def get_movie_info(tmdb_id: int) -> Dict:
 
 
 def get_catalogue_items() -> List[Dict]:
-    """Build the full anime catalogue from the local DB only (no external calls).
+    """The full anime catalogue from the local DB, with no external calls.
 
-    One row per AniList entry (every season / movie / OVA we have mapped), with
-    its category (anime_type) and the ids the frontend needs to navigate
-    (anilist_id for /seasons, tmdb_id + season_number for /info & /watch, or
-    tmdb_movie_id for a film that is its own TMDB entity). Posters come from
-    tmdb_shows / tmdb_movies where present (lazily populated, so often null)
-    — we never hit TMDB here. Sorted by title.
+    One row per mapped AniList entry, carrying its category and the ids the
+    frontend navigates by: anilist_id for /seasons, tmdb_id plus season_number
+    for /info and /watch, or tmdb_movie_id for a film that is its own TMDB
+    entity. Posters come from the lazily populated tables, so they are often
+    null. Sorted by title.
     """
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
 
-            # anilist_id -> (tmdb_id, season_number) for real TV seasons.
+            # For real TV seasons.
             cursor.execute("SELECT anilist_id, tmdb_id, season_number FROM tmdb_seasons")
             season_map: Dict[int, Tuple[int, int]] = {}
             for r in cursor.fetchall():
                 season_map.setdefault(r["anilist_id"], (r["tmdb_id"], r["season_number"]))
 
-            # anilist_id -> tmdb_id for extras (specials/OVAs/movies).
+            # For extras: specials, OVAs and movies.
             cursor.execute("SELECT anilist_id, tmdb_id FROM tmdb_extras")
             extra_map: Dict[int, int] = {}
             for r in cursor.fetchall():
                 extra_map.setdefault(r["anilist_id"], r["tmdb_id"])
 
-            # tmdb_id -> poster_path (sparse; only shows that were opened once).
+            # Sparse: only shows that have been opened once.
             cursor.execute("SELECT tmdb_id, poster_path FROM tmdb_shows")
             posters: Dict[int, Optional[str]] = {r["tmdb_id"]: r["poster_path"] for r in cursor.fetchall()}
 
-            # The same, for anime films keyed by their own TMDB *movie* id. A
-            # separate id space from tmdb_shows (the numbers overlap), hence a
-            # separate map rather than more rows in `posters`.
+            # Anime films keyed by their own TMDB movie id. That is a separate id
+            # space from tmdb_shows, and the numbers overlap, hence its own map.
             cursor.execute("SELECT tmdb_id, poster_path FROM tmdb_movies")
             movie_posters: Dict[int, Optional[str]] = {r["tmdb_id"]: r["poster_path"] for r in cursor.fetchall()}
 
@@ -243,7 +235,7 @@ def get_catalogue_items() -> List[Dict]:
     for e in entries:
         title = e["title_english"] or e["title_romaji"] or e["title_native"]
         if not title:
-            continue  # entry whose AniList titles never resolved — useless in a list
+            continue  # AniList titles never resolved, so useless in a list
         aid = e["anilist_id"]
         tmdb_id: Optional[int] = None
         season_number: Optional[int] = None
@@ -251,16 +243,14 @@ def get_catalogue_items() -> List[Dict]:
             tmdb_id, season_number = season_map[aid]
         elif aid in extra_map:
             tmdb_id = extra_map[aid]
-        # An anime film TMDB tracks in its own right has no show to sit under, so
-        # it carries neither. It is still listable and playable through its own
-        # movie id, which the frontend routes on (see tmdb_movie_id below).
+        # A film TMDB tracks in its own right has no show to sit under, but is
+        # still listable and playable through its own movie id.
         movie_id = e["tmdb_movie_id"]
         if tmdb_id is None and movie_id is None:
-            continue  # unreachable entry: nothing the frontend could open
+            continue  # unreachable: nothing the frontend could open
         poster_path = (posters.get(tmdb_id) if tmdb_id is not None
                        else movie_posters.get(movie_id))
-        # genres is a JSON-encoded list (null for entries synced before genres
-        # existed, or with no AniList genres); decode defensively to [].
+        # A JSON-encoded list, null for entries synced before genres existed.
         try:
             genres = json.loads(e["genres"]) if e["genres"] else []
         except (TypeError, ValueError):
@@ -284,11 +274,8 @@ def get_catalogue_items() -> List[Dict]:
 
 
 def _decode_genres(raw) -> List[str]:
-    """Decode a tmdb_shows/tmdb_movies ``genres`` JSON string column to a list.
-
-    Null (rows synced before genres, or with none) and malformed values both
-    degrade to ``[]`` — mirrors the defensive decode in get_catalogue_items.
-    """
+    """Decode a ``genres`` JSON column to a list. Null and malformed values both
+    degrade to ``[]``, mirroring the decode in get_catalogue_items."""
     try:
         return json.loads(raw) if raw else []
     except (TypeError, ValueError):
@@ -296,14 +283,15 @@ def _decode_genres(raw) -> List[str]:
 
 
 def get_shows_catalogue_items() -> List[Dict]:
-    """Full non-anime TV-show catalogue from the local tmdb_shows table (no live
-    TMDB). One poster-card item per row, tagged ``kind: 'show'`` and keyed by
-    tmdb_id so the frontend routes it through the TMDB-keyed show pages. Ordered
-    by popularity (desc, NULLS LAST) then year then title, so the browse grid
-    leads with the popular titles even before a full backfill.
+    """The non-anime TV catalogue from the local table, with no live TMDB.
 
-    Rows are lazily populated by /search/shows, /trending/shows and show
-    overviews, and bulk-populated by the nightly TMDB-discover backfill.
+    One poster card per row, tagged ``kind: 'show'`` and keyed by tmdb_id so the
+    frontend routes it through the TMDB-keyed pages. Ordered by popularity, then
+    year, then title, so the grid leads with popular titles even before a full
+    backfill.
+
+    Rows are populated lazily by search, trending and overviews, and in bulk by
+    the nightly TMDB-discover backfill.
     """
     try:
         with get_db_connection() as conn:
@@ -321,7 +309,7 @@ def get_shows_catalogue_items() -> List[Dict]:
     for r in rows:
         title = r["title"]
         if not title:
-            continue  # a row with no resolved title is useless in a browse list
+            continue  # a row with no title is useless in a browse list
         first_air = r["first_air_date"] or ""
         items.append({
             "tmdb_id": r["tmdb_id"],
@@ -334,7 +322,7 @@ def get_shows_catalogue_items() -> List[Dict]:
             "genres": _decode_genres(r["genres"]),
         })
 
-    # Popular first (NULLS LAST via the -inf sentinel), then newest, then title.
+    # Popular first, with the -inf sentinel putting NULLs last, then newest.
     items.sort(key=lambda x: (
         -(x["popularity"] if isinstance(x["popularity"], (int, float)) else float("-inf")),
         -(int(x["year"]) if (x["year"] or "").isdigit() else 0),
@@ -344,10 +332,8 @@ def get_shows_catalogue_items() -> List[Dict]:
 
 
 def get_movies_catalogue_items() -> List[Dict]:
-    """Full general-movie catalogue from the local tmdb_movies table (no live
-    TMDB). The movie twin of get_shows_catalogue_items — additionally carries
-    ``vote_average`` (movies have a rating column; shows do not). Ordered by
-    popularity (desc, NULLS LAST) then year then title.
+    """The general-movie catalogue, the twin of get_shows_catalogue_items. It also
+    carries ``vote_average``, since movies have a rating column and shows do not.
     """
     try:
         with get_db_connection() as conn:

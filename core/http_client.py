@@ -1,10 +1,9 @@
 """
-Process-wide shared httpx.AsyncClient + the TMDB retry helper, lifted out of api.py.
+Process-wide shared httpx.AsyncClient and the TMDB retry helper.
 
-Keeping one warm client (and its TMDB/AniList keep-alive connections) is the
-biggest latency win on the metadata endpoints. The fetchers import ``http_client``
-/ ``fetch_with_retry`` from here; api.py's lifespan drives ``open_client`` /
-``close_client``.
+One warm client, with its keep-alive connections to TMDB and AniList, is the
+biggest latency win on the metadata endpoints. api.py's lifespan drives
+``open_client`` / ``close_client``.
 """
 
 import asyncio
@@ -20,7 +19,7 @@ logger = logging.getLogger("crimson.http")
 
 
 def open_client() -> None:
-    """Open the shared client (called from api.py's lifespan startup)."""
+    """Open the shared client; called from api.py's lifespan startup."""
     global _http_client
     _http_client = httpx.AsyncClient(
         timeout=Config.REQUEST_TIMEOUT,
@@ -29,26 +28,23 @@ def open_client() -> None:
 
 
 async def close_client() -> None:
-    """Close the shared client (called from api.py's lifespan shutdown)."""
+    """Close the shared client; called from api.py's lifespan shutdown."""
     global _http_client
     if _http_client is not None:
         await _http_client.aclose()
         _http_client = None
 
 
-# --- SHARED HTTP CLIENT ---
-# One process-wide AsyncClient (opened in lifespan) instead of a fresh
-# httpx.AsyncClient() per request. Reusing it keeps the TCP+TLS connections to
-# TMDB / AniList warm across requests rather than paying a new handshake every
-# call — the single biggest latency win on the metadata endpoints. Call sites use
-# the ``http_client()`` context manager below, which yields this shared instance
-# and deliberately does NOT close it on block exit.
+# One AsyncClient for the process rather than a fresh one per request, so the
+# TCP+TLS connections stay warm instead of paying a handshake every call. Call
+# sites use the ``http_client()`` manager below, which yields this instance and
+# deliberately does not close it on exit.
 _http_client: Optional[httpx.AsyncClient] = None
 
 
 def get_http_client() -> httpx.AsyncClient:
-    """Return the shared AsyncClient, creating a transient fallback if the
-    lifespan hasn't run yet (only possible outside the normal request path)."""
+    """The shared AsyncClient, with a transient fallback if the lifespan has not
+    run yet, which only happens outside the request path."""
     if _http_client is None:
         return httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT)
     return _http_client
@@ -56,30 +52,27 @@ def get_http_client() -> httpx.AsyncClient:
 
 @asynccontextmanager
 async def http_client():
-    """Yield the shared AsyncClient. Drop-in for ``httpx.AsyncClient()`` at the
-    existing ``async with ... as client:`` call sites — but the shared client is
-    kept open (not closed) when the block exits."""
+    """Yield the shared AsyncClient. A drop-in for ``httpx.AsyncClient()`` at the
+    ``async with`` call sites, except that it stays open when the block exits."""
     yield get_http_client()
 
 
-# --- TMDB API FUNCTIONS ---
 async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
-    """Fetch data from API with retry logic"""
+    """GET with backoff on 429 and transient 5xx. None once retries are spent."""
     for attempt in range(Config.MAX_RETRIES):
         try:
             response = await client.get(url, headers=TMDB_HEADERS, params=params, timeout=Config.REQUEST_TIMEOUT)
             
             if response.status_code == 200:
                 return response.json()
-            elif response.status_code == 429:  # Rate limit
+            elif response.status_code == 429:
                 wait_time = Config.RETRY_BACKOFF_FACTOR * (2 ** attempt)
                 logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}")
                 await asyncio.sleep(wait_time)
                 continue
             elif response.status_code in (500, 502, 503, 504):
-                # Transient upstream failure (TMDB occasionally 502s on individual
-                # records — see status_code 43 "Couldn't connect to the backend").
-                # Back off and retry rather than treating it as a hard failure.
+                # TMDB occasionally 502s on individual records (its status_code 43),
+                # so back off rather than treating this as a hard failure.
                 logger.warning(
                     f"TMDB upstream {response.status_code} for URL {url} "
                     f"(attempt {attempt + 1}/{Config.MAX_RETRIES})"

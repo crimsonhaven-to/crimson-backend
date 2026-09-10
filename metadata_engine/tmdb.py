@@ -1,10 +1,9 @@
 """
-TMDB metadata fetchers, lifted out of api.py.
+TMDB metadata fetchers.
 
-All TMDB HTTP access (show/movie/season metadata, search, trending, genre map,
-localized titles) plus the small ``_tmdb_img`` URL helper. Pure remote-metadata
-concern — it never touches the mapping DB (metadata_engine.db_handler) — so it
-imports only the shared config / HTTP client / response cache from core.
+All TMDB HTTP access: show, movie and season metadata, search, trending, the
+genre map and localized titles. A pure remote-metadata concern that never touches
+the mapping DB, so it imports only config, the HTTP client and the response cache.
 """
 
 import asyncio
@@ -33,8 +32,8 @@ from metadata_engine.store import (
 logger = logging.getLogger("crimson.tmdb")
 
 
-# Bump when the cached TMDB payload shape changes, so stale entries in the
-# volume-persisted api_cache are ignored after a deploy instead of served.
+# Bump when the cached payload shape changes, so entries persisted across a
+# deploy are ignored rather than served.
 TMDB_CACHE_VERSION = "v3"
 
 
@@ -43,13 +42,11 @@ def _tmdb_img(path: Optional[str], size: str = "w500") -> Optional[str]:
 
 
 async def fetch_tmdb_genre_map(client: httpx.AsyncClient, kind: str) -> Dict[int, str]:
-    """TMDB genre id -> name map for ``kind`` ('tv' or 'movie'), cached.
+    """TMDB genre id to name map for ``kind``, cached.
 
-    Discover/search results carry only ``genre_ids`` (ints), not names. This map
-    turns them into the genre-name lists we store in tmdb_shows/tmdb_movies (the
-    non-anime twin of anime_entries.genres), so the recommend engine can score
-    shows/movies the same way it scores anime. The map is tiny and very stable, so
-    it's cached aggressively (L1 + DB)."""
+    Discover and search results carry only genre ids. This turns them into the
+    name lists stored alongside each row, so the recommend engine can score shows
+    and movies the way it scores anime. Tiny and stable, so cached aggressively."""
     if kind not in ("tv", "movie"):
         return {}
     cache_key = f"tmdb:genremap:{kind}"
@@ -77,13 +74,11 @@ async def fetch_tmdb_genre_map(client: httpx.AsyncClient, kind: str) -> Dict[int
 
 async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int,
                           force_refresh: bool = False) -> Dict:
-    """
-    Fetch a TMDB show with its real season list (the authority for what the
-    TMDB-keyed sources can play). Cached, and persists core fields into tmdb_shows
-    on first fetch.
+    """A TMDB show with its real season list, the authority for what the TMDB-keyed
+    sources can play. Cached, and persists core fields on first fetch.
 
-    ``force_refresh`` skips the cached-response shortcut so the row is re-pulled
-    from TMDB and re-upserted (used by the staleness refresher).
+    ``force_refresh`` skips the cache so the row is re-pulled and re-upserted,
+    which is how the staleness refresher works.
     """
     cache_key = f"tmdb:show:{TMDB_CACHE_VERSION}:{tmdb_id}"
     if not force_refresh:
@@ -98,7 +93,7 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int,
     seasons = []
     for s in data.get("seasons", []):
         num = s.get("season_number")
-        # Skip specials (season 0) and empty placeholder seasons.
+        # Skip season 0 and empty placeholder seasons.
         if num is None or num < 1 or (s.get("episode_count") or 0) < 1:
             continue
         seasons.append({
@@ -119,8 +114,7 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int,
         "poster": _tmdb_img(data.get("poster_path")),
         "backdrop": _tmdb_img(data.get("backdrop_path"), "original"),
         "first_air_date": data.get("first_air_date"),
-        # Genre names — the non-anime twin of anime_entries.genres. Stored into
-        # tmdb_shows so the recommend engine can score shows by genre too.
+        # Stored so the recommend engine can score shows by genre too.
         "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
         "popularity": data.get("popularity"),
         "seasons": seasons,
@@ -134,13 +128,12 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int,
 
 async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int,
                            force_refresh: bool = False) -> Dict:
-    """Fetch a TMDB *movie* (the /movie/{id} entity — a different id space from
-    /tv). Cached, and persists core fields into tmdb_movies on first fetch so the
-    overview/watch pages can degrade gracefully when TMDB is unavailable.
+    """A TMDB movie, a different id space from /tv. Cached, and persists core
+    fields on first fetch so the overview and watch pages degrade gracefully when
+    TMDB is unavailable.
 
-    Movies have no seasons/episodes; the TMDB-keyed sources play them off the bare
-    movie id, so this is all the metadata the movie surface needs. ``force_refresh``
-    skips the cache shortcut so the staleness refresher can re-pull + re-upsert."""
+    Movies have no seasons, and the sources play them off the bare movie id, so
+    this is all the metadata the movie surface needs."""
     cache_key = f"tmdb:movie:{TMDB_CACHE_VERSION}:{tmdb_id}"
     if not force_refresh:
         cached_data = await get_cached_response(cache_key)
@@ -177,12 +170,11 @@ async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int,
 
 async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: int = 1,
                               show: Optional[Dict] = None) -> Dict:
-    """Fetch metadata + episode list for a specific TMDB season.
+    """Metadata and the episode list for one TMDB season.
 
-    Falls back to show-level overview when the season overview is empty (common
-    for anime) so a description is always available. ``show`` may be passed in by
-    a caller that already fetched it (e.g. /info), avoiding a redundant cached
-    re-fetch; otherwise it is fetched here.
+    Falls back to the show-level overview when the season's is empty, which is
+    common for anime, so a description is always available. ``show`` may be passed
+    in by a caller that already fetched it, avoiding a redundant re-fetch.
     """
     cache_key = f"tmdb:meta:{TMDB_CACHE_VERSION}:{tmdb_id}:s{season}"
     cached_data = await get_cached_response(cache_key)
@@ -229,12 +221,11 @@ async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: i
 
 
 async def _season_episode_info(tmdb_id: int, season_number: int) -> Dict:
-    """{count, air_dates:{ep_num: 'YYYY-MM-DD'|None}} for a TMDB season.
+    """Episode count and per-episode air dates for a TMDB season.
 
-    Derived from the (DB-cached) TMDB season metadata and additionally held in the
-    in-process L1 cache, since both the unaired gate and the progress enricher hit
-    it on hot paths. Best-effort: returns {} when the season can't be loaded so
-    callers degrade gracefully (no episode-count gating, no unaired check)."""
+    Derived from the cached season metadata and also held in L1, since both the
+    unaired gate and the progress enricher hit it on hot paths. Returns {} when
+    the season cannot be loaded, so callers degrade to no gating."""
     key = f"epinfo:{tmdb_id}:s{season_number}"
     cached = _local_get(key)
     if cached is not None:
@@ -255,10 +246,9 @@ async def _season_episode_info(tmdb_id: int, season_number: int) -> Dict:
 
 
 async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
-    """Search TMDB for anime titles"""
+    """Search TMDB for anime titles."""
     cache_key = f"tmdb:search:{query.lower()}"
     
-    # Check cache
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         return cached_data.get("results", [])
@@ -270,8 +260,7 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit
         return []
 
     items = data.get("results", [])[:limit]
-    # One batched lookup for every candidate's anilist mapping instead of a query
-    # per result.
+    # One batched lookup instead of a query per result.
     anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
 
     results = []
@@ -288,21 +277,19 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit
                 "vote_average": item.get("vote_average")
             })
 
-    # Cache search results for 24 hours
     await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
     return results
 
 
 async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> List[Dict]:
-    """Fetch trending anime from TMDB"""
+    """Trending anime from TMDB."""
     cache_key = "tmdb:trending"
 
-    # L1: in-process cache (no DB round-trip on a hit).
+    # L1, so a hit costs no DB round-trip.
     local = _local_get(cache_key)
     if local is not None:
         return local
 
-    # Check cache
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         results = cached_data.get("results", [])
@@ -314,10 +301,10 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
         "page": 1,
         "include_adult": "false",
         "language": "en-US",
-        "with_genres": "16",  # Animation genre
+        "with_genres": "16",             # Animation
         "with_original_language": "ja",  # Japanese originals
         "sort_by": "popularity.desc",
-        "vote_count.gte": 100  # Minimum votes for quality filter
+        "vote_count.gte": 100            # quality floor
     }
     
     data = await fetch_with_retry(client, url, params=params)
@@ -326,8 +313,7 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
         return []
 
     items = data.get("results", [])[:limit]
-    # One batched lookup for every candidate's anilist mapping instead of a query
-    # per result.
+    # One batched lookup instead of a query per result.
     anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
 
     trending_list = []
@@ -344,7 +330,7 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
                 "vote_average": item.get("vote_average")
             })
 
-    # Cache trending results (DB for cross-replica reuse + L1 for this process).
+    # The DB for cross-replica reuse, L1 for this process.
     await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
     _local_set(cache_key, trending_list)
     return trending_list
@@ -353,9 +339,9 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
 async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
     """Search TMDB for general TV shows, excluding anime.
 
-    Excludes (a) titles that already map to an AniList entry — those are anime,
-    served by /search/anime — and (b) anything that looks like Japanese animation,
-    so unmapped anime doesn't leak into the shows surface."""
+    Drops titles that already map to an AniList entry, which /search/anime serves,
+    and anything that looks like Japanese animation, so unmapped anime cannot leak
+    into the shows surface."""
     cache_key = f"tmdb:search_shows:{query.lower()}"
     cached_data = await get_cached_response(cache_key)
     if cached_data:
@@ -367,7 +353,7 @@ async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, 
         return []
 
     items = data.get("results", [])
-    # One batched lookup so we can drop anything already mapped as anime.
+    # One batched lookup, to drop anything already mapped as anime.
     anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
     genre_map = await fetch_tmdb_genre_map(client, "tv")
 
@@ -377,8 +363,8 @@ async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, 
         if not tmdb_id or anilist_by_tmdb.get(tmdb_id) or _looks_like_anime(item):
             continue
         if not item.get("poster_path"):
-            continue  # posterless rows are usually junk/duplicates — skip for a clean grid
-        # Cache the show's metadata + genres so it can seed recommendations later.
+            continue  # posterless rows are usually junk, and spoil the grid
+        # Cached so it can seed recommendations later.
         _persist_discovered_show(item, genre_map)
         results.append(_show_item(item))
         if len(results) >= limit:
@@ -389,7 +375,7 @@ async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, 
 
 
 async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> List[Dict]:
-    """Fetch trending non-anime TV shows from TMDB (popular, excluding animation)."""
+    """Trending non-anime TV shows: popular, excluding animation."""
     cache_key = "tmdb:trending_shows"
 
     local = _local_get(cache_key)
@@ -407,7 +393,7 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
         "page": 1,
         "include_adult": "false",
         "language": "en-US",
-        "without_genres": "16",          # exclude Animation (keeps anime out)
+        "without_genres": "16",          # excludes Animation, keeping anime out
         "sort_by": "popularity.desc",
         "vote_count.gte": 200,           # quality floor
     }
@@ -426,7 +412,7 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
             continue
         if not item.get("poster_path"):
             continue
-        # Popular shows make the best recommendation candidates — cache them.
+        # Popular shows make the best recommendation candidates.
         _persist_discovered_show(item, genre_map)
         trending_list.append(_show_item(item))
         if len(trending_list) >= limit:
@@ -438,8 +424,8 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
 
 
 async def fetch_tmdb_movie_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
-    """Search TMDB for general movies, excluding Japanese animation (anime films
-    stay on the anime surface). Posterless rows are dropped for a clean grid."""
+    """Search TMDB for general movies, excluding Japanese animation, which stays on
+    the anime surface. Posterless rows are dropped."""
     cache_key = f"tmdb:search_movies:{query.lower()}"
     cached_data = await get_cached_response(cache_key)
     if cached_data:
@@ -467,7 +453,7 @@ async def fetch_tmdb_movie_search_results(client: httpx.AsyncClient, query: str,
 
 
 async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> List[Dict]:
-    """Fetch trending general movies from TMDB (popular, excluding animation)."""
+    """Trending general movies: popular, excluding animation."""
     cache_key = "tmdb:trending_movies"
 
     local = _local_get(cache_key)
@@ -485,7 +471,7 @@ async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> L
         "page": 1,
         "include_adult": "false",
         "language": "en-US",
-        "without_genres": "16",          # exclude Animation (keeps anime films out)
+        "without_genres": "16",          # excludes Animation, keeping anime out
         "sort_by": "popularity.desc",
         "vote_count.gte": 300,           # quality floor
     }
@@ -510,18 +496,15 @@ async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> L
     return trending_list
 
 
-# --- SCRAPER HELPER FUNCTIONS ---
+# --- SCRAPER HELPERS --------------------------------------------------------
 async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -> List[str]:
     """German-language titles for a TMDB show, for the German scraper sites.
 
-    The German streaming sources (s.to, aniworld) list many shows under their
-    *German broadcast title*, not the English one TMDB hands us first — e.g. NCIS
-    is "Navy CIS" on s.to, so plain title matching misses the show entirely. We
-    pull the German title(s) from TMDB so the title-based scrapers get them as
-    extra search candidates: the localized name from ``/translations`` (de) plus
-    any DE/AT/CH entries in ``/alternative_titles``. Cached (these are stable);
-    returns an empty list on failure (matching just falls back to the English
-    title, i.e. today's behaviour)."""
+    Those sites list many shows under their German broadcast title rather than the
+    English one TMDB hands over first, so plain title matching misses the show
+    entirely. This pulls the localized name plus any DE/AT/CH alternative titles as
+    extra search candidates. Cached, since they are stable, and an empty list on
+    failure just falls matching back to the English title."""
     cache_key = f"tmdb:detitles:{tmdb_id}"
     cached = _local_get(cache_key)
     if cached is not None:
@@ -554,10 +537,8 @@ async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -
 
 async def fetch_tmdb_imdb_id(client: httpx.AsyncClient, tmdb_id: int,
                              media_type: str = "tv") -> Optional[str]:
-    """The IMDb id ("tt…") for a TMDB show/movie, from ``/external_ids``.
-
-    Needed by IMDb-keyed client sources (insertunit). Cached (stable); returns
-    None on failure so callers degrade to skipping that source."""
+    """The IMDb id for a TMDB show or movie, needed by the IMDb-keyed client
+    sources. Cached, and None on failure so callers skip that source."""
     path = "movie" if media_type == "movie" else "tv"
     cache_key = f"tmdb:imdb:{path}:{tmdb_id}"
     cached = _local_get(cache_key)
@@ -571,27 +552,24 @@ async def fetch_tmdb_imdb_id(client: httpx.AsyncClient, tmdb_id: int,
     return imdb or None
 
 
-# --- NON-ANIME TV SHOWS (secondary, additive) -------------------------------
-# These mirror the anime discovery helpers above but invert the AniList gate:
-# they surface TMDB TV results that are NOT mapped anime, so the site can also
-# play general (non-anime) series through the same TMDB-keyed pipeline (/info,
-# /watch/{tmdb_id}/{season}/{episode}) and the s.to scraper, which matches by
-# title. Anime stays priority 1 — these are a separate, parallel surface and the
-# anime helpers/endpoints above are left completely untouched.
+# --- NON-ANIME TV SHOWS -----------------------------------------------------
+# These mirror the anime discovery helpers above but invert the AniList gate,
+# surfacing TMDB TV results that are not mapped anime. The site plays them through
+# the same TMDB-keyed pipeline and the title-matching scrapers. A separate,
+# parallel surface: the anime helpers above are untouched.
 
 
 def _looks_like_anime(item: Dict) -> bool:
-    """Heuristic: a TMDB TV item that is Japanese Animation. Used to keep anime
-    (including titles we haven't mapped in Fribb yet) out of the *shows* surface,
-    so the two stay cleanly separated even at the edges."""
+    """Whether a TMDB TV item looks like Japanese animation. Keeps anime, including
+    titles not yet mapped in Fribb, out of the shows surface."""
     genres = item.get("genre_ids") or []
     return 16 in genres and item.get("original_language") == "ja"
 
 
 def _show_item(item: Dict) -> Dict:
-    """Shape one TMDB TV search/discover result as a non-anime show entry. Keyed
-    by tmdb_id (no anilist_id) and tagged ``kind: "show"`` so the frontend routes
-    it through the TMDB-keyed show pages instead of the AniList ones."""
+    """Shape one TMDB TV result as a non-anime show entry, keyed by tmdb_id and
+    tagged ``kind: "show"`` so the frontend routes it through the TMDB-keyed
+    pages."""
     return {
         "title": item.get("name") or item.get("original_name"),
         "tmdb_id": item.get("id"),

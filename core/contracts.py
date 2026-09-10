@@ -1,26 +1,23 @@
 """
-Canonical wire contracts shared with the frontend + crimson-sources.
+Canonical wire contracts shared with the frontend and crimson-sources.
 
-This is the single source of truth for the **/watch NDJSON protocol** — the
-line-delimited JSON stream `stream_watch_response()` produces and that
-crimson-client's `hooks.js handleLine` (and crimson-sources, as a drop-in
-*producer*) consume. It used to live only as a prose comment duplicated across
-three repos; a silent drift there breaks playback for everyone, so it now lives
-here as:
+The single source of truth for the /watch NDJSON protocol that
+``stream_watch_response()`` produces and crimson-client consumes. It used to be a
+prose comment duplicated across three repos, where silent drift broke playback
+for everyone, so it lives here as:
 
-  * typed **builder functions** the producer calls (so the shape exists in exactly
-    one place in the backend), and
-  * a **JSON Schema** (`WATCH_NDJSON_SCHEMA`) the test suite validates the builders
-    against, exported to ``contracts/watch_ndjson.schema.json`` for the frontend
-    to vendor + check its own `StreamLine` type against.
+  * builder functions the producer calls, so the shape exists in exactly one
+    place in the backend, and
+  * a JSON Schema the test suite validates those builders against, exported to
+    ``contracts/watch_ndjson.schema.json`` for the frontend to vendor.
 
 Regenerate the exported schema after changing anything here::
 
     python -m core.contracts
 
-The protocol is a discriminated union on ``type``; the producer emits, in order:
-one ``meta`` line, then either an ``unaired`` line, or zero-or-more ``stream``
-lines, and always a final ``done`` line.
+The protocol is a discriminated union on ``type``. The producer emits one
+``meta`` line, then either an ``unaired`` line or zero or more ``stream`` lines,
+and always a final ``done`` line.
 """
 
 from __future__ import annotations
@@ -29,9 +26,8 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
-# Bump when the protocol changes in a way the client must be aware of. Mirrored in
-# the exported schema's ``$id`` so a vendored copy can assert it's the version it
-# was written against.
+# Bump when the protocol changes in a way the client must know about. Mirrored in
+# the schema's ``$id`` so a vendored copy can assert which version it targets.
 WATCH_PROTOCOL_VERSION = 1
 
 
@@ -44,8 +40,8 @@ def build_meta_line(
     anilist_id: Optional[int],
     title: Optional[str],
 ) -> Dict[str, Any]:
-    """First line of every /watch stream: the ids + resolved title, flushed
-    immediately so the player can render its header before any source lands."""
+    """First line of every /watch stream. Flushed immediately so the player can
+    render its header before any source lands."""
     return {
         "type": "meta",
         "success": True,
@@ -64,8 +60,8 @@ def build_unaired_line(
     season_number: Optional[int],
     episode_number: Optional[int],
 ) -> Dict[str, Any]:
-    """Emitted instead of any ``stream`` line when the requested episode is dated
-    in the future — the client renders a "not yet aired" state."""
+    """Replaces every ``stream`` line when the episode is dated in the future, so
+    the client can render a "not yet aired" state."""
     return {
         "type": "unaired",
         "air_date": air_date,
@@ -76,10 +72,9 @@ def build_unaired_line(
 
 
 def build_stream_line(stream: Dict[str, Any]) -> Dict[str, Any]:
-    """One resolved playable source. ``stream`` is the internal resolver dict
-    (``{source, type, url, language?, subtitles?, cacheTicket?}``); this projects
-    it onto the wire shape (note ``type`` -> ``streamType``). ``cacheTicket`` is
-    only present on cacheable streams when server-side caching is enabled."""
+    """One resolved playable source, projecting the internal resolver dict onto
+    the wire shape. Note ``type`` becomes ``streamType``, and ``cacheTicket``
+    appears only on cacheable streams while server-side caching is on."""
     line: Dict[str, Any] = {
         "type": "stream",
         "source": stream["source"],
@@ -115,7 +110,7 @@ WATCH_NDJSON_SCHEMA: Dict[str, Any] = {
     "title": "Crimson /watch NDJSON line",
     "description": (
         "One line of the /watch line-delimited JSON stream. Discriminated on "
-        "`type`. Generated from core/contracts.py — do not edit by hand."
+        "`type`. Generated from core/contracts.py; do not edit by hand."
     ),
     "oneOf": [
         {
@@ -185,7 +180,7 @@ def export_path() -> str:
 
 
 def schema_json() -> str:
-    """The schema serialized exactly as it's written to disk (stable + diff-able)."""
+    """The schema serialized exactly as written to disk, so diffs stay stable."""
     return json.dumps(WATCH_NDJSON_SCHEMA, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -197,7 +192,7 @@ def _write_schema() -> None:
     print(f"wrote {path}")
 
 
-# Convenience for callers that build a whole stream's worth of lines (tests, docs).
+# For callers that build a whole stream's worth of lines (tests, docs).
 def all_event_types() -> List[str]:
     return ["meta", "unaired", "stream", "done"]
 

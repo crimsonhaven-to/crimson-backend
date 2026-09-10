@@ -1,22 +1,16 @@
 """
 Startup configuration report.
 
-Crimson has a lot of *optional*, env-gated features (Jellyfin, the external proxy
-offload, OpenSubtitles, SMTP, the Discord bot, Ko-fi supporters, plus any
-overlay-contributed ones …). When one is "dark" it's almost always a missing/blank
-env var, and there was
-no single place to see what's on. ``build_report()`` inspects the environment and
-returns a tidy, **secret-free** summary (presence only, never values) that
-``log_report()`` prints once at startup, e.g.::
+A lot of features here are optional and env-gated, and a dark one is almost
+always a missing env var. ``build_report()`` inspects the environment and returns
+a secret-free summary, presence only and never values, which ``log_report()``
+prints once at startup::
 
     Crimson feature configuration:
       [ on] Jellyfin personal source
-      [off] OpenSubtitles subtitles            — set OPENSUBTITLES_API_KEY
-      [WARN] Proxy signing secret               — PROXY_SECRET unset: signed
-             proxies use a random per-process secret (breaks across replicas)
+      [off] OpenSubtitles subtitles     - set OPENSUBTITLES_API_KEY
 
-This is diagnostics only; it never raises (hard requirements stay in
-``Config.validate()``).
+Diagnostics only, and never raises. Hard requirements stay in ``Config.validate()``.
 """
 
 from __future__ import annotations
@@ -42,22 +36,21 @@ def _flag_on(name: str, default: bool) -> bool:
 @dataclass
 class Feature:
     label: str
-    # True => enabled, False => disabled, None => warning (enabled but risky).
+    # True enabled, False disabled, None warning (on but risky).
     state: Callable[[], Optional[bool]]
-    # Shown when disabled (how to turn it on) or warning (what's wrong).
+    # How to turn it on, or what is wrong when warning.
     hint: str = ""
 
 
 def _proxy_secret_state() -> Optional[bool]:
-    # Enabled+safe when a stable shared secret is set; warn when it isn't (a
-    # random per-process secret breaks signed-link verification across replicas).
+    # Warn without a stable shared secret: a random per-process one breaks
+    # signed-link verification across replicas.
     return True if _has("PROXY_SECRET") else None
 
 
 def _prometheus_state() -> Optional[bool]:
-    """Whether the optional prometheus-client dependency made it into this build.
-    Imported lazily so a diagnostics helper never drags the metrics module into an
-    import cycle."""
+    """Whether the optional prometheus-client dependency is in this build.
+    Imported lazily so diagnostics never drag metrics into an import cycle."""
     try:
         from core.observability import PROMETHEUS_AVAILABLE
         return PROMETHEUS_AVAILABLE
@@ -67,7 +60,7 @@ def _prometheus_state() -> Optional[bool]:
 
 FEATURES: List[Feature] = [
     Feature("TMDB metadata (required)", lambda: _has("TMDB_API_KEY"),
-            "set TMDB_API_KEY — the app will not start without it"),
+            "set TMDB_API_KEY; the app will not start without it"),
     Feature("Login wall (members-only)", lambda: _flag_on("REQUIRE_LOGIN", True),
             "REQUIRE_LOGIN=false serves a fully open API"),
     Feature("Proxy signing secret", _proxy_secret_state,
@@ -94,10 +87,9 @@ FEATURES: List[Feature] = [
             "set DISCORD_BOT_TOKEN + DISCORD_OWNER_ID"),
     Feature("Ko-fi supporters webhook", lambda: _has("KOFI_VERIFICATION_TOKEN"),
             "set KOFI_VERIFICATION_TOKEN to ingest Ko-fi events"),
-    # Reports only whether a provider key exists, which is the part that needs an
-    # env var. Whether Lumi is actually awake, which provider answers and who may
-    # talk to her are database-backed operator settings (Admin -> Lumi / Users),
-    # so a key alone does not mean the feature is live.
+    # Only the key needs an env var. Whether Lumi is awake, which provider answers
+    # and who may talk to her are operator settings in the database, so a key alone
+    # does not mean the feature is live.
     Feature("Lumi chatbot key", lambda: _has("ANTHROPIC_API_KEY") or _has("GEMINI_API_KEY"),
             "set ANTHROPIC_API_KEY or GEMINI_API_KEY, then switch Lumi on in "
             "Admin -> Lumi and grant members access in Admin -> Users"),
@@ -105,16 +97,14 @@ FEATURES: List[Feature] = [
             "set SIGNUP_INVITE_CODE for a reusable invite (bot mints single-use)"),
     Feature("Admin seed", lambda: _has("ADMIN_EMAILS"),
             "set ADMIN_EMAILS (comma-separated) to seed the first admin"),
-    # prometheus-client is an OPTIONAL import (see core/observability.py), so this
-    # line reports a property of the build rather than of the environment: it is the
-    # only place a stripped image announces that /metrics will answer 503.
+    # An optional import, so this reports a property of the build rather than the
+    # environment: the only place a stripped image announces /metrics will 503.
     Feature("Prometheus metrics support", _prometheus_state,
             "prometheus-client is not installed in this build; /metrics answers 503"),
     Feature("Metrics scrape token", lambda: _has("METRICS_TOKEN"),
             "set METRICS_TOKEN for a Prometheus scrape; without it /metrics is "
             "reachable only with an admin session"),
-    # Without this the Admin › Metrics tab still works, it just has no time axis
-    # (live snapshot of one replica only). See deploy/prometheus/README.md.
+    # Without this the Metrics tab still works, just with no time axis.
     Feature("Metrics history (Prometheus)", lambda: _has("PROMETHEUS_URL"),
             "set PROMETHEUS_URL (e.g. http://prometheus:9090) to give the admin "
             "dashboard charts over time; unset leaves it on the live snapshot"),
@@ -128,11 +118,10 @@ FEATURES: List[Feature] = [
 
 
 def _overlay_features() -> List[Feature]:
-    """Feature lines contributed by the build-time source overlay (empty in a base
-    build). A client-offload overlay source declares a ``config_feature`` (label,
-    hint) on its RESOLVE_GRANT descriptor; we surface it here so the operator build
-    reports it too — without the public config naming any overlay source. Imported
-    lazily so a diagnostics helper never participates in import ordering."""
+    """Feature lines contributed by the build-time source overlay, empty in a base
+    build. An overlay source declares a ``config_feature`` on its RESOLVE_GRANT, so
+    surfacing them here reports the operator build without the public config
+    naming any overlay source."""
     try:
         import resolvers as _resolvers_pkg
         from core.private_sources import discover_resolve_grants
@@ -149,7 +138,7 @@ def _overlay_features() -> List[Feature]:
 
 
 def build_report() -> List[str]:
-    """Return the report as a list of pre-formatted lines (no I/O, easy to test)."""
+    """The report as pre-formatted lines. No I/O, so it is easy to test."""
     lines: List[str] = ["Crimson feature configuration:"]
     for feat in FEATURES + _overlay_features():
         try:
@@ -162,7 +151,7 @@ def build_report() -> List[str]:
         elif state is False:
             tag = "off"
             suffix = f"  - {feat.hint}" if feat.hint else ""
-        else:  # None => warning
+        else:  # None means warning
             tag = "WARN"
             suffix = f"  - {feat.hint}" if feat.hint else ""
         lines.append(f"  [{tag:>4}] {feat.label}{suffix}")

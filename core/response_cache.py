@@ -1,10 +1,9 @@
 """
-Two-tier response cache, lifted out of api.py.
+Two-tier response cache.
 
-L1 is a tiny in-process TTL dict in front of the L2 PostgreSQL ``api_cache`` table,
-removing a DB round-trip on the hottest fixed-key payloads (trending, catalogue).
-Both api.py and the metadata fetchers import these helpers, so they live here
-rather than in api.py (which would be a circular import for the fetchers).
+L1 is an in-process TTL dict in front of the L2 PostgreSQL ``api_cache`` table,
+saving a DB round-trip on the hottest fixed-key payloads. Lives here rather than
+in api.py, which would be a circular import for the metadata fetchers.
 """
 
 import asyncio
@@ -25,20 +24,16 @@ logger = logging.getLogger("crimson.cache")
 def _utcnow_iso() -> str:
     """Current UTC time as a naive ISO-8601 string.
 
-    ``datetime.utcnow()`` is deprecated (and slated for removal), so we derive
-    UTC from a tz-aware ``now`` but drop the offset to keep the exact same
-    ``YYYY-MM-DDTHH:MM:SS.ffffff`` shape the api_cache rows were written with —
-    so lexicographic ``expires_at`` comparisons stay correct across an upgrade.
+    ``datetime.utcnow()`` is deprecated, so UTC is derived from a tz-aware ``now``
+    with the offset dropped. That keeps the exact shape existing api_cache rows
+    were written with, so lexicographic ``expires_at`` comparisons stay correct.
     """
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
-# --- IN-PROCESS L1 CACHE (hot global keys) ---
-# A tiny TTL cache in front of the PostgreSQL api_cache for the few hot keys that
-# use a fixed global cache key (trending, catalogue). It removes a DB round-trip
-# on every hit. Stateless-friendly: it only ever serves data up to its short TTL
-# and each replica converges independently (no cross-replica invalidation needed
-# because these payloads are read-mostly and already TTL-bounded upstream).
+# L1, for the few hot keys with a fixed global cache key. Each replica converges
+# independently: no cross-replica invalidation is needed because these payloads
+# are read-mostly and already TTL-bounded upstream.
 _LOCAL_CACHE_TTL = 300  # seconds
 
 
@@ -46,9 +41,9 @@ _local_cache: Dict[str, Tuple[float, object]] = {}
 
 
 def _local_get(key: str):
-    # Hit/miss is counted WITHOUT the cache key as a label: keys include per-search
-    # and per-title values, so labelling by key would be unbounded cardinality. The
-    # ratio per tier is the operationally useful number anyway.
+    # Counted without the key as a label: keys carry per-search and per-title
+    # values, so that would be unbounded cardinality. The per-tier ratio is the
+    # useful number anyway.
     hit = _local_cache.get(key)
     if not hit:
         observability.record_cache_lookup("l1", False)
@@ -66,9 +61,8 @@ def _local_set(key: str, value: object, ttl: int = _LOCAL_CACHE_TTL) -> None:
     _local_cache[key] = (time.monotonic() + ttl, value)
 
 
-# --- CACHE HELPER FUNCTIONS ---
 async def get_cached_response(cache_key: str) -> Optional[Dict]:
-    """Retrieve cached response from database"""
+    """The L2 (database) entry for ``cache_key``, or None when absent or expired."""
     try:
         def _query():
             with get_connection() as conn:
@@ -90,13 +84,13 @@ async def get_cached_response(cache_key: str) -> Optional[Dict]:
 
 
 async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Config.CACHE_TTL_SECONDS):
-    """Save response to cache"""
+    """Upsert an L2 entry. A no-op on empty data."""
     if not data:
         return
     
     try:
         expires_at = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl_seconds)).isoformat()
-        # orjson.dumps returns bytes; the response_json column is TEXT, so decode.
+        # response_json is TEXT and orjson.dumps returns bytes.
         payload = orjson.dumps(data).decode("utf-8")
         
         def _insert():
@@ -116,12 +110,10 @@ async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Con
 
 
 # --- SERVE-STALE-ON-ERROR ---------------------------------------------------
-# A "last known good" shadow copy kept alongside the normal (short-TTL) cache
-# entry, used when the live upstream (AniList) fails so the discovery hubs serve
-# the previous result instead of a 503 / empty grid. The shadow lives far longer
-# than any fresh TTL — it only ever surfaces during an outage, so it can be safely
-# old; a week keeps the hubs alive across a prolonged outage while still eventually
-# expiring genuinely dead content.
+# A last-known-good shadow beside the normal short-TTL entry, so a failed upstream
+# leaves the discovery hubs serving the previous result instead of an empty grid.
+# It only surfaces during an outage, so it can safely be far older than any fresh
+# TTL; a week outlives a prolonged outage while still expiring dead content.
 STALE_TTL_SECONDS = 7 * 24 * 3600
 
 
@@ -130,11 +122,10 @@ def _stale_key(cache_key: str) -> str:
 
 
 async def set_cached_response_shadowed(cache_key: str, data: Dict, ttl_seconds: int = Config.CACHE_TTL_SECONDS):
-    """Write the fresh cache entry AND a long-lived 'last known good' shadow.
+    """Write the fresh entry and its long-lived shadow.
 
-    The shadow (see ``get_stale_response``) is what serve-stale-on-error reads when
-    the upstream is down. No-op on empty data (mirrors ``set_cached_response``), so
-    a failed fetch never overwrites a good shadow with nothing.
+    A no-op on empty data, like ``set_cached_response``, so a failed fetch never
+    overwrites a good shadow with nothing.
     """
     if not data:
         return
@@ -143,10 +134,8 @@ async def set_cached_response_shadowed(cache_key: str, data: Dict, ttl_seconds: 
 
 
 async def get_stale_response(cache_key: str) -> Optional[Dict]:
-    """The last known good copy of ``cache_key`` (its shadow), if still retained.
-
-    Returned only on the failure path — a live success always prefers the fresh
-    entry via ``get_cached_response``."""
+    """The last known good copy of ``cache_key``, if still retained. Read only on
+    the failure path; a success always prefers ``get_cached_response``."""
     return await get_cached_response(_stale_key(cache_key))
 
 

@@ -1,21 +1,18 @@
 """
-Security event log — who tried to get in, what was denied, what an admin changed.
+Security event log: who tried to get in, what was denied, what an admin changed.
 
-One append-only table (``security_events``) fed from the auth choke points in
-account_engine.routes, the admin actions in account_engine.admin_routes, and the
-slowapi 429 handler in api.py. Deliberately NOT fed by the site-wide login wall:
-every bot probing the internet hits that wall, and logging it would drown the
-table in noise within days — the auth endpoints (someone actively trying
-credentials / invite codes) plus rate-limit hits carry the actual signal.
+One append-only table fed from the auth choke points in .routes, the admin
+actions in .admin_routes, and the slowapi 429 handler in api.py. Deliberately
+not fed by the site-wide login wall, which every internet bot hits and would
+drown the table in noise; the auth endpoints and rate-limit hits carry the
+actual signal. Reads power the dashboard's Security tab.
 
-Writes are fire-and-forget: :func:`log_event` swallows every exception, so a
-full disk / dropped DB can degrade the *log*, never a login. Reads power the
-admin dashboard's Security tab (see admin_routes: /admin/security/*).
+Writes are fire-and-forget: :func:`log_event` swallows everything, so a full
+disk can degrade the log but never a login.
 
-Privacy: raw client IPs and the *attempted* identity (email, or a mnemonic key
-prefix, never the full key, never a password or token) are stored; the
-scheduler prunes rows past ``SECURITY_EVENTS_RETENTION_DAYS`` (default 90), which
-is the privacy mechanism for a private, members-only site.
+Privacy: raw client IPs and the attempted identity are stored, but never a full
+public key, password or token. Rows past ``SECURITY_EVENTS_RETENTION_DAYS``
+(default 90) are pruned by the scheduler.
 """
 
 from __future__ import annotations
@@ -30,17 +27,16 @@ from core.db_pool import get_connection, lock_schema_init
 
 logger = logging.getLogger(__name__)
 
-# Retention for the prune job (api.py schedules it with the other housekeeping).
+# Retention for the prune job, scheduled in api.py.
 RETENTION_DAYS = int(os.getenv("SECURITY_EVENTS_RETENTION_DAYS", "90"))
 
-# Defensive field caps so a hostile client can't bloat rows via crafted inputs.
+# Caps so a hostile client can't bloat rows with crafted inputs.
 MAX_IDENTITY_LEN = 200
 MAX_USER_AGENT_LEN = 300
 MAX_DETAIL_LEN = 2000
 
-# The event vocabulary, kept in one place so the dashboard and any future
-# alerting agree on spelling. log_event accepts unknown types (forward-compat),
-# but everything the backend emits today is listed here.
+# Kept in one place so the dashboard and any alerting agree on spelling.
+# log_event accepts unknown types too, for forward compatibility.
 EVENT_TYPES = (
     "login_success",            # a session was issued (email or mnemonic)
     "login_failed",             # bad credentials / bad signature / unknown key
@@ -58,9 +54,8 @@ EVENT_TYPES = (
     "admin_action",             # an admin changed users / invites / bridge keys
 )
 
-# outcome: 'success' for granted access / completed sensitive changes,
-# 'failure' for every denial (the attack signal), 'info' for neutral events
-# (reset requested, resend asked) that are worth a paper trail but deny nothing.
+# 'failure' marks every denial, which is the attack signal; 'info' is for
+# neutral events worth a paper trail that deny nothing.
 OUTCOMES = ("success", "failure", "info")
 
 
@@ -69,9 +64,8 @@ def _now() -> datetime:
 
 
 def client_ip(request) -> Optional[str]:
-    """The real client IP. uvicorn runs with ``--proxy-headers``, so
-    ``request.client.host`` is already the X-Forwarded-For client (same source
-    of truth the rate limiter keys on — see core.rate_limit)."""
+    """The real client IP. uvicorn runs with ``--proxy-headers``, so this is
+    already the X-Forwarded-For client, the same source core.rate_limit keys on."""
     try:
         return request.client.host if request and request.client else None
     except Exception:
@@ -79,20 +73,19 @@ def client_ip(request) -> Optional[str]:
 
 
 def key_prefix(public_key: Optional[str]) -> Optional[str]:
-    """A loggable handle for a mnemonic identity: the first 12 hex chars of the
-    64-char public key. Enough to correlate repeat attempts, never the full key."""
+    """A loggable handle for a mnemonic identity: enough to correlate repeat
+    attempts, never the full key."""
     if not public_key:
         return None
     return f"{public_key[:12]}…"
 
 
 def init_db() -> None:
-    """Create the schema (idempotent, additive — safe on every replica).
+    """Create the schema (idempotent, safe on every replica).
 
-    ``user_id`` deliberately has NO foreign key: the audit trail must survive
-    the account it describes being deleted. ``ts`` is TIMESTAMPTZ (not the
-    ISO-TEXT convention of the account tables) because the dashboard charts
-    lean on ``date_trunc``/interval arithmetic."""
+    ``user_id`` has no foreign key on purpose: the trail must survive the account
+    it describes being deleted. ``ts`` is TIMESTAMPTZ rather than the ISO-TEXT
+    used by the account tables because the charts need ``date_trunc``."""
     with get_connection() as conn:
         lock_schema_init(conn)
         conn.execute(
@@ -124,8 +117,8 @@ def _clip(value: Optional[str], cap: int) -> Optional[str]:
 
 
 def encode_detail(detail: Optional[dict]) -> Optional[str]:
-    """Serialize the small structured context blob, dropping it (rather than the
-    whole event) if it doesn't fit the cap or won't serialize."""
+    """Serialize the context blob, dropping it (not the whole event) if it does
+    not fit the cap or will not serialize."""
     if not detail:
         return None
     try:
@@ -144,13 +137,11 @@ def log_event(
     identity: Optional[str] = None,
     detail: Optional[dict] = None,
 ) -> None:
-    """Record one security event. Fire-and-forget: never raises, never blocks a
-    login on the log — a failed write is a warning in the app log and nothing else.
+    """Record one security event. Never raises: a failed write is a warning in
+    the app log and nothing else.
 
-    Synchronous by design (single small INSERT per auth attempt; see AccountStore
-    docstring). Callers are responsible for keeping it off the event loop: the
-    account routes either run wholly in a worker thread (plain ``def`` handlers)
-    or wrap this in ``run_in_threadpool``."""
+    Synchronous by design (one small INSERT). Callers keep it off the event loop
+    with a plain ``def`` handler or ``run_in_threadpool``."""
     try:
         if outcome not in OUTCOMES:
             outcome = "info"
@@ -213,8 +204,7 @@ def list_events(
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
-    """Filterable, newest-first page of the ledger for the dashboard table.
-    ``search`` matches identity/IP substrings (case-insensitive)."""
+    """Newest-first page of the ledger. ``search`` matches identity/IP substrings."""
     where: List[str] = []
     params: List = []
     if event_type:
@@ -251,9 +241,8 @@ def list_events(
 
 
 def zero_filled_series(rows: List[dict], days: int, today) -> List[dict]:
-    """Fold (day, event_type, outcome, n) aggregate rows into one entry per
-    calendar day over the window, oldest first, with missing days at zero — so
-    the dashboard chart never has holes. Pure; unit-tested."""
+    """Fold aggregate rows into one entry per calendar day, oldest first, with
+    missing days at zero so the chart never has holes."""
     by_day: Dict[str, dict] = {}
     for offset in range(days - 1, -1, -1):
         day = (today - timedelta(days=offset)).isoformat()
@@ -272,8 +261,7 @@ def zero_filled_series(rows: List[dict], days: int, today) -> List[dict]:
 
 
 def fold_top_ips(rows: List[dict], limit: int = 10) -> List[dict]:
-    """Fold (ip, event_type, n, last_seen) failure aggregates into a ranked
-    top-offenders list with a per-type breakdown. Pure; unit-tested."""
+    """Fold failure aggregates into a ranked top-offenders list."""
     by_ip: Dict[str, dict] = {}
     for r in rows:
         ip = r.get("ip")
@@ -292,9 +280,8 @@ def fold_top_ips(rows: List[dict], limit: int = 10) -> List[dict]:
 
 
 def stats(days: int = 14) -> dict:
-    """Everything the Security tab's metrics need in one payload: 24h tiles, a
-    zero-filled per-day series, per-type totals, top offending IPs, and the
-    most-targeted identities — all failure-centric, over the last ``days`` days."""
+    """Everything the Security tab needs in one payload: 24h tiles, a per-day
+    series, per-type totals, top offending IPs and most-targeted identities."""
     days = max(1, min(days, 90))
     now = _now()
     since = now - timedelta(days=days - 1)
@@ -396,8 +383,7 @@ def stats(days: int = 14) -> dict:
 
 
 def purge_old(keep_days: int = RETENTION_DAYS) -> int:
-    """Drop events past retention (housekeeping; scheduled in api.py alongside
-    the session/challenge purge). Returns rows removed."""
+    """Drop events past retention. Returns rows removed."""
     cutoff = _now() - timedelta(days=max(1, keep_days))
     with get_connection() as conn:
         cur = conn.execute("DELETE FROM security_events WHERE ts < %s", (cutoff,))

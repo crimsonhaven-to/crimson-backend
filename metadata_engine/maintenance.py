@@ -1,22 +1,19 @@
 """
-Background maintenance for the non-anime metadata tables (tmdb_shows / tmdb_movies).
+Background maintenance for the non-anime metadata tables.
 
-These tables are written lazily — on overview open (fetch_tmdb_show / fetch_tmdb_movie)
-and from search/trending discovery (_persist_discovered_*). That leaves two gaps this
-module fills. Both the work and the queue here are driven exclusively from the single
-RUN_DB_SYNC replica (the api-sync container), so exactly one container ever churns this
-much metadata:
+Those tables are written lazily, on overview open and from search and trending
+discovery, which leaves two gaps this module fills. Both run only on the single
+RUN_DB_SYNC replica, so exactly one container churns this much metadata:
 
-* refresh_daily_slice — there's no upstream to signal a TMDB change (unlike the Fribb
-  dataset), so the catalogue is swept in slices: each night the oldest 1/N of each table
-  is re-pulled, cycling the whole table over N nights, then repeating.
-* backfill_catalogue — page TMDB discover to pre-populate the tables beyond what's been
-  browsed. Triggered from the Admin dashboard (queued in the DB, drained here) or once at
-  startup via RUN_METADATA_BACKFILL.
+* refresh_daily_slice, because nothing upstream signals a TMDB change the way the
+  Fribb dataset does. Each night the oldest 1/N of each table is re-pulled,
+  cycling the whole table over N nights.
+* backfill_catalogue, which pages TMDB discover to pre-populate the tables beyond
+  what has been browsed.
 
-The Admin "Start Backfill" button runs on a portless-api-sync-unreachable serving replica,
-so it enqueues a metadata_backfill_jobs row; ``run_pending_backfill`` (polled by api-sync)
-claims and runs it. The job-queue helpers below own that table.
+The admin's backfill button runs on a serving replica that cannot reach the
+portless api-sync container, so it enqueues a row that ``run_pending_backfill``
+claims. The job-queue helpers below own that table.
 """
 
 import asyncio
@@ -44,22 +41,20 @@ from metadata_engine.tmdb import (
 
 logger = logging.getLogger("crimson.metadata.maintenance")
 
-# Pacing between individual TMDB calls. Gentle on TMDB's rate limit and, for the
-# backfill, on WAL churn / standby replication during the bulk insert.
-_REFRESH_DELAY = 0.25   # seconds between per-row refresh fetches
-_BACKFILL_PAGE_DELAY = 0.5  # seconds between discover pages
+# Gentle on TMDB's rate limit and, during a bulk backfill, on standby replication.
+_REFRESH_DELAY = 0.25       # between per-row refresh fetches
+_BACKFILL_PAGE_DELAY = 0.5  # between discover pages
 
 
 @asynccontextmanager
 async def _dedicated_client():
     """A short-lived, loop-local httpx client for the maintenance jobs.
 
-    The nightly refresh + backfill run in the scheduler's worker thread via
-    ``asyncio.run()`` (a fresh event loop each tick), so they must NOT borrow the
-    process-wide shared AsyncClient (which is bound to the main event loop). TMDB
-    auth is applied per-request by ``fetch_with_retry``, so a bare client behaves
-    identically to the shared one — it just doesn't reuse the warm connection pool,
-    which is fine for these background sweeps."""
+    These run in the scheduler's worker thread on a fresh event loop each tick, so
+    they must not borrow the shared AsyncClient, which is bound to the main loop.
+    ``fetch_with_retry`` applies TMDB auth per request, so a bare client behaves
+    identically; it just misses the warm pool, which is fine for a background
+    sweep."""
     async with httpx.AsyncClient(
         timeout=Config.REQUEST_TIMEOUT,
         limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
@@ -69,10 +64,8 @@ async def _dedicated_client():
 
 # --- NIGHTLY STALENESS REFRESH (1/N slice) ---------------------------------
 def _slice_oldest_ids(table: str, buckets: int) -> List[int]:
-    """tmdb_ids of the oldest ceil(rowcount / buckets) rows in ``table``.
-
-    This is one night's slice: the stalest 1/N of the table (rows never refreshed
-    sort first via NULLS FIRST). ``table`` is a trusted literal (never user input).
+    """The oldest ceil(rowcount / buckets) tmdb_ids in ``table``: one night's
+    slice. Rows never refreshed sort first. ``table`` is a trusted literal.
     """
     if buckets < 1:
         buckets = 1
@@ -90,8 +83,8 @@ def _slice_oldest_ids(table: str, buckets: int) -> List[int]:
 
 
 async def _refresh_ids(client, kind: str, ids: List[int]) -> int:
-    """Re-pull each id from TMDB (force-refresh so the row is re-upserted), paced.
-    ``kind`` is 'show' or 'movie'. Best-effort per id. Returns how many succeeded."""
+    """Re-pull each id from TMDB, forcing the row to be re-upserted. Paced, and
+    best-effort per id. Returns how many succeeded."""
     fetch = fetch_tmdb_show if kind == "show" else fetch_tmdb_movie
     done = 0
     for tid in ids:
@@ -105,11 +98,10 @@ async def _refresh_ids(client, kind: str, ids: List[int]) -> int:
 
 
 async def refresh_daily_slice(buckets: int = None) -> Tuple[int, int]:
-    """Refresh one night's slice (oldest 1/buckets) of each metadata table.
+    """Refresh one night's slice of each metadata table.
 
-    Re-pulling re-upserts the row (stamping last_updated), so over ``buckets`` nights
-    the whole catalogue is swept back into agreement with TMDB. Returns
-    (shows_refreshed, movies_refreshed)."""
+    Re-pulling stamps last_updated, so over ``buckets`` nights the whole catalogue
+    is swept back into agreement with TMDB."""
     buckets = buckets if buckets is not None else Config.METADATA_REFRESH_BUCKETS
 
     loop = asyncio.get_event_loop()
@@ -126,11 +118,11 @@ async def refresh_daily_slice(buckets: int = None) -> Tuple[int, int]:
 
 # --- CATALOGUE BACKFILL -----------------------------------------------------
 async def _backfill_discover(client, kind: str, genre_map: dict, max_pages: int) -> int:
-    """Page TMDB discover/{kind} and persist each (non-anime, postered) result.
+    """Page TMDB discover and persist each non-anime, postered result.
 
-    Mirrors the filtering of fetch_trending_shows / fetch_trending_movies so the
-    backfilled rows match what the surfaces would themselves have cached. Stops at
-    the real total_pages or ``max_pages`` (TMDB caps discover at page 500)."""
+    Mirrors the trending fetchers' filtering, so backfilled rows match what those
+    surfaces would have cached themselves. Stops at the real total_pages or
+    ``max_pages``; TMDB caps discover at page 500."""
     url = f"https://api.themoviedb.org/3/discover/{kind}"
     persisted = 0
     for page in range(1, max_pages + 1):
@@ -174,9 +166,8 @@ async def _backfill_discover(client, kind: str, genre_map: dict, max_pages: int)
 
 
 async def backfill_catalogue(max_pages: int = None) -> Tuple[int, int]:
-    """One-shot pre-population of tmdb_shows / tmdb_movies from TMDB discover.
-
-    Paced between pages. Returns (shows, movies) persisted."""
+    """One-shot pre-population of both tables from TMDB discover, paced between
+    pages. Returns how many of each were persisted."""
     max_pages = max_pages if max_pages is not None else Config.METADATA_BACKFILL_PAGES
     async with _dedicated_client() as client:
         tv_genre_map = await fetch_tmdb_genre_map(client, "tv")
@@ -186,15 +177,15 @@ async def backfill_catalogue(max_pages: int = None) -> Tuple[int, int]:
     return (shows, movies)
 
 
-# --- BACKFILL JOB QUEUE (metadata_backfill_jobs) ---------------------------
-# The admin button runs on a serving replica; api-sync drains the queue. Helpers
-# are sync (DB) — callers wrap them in run_in_executor / run_in_threadpool.
+# --- BACKFILL JOB QUEUE ------------------------------------------------------
+# The admin button runs on a serving replica and api-sync drains the queue. These
+# helpers are synchronous, so callers wrap them in a threadpool.
 _ACTIVE = ("requested", "running")
 
 
 def job_status_payload(row: Optional[dict]) -> Optional[dict]:
-    """Shape a metadata_backfill_jobs row for the Admin dashboard (and derive the
-    running/queued/ok booleans the frontend keys on). ``None`` when no job yet."""
+    """Shape a job row for the dashboard, deriving the booleans the frontend keys
+    on. ``None`` when there is no job yet."""
     if not row:
         return None
     st = row["status"]
@@ -215,12 +206,12 @@ def job_status_payload(row: Optional[dict]) -> Optional[dict]:
 
 
 def request_backfill(pages: int, requested_by: str) -> Tuple[dict, bool]:
-    """Enqueue a backfill request. Returns (row, created). If a job is already
-    requested/running, no new row is inserted and the existing one is returned with
-    created=False — so a double-click or a second admin can't stack runs."""
+    """Enqueue a backfill request, returning (row, created). An already active job
+    is returned with created=False rather than inserted again, so a double-click or
+    a second admin cannot stack runs."""
     with get_connection() as conn:
         cursor = conn.cursor()
-        # Atomic: insert only when nothing is active, returning the new row.
+        # Atomic: inserts only when nothing is active.
         cursor.execute(
             """
             INSERT INTO metadata_backfill_jobs (status, pages, requested_by)
@@ -235,7 +226,7 @@ def request_backfill(pages: int, requested_by: str) -> Tuple[dict, bool]:
         row = cursor.fetchone()
         if row:
             return dict(row), True
-        # Something is already active — hand it back instead.
+        # Something is already active, so hand that back.
         cursor.execute(
             "SELECT * FROM metadata_backfill_jobs WHERE status IN ('requested', 'running') "
             "ORDER BY requested_at DESC LIMIT 1"
@@ -244,7 +235,7 @@ def request_backfill(pages: int, requested_by: str) -> Tuple[dict, bool]:
 
 
 def latest_backfill_job() -> Optional[dict]:
-    """The most recent job row (any status), for the status endpoint."""
+    """The most recent job row of any status, for the status endpoint."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM metadata_backfill_jobs ORDER BY id DESC LIMIT 1")
@@ -253,8 +244,8 @@ def latest_backfill_job() -> Optional[dict]:
 
 
 def _claim_backfill_job() -> Optional[dict]:
-    """Atomically claim the oldest still-'requested' job (mark it 'running').
-    Returns the claimed row, or None if the queue is empty."""
+    """Atomically claim the oldest 'requested' job, or None when the queue is
+    empty."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -289,8 +280,8 @@ def _finish_backfill_job(job_id: int, ok: bool, shows: Optional[int],
 
 
 async def run_pending_backfill() -> Optional[Tuple[int, int]]:
-    """Claim and run one queued backfill, if any. Called on a short interval by the
-    RUN_DB_SYNC replica. Returns (shows, movies) when it ran one, else None."""
+    """Claim and run one queued backfill, if any. Polled on a short interval by the
+    sync replica. None when there was nothing to run."""
     loop = asyncio.get_event_loop()
     row = await loop.run_in_executor(None, _claim_backfill_job)
     if not row:

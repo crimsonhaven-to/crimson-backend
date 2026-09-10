@@ -1,12 +1,9 @@
-# core/private_sources.py
-#
 # Auto-discovery for the optional build-time source overlay.
 #
-# An operator build may drop extra source modules into the ``scrapers`` and
-# ``resolvers`` packages (see the self-hosting docs). This helper finds those
-# modules and returns their source classes so the registries can append them — with
-# no edit to the committed registries. A build without the overlay finds nothing, so
-# discovery returns ``[]``. Off via ``PRIVATE_SOURCES_ENABLED=0``.
+# An operator build may drop extra source modules into ``scrapers`` and
+# ``resolvers``. These helpers find them so the registries can append them with no
+# edit to the committed registries. A base build finds nothing and they return
+# empty. Off via ``PRIVATE_SOURCES_ENABLED=0``.
 import importlib
 import inspect
 import logging
@@ -17,15 +14,13 @@ logger = logging.getLogger(__name__)
 
 
 def discover_private_sources(package, base_class, public_modules):
-    """Return the injected (private) source classes found in ``package``.
+    """The injected source classes found in ``package``.
 
-    A module is considered an injected source when it is NOT one of the known
-    public/operator-owned modules, is not a private helper (``_``-prefixed) and is
-    not a test module. Within each such module we collect every concrete subclass
-    of ``base_class`` that is *defined there* (so a class merely imported from a
-    shared helper isn't double-registered) and whose name isn't ``_``-prefixed (so
-    ``_``-prefixed abstract bases are skipped). Modules that fail to import are
-    logged and skipped rather than taking the whole registry down.
+    A module counts as injected when it is not a known public module, a
+    ``_``-prefixed helper or a test. From each, every concrete ``base_class``
+    subclass *defined there* is collected, so a class merely imported from a
+    shared helper is not double-registered. A module that fails to import is
+    logged and skipped rather than taking the registry down.
     """
     if os.getenv("PRIVATE_SOURCES_ENABLED", "1") == "0":
         return []
@@ -38,12 +33,11 @@ def discover_private_sources(package, base_class, public_modules):
         full_name = f"{package.__name__}.{name}"
         try:
             module = importlib.import_module(full_name)
-        except Exception as exc:  # noqa: BLE001 - a dead/legacy source must not break boot
+        except Exception as exc:  # noqa: BLE001 - a dead source must not break boot
             logger.warning("private source %s failed to import, skipping: %s", full_name, exc)
             continue
-        # A module may opt out of the /watch registries by declaring RESOLVE_ONLY:
-        # it wires itself into the /resolve client-offload grant instead (its bytes
-        # never flow through the backend). See discover_resolve_grants below.
+        # RESOLVE_ONLY opts a module out of the /watch registries: it wires into
+        # the /resolve grant instead, so its bytes never flow through the backend.
         if getattr(module, "RESOLVE_ONLY", False):
             continue
         for cls_name, obj in inspect.getmembers(module, inspect.isclass):
@@ -60,31 +54,26 @@ def discover_private_sources(package, base_class, public_modules):
     return list(found.values())
 
 
-# Cache the descriptor sweep: the set of injected modules is fixed at process
-# start, so scan the package once and reuse (build_report / admin snapshot / the
-# grant registry all ask for it).
+# The set of injected modules is fixed at process start, and three callers ask
+# for it, so scan the package once and reuse.
 _grant_cache: dict[str, list] = {}
 
 
 def discover_resolve_grants(package):
-    """Return the ``RESOLVE_GRANT`` descriptors declared by injected modules in
-    ``package`` (empty in a base build).
+    """The ``RESOLVE_GRANT`` descriptors declared by injected modules in ``package``.
 
-    A cookie/secret-bound source that delivers its bytes off-backend (the /resolve
-    client-offload path, not the /watch registries) declares a module-level
-    ``RESOLVE_GRANT`` dict describing how to wire it. This helper collects those so
-    the public HTTP layer can build the grant registry, the admin flags and the
-    config report **without naming any injected source**. A build without the
-    overlay finds none, so the whole path stays dormant. Off via
-    ``PRIVATE_SOURCES_ENABLED=0``.
+    A secret-bound source that delivers its bytes off-backend declares a
+    module-level ``RESOLVE_GRANT`` dict. Collecting them here lets the public HTTP
+    layer build the grant registry, admin flags and config report without naming
+    any injected source. A base build finds none, so the path stays dormant.
 
-    Each descriptor is a dict with keys:
-      * ``keys``           — the /resolve ``source`` values it answers (tuple/list).
-      * ``is_configured``  — callable() -> bool (the secret/env gate).
-      * ``scraper``        — "package.module:ClassName" discovery ref.
-      * ``resolver``       — "package.module:ClassName" discovery ref.
-      * ``admin_flags``    — optional {flag_name: callable() -> bool} for the dashboard.
-      * ``config_feature`` — optional (label, hint) for the startup config report.
+    Each descriptor holds:
+      * ``keys``           the /resolve ``source`` values it answers
+      * ``is_configured``  callable() -> bool, the secret gate
+      * ``scraper``        "package.module:ClassName" ref
+      * ``resolver``       "package.module:ClassName" ref
+      * ``admin_flags``    optional {name: callable() -> bool} for the dashboard
+      * ``config_feature`` optional (label, hint) for the startup report
     """
     if os.getenv("PRIVATE_SOURCES_ENABLED", "1") == "0":
         return []
@@ -113,15 +102,11 @@ def discover_resolve_grants(package):
 
 
 def discover_manga_provider(package):
-    """Return the injected manga provider instance declared by an overlay module in
-    ``package`` (``manga_engine``), or ``None`` in a base build.
+    """The injected manga provider instance from an overlay module, else ``None``.
 
-    The public backend ships no manga source (it never talks to a manga host); an
-    operator build may drop a module that declares a module-level ``MANGA_PROVIDER``
-    instance (see ``manga_engine.provider.MangaProvider``). This finds the first such
-    module — mirroring ``discover_resolve_grants`` — so the public code names no
-    provider. A build without the overlay finds none. Off via
-    ``PRIVATE_SOURCES_ENABLED=0``.
+    The public backend ships no manga source and never talks to a manga host. An
+    operator build may drop in a module declaring a ``MANGA_PROVIDER`` instance;
+    this returns the first one, so the public code names no provider.
     """
     if os.getenv("PRIVATE_SOURCES_ENABLED", "1") == "0":
         return None
@@ -142,9 +127,8 @@ def discover_manga_provider(package):
 
 
 def load_ref(ref: str):
-    """Resolve a ``"package.module:ClassName"`` descriptor reference to the object.
-    Used to load a grant's scraper/resolver class lazily (the descriptor carries
-    strings so the injected resolver module needn't import its scraper, avoiding a
-    circular import)."""
+    """Resolve a ``"package.module:ClassName"`` reference to the object. Grants
+    carry strings so an injected resolver needn't import its scraper, which would
+    be a circular import."""
     module_path, _, attr = ref.partition(":")
     return getattr(importlib.import_module(module_path), attr)

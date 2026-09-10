@@ -1,11 +1,11 @@
-"""Playback endpoints: the NDJSON /watch streams, the client-offload grants, the
-movie-web bridge, and the cache/telemetry beacons.
+"""Playback: the NDJSON /watch streams, the client-offload grants, the movie-web
+bridge, and the cache and telemetry beacons.
 
-The /watch routes emit the progressive NDJSON the player consumes (one line per
-source). The /sign + /resolve grants hand the client engine the few crumbs it
-can't derive without a server-held secret (New System §8a). The /mw bridge
-reshapes the same pipeline into movie-web's native Stream JSON. Lifted verbatim
-from ``api.py``; the shared scrape/resolve pipeline lives in ``web.pipeline``.
+The /watch routes emit the progressive NDJSON the player consumes, one line per
+source. The /sign and /resolve grants hand the client engine the few crumbs it
+cannot derive without a server-held secret (New System 8a). The /mw bridge
+reshapes the same pipeline into movie-web's native Stream JSON. The shared
+scrape/resolve pipeline lives in ``web.pipeline``.
 """
 
 import logging
@@ -48,9 +48,9 @@ router = APIRouter()
 @router.get("/watch/{tmdb_id}/{season_number}/{episode_number}")
 @limiter.limit("30/minute")
 async def get_watch_links(request: Request, tmdb_id: int, season_number: int, episode_number: int):
-    """Get streaming links as a progressive NDJSON stream (one line per source,
-    emitted as soon as that source resolves). Works even for TMDB seasons with no
-    AniList mapping (long shows like Naruto) — the proxy sources play off the TMDB id."""
+    """Streaming links as progressive NDJSON, one line per source, emitted as soon
+    as that source resolves. Works for TMDB seasons with no AniList mapping too,
+    since the proxy sources play off the TMDB id."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
 
     fallback_title = None
@@ -73,16 +73,15 @@ async def get_watch_links(request: Request, tmdb_id: int, season_number: int, ep
 @router.get("/watch/movie/{tmdb_id}")
 @limiter.limit("30/minute")
 async def get_movie_watch_links(request: Request, tmdb_id: int):
-    """Streaming links for a standalone MOVIE (TMDB *movie* id), as the same
-    progressive NDJSON the TV watch route emits — one line per source. Movies have
-    no season/episode and no AniList mapping; only the movie-capable TMDB-keyed
-    sources run. Declared before /watch/{anilist_id}/{episode_number} so the literal
-    'movie' segment is matched here rather than failing that route's int parse.
+    """Streaming links for a standalone movie, as the same progressive NDJSON the
+    TV route emits.
 
-    The meta line carries null season_number/episode_number; the player ignores
-    them for movies."""
-    # A title helps any title-keyed movie source. Prefer the stored row,
-    # then a live TMDB fetch; never hard-fail (sources can still play off the id).
+    A movie has no season, episode or AniList mapping, so only the movie-capable
+    sources run and the meta line carries nulls the player ignores. Declared before
+    /watch/{anilist_id}/{episode_number} so the literal 'movie' segment matches
+    here rather than failing that route's int parse."""
+    # A title helps any title-keyed source. The stored row first, then a live
+    # fetch, and never a hard failure since sources can still play off the id.
     info = get_movie_info(tmdb_id)
     fallback_title = info.get("title") if info else None
     if not fallback_title:
@@ -102,23 +101,21 @@ async def get_movie_watch_links(request: Request, tmdb_id: int):
     )
 
 
-# --- crimson-proxy sign grant (New System §8a) -----------------------------
-# The E2 (web-only, no-extension) path: the client resolves a stream in the
-# browser and needs a *signed* crimson-proxy link to relay the segment bytes off
-# the backend — but PROXY_SECRET must never ship to the browser. So the client
-# sends the upstream URL(s) + the headers the CDN wants injected here, and we hand
-# back the signed proxy link(s). This is the only thing that keeps PROXY_SECRET
+# --- crimson-proxy sign grant (New System 8a) ------------------------------
+# On the web-only E2 path the client resolves a stream in the browser and needs a
+# signed proxy link to relay the bytes off the backend, but PROXY_SECRET must
+# never ship to the browser. So the client sends the upstream URL and the headers
+# the CDN wants, and gets back the signed link. That is what keeps the secret
 # server-side while letting the client drive what gets fetched.
 #
-# Login-gated (NOT in _PUBLIC_PREFIXES) + rate-limited, so it can't be used as an
-# anonymous free signing/relay oracle. We only sign http(s) upstreams; the proxy
-# itself still runs its own isSafeUpstream SSRF check before fetching.
+# Login-gated and rate-limited, so it cannot be an anonymous signing oracle. Only
+# http(s) upstreams are signed, and the proxy still runs its own SSRF check.
 _SIGN_MAX_ITEMS = 24
 
 
 def _sign_one(item: Dict) -> Optional[str]:
-    """Sign a single ``{url, referer?, origin?, userAgent?}`` into a proxy link, or
-    None if the url is missing / not http(s)."""
+    """Sign one item into a proxy link, or None if its url is missing or not
+    http(s)."""
     if not isinstance(item, dict):
         return None
     url = (item.get("url") or "").strip()
@@ -135,14 +132,13 @@ def _sign_one(item: Dict) -> Optional[str]:
 @router.post("/sign")
 @limiter.limit("240/minute")
 async def sign_proxy_links(request: Request):
-    """Mint signed crimson-proxy link(s) for client-resolved streams (New System
-    §8a). Accepts either a single ``{url, referer, origin, userAgent}`` object or
-    ``{"items": [ … ]}`` for batch signing, and always returns a parallel
-    ``signed`` array (null for any item we refuse to sign).
+    """Mint signed proxy links for client-resolved streams.
 
-    Returns 503 when the external proxy isn't configured (no ``CRIMSON_PROXY_BASE``
-    / ``PROXY_SECRET``) — the client then stays on E3 (extension) or E0 (backend),
-    exactly as today, so an unconfigured proxy never breaks playback."""
+    Accepts one item or ``{"items": [...]}`` and always returns a parallel
+    ``signed`` array, with null for anything refused.
+
+    503 when the external proxy is unconfigured, which leaves the client on its
+    extension or backend path, so an unconfigured proxy never breaks playback."""
     if not _crimson_proxy.is_enabled():
         return JSONResponse({"ok": False, "error": "proxy_unconfigured"}, status_code=503)
 
@@ -165,24 +161,22 @@ async def sign_proxy_links(request: Request):
     return {"ok": True, "signed": signed}
 
 
-# --- client-side resolve grants (New System: take the backend out of the byte path) ---
-# Some operator-owned sources can't run wholly in the viewer's browser because the
-# final hop needs a server-held secret — e.g. the Jellyfin access token. But only
-# the *resolve* needs the secret; the URL it yields is a stream the viewer (or the
-# crimson-proxy edge) can fetch. So /resolve does the token lookup server-side and
-# returns the **raw** stream URL + the headers the upstream wants — and the client
-# engine delivers the bytes (extension E3 / signed crimson-proxy E2). The heavy
-# mp4/HLS never travels through this backend; only a little control traffic does.
+# --- client-side resolve grants ---------------------------------------------
+# Some operator-owned sources cannot run wholly in the browser because the final
+# hop needs a server-held secret, such as the Jellyfin token. But only the resolve
+# needs it: the URL it yields is a stream the viewer or the proxy edge can fetch.
+# So /resolve does the lookup server-side and returns the raw URL plus the headers
+# the upstream wants, and the client engine delivers the bytes. The heavy media
+# never travels through this backend, only a little control traffic.
 
 
 def _make_offload_grant_runner(scraper_ref: str, resolver_ref: str):
-    """Build a /resolve runner for a scraper->resolver.resolve_direct source declared
-    by an injected overlay's RESOLVE_GRANT descriptor (see core.private_sources). The
-    runner runs discovery, unlocks each embed with the resolver's secret-gated
-    ``resolve_direct``, and returns one raw-URL stream dict per quality variant — the
-    client engine delivers the bytes (E2/E3), so nothing heavy touches this backend.
-    Class refs are strings in the descriptor (to dodge the scraper<->resolver import
-    cycle); they're resolved once here, at import."""
+    """Build a /resolve runner for a source declared by an overlay's RESOLVE_GRANT.
+
+    The runner runs discovery, unlocks each embed with the resolver's secret-gated
+    ``resolve_direct``, and returns one raw-URL stream per quality variant, leaving
+    byte delivery to the client engine. The descriptor's class refs are strings, to
+    dodge the scraper/resolver import cycle, and are resolved once here at import."""
     scraper_cls = load_ref(scraper_ref)
     resolver_cls = load_ref(resolver_ref)
 
@@ -204,7 +198,7 @@ def _make_offload_grant_runner(scraper_ref: str, resolver_ref: str):
                 logger.warning(f"[resolve] {resolver.source_name} resolve_direct failed: "
                                f"{type(e).__name__} - {e}")
                 continue
-            # resolve_direct returns one stream per quality variant (best-first).
+            # One stream per quality variant, best first.
             for res in streams or []:
                 if not res.get("url"):
                     continue
@@ -216,7 +210,7 @@ def _make_offload_grant_runner(scraper_ref: str, resolver_ref: str):
                         for s in subs
                     ]
                 out.append({
-                    # per-quality label (e.g. "Source (1080p)") -> dedups with the client tile
+                    # A per-quality label, which dedups with the client tile
                     "label": res.get("label") or resolver.source_name,
                     "streamType": res.get("streamType") or "mp4",
                     "url": res["url"],
@@ -230,11 +224,10 @@ def _make_offload_grant_runner(scraper_ref: str, resolver_ref: str):
 
 
 def _jellyfin_edge_inject_enabled() -> bool:
-    """Opt-in switch for delivering Jellyfin off-backend via crimson-proxy edge
-    token injection. OFF by default → Jellyfin stays fully on the backend /watch
-    proxy (today's behaviour, no regression). Flip it on ONLY after the proxy is
-    deployed with NITRO_JELLYFIN_HOSTS + NITRO_JELLYFIN_TOKEN, since the edge — not
-    the browser — holds the token and the client path is E2-only."""
+    """Opt-in switch for delivering Jellyfin off-backend through edge token
+    injection. Off by default, leaving Jellyfin on the backend /watch proxy. Turn
+    it on only once the proxy is deployed with its Jellyfin host and token, since
+    the edge rather than the browser holds that token."""
     return (os.getenv("JELLYFIN_EDGE_INJECT", "").strip().lower() in ("1", "true", "yes", "on"))
 
 
@@ -246,10 +239,11 @@ async def _grant_jellyfin(
     tmdb_id: int, season_num: int, episode_num: int,
     anilist_data: Dict, media_type: str, base_url: str,
 ) -> List[Dict]:
-    """Resolve the Jellyfin item to its RAW, token-less absolute URL. The client
-    delivers it E2-only through the crimson-proxy, which injects the access token at
-    the edge — so the heavy bytes go Jellyfin → edge → viewer and the token never
-    reaches the browser. ``base_url`` is unused (no same-origin proxy path here)."""
+    """Resolve the Jellyfin item to its raw, token-less absolute URL.
+
+    The client delivers it through the proxy, which injects the access token at the
+    edge, so the bytes go Jellyfin to edge to viewer and the token never reaches
+    the browser. ``base_url`` is unused, as there is no same-origin path here."""
     embeds = await run_single_scraper(
         JellyfinScraper, tmdb_id, season_num, episode_num, anilist_data, media_type
     )
@@ -266,10 +260,10 @@ async def _grant_jellyfin(
         if not res or not res.get("url"):
             continue
         out.append({
-            "label": resolver.source_name,  # "Jellyfin" -> dedups with the /watch tile
+            "label": resolver.source_name,  # dedups with the /watch tile
             "streamType": res.get("streamType") or "hls",
             "url": res["url"],
-            # No upstream headers: the edge supplies the token + Authorization itself.
+            # None needed: the edge supplies the token and Authorization itself.
             "headers": {},
             "subtitles": [],
             "language": None,
@@ -277,13 +271,12 @@ async def _grant_jellyfin(
     return out
 
 
-# Per-source grant registry: source key -> (is_configured probe, runner). Jellyfin
-# is operator-owned and always public; any additional cookie/secret-bound source is
-# contributed by the build-time overlay, which declares a RESOLVE_GRANT descriptor
-# (see core.private_sources.discover_resolve_grants). A base build discovers none, so
-# only Jellyfin is wired and /resolve 404s for any other source — the client then
-# stays on its E0/backend path. This keeps the public backend free of any overlay
-# source name while giving each injected one a client-delivery path for free.
+# source key -> (is_configured probe, runner). Jellyfin is operator-owned and
+# always public; any other secret-bound source comes from the overlay's
+# RESOLVE_GRANT descriptors. A base build discovers none, so only Jellyfin is
+# wired and /resolve 404s for anything else, leaving the client on its backend
+# path. That keeps this file free of any overlay source name while giving each
+# injected one a client-delivery path for free.
 def _build_resolve_grants() -> Dict:
     grants = {"jellyfin": (_jellyfin_grant_configured, _grant_jellyfin)}
     for desc in discover_resolve_grants(_resolvers_pkg):
@@ -304,16 +297,14 @@ _RESOLVE_GRANTS = _build_resolve_grants()
 @router.post("/resolve")
 @limiter.limit("120/minute")
 async def resolve_grant(request: Request):
-    """Server-side resolve grant for cookie/secret-bound sources (New System).
+    """Server-side resolve grant for secret-bound sources.
 
-    Body is the client's MediaCtx + a ``source`` key:
-    ``{source, tmdbId, mediaType, season, episode, title, titleEnglish,
-    titleRomaji, titleNative, synonyms}``. Returns
-    ``{ok, streams:[{label, streamType, url, headers, subtitles, language}]}`` with
-    **raw** CDN URLs — the client engine handles the actual byte delivery.
+    The body is the client's MediaCtx plus a ``source`` key. Returns
+    ``{ok, streams:[...]}`` carrying raw CDN URLs, leaving byte delivery to the
+    client engine.
 
-    503 when the requested source isn't configured;
-    the client then keeps using the backend /watch line for it."""
+    503 when that source is unconfigured, which keeps the client on the backend
+    /watch line for it."""
     try:
         body = await request.json()
     except Exception:
@@ -341,9 +332,8 @@ async def resolve_grant(request: Request):
     except (TypeError, ValueError):
         season_num, episode_num = 1, 1
 
-    # The title bundle the discovery scraper matches on — the same fields the client
-    # already carries (and enriched via /scrape-meta). None values are simply skipped
-    # by the scraper's candidate-title builder.
+    # The same fields the client already carries, enriched via /scrape-meta. The
+    # scraper's candidate-title builder skips None values.
     anilist_data = {
         "title": body.get("title"),
         "title_english": body.get("titleEnglish"),
@@ -365,30 +355,26 @@ async def resolve_grant(request: Request):
 
 
 # --- movie-web bridge (/mw) -------------------------------------------------
-# A thin compatibility surface that re-shapes the existing scrape+resolve
-# pipeline into @movie-web/providers' native `Stream` JSON, so a modified
-# movie-web fork can consume Crimson as a single "source" instead of scraping
-# locally. These routes are the ONLY ones an API key can reach (see the login
-# wall): a valid X-API-Key unlocks /mw and nothing else.
+# Reshapes the existing pipeline into @movie-web/providers' native `Stream` JSON,
+# so a modified movie-web fork can consume Crimson as a single source instead of
+# scraping locally. These are the only routes an API key can reach: a valid
+# X-API-Key unlocks /mw and nothing else.
 #
 # Two differences from the frontend /watch routes:
-#   * the output is one buffered JSON document (a streams[] array), not the
-#     progressive NDJSON our own player consumes — movie-web's runner wants a
-#     source to return its streams as a value;
-#   * `iframe`-type sources (Movish player-proxy, AnimeSuge /player) are dropped:
-#     movie-web has no iframe player, only direct hls/file playback. The direct
-#     sources (PlayIMDb, Cinema.bz, ShowBox, VidSrc, Jellyfin, Cache, …) carry
-#     through unchanged.
+#   * the output is one buffered JSON document, not progressive NDJSON, because
+#     movie-web's runner wants a source to return its streams as a value
+#   * iframe-type sources are dropped, since movie-web has no iframe player. The
+#     direct sources carry through unchanged.
 def _mw_slug(text: Optional[str]) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     return s or "src"
 
 
 def _mw_captions(subtitles: Optional[List[Dict]]) -> List[Dict]:
-    """Map Crimson's `{label, lang, url}` subtitle tracks onto movie-web's
-    `Caption` shape. URLs are already absolutized same-origin proxy paths (see
-    resolve_streams), which serve WebVTT — so default the type to vtt, honoring
-    an explicit .srt extension when present."""
+    """Map Crimson's subtitle tracks onto movie-web's `Caption` shape.
+
+    The URLs are already absolutized same-origin proxy paths serving WebVTT, so
+    the type defaults to vtt, honouring an explicit .srt extension when present."""
     out: List[Dict] = []
     for i, s in enumerate(subtitles or []):
         url = s.get("url")
@@ -407,36 +393,33 @@ def _mw_captions(subtitles: Optional[List[Dict]]) -> List[Dict]:
 
 
 def _to_mw_stream(line: Dict, idx: int) -> Optional[Dict]:
-    """One NDJSON `stream` line -> one movie-web `Stream`, or None if movie-web
-    can't play it (iframe sources, or a line with no URL)."""
+    """One NDJSON `stream` line as a movie-web `Stream`, or None when movie-web
+    cannot play it."""
     stype = line.get("streamType")
     url = line.get("url")
     if not url or stype == "iframe":
         return None
     captions = _mw_captions(line.get("subtitles"))
-    # `flags` is intentionally empty: it advertises no special playback
-    # guarantees, so the fork routes the stream through its own proxy (which is
-    # also where it injects the bridge key) rather than fetching us directly.
+    # Empty on purpose: advertising no playback guarantees makes the fork route
+    # the stream through its own proxy, which is also where it injects the key.
     base = {
         "id": f"crimson-{_mw_slug(line.get('source'))}-{idx}",
         "flags": [],
         "captions": captions,
-        # Non-standard hints the fork can surface (source label + dub/sub
-        # language). movie-web ignores unknown keys, so this is additive.
+        # Hints the fork can surface. movie-web ignores unknown keys.
         "crimsonSource": line.get("source"),
         "crimsonLanguage": line.get("language"),
     }
     if stype == "hls":
         return {**base, "type": "hls", "playlist": url}
-    # mp4 / any direct file: movie-web's `file` shape keys streams by quality.
-    # Crimson doesn't probe quality, so expose it as the single "unknown" rung.
+    # movie-web's `file` shape keys streams by quality, and Crimson does not probe
+    # it, so everything goes on the single "unknown" rung.
     return {**base, "type": "file", "qualities": {"unknown": {"type": "mp4", "url": url}}}
 
 
 async def _collect_mw_streams(agen) -> Tuple[Optional[Dict], List[Dict]]:
-    """Drain the NDJSON watch generator into (meta, movie-web streams[]). Reuses
-    the entire real pipeline (scrape, resolve, dedup, air-date + localized-title
-    handling) — this only reshapes the output, it does not re-implement it."""
+    """Drain the NDJSON watch generator into (meta, movie-web streams). Reuses the
+    whole real pipeline and only reshapes its output."""
     meta: Optional[Dict] = None
     streams: List[Dict] = []
     idx = 0
@@ -461,10 +444,9 @@ async def _collect_mw_streams(agen) -> Tuple[Optional[Dict], List[Dict]]:
 @router.get("/mw/watch/movie/{tmdb_id}")
 @limiter.limit("30/minute")
 async def mw_watch_movie(request: Request, tmdb_id: int):
-    """movie-web bridge — streams for a standalone MOVIE (TMDB movie id), as a
-    single JSON document of native movie-web `Stream`s. Declared before the TV
-    route so the literal 'movie' segment matches here. Requires a valid
-    X-API-Key (or an admin/user session)."""
+    """Bridge streams for a standalone movie, as one JSON document of native
+    movie-web `Stream`s. Declared before the TV route so the literal 'movie'
+    segment matches here. Requires a valid X-API-Key or a session."""
     info = get_movie_info(tmdb_id)
     fallback_title = info.get("title") if info else None
     if not fallback_title:
@@ -491,10 +473,9 @@ async def mw_watch_movie(request: Request, tmdb_id: int):
 @router.get("/mw/watch/{tmdb_id}/{season_number}/{episode_number}")
 @limiter.limit("30/minute")
 async def mw_watch_tv(request: Request, tmdb_id: int, season_number: int, episode_number: int):
-    """movie-web bridge — streams for a TV episode (TMDB show id + season +
-    episode), as a single JSON document of native movie-web `Stream`s. Mirrors
-    the frontend /watch route's id/title resolution, then reshapes the output.
-    Requires a valid X-API-Key (or an admin/user session)."""
+    """Bridge streams for a TV episode, as one JSON document of native movie-web
+    `Stream`s. Mirrors the frontend /watch route's id and title resolution, then
+    reshapes the output. Requires a valid X-API-Key or a session."""
     anilist_id = get_anilist_id(tmdb_id, season_number)
     fallback_title = None
     if not anilist_id:
@@ -527,14 +508,13 @@ async def mw_watch_tv(request: Request, tmdb_id: int, season_number: int, episod
 @router.post("/cache/confirm")
 @limiter.limit("120/minute")
 async def confirm_cache(request: Request):
-    """Player calls this once the viewer has actually watched a source for a few
-    seconds, passing back the ``cacheTicket`` that source carried. Only then is
-    that exact stream enqueued for server-side caching — so we cache the source
-    the viewer *chose* (its quality + language), not whichever resolved fastest.
+    """Redeem a ``cacheTicket`` once the viewer has watched that source for a few
+    seconds, which is when the stream is enqueued for caching. That way the cached
+    source is the one the viewer chose, not whichever resolved fastest.
 
-    The ticket is HMAC-signed by ``/watch``, so no arbitrary URL can be injected
-    into the downloader. Behind the login wall; always 200 so it never leaks
-    whether caching is on or whether the episode was already cached."""
+    The ticket is HMAC-signed by /watch, so no arbitrary URL reaches the
+    downloader. Always 200, so it never leaks whether caching is on or whether the
+    episode was already cached."""
     try:
         body = await request.json()
         ticket = (body or {}).get("ticket") or ""
@@ -549,11 +529,9 @@ async def confirm_cache(request: Request):
 async def telemetry_resolve(request: Request):
     """Ingest an anonymous per-source resolve beacon from the client engine.
 
-    Body: ``{"events": [{"source": "Cinema.bz (tcloud)", "ok": true, "env": "extension"}, …]}``.
-    Strictly aggregate + anonymous — no title, no user, no IP is stored (see
-    telemetry_engine). Restores the source-success visibility lost when resolving
-    moved client-side. Behind the login wall + rate-limited; always 200 so a
-    beacon can be fire-and-forget."""
+    Strictly aggregate: no title, user or IP is stored. Restores the source-success
+    visibility lost when resolving moved client-side. Always 200, so a beacon can
+    be fire-and-forget."""
     try:
         body = await request.json()
         events = (body or {}).get("events") or []
@@ -571,10 +549,8 @@ async def telemetry_resolve(request: Request):
 @router.get("/watch/{anilist_id}/{episode_number}")
 @limiter.limit("30/minute")
 async def deprecated_watch(request: Request, anilist_id: int, episode_number: int, season_part: int = Query(1)):
-    """
-    Watch by anilist_id. TV seasons redirect to the canonical /watch route;
-    extras (specials/OVAs/movies) have no TMDB season number, so they are served
-    directly here.
+    """Watch by anilist_id. TV seasons map to the canonical /watch route, while
+    extras have no TMDB season number and are served directly here.
     """
     mapping = get_tmdb_season(anilist_id)
     if not mapping:
@@ -582,11 +558,10 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
 
     tmdb_id, season_number = mapping
 
-    # An extra that is a film in TMDB's own right (Overlord: The Sacred Kingdom)
-    # has a movie page, not an episode page. Serve it through the movie pipeline
-    # off its own id: the movie-capable sources can actually find it, and the
-    # cache keys itself in the movie namespace instead of colliding with an
-    # episode of the parent show.
+    # An extra that is a film in TMDB's own right has a movie page, not an episode
+    # page, so it goes through the movie pipeline off its own id. The
+    # movie-capable sources can then find it, and its cache key lands in the movie
+    # namespace instead of colliding with an episode of the parent show.
     if season_number is None:
         movie_id = get_extra_movie_id(anilist_id)
         if movie_id:
@@ -600,16 +575,15 @@ async def deprecated_watch(request: Request, anilist_id: int, episode_number: in
                 headers=_STREAM_HEADERS,
             )
 
-    # Serve the stream directly rather than 301-redirecting to the canonical
-    # 3-segment route. A redirect is fatal on WebKit (all iOS browsers + Safari):
-    # it drops the Authorization header when fetch() follows the redirect, so the
-    # redirected request hits the login wall unauthenticated → 401 → the client
-    # clears the session and the user is bounced to the login wall.
+    # Served directly rather than 301-redirecting to the canonical 3-segment
+    # route, because a redirect is fatal on WebKit: it drops the Authorization
+    # header when fetch() follows, so the request hits the login wall
+    # unauthenticated, the client clears the session and the user is bounced out.
     #
-    # A remaining extra (special/OVA/ONA) has no numbered season, so it plays as
-    # season 0, the specials season TMDB and the streaming sites both use. It
-    # used to borrow season 1, which pointed every special at the first episode of
-    # the show proper and, worse, minted its cache ticket under that episode's key.
+    # A remaining extra has no numbered season, so it plays as season 0, the
+    # specials season TMDB and the streaming sites both use. It used to borrow
+    # season 1, which pointed every special at the first episode of the show
+    # proper and minted its cache ticket under that episode's key.
     return StreamingResponse(
         stream_watch_response(tmdb_id, season_number if season_number is not None else 0,
                               episode_number, anilist_id,
