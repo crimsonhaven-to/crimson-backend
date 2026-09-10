@@ -5,6 +5,7 @@
 #                       sourceless demo stack.
 
 stages:
+  - security
   - gate
   - build
   - deploy
@@ -182,3 +183,59 @@ deploy-demo:
     url: https://demo.crimsonhaven.org
   script:
     - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/demo-crimson-deploy/deploy.sh '${DEMO_IMAGE_TAG}'"
+
+# --- Dependency vulnerability scan ---------------------------------------------
+# GitLab's own Dependency Scanning is Ultimate-only: every job in its template is
+# gated on $GITLAB_FEATURES, which a CE instance never sets, so including it would
+# quietly scan nothing. Trivy reads the committed lockfiles directly instead and
+# needs no licence.
+#
+# Two passes on purpose. The first prints every severity for the record; only the
+# second is allowed to fail, so HIGH and CRITICAL block a deploy and the rest do
+# not. This scans DEPENDENCIES, not the built image: base-image OS findings are
+# usually not actionable here and would wedge every deploy.
+scan-deps:
+  stage: security
+  tags: [docker]
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v/
+  variables:
+    TRIVY_CACHE_DIR: .trivycache
+    TRIVY_NO_PROGRESS: "true"
+  cache:
+    key: trivy-db
+    paths:
+      - .trivycache/
+  script:
+    - trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --exit-code 0 .
+    - trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 .
+
+# --- Automated dependency updates ----------------------------------------------
+# Dependabot does not exist here, so Renovate fills the same role: it opens one
+# merge request per available update, which then runs the gate like any other MR.
+#
+# Runs ONLY from a pipeline schedule, and self-skips when RENOVATE_TOKEN is unset,
+# so an ordinary push never triggers it and the pipeline stays green before setup.
+# One-time setup: add a group CI/CD variable RENOVATE_TOKEN (a personal access
+# token with the `api` scope), then create a pipeline schedule on this project.
+renovate:
+  stage: security
+  tags: [docker]
+  image:
+    name: renovate/renovate:latest
+    entrypoint: [""]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $RENOVATE_TOKEN
+  variables:
+    RENOVATE_PLATFORM: gitlab
+    RENOVATE_ENDPOINT: $CI_API_V4_URL
+    RENOVATE_REPOSITORIES: $CI_PROJECT_PATH
+    RENOVATE_GIT_AUTHOR: "Renovate Bot <renovate@crimsonhaven.to>"
+    LOG_LEVEL: info
+  script:
+    - renovate
