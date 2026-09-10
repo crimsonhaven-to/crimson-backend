@@ -211,7 +211,7 @@ in roughly 30 lines. Then:
   and method pair.
 
 It slots straight into the existing `gate` job in
-`.github/workflows/build-image.yml`, which already runs `pytest`.
+`.gitlab-ci.yml`, which already runs `pytest`.
 
 **Risk:** low. Test-only, no production code changes. The main cost is stubbing
 the DB cleanly enough that the suite keeps its "no network, no database"

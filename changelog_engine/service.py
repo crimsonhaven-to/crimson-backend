@@ -1,9 +1,9 @@
 """
 Changelog service — surfaces the project's GitHub Releases as a public changelog.
 
-Deploys are cut as *published GitHub Releases* (see
-.github/workflows/build-image.yml — ``on: release: [published]`` builds + deploys
-that tag), so the release notes you already write ARE the changelog. This service
+Deploys are cut as *published GitHub Releases* (see .gitlab-ci.yml, whose `.release`
+rule builds + deploys a v* tag), so the release notes you already write ARE the
+changelog. This service
 fetches them from the GitHub REST API and caches them in-process, so /changelog
 never blocks on — or hammers — GitHub.
 

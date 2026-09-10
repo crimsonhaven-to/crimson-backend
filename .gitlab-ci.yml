@@ -1,5 +1,8 @@
-# GitLab CI/CD — translated from .github/workflows/build-image.yml, which is left
-# in place so the project still builds on GitHub.
+# GitLab CI/CD for crimson-backend.
+#
+#   * push to `main` -> build :dev-<sha> and roll the crimson-dev stack.
+#   * a v* tag       -> build :<tag> + :latest, roll prod, and build/roll the
+#                       sourceless demo stack.
 
 stages:
   - gate
@@ -17,22 +20,22 @@ variables:
 default:
   interruptible: false
 
-.dev_push:
+.main_push:
   rules:
-    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
 
 .release:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v/
 
-.dev_or_release:
+.main_or_release:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v/
-    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
 
 # Quality gate
 gate:
-  extends: .dev_or_release
+  extends: .main_or_release
   stage: gate
   tags: [docker]
   image: python:3.14-slim
@@ -57,7 +60,7 @@ gate:
 
 build:
   extends:
-    - .dev_or_release
+    - .main_or_release
     - .buildx_setup
   stage: build
   tags: [crimsonrunner]
@@ -115,12 +118,12 @@ deploy:
     - echo "Deploy to the swarm"
     - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/crimson-deploy/deploy.sh '${VERSION}'"
 
-# Dev auto-deploy: a push to `dev` rolls the just-built dev-<sha> image onto the
+# Dev auto-deploy: a push to `main` rolls the just-built dev-<sha> image onto the
 # crimson-dev stack. Unlike the prod deploy this ships NO stack file — the dev
 # docker-stack.yml lives only on the manager (~/dev-crimson-deploy/), bundling
 # its own Postgres; CI just triggers its deploy.sh.
 deploy-dev:
-  extends: .dev_push
+  extends: .main_push
   stage: deploy
   tags: [crimsonrunner]
   needs: [build]

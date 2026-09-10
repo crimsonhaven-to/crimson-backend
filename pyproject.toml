@@ -1,4 +1,4 @@
-# Tooling config for the CI quality gate (see .github/workflows/build-image.yml).
+# Tooling config for the CI quality gate (see the `gate` job in .gitlab-ci.yml).
 # This file configures dev tooling only; the app itself is run via uvicorn (see
 # Dockerfile) and has no build step / packaging — there is intentionally no
 # [build-system] table.
