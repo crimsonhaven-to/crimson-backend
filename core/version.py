@@ -7,7 +7,7 @@ pulling in the whole app.
 import time
 
 # Fed to the FastAPI app metadata and the "/" root greeting.
-VERSION = "18.2.0"
+VERSION = "18.2.1"
 
 # The dashboard derives uptime from this. Module-load time is close enough to
 # boot for an operator metric.
