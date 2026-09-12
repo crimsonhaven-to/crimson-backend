@@ -1063,7 +1063,7 @@ registers both while logging a warning that nobody will receive anything.
 
 ## 6. User-facing security surface
 
-**Status:** `[ ]` not started
+**Status:** `[x]` done
 
 ### The problem
 
@@ -1135,11 +1135,82 @@ to `sessions`.
 **Risk:** low-medium. Mostly reads over existing tables. The two things that
 carry real weight are the irreversible delete and not leaking `token_hash`.
 
+### What was built
+
+`migrations/005_session_devices.sql` adds `user_agent`, `ip` and `last_seen_at`
+to `sessions`, all TEXT because the rest of that table is ISO-8601 TEXT and the
+`expires_at` comparisons elsewhere depend on it. It also adds
+`idx_secevents_user_ts`, since the existing indexes are on `ts` and
+`(event_type, ts)` and neither serves a per-account read.
+
+`account_engine/security_routes.py` is the whole surface:
+
+| Route | Does |
+| --- | --- |
+| `GET /account/sessions` | live sessions, newest first, caller flagged |
+| `DELETE /account/sessions/{id}` | sign out one device |
+| `DELETE /account/sessions` | sign out everywhere else |
+| `GET /account/security-events` | the account's own whitelisted events |
+| `GET /account/export` | every row this account owns, one JSON attachment |
+| `DELETE /account` | self-service deletion, confirmed and audited |
+
+The session queries live in `AccountStore` because that is where the token hash
+lives, and the point is that it never leaves.
+
+### Deviations from the plan
+
+1. **The public session id is derived in the data layer, not the route layer.**
+   The plan said "an opaque id derived per response". `_public_session_id` is a
+   second SHA-256 over `token_hash` with a distinct prefix, computed inside
+   `account_engine/db.py`, and `list_sessions` builds its rows by hand rather
+   than forwarding what it selected. A route handler therefore cannot leak the
+   hash by passing through a row it did not inspect, and the id is stable, so a
+   client can revoke a session it listed a minute ago. Revocation matches in
+   Python over the caller's own rows: a one-way id cannot be turned back into a
+   WHERE clause, and scanning one user's handful of sessions is the honest way
+   to do it.
+2. **`last_seen_at` is stamped by the check, not after it.**
+   `validate_and_touch_session` is one `UPDATE ... WHERE token_hash = %s AND
+   expires_at > %s` whose rowcount is the answer, exactly like
+   `ApiKeyStore.validate_and_touch`. The login wall calls it on a cache miss, so
+   the write costs nothing beyond the check that was already happening, rather
+   than adding a second round trip to that path.
+3. **`account_delete_failed` was added to the whitelist.** It is not in the plan,
+   and a failed attempt to delete your account is exactly the kind of thing its
+   owner should be able to see.
+
+### Verified
+
+Every landmine was checked against a real Postgres 17, not reasoned about:
+
+| Check | Result |
+| --- | --- |
+| Migration set applies through 006 | version 6, no error |
+| A pre-005 session row | lists as an unknown device, not hidden |
+| Token hash in any listed session | **absent, for all three sessions** |
+| `validate_and_touch_session` | stamps `last_seen_at`, one statement |
+| Expired and unknown tokens | both refused |
+| Revoking by public id | works once, then 404s |
+| **Another account's session id** | **not revocable from here** |
+| Sign out everywhere else | kept the caller, dropped the rest |
+| `admin_action` in the user's feed | absent |
+| An event with a null `user_id` | invisible, so no enumeration oracle |
+| `detail` and `identity` in the payload | absent |
+| **Ledger after the account is deleted** | **4 rows before, 4 rows after** |
+| Sessions after the account is deleted | cascaded away |
+
+The suite adds `tests/test_account_security.py` (32 tests). Two are worth
+naming: one asserts no value equal to any session's `token_hash` appears
+anywhere in the serialized response, rather than merely that no key is called
+`token_hash`; another walks `account_engine/*.py` for every `log_event` call and
+fails if a whitelisted type is never emitted, since a typo there would silently
+hide a category forever.
+
 ---
 
 ## 7. Crimson Wrapped
 
-**Status:** `[ ]` not started
+**Status:** `[x]` done
 
 ### The problem, and the honest version of it
 
@@ -1216,3 +1287,74 @@ anime / show / movie / manga / local surfaces.
 **Risk:** low for the read endpoint, low-medium for the write. The write is the
 part that touches a hot path; the read is pure aggregation over tables nothing
 else mutates.
+
+### What was built
+
+`migrations/006_watch_events.sql` adds the append-only table, keyed
+`(user_id, item_key, watched_on)`. The write is a single `INSERT ... ON CONFLICT`
+inside the **same** `with self._connect()` block as the existing progress upsert,
+so `POST /account/progress` still costs one threadpool hop and one connection.
+
+`account_engine/wrapped.py` holds the aggregation and every counting rule;
+`account_engine/wrapped_routes.py` is `GET /account/wrapped?year=&offset_minutes=`.
+
+### Deviations from the plan
+
+1. **The local day is derived from `first_seen_at`, not from `watched_on`.**
+   The plan said to store UTC and take an offset at read time, which the stored
+   column alone cannot support: `watched_on` is a DATE, and a date has no
+   time-of-day left to shift. `watched_on` therefore stays the storage-side dedup
+   key (one row per item per UTC day) and the read computes the viewer's day from
+   the `first_seen_at` timestamp. The query window is padded a day either side and
+   the local date does the real filtering, or a viewer east of UTC loses New
+   Year's Eve and one west of it loses New Year's Day.
+2. **Hours are the furthest point reached per show, not a sum of daily figures.**
+   Each day's row holds the furthest position reached that day, so an episode
+   watched across two days appears in both. Summing them reports a 24-minute
+   episode as 40 minutes. Taking the maximum per item undercounts a rewatch and
+   never overcounts, which is the right direction for a number shown to the
+   person who did the watching.
+3. **`top_titles` and `distinct_titles` group per show, not per item.** The first
+   real-database run listed "One Piece" three times, once per episode. `_show_key`
+   collapses them the same way `_dedup_by_show` already collapses Continue
+   Watching, recovering a local title from its item key since local media is the
+   one surface with no AniList or TMDB id.
+4. **Manga is excluded from genres, not just counted separately.** The plan only
+   flagged local rows. AniList numbers manga in its own id space, so looking a
+   manga id up in `anime_entries` would silently return a different title's
+   genres, which is worse than no genres.
+5. **The three-year prune is guarded on the table existing.** `purge_expired()` is
+   called from `init_db()`, and `init_db()` runs *before* the migration runner by
+   design. On the first boot after this change the table does not exist yet, and
+   an unguarded `DELETE` there would abort that transaction and boot-loop every
+   replica.
+
+### Verified
+
+Against a real Postgres 17, applying the real migration set on top of the real
+`init_db()`s in the order `startup.init_schema` uses:
+
+| Check | Result |
+| --- | --- |
+| **`init_db()` on a database with no `watch_events`** | **survives, then migrates to 6** |
+| **Five progress pings for one episode** | **one row, not five** |
+| A ping that restarts at the beginning | `seconds` holds the furthest point |
+| 12 episodes + 1 film + 1 manga | `episodes` 12, `movies` 1, `manga_titles` 1 |
+| Genres across three tables | Action, Adventure, Drama, one vote each |
+| `top_titles` | One Piece 280 min, Fight Club 117 min |
+| **A year the table does not cover** | **`approximate: true`** |
+| Every legal UTC offset | runs |
+| A four-year-old event | pruned |
+| Account deleted | `watch_events` cascaded |
+
+The `approximate` flag is not a corner case: the first Wrapped in production
+will carry it, because the table starts existing the day it ships and most of
+the year predates it. That was confirmed on the real database rather than
+assumed.
+
+`tests/test_wrapped.py` adds 44 tests, concentrated on the counting rules rather
+than on the happy path, since the failure mode here is a plausible number that
+is wrong rather than a crash.
+
+---
+
