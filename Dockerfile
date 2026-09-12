@@ -50,6 +50,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code.
 COPY api.py .
+# What api.py's lifespan runs: schema init, migrations, the background jobs and
+# the cache/download workers. Sits beside api.py because it assembles the app's
+# runtime the way api.py assembles its routes.
+COPY startup.py .
 # The HTTP layer (FastAPI routers + the shared web helpers) that api.py assembles.
 COPY web ./web
 # Shared infrastructure: config, db pool, rate limiter, HTTP client, response

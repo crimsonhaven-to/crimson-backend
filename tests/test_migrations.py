@@ -189,8 +189,9 @@ def test_apply_pending_reports_drift_without_reapplying(tmp_path, monkeypatch, f
 
 
 def test_apply_pending_survives_a_broken_directory(tmp_path, monkeypatch, fake_db):
-    """A duplicate version must not raise out of startup: api.py treats migrations
-    as non-fatal, and the runner reports the problem rather than propagating it."""
+    """A duplicate version must not raise out of startup: startup.init_schema
+    treats migrations as non-fatal, and the runner reports the problem rather
+    than propagating it."""
     _write(tmp_path, "001_a.sql")
     _write(tmp_path, "001_b.sql")
     monkeypatch.setenv("MIGRATIONS_DIR", str(tmp_path))
