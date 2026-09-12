@@ -50,6 +50,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code.
 COPY api.py .
+# What api.py's lifespan runs: schema init, migrations, the background jobs and
+# the cache/download workers. Sits beside api.py because it assembles the app's
+# runtime the way api.py assembles its routes.
+COPY startup.py .
 # The HTTP layer (FastAPI routers + the shared web helpers) that api.py assembles.
 COPY web ./web
 # Shared infrastructure: config, db pool, rate limiter, HTTP client, response
@@ -73,6 +77,7 @@ COPY skiptimes_engine ./skiptimes_engine
 COPY telemetry_engine ./telemetry_engine
 COPY manga_engine ./manga_engine
 COPY iptv_engine ./iptv_engine
+COPY notify_engine ./notify_engine
 # Versioned schema migrations (.sql, not Python, so the import-graph guard in
 # tests/test_dockerfile_copies.py cannot catch a missing line here; see the
 # dedicated assertion in tests/test_migrations.py instead). Without this COPY the

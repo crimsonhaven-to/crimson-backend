@@ -372,3 +372,141 @@ def get_movies_catalogue_items() -> List[Dict]:
         (x["title"] or "").lower(),
     ))
     return items
+
+
+# --- local anime search -----------------------------------------------------
+# /search/anime used to be a live TMDB proxy, which was both a network round trip
+# per keystroke and worse recall than the local data: fetch_tmdb_search_results
+# takes TMDB's first ten results and then drops every one without a local AniList
+# mapping, so a title that maps perfectly well can be pushed out of the top ten by
+# titles that do not map at all. anime_entries already holds the whole
+# Fribb-derived catalogue with three title columns, so the answer is on disk.
+
+# A query matching this many rows is too vague to autocomplete usefully, and the
+# cap is what keeps a one-letter query from sorting the entire catalogue.
+_SEARCH_SCAN_CAP = 400
+
+
+# Backslash is LIKE's default escape character in Postgres, and the pattern
+# travels as a bound parameter, so it arrives at the server unmangled.
+_LIKE_ESCAPES = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
+
+
+def _escape_like(value: str) -> str:
+    """Escape the LIKE wildcards so a query typed with % or _ matches literally.
+
+    Without this, searching for "_" matches every single-character title and "%"
+    matches the whole catalogue, which is a denial of service dressed as a typo.
+    """
+    return value.translate(_LIKE_ESCAPES)
+
+
+def search_anime_entries(query: str, limit: int = 10) -> List[Dict]:
+    """Anime whose AniList titles contain ``query``, best match first.
+
+    Emits the same item shape as ``fetch_tmdb_search_results`` so the two can be
+    merged and the frontend cannot tell them apart. ``vote_average`` is always
+    present and always null: TMDB scores it and anime_entries does not carry it,
+    and the frontend reads it only when sorting a hub, never on a suggestion.
+
+    Ordering is a plain CASE rather than pg_trgm's similarity(), so this query is
+    identical with or without the trigram index from migration 003 and there is
+    no second code path to keep in sync.
+    """
+    needle = (query or "").strip()
+    if not needle:
+        return []
+
+    escaped = _escape_like(needle)
+    exact = needle.lower()
+    prefix = f"{escaped}%"
+    contains = f"%{escaped}%"
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT e.anilist_id,
+                       e.title_romaji,
+                       e.title_english,
+                       e.title_native,
+                       e.start_year,
+                       e.tmdb_movie_id,
+                       s.tmdb_id      AS season_tmdb_id,
+                       s.season_number,
+                       x.tmdb_id      AS extra_tmdb_id,
+                       sh.poster_path AS show_poster,
+                       mv.poster_path AS movie_poster
+                FROM anime_entries e
+                -- One row per entry: an AniList id can map to several seasons and
+                -- a plain join would multiply the result. Ordered so the choice
+                -- is deterministic rather than whatever the heap returns first.
+                LEFT JOIN LATERAL (
+                    SELECT tmdb_id, season_number
+                    FROM tmdb_seasons
+                    WHERE anilist_id = e.anilist_id
+                    ORDER BY tmdb_id, season_number
+                    LIMIT 1
+                ) s ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT tmdb_id
+                    FROM tmdb_extras
+                    WHERE anilist_id = e.anilist_id
+                    ORDER BY tmdb_id
+                    LIMIT 1
+                ) x ON TRUE
+                LEFT JOIN tmdb_shows  sh ON sh.tmdb_id = COALESCE(s.tmdb_id, x.tmdb_id)
+                LEFT JOIN tmdb_movies mv ON mv.tmdb_id = e.tmdb_movie_id
+                WHERE (e.title_romaji  ILIKE %(contains)s
+                    OR e.title_english ILIKE %(contains)s
+                    OR e.title_native  ILIKE %(contains)s)
+                  -- Unreachable otherwise: nothing the frontend could open.
+                  AND (s.tmdb_id IS NOT NULL
+                    OR x.tmdb_id IS NOT NULL
+                    OR e.tmdb_movie_id IS NOT NULL)
+                ORDER BY
+                    CASE
+                        WHEN LOWER(e.title_english) = %(exact)s
+                          OR LOWER(e.title_romaji)  = %(exact)s THEN 0
+                        WHEN e.title_english ILIKE %(prefix)s
+                          OR e.title_romaji  ILIKE %(prefix)s   THEN 1
+                        WHEN e.title_english ILIKE %(contains)s
+                          OR e.title_romaji  ILIKE %(contains)s THEN 2
+                        -- Matched on the native title alone, which for a
+                        -- Latin-script query is usually incidental.
+                        ELSE 3
+                    END,
+                    e.start_year DESC NULLS LAST,
+                    e.anilist_id
+                LIMIT %(cap)s
+                """,
+                {
+                    "contains": contains,
+                    "prefix": prefix,
+                    "exact": exact,
+                    "cap": min(max(limit, 1), _SEARCH_SCAN_CAP),
+                },
+            )
+            rows = cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Database error in search_anime_entries: {e}")
+        return []
+
+    items: List[Dict] = []
+    for r in rows:
+        title = r["title_english"] or r["title_romaji"] or r["title_native"]
+        if not title:
+            continue  # AniList titles never resolved, so useless in a list
+        tmdb_id = r["season_tmdb_id"] or r["extra_tmdb_id"]
+        poster_path = r["show_poster"] if tmdb_id else r["movie_poster"]
+        items.append({
+            "title": title,
+            "tmdb_id": tmdb_id,
+            "anilist_id": r["anilist_id"],
+            "poster": _tmdb_img(poster_path) if poster_path else None,
+            "year": str(r["start_year"]) if r["start_year"] else None,
+            # Always present, always null: see the docstring.
+            "vote_average": None,
+        })
+    return items

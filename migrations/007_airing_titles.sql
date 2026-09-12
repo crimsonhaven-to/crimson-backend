@@ -1,0 +1,22 @@
+-- 007_airing_titles.sql
+--
+-- Keep the title AniList already told us, so the calendar can name a show the
+-- mapping has not caught up with yet.
+--
+-- The calendar resolved a title through anime_entries, which is filled by the
+-- Fribb mapping resync. A brand-new seasonal show is often not in that dataset
+-- yet, and a brand-new seasonal show is exactly what somebody wants to follow,
+-- so those rows rendered as "AniList #191832". Running this against a real
+-- window confirmed it: with an empty catalogue every one of 134 airings came
+-- back with a null title.
+--
+-- The fix costs nothing upstream. Page.airingSchedules can return media.title in
+-- the same request the poller already makes, so this is one more column on a row
+-- that was being written anyway, not another API call.
+--
+-- The lookup order in AiringStore.calendar is now: the subscription's own
+-- snapshot (what the user saw when they followed it), then this, then
+-- anime_entries. Existing rows keep NULL until the next refresh overwrites them,
+-- which happens within six hours.
+
+ALTER TABLE airing_schedule ADD COLUMN IF NOT EXISTS title TEXT;

@@ -39,6 +39,7 @@ from web.queries import (
     get_catalogue_items,
     get_movies_catalogue_items,
     get_shows_catalogue_items,
+    search_anime_entries,
 )
 from web.serialization import _gzip_json, _gzip_response, _json_gzip_bodies
 
@@ -47,15 +48,39 @@ logger = logging.getLogger("crimson.discovery")
 router = APIRouter()
 
 
+# Below this many local hits the TMDB search runs too, so a title added upstream
+# since the last Fribb sync still resolves. Above it, the local catalogue already
+# holds everything TMDB would have offered, since fetch_tmdb_search_results drops
+# every TMDB result that has no local AniList mapping anyway.
+_LOCAL_SEARCH_FLOOR = 3
+
+
 @router.get("/search/anime")
 async def search_anime_by_name(query_name: str = Query(..., min_length=1, description="Anime name to search")):
-    """Search anime by name."""
+    """Search anime by name, from the local catalogue first.
+
+    The client fires a search per keystroke across five surfaces, so the cost
+    that matters is the round trip, not the query. anime_entries already holds
+    the whole mapped catalogue, and TMDB results without a mapping are discarded
+    downstream regardless, so the local table answers most searches outright and
+    TMDB is consulted only when it returns few enough hits to be worth it.
+    """
     if not Config.TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="TMDB API key not configured")
 
     try:
-        async with http_client() as client:
-            results = await fetch_tmdb_search_results(client, query_name)
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            None, lambda: search_anime_entries(query_name)
+        )
+
+        if len(results) < _LOCAL_SEARCH_FLOOR:
+            async with http_client() as client:
+                remote = await fetch_tmdb_search_results(client, query_name)
+            seen = {r["anilist_id"] for r in results}
+            # Local first: its rows are ranked against the query, where TMDB's
+            # order reflects TMDB's own popularity.
+            results = results + [r for r in remote if r["anilist_id"] not in seen]
 
         return {
             "success": True,

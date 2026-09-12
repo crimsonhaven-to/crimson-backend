@@ -11,6 +11,7 @@ from typing import Dict, Optional
 
 import httpx
 
+from core import single_flight
 from core.config import Config
 from core.response_cache import (
     _local_get,
@@ -108,117 +109,122 @@ async def anilist_post(
 async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> Dict:
     """Titles, synonyms, episodes and airing info for one AniList id."""
     cache_key = f"anilist:meta:{anilist_id}"
-    
+
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         return cached_data
-    
-    query = """
-    query ($id: Int) {
-      Media (id: $id, type: ANIME) {
-        id
-        idMal
-        status
-        episodes
-        bannerImage
-        coverImage {
-          large
-          extraLarge
-        }
-        title {
-          romaji
-          english
-          native
-        }
-        synonyms
-        description
-        startDate {
-          year
-          month
-          day
-        }
-        endDate {
-          year
-          month
-          day
-        }
-        streamingEpisodes {
-          title
-          thumbnail
-          url
-        }
-        nextAiringEpisode {
-          episode
-          airingAt
-        }
-      }
-    }
-    """
-    
-    try:
-        response = await anilist_post(client, query, {"id": anilist_id})
 
-        if response is None or response.status_code != 200:
-            status = response.status_code if response is not None else "no response"
-            logger.error(f"AniList API error: Status {status}")
-            # Serve the last known good copy rather than a blank {}, which would
-            # 404 the overview and drop metadata from the watch pipeline.
+    async def _load() -> Dict:
+        query = """
+        query ($id: Int) {
+          Media (id: $id, type: ANIME) {
+            id
+            idMal
+            status
+            episodes
+            bannerImage
+            coverImage {
+              large
+              extraLarge
+            }
+            title {
+              romaji
+              english
+              native
+            }
+            synonyms
+            description
+            startDate {
+              year
+              month
+              day
+            }
+            endDate {
+              year
+              month
+              day
+            }
+            streamingEpisodes {
+              title
+              thumbnail
+              url
+            }
+            nextAiringEpisode {
+              episode
+              airingAt
+            }
+          }
+        }
+        """
+
+        try:
+            response = await anilist_post(client, query, {"id": anilist_id})
+
+            if response is None or response.status_code != 200:
+                status = response.status_code if response is not None else "no response"
+                logger.error(f"AniList API error: Status {status}")
+                # Serve the last known good copy rather than a blank {}, which would
+                # 404 the overview and drop metadata from the watch pipeline.
+                return await get_stale_response(cache_key) or {}
+
+            data = response.json()
+            media = data.get("data", {}).get("Media", {})
+            if not media: return {}
+
+            raw_episodes = media.get("streamingEpisodes", [])
+            formatted_episodes = []
+
+            for index, ep in enumerate(raw_episodes, start=1):
+                formatted_episodes.append({
+                    "episode_number": index,
+                    "title": ep.get("title", f"Episode {index}"),
+                    "thumbnail": ep.get("thumbnail"),
+                    "url": ep.get("url")
+                })
+
+            if not formatted_episodes and media.get("episodes"):
+                total_episodes = media.get("episodes")
+                for i in range(1, total_episodes + 1):
+                    formatted_episodes.append({
+                        "episode_number": i,
+                        "title": f"Episode {i}",
+                        "thumbnail": None,
+                        "url": None
+                    })
+
+            result = {
+                "anilist_id": media.get("id"),
+                # Surfaced so the skip-intro feature can key AniSkip off it.
+                "mal_id": media.get("idMal"),
+                "title": media.get("title", {}).get("english") or media.get("title", {}).get("romaji"),
+                "title_romaji": media.get("title", {}).get("romaji"),
+                "title_english": media.get("title", {}).get("english"),
+                "title_native": media.get("title", {}).get("native"),
+                "synonyms": media.get("synonyms") or [],
+                "total_episodes": media.get("episodes"),
+                "status": media.get("status"),
+                "banner": media.get("bannerImage"),
+                "cover": media.get("coverImage", {}).get("extraLarge") or media.get("coverImage", {}).get("large"),
+                "description": media.get("description"),
+                "start_date": media.get("startDate"),
+                "end_date": media.get("endDate"),
+                "next_airing_episode": media.get("nextAiringEpisode"),
+                "episodes_list": formatted_episodes
+            }
+
+            # Plus a long-lived shadow, for serve-stale-on-error.
+            if result:
+                await set_cached_response_shadowed(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching from AniList: {e}")
             return await get_stale_response(cache_key) or {}
 
-        data = response.json()
-        media = data.get("data", {}).get("Media", {})
-        if not media: return {}
-        
-        raw_episodes = media.get("streamingEpisodes", [])
-        formatted_episodes = []
-        
-        for index, ep in enumerate(raw_episodes, start=1):
-            formatted_episodes.append({
-                "episode_number": index,
-                "title": ep.get("title", f"Episode {index}"),
-                "thumbnail": ep.get("thumbnail"),
-                "url": ep.get("url")
-            })
-        
-        if not formatted_episodes and media.get("episodes"):
-            total_episodes = media.get("episodes")
-            for i in range(1, total_episodes + 1):
-                formatted_episodes.append({
-                    "episode_number": i,
-                    "title": f"Episode {i}",
-                    "thumbnail": None,
-                    "url": None
-                })
-        
-        result = {
-            "anilist_id": media.get("id"),
-            # Surfaced so the skip-intro feature can key AniSkip off it.
-            "mal_id": media.get("idMal"),
-            "title": media.get("title", {}).get("english") or media.get("title", {}).get("romaji"),
-            "title_romaji": media.get("title", {}).get("romaji"),
-            "title_english": media.get("title", {}).get("english"),
-            "title_native": media.get("title", {}).get("native"),
-            "synonyms": media.get("synonyms") or [],
-            "total_episodes": media.get("episodes"),
-            "status": media.get("status"),
-            "banner": media.get("bannerImage"),
-            "cover": media.get("coverImage", {}).get("extraLarge") or media.get("coverImage", {}).get("large"),
-            "description": media.get("description"),
-            "start_date": media.get("startDate"),
-            "end_date": media.get("endDate"),
-            "next_airing_episode": media.get("nextAiringEpisode"),
-            "episodes_list": formatted_episodes
-        }
-        
-        # Plus a long-lived shadow, for serve-stale-on-error.
-        if result:
-            await set_cached_response_shadowed(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Error fetching from AniList: {e}")
-        return await get_stale_response(cache_key) or {}
+    # Coalesced: a popular title's entry expires while that title is at peak
+    # traffic, and AniList answers a stampede with 429s.
+    return await single_flight.run(cache_key, _load)
 
 
 # --- MANGA (the reading surface) -------------------------------------------

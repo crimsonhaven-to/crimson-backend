@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from core import single_flight
 from core.config import Config
 from core.http_client import http_client, fetch_with_retry
 from core.response_cache import (
@@ -248,37 +249,42 @@ async def _season_episode_info(tmdb_id: int, season_number: int) -> Dict:
 async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:
     """Search TMDB for anime titles."""
     cache_key = f"tmdb:search:{query.lower()}"
-    
+
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         return cached_data.get("results", [])
-    
-    url = "https://api.themoviedb.org/3/search/tv"
-    data = await fetch_with_retry(client, url, params={"query": query, "include_adult": "false"})
-    
-    if not data:
-        return []
 
-    items = data.get("results", [])[:limit]
-    # One batched lookup instead of a query per result.
-    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+    async def _load() -> List[Dict]:
+        url = "https://api.themoviedb.org/3/search/tv"
+        data = await fetch_with_retry(client, url, params={"query": query, "include_adult": "false"})
 
-    results = []
-    for item in items:
-        tmdb_id = item.get("id")
-        anilist_id = anilist_by_tmdb.get(tmdb_id) if tmdb_id else None
-        if anilist_id:
-            results.append({
-                "title": item.get("name") or item.get("original_name"),
-                "tmdb_id": tmdb_id,
-                "anilist_id": anilist_id,
-                "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
-                "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
-                "vote_average": item.get("vote_average")
-            })
+        if not data:
+            return []
 
-    await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
-    return results
+        items = data.get("results", [])[:limit]
+        # One batched lookup instead of a query per result.
+        anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+
+        results = []
+        for item in items:
+            tmdb_id = item.get("id")
+            anilist_id = anilist_by_tmdb.get(tmdb_id) if tmdb_id else None
+            if anilist_id:
+                results.append({
+                    "title": item.get("name") or item.get("original_name"),
+                    "tmdb_id": tmdb_id,
+                    "anilist_id": anilist_id,
+                    "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
+                    "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
+                    "vote_average": item.get("vote_average")
+                })
+
+        await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+        return results
+
+    # Coalesced: the client searches per keystroke, so one typed title arrives
+    # as a burst of concurrent misses on the same key.
+    return await single_flight.run(cache_key, _load)
 
 
 async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> List[Dict]:
@@ -296,44 +302,48 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
         _local_set(cache_key, results)
         return results
 
-    url = "https://api.themoviedb.org/3/discover/tv"
-    params = {
-        "page": 1,
-        "include_adult": "false",
-        "language": "en-US",
-        "with_genres": "16",             # Animation
-        "with_original_language": "ja",  # Japanese originals
-        "sort_by": "popularity.desc",
-        "vote_count.gte": 100            # quality floor
-    }
-    
-    data = await fetch_with_retry(client, url, params=params)
-    
-    if not data:
-        return []
+    async def _load() -> List[Dict]:
+        url = "https://api.themoviedb.org/3/discover/tv"
+        params = {
+            "page": 1,
+            "include_adult": "false",
+            "language": "en-US",
+            "with_genres": "16",             # Animation
+            "with_original_language": "ja",  # Japanese originals
+            "sort_by": "popularity.desc",
+            "vote_count.gte": 100            # quality floor
+        }
 
-    items = data.get("results", [])[:limit]
-    # One batched lookup instead of a query per result.
-    anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+        data = await fetch_with_retry(client, url, params=params)
 
-    trending_list = []
-    for item in items:
-        tmdb_id = item.get("id")
-        anilist_id = anilist_by_tmdb.get(tmdb_id) if tmdb_id else None
-        if anilist_id:
-            trending_list.append({
-                "title": item.get("name") or item.get("original_name"),
-                "tmdb_id": tmdb_id,
-                "anilist_id": anilist_id,
-                "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
-                "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
-                "vote_average": item.get("vote_average")
-            })
+        if not data:
+            return []
 
-    # The DB for cross-replica reuse, L1 for this process.
-    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
-    _local_set(cache_key, trending_list)
-    return trending_list
+        items = data.get("results", [])[:limit]
+        # One batched lookup instead of a query per result.
+        anilist_by_tmdb = get_first_anilist_ids([it["id"] for it in items if it.get("id")])
+
+        trending_list = []
+        for item in items:
+            tmdb_id = item.get("id")
+            anilist_id = anilist_by_tmdb.get(tmdb_id) if tmdb_id else None
+            if anilist_id:
+                trending_list.append({
+                    "title": item.get("name") or item.get("original_name"),
+                    "tmdb_id": tmdb_id,
+                    "anilist_id": anilist_id,
+                    "poster": f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}" if item.get('poster_path') else None,
+                    "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
+                    "vote_average": item.get("vote_average")
+                })
+
+        # The DB for cross-replica reuse, L1 for this process.
+        await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+        _local_set(cache_key, trending_list)
+        return trending_list
+
+    # Coalesced: one global key that every homepage load lands on at once.
+    return await single_flight.run(cache_key, _load)
 
 
 async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, limit: int = 10) -> List[Dict]:

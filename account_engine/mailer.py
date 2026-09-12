@@ -199,3 +199,86 @@ def send_broadcast(recipients: list[dict], subject: str, message: str, progress=
             progress(sent, failed)
     logger.info("[mailer] broadcast %r: %d sent, %d failed", subject, sent, failed)
     return {"sent": sent, "failed": failed}
+
+
+# --- airing notifications ----------------------------------------------------
+# One connection for the whole burst, like send_broadcast: a popular seasonal
+# title notifies all of its subscribers within one poll tick, and transactional
+# SMTP providers rate limit per connection as well as per minute.
+
+def airing_bodies(title: str, episode: int, username: str | None, link: str) -> tuple[str, str]:
+    """(text, html) for one "a new episode aired" notice.
+
+    The copy says *aired in Japan*, not "available now", and that wording is
+    load-bearing. AniList gives the broadcast time; the backend genuinely cannot
+    know when a source has the episode, because third-party sources resolve in
+    the viewer's own browser by design. Promising availability would be a support
+    burden the architecture cannot pay off.
+    """
+    greeting = f"Greetings, {username}." if username else "Greetings, mortal."
+    safe_title = html.escape(title or "A title you follow")
+    text = (
+        f"{greeting}\n\n"
+        f"Episode {episode} of {title} has aired in Japan.\n\n"
+        f"{link}\n\n"
+        "Sources may take a little while to catch up.\n"
+        "You're receiving this because you follow this title on CrimsonHaven."
+    )
+    html_body = _wrap(
+        "A new episode has aired",
+        f'<p style="font-size:14px;line-height:1.7;color:#d9aab4;margin:0 0 8px">'
+        f"{html.escape(greeting)}</p>"
+        f'<p style="font-size:18px;line-height:1.5;color:#fff;font-weight:700;margin:0 0 4px">'
+        f"{safe_title}</p>"
+        f'<p style="font-size:14px;line-height:1.7;color:#d9aab4;margin:0 0 24px">'
+        f"Episode {episode} has aired in Japan. Sources may take a little while to catch up."
+        "</p>"
+        f"{_button(link, 'Open in the Haven')}",
+        footer="You're receiving this because you follow this title. "
+               "Manage what you follow in your account settings.",
+    )
+    return text, html_body
+
+
+def send_airing_batch(messages: list[dict], progress=None) -> dict:
+    """Send every notice over one SMTP connection, failing soft per recipient.
+
+    ``messages`` are ``{email, subject, text, html}``. ``progress`` is called as
+    progress(message, sent: bool) after each attempt, which is how the caller
+    records each outcome in the ledger as it happens rather than assuming the
+    whole batch shared one fate.
+
+    Mirrors send_broadcast: one bad address does not abort the rest, and a dead
+    server yields sent=0 rather than an exception.
+    """
+    sent, failed = 0, 0
+    if not is_configured():
+        logger.warning("[mailer] SMTP_HOST unset, %d airing notice(s) skipped", len(messages))
+        if progress:
+            for message in messages:
+                progress(message, False)
+        return {"sent": 0, "failed": len(messages)}
+    try:
+        with _connection() as server:
+            for message in messages:
+                ok = False
+                try:
+                    server.send_message(_build_message(
+                        message["email"], message["subject"], message["text"], message.get("html")
+                    ))
+                    ok = True
+                    sent += 1
+                except Exception as e:  # noqa: BLE001 - skip the bad address, keep going
+                    logger.error("[mailer] airing notice to %s failed: %s", message["email"], e)
+                    failed += 1
+                if progress:
+                    progress(message, ok)
+    except Exception as e:  # noqa: BLE001 - connection died, the rest never sent
+        logger.error("[mailer] airing batch aborted after %d sent: %s", sent, e)
+        remaining = messages[sent + failed:]
+        failed += len(remaining)
+        if progress:
+            for message in remaining:
+                progress(message, False)
+    logger.info("[mailer] airing notices: %d sent, %d failed", sent, failed)
+    return {"sent": sent, "failed": failed}
