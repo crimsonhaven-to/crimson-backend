@@ -206,6 +206,9 @@ services:
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
       # The one process that runs the Fribb resync.
       - RUN_DB_SYNC=true
+      # Next to the DB-Sync, it also handles the airing notification via mailer
+      - AIRING_NOTIFY_ENABLED=${AIRING_NOTIFY_ENABLED:-false}
+      - AIRING_NOTIFY_DRY_RUN=${AIRING_NOTIFY_DRY_RUN:-true}
       # api-sync serves no ingress and has no NAS mount; it never downloads.
       - RUN_CACHE_WORKER=false
       - RUN_DOWNLOAD_WORKER=false
