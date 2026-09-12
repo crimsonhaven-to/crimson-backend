@@ -394,6 +394,7 @@ Ordering rationale:
 | 5 | Airing calendar + subscriptions | The largest item; needs 2 and 3 in place |
 | 6 | User-facing security surface | Mostly reuses tables that already exist |
 | 7 | Crimson Wrapped | Depends on the write added in 6's neighbourhood |
+| 8 | The client half | Last, so every surface above exists to wire up |
 
 ---
 
@@ -1358,3 +1359,91 @@ is wrong rather than a crash.
 
 ---
 
+## 8. The client half, and what driving it over HTTP found
+
+**Status:** `[x]` done
+
+Items 1 to 7 were all backend. This is the other half: the sibling repo
+`crimson-client`, so every one of them is reachable by a person rather than by
+curl. It is recorded here because two of the three defects below were only
+findable by running the two halves together, and neither unit suite could have
+caught them.
+
+### What was built
+
+| Surface | Where |
+| --- | --- |
+| Airing calendar, follow toggles, "everything you follow" | `src/AiringCalendar.jsx`, `/calendar` |
+| Follow button beside the watchlist control | `src/FollowButton.jsx`, mounted in `OverviewView` |
+| Crimson Wrapped | `src/CrimsonWrapped.jsx`, `/wrapped` |
+| Sessions, activity, export, deletion | `src/AccountSecurity.jsx`, on the Account page |
+| Data layer | `src/hooks/airing.js`, `security.js`, `wrapped.js` |
+| Pure formatting, separately testable | `src/airingFormat.js`, `src/securityFormat.js` |
+
+Item 4 (local search) needed no client change at all: `/search/anime` kept its
+shape, so the existing autocomplete got the local-first answer for free. That is
+what the item was designed for and it is worth noting that it held.
+
+Deleting a mnemonic account needed one new thing on the client: `useAuth` gained
+`signChallenge`, the same challenge-and-sign it already does for login, so an
+identity with no password can still prove ownership. The mnemonic is typed in at
+the moment of deletion and never stored.
+
+### Three defects, found by running the two halves together
+
+1. **Every error message the client showed was the generic fallback.**
+   `api.py`'s `http_exception_handler` rewrites every raised `HTTPException` into
+   `{success, error, message}`, and the client's `extractError` only ever read
+   `detail`. So "Password is incorrect" and "This invite code has already been
+   used" both reached the user as whatever fallback the caller happened to pass.
+   This was pre-existing and affects every flow in the app, not just the new
+   ones; it surfaced here because the delete confirmation is useless without the
+   real reason. `extractError` now reads `detail` first, then `error`.
+2. **The calendar could not name a new season.** `AiringStore.calendar` resolved
+   titles through `anime_entries`, which the Fribb resync fills and which lags a
+   new season by weeks. Against a real AniList window, **0 of 134 airings had a
+   title**; they rendered as "AniList #191832". A brand-new seasonal show is
+   exactly what somebody wants to follow, so this was the feature failing at its
+   own centre. `migrations/007_airing_titles.sql` adds `title` to
+   `airing_schedule` and the poller now asks for `media { title }` in the request
+   it was already making, so it costs nothing upstream. After the change, **134
+   of 134**. The lookup order is the subscription's snapshot, then this, then
+   `anime_entries`, and a refresh that comes back without a name does not erase
+   one already stored.
+3. **`3/hour` on the self-delete locked out a legitimate user.** Two mistyped
+   passwords and the account holder cannot delete their account for an hour, and
+   the third attempt answers "Rate limit exceeded" rather than saying why. The
+   confirmation is the real gate; the limit is now `5/hour`.
+
+A fourth thing was not a defect but a gap: a followed title between seasons has
+nothing on the week's schedule, so it was invisible on the calendar page and
+could not be unfollowed. The page now lists every follow below the schedule, and
+`list_subscriptions` gained a second LATERAL so a title with no upcoming episode
+still has a name from its past rows.
+
+### Verified
+
+Two throwaway Postgres 17 containers and a live uvicorn, driven over real HTTP
+with a real bearer token, which is the only way to exercise the login wall, the
+dependency wiring and a DELETE carrying a body:
+
+| Check | Result |
+| --- | --- |
+| All six new routes with no token | 401, every one |
+| Sign-in from two devices | both listed, the caller flagged |
+| **Any session's `token_hash` in the response body** | **absent** |
+| Revoking by public id | 200, then 404; that token then 401s |
+| The ledger over HTTP | no `admin_action`, no `detail`, no `identity` |
+| Progress pinged four times for three episodes | Wrapped counts 3 |
+| `approximate` on a fresh table | true |
+| `offset_minutes=99999` | 422, not silently clamped |
+| Export | no `password_hash`, no `is_admin`, 3 progress rows |
+| Delete with no proof / bad signature / real signature | 400, 401, 200 |
+| Session after deletion | 401 |
+| **Calendar against a real AniList window** | **134 airings, 134 named** |
+| Following one | 2 of its episodes flagged, next episode resolved |
+
+Client: 168 tests pass (was 142), `eslint` clean of errors, `vite build` clean.
+Backend: 469 pass (was 385).
+
+---

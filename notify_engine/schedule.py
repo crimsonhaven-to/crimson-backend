@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import httpx
 
@@ -43,18 +43,30 @@ query ($page: Int, $perPage: Int, $from: Int, $to: Int) {
       mediaId
       episode
       airingAt
+      media { title { romaji english } }
     }
   }
 }
 """
 
 
+def _title(entry: dict) -> Optional[str]:
+    """The show's name as AniList gives it, English first.
+
+    Worth carrying because the calendar's other source, anime_entries, is filled
+    by the Fribb mapping resync and lags behind a new season: without this, the
+    shows most worth following are the ones that render as a bare id."""
+    titles = ((entry.get("media") or {}).get("title") or {})
+    name = titles.get("english") or titles.get("romaji")
+    return name.strip()[:500] if isinstance(name, str) and name.strip() else None
+
+
 async def fetch_window(
     client: httpx.AsyncClient, lookback_hours: int, horizon_days: int
-) -> List[Tuple[int, int, datetime]]:
+) -> List[Tuple[int, int, datetime, Optional[str]]]:
     """Every anime airing between ``now - lookback`` and ``now + horizon``.
 
-    Returns ``(anilist_id, episode, airing_at)`` tuples ready for
+    Returns ``(anilist_id, episode, airing_at, title)`` tuples ready for
     ``AiringStore.upsert_schedule``. Degrades to whatever it managed to collect:
     a partial window keeps the calendar mostly right and the next refresh fills
     the rest, where raising would leave it empty.
@@ -63,7 +75,7 @@ async def fetch_window(
     start = int((now - timedelta(hours=lookback_hours)).timestamp())
     end = int((now + timedelta(days=horizon_days)).timestamp())
 
-    collected: List[Tuple[int, int, datetime]] = []
+    collected: List[Tuple[int, int, datetime, Optional[str]]] = []
     page = 1
     while page <= _MAX_PAGES:
         try:
@@ -87,10 +99,11 @@ async def fetch_window(
             airing_at = entry.get("airingAt")
             if media_id is None or episode is None or airing_at is None:
                 continue
-            collected.append(
-                (int(media_id), int(episode),
-                 datetime.fromtimestamp(int(airing_at), tz=timezone.utc))
-            )
+            collected.append((
+                int(media_id), int(episode),
+                datetime.fromtimestamp(int(airing_at), tz=timezone.utc),
+                _title(entry),
+            ))
 
         if not (payload.get("pageInfo") or {}).get("hasNextPage"):
             break

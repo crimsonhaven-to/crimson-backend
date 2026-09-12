@@ -39,8 +39,10 @@ class AiringStore:
         return get_connection()
 
     # -- schedule -------------------------------------------------------
-    def upsert_schedule(self, rows: Sequence[Tuple[int, int, datetime]]) -> int:
-        """Record airings as ``(anilist_id, episode, airing_at)``.
+    def upsert_schedule(
+        self, rows: Sequence[Tuple[int, int, datetime, Optional[str]]]
+    ) -> int:
+        """Record airings as ``(anilist_id, episode, airing_at, title)``.
 
         Upserts on ``(anilist_id, episode)`` so a delayed broadcast moves its row
         rather than adding a second one. Returns the number written.
@@ -51,11 +53,14 @@ class AiringStore:
             cursor = conn.cursor()
             cursor.executemany(
                 """
-                INSERT INTO airing_schedule (anilist_id, episode, airing_at, fetched_at)
-                VALUES (%s, %s, %s, now())
+                INSERT INTO airing_schedule (anilist_id, episode, airing_at, fetched_at, title)
+                VALUES (%s, %s, %s, now(), %s)
                 ON CONFLICT (anilist_id, episode) DO UPDATE
                     SET airing_at = EXCLUDED.airing_at,
-                        fetched_at = EXCLUDED.fetched_at
+                        fetched_at = EXCLUDED.fetched_at,
+                        -- A refresh that came back without a name must not erase
+                        -- the one already on the row.
+                        title = COALESCE(EXCLUDED.title, airing_schedule.title)
                 """,
                 list(rows),
             )
@@ -77,6 +82,7 @@ class AiringStore:
                        s.user_id IS NOT NULL AS subscribed,
                        s.title,
                        s.poster,
+                       a.title AS schedule_title,
                        e.title_english,
                        e.title_romaji
                 FROM airing_schedule a
@@ -96,9 +102,13 @@ class AiringStore:
                 "episode": r["episode"],
                 "airing_at": r["airing_at"].isoformat(),
                 "subscribed": bool(r["subscribed"]),
-                # The subscription's snapshot first (it exists even for a title
-                # the mapping sync has not seen), then the catalogue's.
-                "title": r["title"] or r["title_english"] or r["title_romaji"],
+                # The subscription's snapshot first (what the user saw when they
+                # followed it), then AniList's own name from the schedule fetch,
+                # then the catalogue's. anime_entries comes last because the Fribb
+                # resync that fills it lags a new season, which is exactly when a
+                # title is most worth following.
+                "title": (r["title"] or r["schedule_title"]
+                          or r["title_english"] or r["title_romaji"]),
                 "poster": r["poster"],
             }
             for r in rows
@@ -123,7 +133,8 @@ class AiringStore:
                        s.notify_email,
                        s.created_at,
                        n.episode   AS next_episode,
-                       n.airing_at AS next_airing_at
+                       n.airing_at AS next_airing_at,
+                       t.title     AS schedule_title
                 FROM anime_subscriptions s
                 LEFT JOIN LATERAL (
                     SELECT episode, airing_at
@@ -132,6 +143,16 @@ class AiringStore:
                     ORDER BY airing_at
                     LIMIT 1
                 ) n ON TRUE
+                -- A separate lookup from the one above: a title between seasons
+                -- has no upcoming episode but still has a name on its past rows,
+                -- and a follow with no name at all is unmanageable.
+                LEFT JOIN LATERAL (
+                    SELECT title
+                    FROM airing_schedule
+                    WHERE anilist_id = s.anilist_id AND title IS NOT NULL
+                    ORDER BY airing_at DESC
+                    LIMIT 1
+                ) t ON TRUE
                 WHERE s.user_id = %s
                 ORDER BY s.created_at DESC
                 """,
@@ -141,7 +162,7 @@ class AiringStore:
         return [
             {
                 "anilist_id": r["anilist_id"],
-                "title": r["title"],
+                "title": r["title"] or r["schedule_title"],
                 "poster": r["poster"],
                 "notify_email": r["notify_email"],
                 "created_at": r["created_at"].isoformat(),

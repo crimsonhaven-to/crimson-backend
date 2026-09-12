@@ -205,7 +205,10 @@ def _confirm_owner(user: dict, body: DeleteAccountRequest, request: Request) -> 
 
 
 @router.delete("/account")
-@limiter.limit("3/hour")
+# Bounded, but with room for a mistyped password: the confirmation is the real
+# gate, and a limit so tight that two typos lock the account holder out of a
+# deliberate action for an hour is a worse failure than the one it prevents.
+@limiter.limit("5/hour")
 async def delete_account(
     request: Request,
     body: DeleteAccountRequest,
