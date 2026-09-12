@@ -910,7 +910,7 @@ and every future one.
 
 ## 5. Airing calendar, subscriptions and email notifications
 
-**Status:** `[ ]` not started
+**Status:** `[x]` done
 
 ### The problem
 
@@ -994,6 +994,70 @@ item in this batch that sends something to a human. Everything else is
 recoverable by a redeploy; a bad send is not. Ship it with the poller behind a
 config flag, default off, and a dry-run mode that logs recipients without
 connecting to SMTP.
+
+### What was built
+
+`migrations/004_airing.sql` and `notify_engine/` (`db`, `schedule`, `notifier`,
+`routes`), plus `airing_bodies` / `send_airing_batch` in the existing mailer and
+two jobs in `startup.py`. 15 unit tests.
+
+Three deviations, all recorded here rather than quietly taken:
+
+* **The window is polled unfiltered, not per subscribed id.** Fetching every
+  anime airing in the window costs the same handful of requests as fetching only
+  the followed ones, and it is what lets `/calendar` show the whole week rather
+  than only the caller's shows. The plan promised both halves of that calendar
+  without saying where the other half would come from; this is where.
+* **Two jobs, not one.** They want different intervals for different reasons: the
+  schedule changes only when a broadcast slips (six-hourly), while a notice
+  should follow the airing closely (ten-minutely) and touches only the database
+  until it has something to send.
+* **A lookback window bounds the send queue**, and this is the important one the
+  plan missed. `pending_notifications` requires `airing_at > now() - 36h` as well
+  as `<= now()`. Without the lower bound, the first run after enabling the
+  feature would mail every subscriber about every episode in the table, and a
+  subscriber who verified their address today would receive a backlog. It also
+  means a few hours of downtime catches up instead of silently dropping what it
+  missed.
+
+Gating is one flag, `AIRING_NOTIFY_ENABLED` (default off), plus
+`AIRING_NOTIFY_DRY_RUN`. The calendar and follows are not gated: they are
+read-only and useful on their own, and a flag nobody needs is a flag to get
+wrong. `config_report` reports the feature in **three** states rather than two,
+because a dry run and a live run both read as "enabled" in the environment while
+only one of them reaches anybody.
+
+### Verified against a real Postgres 17
+
+The unit tests fake the store, so nothing there parses the SQL. A throwaway
+container covered what only a real server can answer:
+
+| Check | Result |
+| --- | --- |
+| Migration set applies through 004 | version 4, no error |
+| A delayed broadcast moves its row | one row, not two |
+| Who is eligible | only the verified-email account; the unverified and the mnemonic one are skipped |
+| `claim` twice on one key | `True` then `False` |
+| A claimed episode | leaves the pending queue |
+| A failed send | stays claimed, not re-claimable |
+| **Enabling with a full table** | **zero pending: the back catalogue is not mailed** |
+| **A user verifying their email today** | **gets only what is still inside the window** |
+| `notify_email=false` | opts out, and re-subscribing does not blank the title snapshot |
+| Retention sweep | drops airings past 30 days |
+
+**The claim was raced for real, not just called twice.** Eight threads released
+from a barrier onto the same key produced exactly one winner. That is the
+property the comments claim and the reason a stray second replica is harmless
+rather than a duplicate-mail incident.
+
+End to end over the real database with a faked mailer: the first run sent two
+notices, and a second run **inside the same lookback window sent nothing**, which
+is the whole reason the ledger exists.
+
+The scheduler wiring was checked across four configurations with the harness
+built for item 2: notify off on the sync replica registers the refresh job alone,
+notify on registers both, a **non-sync replica registers neither**, and a dry run
+registers both while logging a warning that nobody will receive anything.
 
 ---
 

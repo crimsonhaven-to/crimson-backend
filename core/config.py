@@ -81,6 +81,15 @@ class Config:
     # Hour the nightly reset runs at, in server time (UTC in the container).
     DEMO_RESET_HOUR = int(os.getenv("DEMO_RESET_HOUR", "4"))
 
+    # --- Airing notifications (see notify_engine) --------------------------
+    # The calendar and the subscription surface are always on; this gates only
+    # the job that emails people. Default off because it is the one thing here
+    # that a redeploy cannot take back: a wrong send has already arrived.
+    AIRING_NOTIFY_ENABLED = os.getenv("AIRING_NOTIFY_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+    # Claims and logs recipients without opening an SMTP connection, so a first
+    # run can be watched before it is allowed to reach anyone.
+    AIRING_NOTIFY_DRY_RUN = os.getenv("AIRING_NOTIFY_DRY_RUN", "false").lower() in ("1", "true", "yes", "on")
+
     # --- Lumi, the chatbot (see chat_engine) -------------------------------
     # Only the provider API keys live here. Everything else about the feature is
     # operator state in chat_settings, managed from the dashboard, so changing it

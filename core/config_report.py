@@ -58,6 +58,19 @@ def _prometheus_state() -> Optional[bool]:
         return False
 
 
+def _airing_notify_state() -> Optional[bool]:
+    """Off, on, or on-but-not-actually-delivering.
+
+    Three states rather than two, because a dry run and a live run both read as
+    "enabled" in the environment while only one of them reaches anybody, and the
+    boot log is the only place that distinction is visible."""
+    if not _flag_on("AIRING_NOTIFY_ENABLED", False):
+        return False
+    if _flag_on("AIRING_NOTIFY_DRY_RUN", False) or not _has("SMTP_HOST"):
+        return None
+    return True
+
+
 FEATURES: List[Feature] = [
     Feature("TMDB metadata (required)", lambda: _has("TMDB_API_KEY"),
             "set TMDB_API_KEY; the app will not start without it"),
@@ -83,6 +96,12 @@ FEATURES: List[Feature] = [
             "set SMTP_HOST/SMTP_USER/SMTP_PASSWORD for verify + reset mail"),
     Feature("Changelog (GitHub Releases)", lambda: _has("GITHUB_TOKEN"),
             "set GITHUB_TOKEN to expose /changelog (503 otherwise)"),
+    # The calendar and /account/subscriptions do not depend on this; it gates
+    # only the job that sends mail. Reported as a warning while the dry run is on,
+    # since "enabled" then means "claiming and logging", not "delivering".
+    Feature("Airing email notifications", _airing_notify_state,
+            "set AIRING_NOTIFY_ENABLED=true (and SMTP_*) to mail subscribers when "
+            "an episode airs; the calendar and follows work either way"),
     Feature("Discord invite bot", lambda: _has("DISCORD_BOT_TOKEN", "DISCORD_OWNER_ID"),
             "set DISCORD_BOT_TOKEN + DISCORD_OWNER_ID"),
     Feature("Ko-fi supporters webhook", lambda: _has("KOFI_VERIFICATION_TOKEN"),

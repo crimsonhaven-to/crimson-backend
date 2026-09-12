@@ -53,6 +53,8 @@ from iptv_engine import enabled as iptv_enabled
 from iptv_engine import service as iptv_service
 from metadata_engine import maintenance as metadata_maintenance
 from metadata_engine import sync_status
+from notify_engine import notifier as airing_notifier
+from notify_engine import store as airing_store
 from subtitles_engine import service as subtitles_service
 from supporters_engine import store as supporters_store
 
@@ -176,6 +178,17 @@ def _register_every_replica_jobs(scheduler: BackgroundScheduler, logger: logging
                 logger.info(f"Purged {n} security events past retention")
         except Exception as e:
             logger.error(f"Security event purge failed: {e}")
+        # Same shape again: old airings, and notification ledger rows old enough
+        # that the episodes they name are long gone from the schedule.
+        try:
+            removed = airing_store.purge_old()
+            if removed["schedule"] or removed["notifications"]:
+                logger.info(
+                    f"Airing prune: {removed['schedule']} schedule row(s), "
+                    f"{removed['notifications']} notification row(s)"
+                )
+        except Exception as e:
+            logger.error(f"Airing prune failed: {e}")
 
     scheduler.add_job(
         _purge_expired,
@@ -429,6 +442,72 @@ def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.
                 logger.error(f"Startup metadata backfill failed: {e}")
 
         asyncio.create_task(_run_backfill())  # paced internally
+
+    # --- the airing calendar ------------------------------------------------
+    # Pinned here rather than run per replica because the refresh rewrites rows
+    # every replica reads, and because the notify half opens an SMTP connection.
+    # AiringStore.claim makes a stray second replica harmless rather than a
+    # duplicate-mail incident, but it should not need to.
+
+    # A fresh deploy would otherwise serve an empty calendar until the first
+    # tick, so the window is pulled once off the boot path, like the other
+    # warm-ups above.
+    async def _warm_airing():
+        try:
+            written = await airing_notifier.refresh_schedule()
+            logger.info(f"Airing schedule warmed: {written} airing(s)")
+        except Exception as e:
+            logger.error(f"Initial airing refresh failed (will retry on schedule): {e}")
+
+    asyncio.create_task(_warm_airing())  # must not delay startup
+
+    # Six-hourly: a broadcast slipping is the only thing that changes here, so a
+    # tighter interval spends AniList requests to learn nothing.
+    def _refresh_airing():
+        try:
+            asyncio.run(airing_notifier.refresh_schedule())
+        except Exception as e:
+            logger.error(f"Airing schedule refresh failed: {e}")
+
+    scheduler.add_job(
+        _refresh_airing,
+        trigger=IntervalTrigger(hours=6),
+        id="airing_refresh_job",
+        replace_existing=True,
+    )
+
+    if not Config.AIRING_NOTIFY_ENABLED:
+        logger.info(
+            "AIRING_NOTIFY_ENABLED is off, the calendar and follows work but "
+            "nobody is mailed when an episode airs"
+        )
+        return
+
+    if Config.AIRING_NOTIFY_DRY_RUN:
+        logger.warning(
+            "AIRING_NOTIFY_DRY_RUN is ON: notifications are claimed and logged, "
+            "but no SMTP connection is opened and nobody receives anything"
+        )
+
+    # Ten-minutely, so a notice follows the broadcast closely. Touches only the
+    # database until it has something to send.
+    def _notify_airing():
+        try:
+            result = airing_notifier.send_due_notifications()
+            if result["claimed"]:
+                logger.info(
+                    f"Airing notifications: {result['sent']} sent, "
+                    f"{result['failed']} failed, {result['skipped']} skipped"
+                )
+        except Exception as e:
+            logger.error(f"Airing notification run failed: {e}")
+
+    scheduler.add_job(
+        _notify_airing,
+        trigger=IntervalTrigger(minutes=10),
+        id="airing_notify_job",
+        replace_existing=True,
+    )
 
 
 async def start_workers(logger: logging.Logger) -> None:

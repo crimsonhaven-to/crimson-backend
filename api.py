@@ -57,6 +57,7 @@ from chat_engine import router as chat_router
 from subtitles_engine import router as subtitles_router
 from skiptimes_engine import router as skiptimes_router
 from manga_engine import manga_router
+from notify_engine import router as airing_router
 from iptv_engine import (
     router as iptv_router,
 )
@@ -482,6 +483,11 @@ app.include_router(manga_router)
 # A read-only catalogue of free-to-air broadcasts indexed by iptv-org. Browse and
 # detail sit behind the login wall; /iptv_proxy is public and signed.
 app.include_router(iptv_router)
+
+# The airing calendar and per-title follows. Fully gated by the login wall, since
+# a subscription list is personal. The email half is a scheduled job, not a route,
+# and is off unless AIRING_NOTIFY_ENABLED says otherwise.
+app.include_router(airing_router)
 
 # The core surface: system, discovery, watch, metadata and proxies.
 for _router in all_routers:
