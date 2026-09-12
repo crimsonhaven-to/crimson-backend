@@ -352,7 +352,7 @@ def auth_register(request: Request, body: RegisterRequest):
     _consume_invite_code(body.invite_code, is_static, used_by=f"mnemonic:{pk}",
                          request=request, flow="mnemonic_register")
     account = store.create_account(pk, body.label)
-    token, expires_at = store.create_session(account["user_id"])
+    token, expires_at = store.create_session(account["user_id"], *_device(request))
     store.touch_login(account["user_id"])
     audit.log_event(
         "register_success", outcome="success", request=request,
@@ -383,7 +383,7 @@ def auth_login(request: Request, body: LoginRequest):
         raise HTTPException(status_code=404, detail="No account for this key; use /auth/register")
 
     _verify_signed_challenge(pk, body.challenge, body.signature, request, "login")
-    token, expires_at = store.create_session(account["user_id"])
+    token, expires_at = store.create_session(account["user_id"], *_device(request))
     store.touch_login(account["user_id"])
     audit.log_event(
         "login_success", outcome="success", request=request,
@@ -451,8 +451,19 @@ def _validate_password(password: str) -> None:
         )
 
 
-def _session_payload(account: dict, created: bool) -> dict:
-    token, expires_at = store.create_session(account["user_id"])
+def _device(request: Optional[Request]) -> tuple:
+    """(user_agent, ip) for a new session row, both clipped and both optional.
+
+    Capped at the same 300 characters audit.log_event uses for a user agent, so a
+    long or hostile header cannot bloat the session table."""
+    if request is None:
+        return (None, None)
+    ua = (request.headers.get("user-agent") or "").strip()[:300] or None
+    return (ua, audit.client_ip(request))
+
+
+def _session_payload(account: dict, created: bool, request: Optional[Request] = None) -> dict:
+    token, expires_at = store.create_session(account["user_id"], *_device(request))
     store.touch_login(account["user_id"])
     return {
         "success": True,
@@ -505,7 +516,7 @@ async def email_register(request: Request, body: EmailRegisterRequest):
     if Config.DEMO_MODE:
         await run_in_threadpool(store.set_email_verified, account["user_id"], True)
         account = await run_in_threadpool(store.get_account, account["user_id"])
-        payload = await run_in_threadpool(_session_payload, account, created=True)
+        payload = await run_in_threadpool(_session_payload, account, created=True, request=request)
         return {**payload, "requires_verification": False}
 
     token = await run_in_threadpool(
@@ -567,7 +578,7 @@ async def email_login(request: Request, body: EmailLoginRequest):
         "login_success", outcome="success", request=request, identity=email,
         user_id=account["user_id"], detail={"method": "email"},
     )
-    return await run_in_threadpool(_session_payload, account, created=False)
+    return await run_in_threadpool(_session_payload, account, created=False, request=request)
 
 
 @router.post("/auth/email/verify")
@@ -585,7 +596,7 @@ def email_verify(request: Request, body: EmailTokenRequest):
         "email_verified", outcome="success", request=request,
         user_id=user_id, identity=account.get("email"),
     )
-    return _session_payload(account, created=True)
+    return _session_payload(account, created=True, request=request)
 
 
 @router.post("/auth/email/resend")

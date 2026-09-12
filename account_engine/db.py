@@ -28,6 +28,11 @@ RESET_TOKEN_TTL = timedelta(hours=1)     # password reset link
 MAX_FAVORITES_PER_USER = 2000
 MAX_PROGRESS_PER_USER = 5000
 
+# How long a watch event is kept. Three years, so Wrapped can look back two full
+# years and still have the current one, and so the one table here designed to be
+# read years later is not also the one that grows forever.
+WATCH_EVENTS_RETENTION_DAYS = 3 * 365
+
 
 class QuotaExceeded(Exception):
     """Raised when a per-account row cap would be exceeded (surfaced as HTTP 409)."""
@@ -43,6 +48,17 @@ def _iso(dt: datetime) -> str:
 
 def _hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _public_session_id(token_hash: str) -> str:
+    """A stable handle for one session that is safe to put in a response.
+
+    ``token_hash`` is the primary key and the obvious identifier, and it is the
+    one value that must never be published: it is the SHA-256 of a live bearer
+    token, so handing it out hands out the lookup key for the session table.
+    Hashing it again with a distinct prefix gives a stable id that identifies the
+    row for revocation without being reversible to the key."""
+    return hashlib.sha256(f"crimson-session:{token_hash}".encode("utf-8")).hexdigest()[:32]
 
 
 class AccountStore:
@@ -617,14 +633,27 @@ class AccountStore:
             return expires > _now()
 
     # -- sessions -------------------------------------------------------
-    def create_session(self, user_id: int) -> Tuple[str, str]:
-        """Issue a session as (raw_token, expires_at_iso). Only the hash is stored."""
+    def create_session(
+        self, user_id: int,
+        user_agent: Optional[str] = None, ip: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Issue a session as (raw_token, expires_at_iso). Only the hash is stored.
+
+        The device columns are what let their owner recognise a session later;
+        they are optional so the callers that have no request context still work.
+        """
         raw = secrets.token_urlsafe(32)
-        expires = _now() + SESSION_TTL
+        now = _now()
+        expires = now + SESSION_TTL
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (%s, %s, %s, %s)",
-                (_hash_token(raw), user_id, _iso(_now()), _iso(expires)),
+                """
+                INSERT INTO sessions (token_hash, user_id, created_at, expires_at,
+                                      user_agent, ip, last_seen_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (_hash_token(raw), user_id, _iso(now), _iso(expires),
+                 (user_agent or None), (ip or None), _iso(now)),
             )
         return raw, _iso(expires)
 
@@ -657,6 +686,85 @@ class AccountStore:
             conn.execute(
                 "DELETE FROM sessions WHERE token_hash = %s", (_hash_token(raw_token),)
             )
+
+    def validate_and_touch_session(self, raw_token: str) -> bool:
+        """True iff the token names a live session. On success, stamp last_seen_at.
+
+        Mirrors ApiKeyStore.validate_and_touch: called only on a cache miss in the
+        login wall, so the write happens at most once per session per cache-TTL
+        rather than once per request. One statement, so recording the use costs
+        nothing beyond the check that was happening anyway."""
+        if not raw_token:
+            return False
+        now = _iso(_now())
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET last_seen_at = %s"
+                " WHERE token_hash = %s AND expires_at > %s",
+                (now, _hash_token(raw_token), now),
+            )
+            return cur.rowcount > 0
+
+    def list_sessions(self, user_id: int, current_token: Optional[str] = None) -> List[Dict]:
+        """The account's live sessions, newest first, with the caller's flagged.
+
+        Deliberately does not return ``token_hash`` under any name: the public id
+        is derived here so a route handler cannot leak the hash by forwarding a
+        row it did not inspect."""
+        current_hash = _hash_token(current_token) if current_token else None
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT token_hash, created_at, expires_at, user_agent, ip, last_seen_at
+                FROM sessions
+                WHERE user_id = %s AND expires_at > %s
+                ORDER BY created_at DESC
+                """,
+                (user_id, _iso(_now())),
+            ).fetchall()
+        return [
+            {
+                "id": _public_session_id(r["token_hash"]),
+                "created_at": r["created_at"],
+                "expires_at": r["expires_at"],
+                "last_seen_at": r["last_seen_at"],
+                "user_agent": r["user_agent"],
+                "ip": r["ip"],
+                "current": current_hash is not None and r["token_hash"] == current_hash,
+            }
+            for r in rows
+        ]
+
+    def revoke_session(self, user_id: int, session_id: str) -> bool:
+        """Revoke one session of this account by its public id.
+
+        The public id is a one-way derivation of the primary key, so it cannot be
+        turned back into a WHERE clause. Matching in Python over the account's own
+        handful of rows is the honest way to do it, and it keeps the scan bound to
+        one user_id so the id is never an oracle for another account's session."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT token_hash FROM sessions WHERE user_id = %s", (user_id,)
+            ).fetchall()
+            for r in rows:
+                if _public_session_id(r["token_hash"]) == session_id:
+                    conn.execute(
+                        "DELETE FROM sessions WHERE token_hash = %s", (r["token_hash"],)
+                    )
+                    return True
+        return False
+
+    def revoke_other_sessions(self, user_id: int, current_token: Optional[str]) -> int:
+        """Sign out everywhere except the caller. Returns how many were dropped."""
+        with self._connect() as conn:
+            if current_token:
+                cur = conn.execute(
+                    "DELETE FROM sessions WHERE user_id = %s AND token_hash <> %s",
+                    (user_id, _hash_token(current_token)),
+                )
+            else:
+                cur = conn.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
+            return cur.rowcount
 
     # -- favorites / watchlists -----------------------------------------
     # A favorite is a row in a named list. 'favorites' is the default; any other
@@ -835,6 +943,32 @@ class AccountStore:
                 {"user_id": user_id, "updated_at": _iso(_now()),
                  "media_type": None, "local_id": None, **prog},
             )
+            # The history half of the same save. watch_progress is keyed
+            # (user_id, item_key) and overwritten on a timer, so it cannot say
+            # when anything was watched; this row can. Same connection and same
+            # threadpool call as the upsert above on purpose: POST
+            # /account/progress fires every 30s for every viewer in every
+            # playback session, and a second round trip there is not free.
+            conn.execute(
+                """
+                INSERT INTO watch_events
+                    (user_id, item_key, watched_on, anilist_id, tmdb_id, media_type, title, seconds)
+                VALUES (%(user_id)s, %(item_key)s, (now() AT TIME ZONE 'utc')::date,
+                        %(anilist_id)s, %(tmdb_id)s, %(media_type)s, %(title)s, %(position_seconds)s)
+                ON CONFLICT (user_id, item_key, watched_on) DO UPDATE SET
+                    -- The furthest point reached that day. A rewatch restarts at
+                    -- zero and climbs again, so taking the max is the only answer
+                    -- that does not shrink as you keep watching.
+                    seconds = GREATEST(COALESCE(watch_events.seconds, 0),
+                                       COALESCE(excluded.seconds, 0)),
+                    title = COALESCE(excluded.title, watch_events.title)
+                """,
+                {"user_id": user_id, "item_key": prog["item_key"],
+                 "anilist_id": prog.get("anilist_id"), "tmdb_id": prog.get("tmdb_id"),
+                 "media_type": prog.get("media_type"), "title": prog.get("title"),
+                 "position_seconds": prog.get("position_seconds")},
+            )
+
             row = conn.execute(
                 "SELECT * FROM watch_progress WHERE user_id = %s AND item_key = %s",
                 (user_id, prog["item_key"]),
@@ -865,9 +999,18 @@ class AccountStore:
 
     # -- maintenance ----------------------------------------------------
     def purge_expired(self) -> None:
-        """Drop expired sessions, challenges and email tokens."""
+        """Drop expired sessions, challenges, email tokens and old watch events."""
         now = _iso(_now())
         with self._connect() as conn:
             conn.execute("DELETE FROM sessions WHERE expires_at <= %s", (now,))
             conn.execute("DELETE FROM challenges WHERE expires_at <= %s", (now,))
             conn.execute("DELETE FROM email_tokens WHERE expires_at <= %s", (now,))
+            # init_db() calls this, and init_db() runs before the migration
+            # runner by design, so on the first boot after 006 the table does not
+            # exist yet. Nothing to prune then, and asking first is cheaper than
+            # aborting the transaction this method shares.
+            if conn.execute("SELECT to_regclass('public.watch_events') AS t").fetchone()["t"]:
+                conn.execute(
+                    "DELETE FROM watch_events WHERE watched_on < %s",
+                    ((_now() - timedelta(days=WATCH_EVENTS_RETENTION_DAYS)).date(),),
+                )

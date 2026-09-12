@@ -388,3 +388,66 @@ def purge_old(keep_days: int = RETENTION_DAYS) -> int:
     with get_connection() as conn:
         cur = conn.execute("DELETE FROM security_events WHERE ts < %s", (cutoff,))
         return cur.rowcount or 0
+
+
+# ------------------------------------------------------- the account's own view
+# What an account holder may see of their own ledger. A whitelist, not a
+# blacklist: every event type here was read and judged safe to show its owner,
+# and a type added to the ledger later stays invisible until someone does the
+# same for it. admin_action in particular must never appear, since it describes
+# what an operator did and often to whom.
+USER_VISIBLE_EVENTS = (
+    "login_success",
+    "login_failed",
+    "login_unverified",
+    "register_success",
+    "password_reset_requested",
+    "password_reset_success",
+    "password_reset_failed",
+    "email_verified",
+    "verify_failed",
+    "verify_resend_requested",
+    "session_revoked",
+    "account_delete_failed",
+    "account_deleted",
+)
+
+
+def _row_for_owner(row: dict) -> dict:
+    """One event as its own account holder may see it.
+
+    ``detail`` and ``identity`` are absent on purpose. detail is an internal blob
+    written by admin actions and auth choke points and can carry operator
+    context; identity is the address or key prefix an attempt was made against,
+    which is not the account holder's to read. What is left answers the only
+    question this endpoint exists for: what happened, when, from where."""
+    return {
+        "ts": row["ts"].isoformat() if row.get("ts") else None,
+        "event_type": row.get("event_type"),
+        "outcome": row.get("outcome"),
+        "ip": row.get("ip"),
+        "user_agent": row.get("user_agent"),
+    }
+
+
+def list_events_for_user(user_id: int, limit: int = 50) -> List[dict]:
+    """Newest-first whitelisted events belonging to this account.
+
+    Filtered on user_id alone. Matching on identity as well would show "someone
+    tried to sign in as you" for a failed attempt against an unknown address,
+    which reads as a feature and is an account enumeration oracle: any registered
+    user could then ask the server whether an address exists. A failed login
+    against an address that has no account has no user_id, and stays invisible
+    here."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT ts, event_type, outcome, ip, user_agent
+            FROM security_events
+            WHERE user_id = %s AND event_type = ANY(%s)
+            ORDER BY ts DESC, id DESC
+            LIMIT %s
+            """,
+            (user_id, list(USER_VISIBLE_EVENTS), limit),
+        ).fetchall()
+    return [_row_for_owner(dict(r)) for r in rows]

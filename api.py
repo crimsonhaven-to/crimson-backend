@@ -43,6 +43,8 @@ from core.http_client import (
 from account_engine import router as account_router, store as account_store
 from account_engine import audit as security_audit
 from account_engine.routes import set_episode_enricher, set_warmup_handler
+from account_engine.security_routes import router as account_security_router
+from account_engine.wrapped_routes import router as wrapped_router
 from account_engine.admin_routes import (
     router as admin_router,
     set_resync_handler,
@@ -220,9 +222,11 @@ async def _session_is_valid(raw_token: str) -> bool:
     exp = _session_ok_cache.get(key)
     if exp is not None and exp > now:
         return True
-    # A miss verifies against the DB, off the event loop.
-    user = await run_in_threadpool(account_store.get_user_by_session, raw_token)
-    if user:
+    # A miss verifies against the DB, off the event loop. The same statement
+    # stamps last_seen_at, so /account/sessions can show when a device was last
+    # used without this path costing a second round trip.
+    ok = await run_in_threadpool(account_store.validate_and_touch_session, raw_token)
+    if ok:
         if len(_session_ok_cache) >= _SESSION_OK_MAX:
             _session_ok_cache.clear()  # cheap bounded reset under abuse
         _session_ok_cache[key] = now + _SESSION_OK_TTL
@@ -450,6 +454,14 @@ app.add_middleware(RequestContextMiddleware)
 
 # Sign-in, favorites and watch progress.
 app.include_router(account_router)
+
+# Sessions, the account's own slice of the security ledger, export and
+# self-service deletion. Same domain as account_router, kept separate because it
+# is the only place that must never leak a session's token hash.
+app.include_router(account_security_router)
+
+# Crimson Wrapped. A read-only aggregate over watch_events and watch_progress.
+app.include_router(wrapped_router)
 
 # Gated by require_admin on every route; the login wall already covers /admin.
 app.include_router(admin_router)
