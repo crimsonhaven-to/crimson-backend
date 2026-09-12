@@ -232,6 +232,13 @@ def test_migrations_directory_is_copied_into_the_image():
 
 def test_migrations_are_not_gitignored():
     """The repo ignores *.sql for ad-hoc dumps; migrations/ must be re-included or
-    the files never reach the image in the first place."""
+    the files never reach the image in the first place.
+
+    Matched as a whole line, not a substring. This test previously passed against
+    a negation reading ``!migrations/*.sql.trivycache``, which re-includes nothing
+    and left every new migration file silently unaddable: the guard reported the
+    rule was present because its text merely started with the right characters.
+    """
     gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
-    assert "!migrations/*.sql" in gitignore
+    rules = [line.strip() for line in gitignore.splitlines()]
+    assert "!migrations/*.sql" in rules
