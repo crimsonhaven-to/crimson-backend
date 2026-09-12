@@ -757,7 +757,7 @@ Suite 281 to 349 passing, ruff clean.
 
 ## 4. Local search for autocomplete
 
-**Status:** `[ ]` not started
+**Status:** `[x]` done
 
 ### The problem
 
@@ -834,6 +834,77 @@ Local-first for **anime only**, falling back to TMDB:
 as a fallback, so the worst realistic failure is different result *ordering* than
 before. Verified with a before/after payload diff on a set of representative
 queries.
+
+### The bug found before writing any of it
+
+**A new migration file would have been silently dropped from the commit.**
+`.gitignore` ignores `*.sql` for ad-hoc dumps, and the negation that backlog item
+2 said to add had been written as `!migrations/*.sql.trivycache`, which
+re-includes nothing. The three existing migrations were unaffected because git
+ignores nothing already tracked, so this was invisible until the next migration,
+which is this one. `git add migrations/003_search_trgm.sql` would have reported
+success and staged nothing, the file would have been absent from the image, and
+production would have reported itself up to date while being unmigrated. Exactly
+the failure mode item 2 predicted.
+
+`tests/test_migrations.py::test_migrations_are_not_gitignored` existed to catch
+this and **passed the whole time**: it asserted `"!migrations/*.sql" in gitignore`
+as a substring, and the broken rule starts with those characters. It now matches
+a whole stripped line.
+
+### What was built
+
+`migrations/003_search_trgm.sql`, `search_anime_entries` in `web/queries.py`, and
+`/search/anime` reworked to call it before TMDB. `tests/test_local_search.py`
+adds 21 tests.
+
+**Ranking is a SQL `CASE`, not Python.** The plan said Python so the query would
+not depend on the trigram extension; a `CASE` expression does not depend on it
+either, and doing it in SQL keeps the ranking in one place instead of splitting
+it between an `ORDER BY` and a sort key. It also removes the fetch-many-then-rank
+step, so `LIMIT` can do its job. Four buckets: exact title, prefix, substring,
+and a fourth for rows that matched on `title_native` alone, which for a
+Latin-script query is usually incidental.
+
+**One query, not the catalogue-wide load `get_catalogue_items` does.** That
+function pulls every mapping row and every poster into memory, which is fine once
+per cache fill and absurd per keystroke. The search uses two `LEFT JOIN LATERAL`
+subqueries to pick one season row and one extras row per entry (an AniList id can
+map to several seasons, and a plain join would multiply the result), then joins
+the two poster tables. One round trip.
+
+**LIKE wildcards are escaped**, which the plan did not mention and needed to.
+Unescaped, a query of `%` matches the entire catalogue and `_` matches every
+single-character title: a denial of service dressed as a typo.
+
+### Verified against a real Postgres 17
+
+The fake connection in the unit tests does not parse SQL, so a throwaway
+`postgres:17-alpine` container was used to check the parts only a real server can
+answer:
+
+| Check | Result |
+| --- | --- |
+| The real runner applies 000 through 003 | version 3, no error |
+| `pg_trgm` and all three GIN indexes created | yes |
+| Ranking: exact, then prefix, then native-only | correct |
+| An entry with no tmdb mapping at all | excluded, as the catalogue excludes it |
+| A film keyed by `tmdb_movie_id` | `tmdb_id` null, poster from `tmdb_movies` |
+| `%` and `_` as queries | match literally, not wildcards |
+| Index actually used at 60k rows | Bitmap Index Scan, 4.1x faster than the seq scan |
+| Same results with the index dropped | identical, only slower |
+
+The last two matter together: the index has to earn its place at catalogue scale
+(it does) while the query has to be correct without it (it is).
+
+**The landmine was tested, not just reasoned about.** A second database was built
+whose role genuinely lacks `CREATE` on the database, which is what Postgres 13+
+requires even for a trusted extension, confirmed by the role being refused
+directly. Against it the batch still applied cleanly to version 3 with no error,
+created no extension and no indexes, and `/search/anime` still returned correct
+results. That is the whole point of the `DO` block: had the refusal propagated,
+it would have rolled back every pending migration on that database, on that boot
+and every future one.
 
 ---
 
