@@ -2,28 +2,41 @@
 
 # ---------------------------------------------------------------------------
 # Optional build-time source overlay. An operator build may inject extra source
-# modules via two BuildKit secrets (a clone URL + a token); absent either, this is
-# a no-op and the image is built as-is. Secrets are mounted only for this RUN and
-# never land in any image layer. See the self-hosting docs.
+# modules from a private repo, passed as two BuildKit secrets: the clone target
+# ("host/group/project") and a token with read access to it. Absent either, this
+# stage copies nothing and the image is built as-is, so a plain `docker build .`
+# needs neither. Secrets are mounted only for this RUN and never land in a layer.
+# See the self-hosting docs.
+#
+# On GitLab the token is the pipeline's own CI_JOB_TOKEN, so there is no PAT to
+# mint or rotate: the overlay project just lists this one under
+# Settings > CI/CD > Job token permissions. See .gitlab-ci.yml.
 # ---------------------------------------------------------------------------
-# FROM python:3.14-slim AS private-sources
-# RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
-#     && rm -rf /var/lib/apt/lists/*
-# WORKDIR /injected
-# RUN mkdir -p resolvers scrapers manga
-# RUN --mount=type=secret,id=sources_pat --mount=type=secret,id=sources_repo \
-#     if [ -s /run/secrets/sources_pat ] && [ -s /run/secrets/sources_repo ]; then \
-#         git clone --depth 1 --branch main \
-#           "https://x-access-token:$(cat /run/secrets/sources_pat)@github.com/$(cat /run/secrets/sources_repo).git" /tmp/src && \
-#         cp /tmp/src/resolvers/*.py resolvers/ && \
-#         cp /tmp/src/scrapers/*.py scrapers/ && \
-#         # The manga provider dir is optional in the overlay repo (older overlays lack it).
-#         if [ -d /tmp/src/manga ]; then cp /tmp/src/manga/*.py manga/ 2>/dev/null || true; fi && \
-#         rm -rf /tmp/src && \
-#         echo ">> overlay applied: $(ls resolvers | wc -l) resolver / $(ls scrapers | wc -l) scraper / $(ls manga | wc -l) manga file(s)"; \
-#     else \
-#         echo ">> no overlay secrets supplied — building base image only"; \
-#     fi
+FROM python:3.14-slim AS private-sources
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /injected
+RUN mkdir -p resolvers scrapers manga
+# Cache buster, and it is load-bearing: BuildKit does NOT hash secret CONTENT into
+# the cache key, and the clone below is byte-identical every build, so without a
+# value that changes the layer is reused and new overlay commits are never baked
+# in. CI passes the pipeline id. It is referenced in the RUN so only the clone is
+# invalidated; the apt layer above stays cached.
+ARG OVERLAY_REV=none
+RUN --mount=type=secret,id=sources_token --mount=type=secret,id=sources_repo \
+    if [ -s /run/secrets/sources_token ] && [ -s /run/secrets/sources_repo ]; then \
+        echo ">> overlay build ${OVERLAY_REV}" && \
+        git clone --depth 1 --branch main \
+          "https://gitlab-ci-token:$(cat /run/secrets/sources_token)@$(cat /run/secrets/sources_repo).git" /tmp/src && \
+        cp /tmp/src/resolvers/*.py resolvers/ && \
+        cp /tmp/src/scrapers/*.py scrapers/ && \
+        # The manga provider dir is optional in the overlay repo (older overlays lack it).
+        if [ -d /tmp/src/manga ]; then cp /tmp/src/manga/*.py manga/ 2>/dev/null || true; fi && \
+        rm -rf /tmp/src && \
+        echo ">> overlay applied: $(ls resolvers | wc -l) resolver / $(ls scrapers | wc -l) scraper / $(ls manga | wc -l) manga file(s)"; \
+    else \
+        echo ">> no overlay secrets supplied, building base image only"; \
+    fi
 
 # ---------------------------------------------------------------------------
 FROM python:3.14-slim
@@ -87,11 +100,11 @@ COPY migrations ./migrations
 
 # Apply the optional build-time source overlay on top of the base packages. In a
 # build without the overlay secrets these directories are empty, so this is a no-op.
-# The manga overlay (if any) drops a private MangaProvider module into manga_engine/
-# — discovered at runtime by manga_engine.provider.get_provider(); absent by default.
-# COPY --from=private-sources /injected/resolvers/ ./resolvers/
-# COPY --from=private-sources /injected/scrapers/ ./scrapers/
-# COPY --from=private-sources /injected/manga/ ./manga_engine/
+# The manga overlay (if any) drops a private MangaProvider module into manga_engine/,
+# discovered at runtime by manga_engine.provider.get_provider(); absent by default.
+COPY --from=private-sources /injected/resolvers/ ./resolvers/
+COPY --from=private-sources /injected/scrapers/ ./scrapers/
+COPY --from=private-sources /injected/manga/ ./manga_engine/
 
 # Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
 # container is stateless and needs no writable data volume.

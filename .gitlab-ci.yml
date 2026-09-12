@@ -86,18 +86,38 @@ build:
         echo "IMAGE_TAG=dev-${SHORT_SHA}" >> build.env
       fi
       echo "Building ${TAGS}"
-      # Optional build-time source overlay (see self-hosting docs): a clone URL
-      # and token passed as BuildKit secrets. Unset = empty = the build skips the
-      # overlay. Never baked into a layer. To enable, add SOURCES_PAT/SOURCES_REPO
-      # as masked CI/CD variables and uncomment the two --secret lines.
+      # Optional build-time source overlay (see self-hosting docs). Set the CI/CD
+      # variable SOURCES_REPO to "group/project" on this GitLab and the Dockerfile's
+      # private-sources stage bakes that repo's resolvers/, scrapers/ and manga/ into
+      # the image. Leave it unset and the --secret flags are omitted entirely, so the
+      # stage copies nothing and the build is the plain public image.
+      #
+      # Auth is this pipeline's own CI_JOB_TOKEN, so there is no PAT to mint, mask or
+      # rotate. It only needs the overlay project to allow this one:
+      #   <overlay project> > Settings > CI/CD > Job token permissions > add crimson-backend
+      # Same mechanism crimson-client uses to bundle crimson-sources.
+      OVERLAY_ARGS=""
+      if [ -n "${SOURCES_REPO:-}" ]; then
+        export SOURCES_TOKEN="$CI_JOB_TOKEN"
+        export SOURCES_TARGET="${CI_SERVER_HOST}/${SOURCES_REPO}"
+        # OVERLAY_REV is load-bearing, not cosmetic: BuildKit does NOT hash secret
+        # CONTENT into the cache key, and the clone RUN is byte-identical every
+        # time, so without a value that changes per pipeline the cached layer is
+        # reused and a new overlay commit is silently never baked in.
+        OVERLAY_ARGS="--secret id=sources_token,env=SOURCES_TOKEN"
+        OVERLAY_ARGS="$OVERLAY_ARGS --secret id=sources_repo,env=SOURCES_TARGET"
+        OVERLAY_ARGS="$OVERLAY_ARGS --build-arg OVERLAY_REV=${CI_PIPELINE_ID}"
+        echo "Source overlay: ${SOURCES_TARGET}@main"
+      else
+        echo "Source overlay: none (SOURCES_REPO unset)"
+      fi
       docker buildx build \
         --push \
         $TAGS \
+        $OVERLAY_ARGS \
         --cache-from "type=registry,ref=${IMAGE}:buildcache" \
         --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max" \
         .
-      #   --secret id=sources_pat,env=SOURCES_PAT \
-      #   --secret id=sources_repo,env=SOURCES_REPO \
   artifacts:
     reports:
       # The GitHub job outputs, carried the GitLab way.
@@ -137,8 +157,8 @@ deploy-dev:
 
 # --- Demo image: a CLEAN build with NO private source overlay -----------------
 # Built only on a release tag, alongside the prod `build`. It deliberately OMITS the
-# sources_pat/sources_repo BuildKit secrets, so the Dockerfile's private-sources
-# stage is a no-op and NONE of secret-backend-sources is baked into the image. A
+# sources_token/sources_repo BuildKit secrets, so the Dockerfile's private-sources
+# stage copies nothing and NO private source repo is baked into the image. A
 # SEPARATE buildcache ref (:democache) guarantees the clean build can never restore
 # a source-bearing layer from the prod cache. The crimson-demo stack runs this with
 # DEMO_MODE=1 + PRIVATE_SOURCES_ENABLED=0, so the demo resolves nothing.
@@ -156,7 +176,7 @@ build-demo:
       VER="$CI_COMMIT_TAG"
       # Deploy the immutable per-release demo tag, not the rolling :demo.
       echo "DEMO_IMAGE_TAG=demo-${VER}" >> demo.env
-      # NOTE: no --secret flags on purpose — without sources_pat/sources_repo the
+      # NOTE: no --secret flags on purpose. Without sources_token/sources_repo the
       # Dockerfile skips the overlay clone, so the demo image carries none of the
       # private backend sources. Its own buildcache ref keeps it source-free.
       docker buildx build \
