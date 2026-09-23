@@ -21,9 +21,8 @@ services:
       # Whichever limit is hit first wins.
       - --storage.tsdb.retention.size=8GB
       - --web.listen-address=0.0.0.0:9090
-      # Off by default; stated so nobody enables it by accident, since it exposes
-      # unauthenticated /-/reload and /-/quit to the whole overlay. kingpin needs
-      # the `--no-<flag>` form: `--web.enable-lifecycle=false` exits 1 on boot.
+      # Stated so nobody enables unauthenticated /-/reload and /-/quit. kingpin
+      # needs this form: `--web.enable-lifecycle=false` exits 1 on boot.
       - --no-web.enable-lifecycle
 
     configs:
@@ -54,7 +53,6 @@ services:
     stop_grace_period: 60s
 
     deploy:
-      mode: replicated
       replicas: 1
       placement:
         constraints:

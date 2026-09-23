@@ -1,71 +1,65 @@
-# Demo instance (e.g. demo.crimsonhaven.org):
-#   docker compose -f docker-compose.demo.yml up -d
+# Source-less demo instance, for reference. The live demo is ~/demo-crimson-deploy
+# on the manager.
 #
-#   DEMO_MODE=1                open signup (invite gate bypassed); non-admin account
-#                              data is wiped nightly so open signup cannot grow
-#                              without bound. ADMIN_EMAILS accounts survive.
-#   PRIVATE_SOURCES_ENABLED=0  with no Jellyfin/Febbox/Local/Cache configured,
-#                              nothing resolves: the demo never serves a stream.
-#   REQUIRE_LOGIN=true         shows the login-walled experience; anyone can register.
+#   TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) \
+#   docker compose -f docker-compose.demo.yml up -d --build
 #
-# Its own postgres volume keeps it away from production data. Build the demo
-# frontend with VITE_API_BASE_URL pointing here; the login page drops the invite
-# field when GET /config reports demo_mode.
+# Deliberately no env_file: .env may hold Jellyfin/Febbox credentials, and the
+# demo must never serve a stream. Build the demo frontend with VITE_API_BASE_URL
+# pointing here; the login page drops the invite field when /config reports
+# demo_mode.
+#
+# | Setting                   | Effect                                        |
+# | ------------------------- | --------------------------------------------- |
+# | DEMO_MODE=1               | open signup, non-admin accounts wiped nightly |
+# | PRIVATE_SOURCES_ENABLED=0 | nothing resolves, whatever Admin says         |
+# | REQUIRE_LOGIN=true        | shows the login-walled experience             |
+
+# Its own project, so its database volume never meets docker-compose.yml's.
+name: crimson-demo
 
 services:
   postgres:
     image: postgres:17-alpine
     environment:
-      - POSTGRES_DB=${POSTGRES_DB:-crimson_demo}
-      - POSTGRES_USER=${POSTGRES_USER:-crimson}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crimson}
+      POSTGRES_DB: crimson_demo
+      POSTGRES_USER: crimson
+      POSTGRES_PASSWORD: crimson
     volumes:
-      - crimson-demo-pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crimson} -d ${POSTGRES_DB:-crimson_demo}"]
+      test: ["CMD-SHELL", "pg_isready -U crimson -d crimson_demo"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     restart: unless-stopped
 
-  anime-api:
-    image: crimson-backend:1.0
+  api:
+    build: .
+    image: crimson-backend:demo
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "8000:8000"
     environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY in the environment or an .env file}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson_demo}
-      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET (e.g. openssl rand -hex 32)}
-      - DEMO_MODE=1
-      # Hour (container time, UTC) of the nightly reset.
-      # - DEMO_RESET_HOUR=4
-      - PRIVATE_SOURCES_ENABLED=0
-      - REQUIRE_LOGIN=true
-      # The single replica owns the nightly reset and the mapping resync.
-      - RUN_DB_SYNC=true
-      # Survives the reset, so /admin stays reachable.
-      # - ADMIN_EMAILS=you@example.com
-      # - ALLOWED_ORIGINS=https://demo.crimsonhaven.org
-      #
-      # Leave JELLYFIN_*, FEBBOX_*, OPENSUBTITLES_* and CRIMSON_PROXY_BASE unset and
-      # register no Local/Cache directories, so every source stays inert.
+      TMDB_API_KEY: ${TMDB_API_KEY:?set TMDB_API_KEY}
+      PROXY_SECRET: ${PROXY_SECRET:?set PROXY_SECRET}
+      DATABASE_URL: postgresql://crimson:crimson@postgres:5432/crimson_demo
+      DEMO_MODE: "1"
+      PRIVATE_SOURCES_ENABLED: "0"
+      REQUIRE_LOGIN: "true"
+      # Admin accounts survive the nightly reset, so /admin stays reachable.
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://demo.crimsonhaven.org}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 40s
+      start_period: 600s
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          # No sources means no transcoding, so it needs little.
-          cpus: "0.75"
-          memory: 512M
 
 volumes:
-  crimson-demo-pgdata:   # disposable, separate from production
+  pgdata:

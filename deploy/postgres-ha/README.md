@@ -1,6 +1,6 @@
 # Highly available PostgreSQL with Patroni
 
-The external PostgreSQL the backend expects (`DATABASE_URL` in `docker-stack.yml`):
+The external PostgreSQL the backend expects (`DATABASE_URL` in the Swarm stack file):
 a 3-node Patroni cluster that promotes a standby automatically if a host dies.
 
 ## 1. Overview

@@ -138,10 +138,17 @@ const { session_token } = await res.json();
 ## Deployment
 
 ```bash
-docker build -t crimson-backend .
-docker compose up -d                       # one host, bundled Postgres
+cp .env.example .env                       # set TMDB_API_KEY, PROXY_SECRET
+docker compose up -d --build               # one host, bundled Postgres
 docker stack deploy -c docker-stack.yml crimson
 ```
+
+| File | Use |
+| --- | --- |
+| `docker-compose.yml` | one host; `--profile downloads` adds aria2, `--profile discord` the bot |
+| `docker-compose.demo.yml` | source-less demo, never reads `.env` |
+| `docker-stack.yml` | production Swarm reference; the live copy is on the manager |
+| `deploy/` | Patroni, PgBouncer and Prometheus, each with its own README |
 
 All state is in PostgreSQL, so API replicas are interchangeable. With more than
 one replica:
@@ -156,6 +163,8 @@ Run behind a TLS-terminating proxy that sets `X-Forwarded-Proto` and
 `X-Forwarded-Host`; otherwise stream URLs come out as `http://` and are blocked as
 mixed content. CI (`.gitlab-ci.yml`) builds on every push to `main` and deploys
 the dev stack; a `v*` tag builds, deploys production and the source-less demo.
+CI only runs `deploy.sh` on the manager and never ships a stack file, so a change
+to `docker-stack.yml` must be applied there by hand.
 
 ## Adding a source
 

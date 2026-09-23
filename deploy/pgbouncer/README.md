@@ -150,7 +150,7 @@ All files are identical on pg-1, pg-2 and pg-3. There is no `.env`.
    already defaults `DB_PREPARE_THRESHOLD` to disabled; do not set it.
 
    Redeploy as usual (e.g. `~/crimson-deploy/deploy.sh` or
-   `docker stack deploy -c docker-stack.yml crimson-api`). Keep `RUN_DB_SYNC=true`
+   `docker stack deploy -c docker-stack.yml crimson`). Keep `RUN_DB_SYNC=true`
    on the single `api-sync` replica; its resync runs as one transaction, which
    transaction pooling handles.
 
@@ -165,7 +165,7 @@ All files are identical on pg-1, pg-2 and pg-3. There is no `.env`.
        -c "select count(*) from pg_stat_activity where usename='crimson'"
      ```
 
-   The `api` service `replicas:` in `docker-stack.yml` can now go well past 8.
+   The `api` service `replicas:` in the stack file can now go well past 8.
 
 ## Rollback
 

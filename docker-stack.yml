@@ -1,586 +1,318 @@
-# Docker Swarm stack for the backend.
+# Production Swarm stack, for reference. The live copy is ~/crimson-deploy on the
+# manager and CI never ships this file (see .gitlab-ci.yml).
 #
 #   TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) \
-#   DATABASE_URL=postgresql://user:pass@db-host:5432/crimson \
-#   docker stack deploy -c docker-stack.yml crimson-api
+#   DATABASE_URL=postgresql://crimson:PASS@db-1,db-2,db-3:5432/crimson?target_session_attrs=read-write \
+#   docker stack deploy -c docker-stack.yml crimson
 #
-# Expects an external PostgreSQL via DATABASE_URL so every replica is identical and
-# stateless. For the self-hosted Patroni cluster (deploy/postgres-ha/README.md),
-# list all three hosts and let psycopg find the primary:
-#   DATABASE_URL=postgresql://crimson:PASS@db-1,db-2,db-3:5432/crimson?target_session_attrs=read-write
+# One image, one role per service. Every service of a role shares its env, and
+# only one process may run each singleton loop, hence:
 #
-# One image, several services (see "Why two services" at the bottom):
-#   api       N serving replicas, RUN_DB_SYNC=false, publishes :8000
-#   api-sync  exactly one replica that owns the Fribb resync, no published port
+# | Service         | Replicas | Owns                                  |
+# | --------------- | -------- | ------------------------------------- |
+# | api             | 3        | all HTTP traffic, publishes :8000     |
+# | api-sync        | 1        | Fribb resync, airing notifications    |
+# | cache-worker    | 1        | ffmpeg cache loop                     |
+# | download-worker | 1        | aria2 poll loop                       |
+# | aria2           | 1        | the download queue itself             |
+# | discord-bot     | 1        | invite bot (idle without a token)     |
+# | pruner          | global   | removes old release images per node   |
 #
-# Keep it behind a TLS-terminating reverse proxy and never expose :8000 directly:
-# the app builds absolute iframe URLs from X-Forwarded-Proto/Host, so direct access
-# lets anyone spoof X-Forwarded-Host. Either drop `ports:` and attach the proxy to
-# `crimson_net`, or publish to loopback and forward from the host proxy.
+# Keep :8000 behind a TLS-terminating proxy. The app builds absolute URLs from
+# X-Forwarded-Proto/Host, so direct access lets anyone spoof X-Forwarded-Host.
+#
+# Each api replica holds up to DB_POOL_MAX (10) connections, so past about 8
+# replicas put PgBouncer in front (deploy/pgbouncer/README.md).
+#
+# Compose does not pass the manager's env file into containers, so every setting
+# a service reads is listed here.
 version: "3.8"
 
+x-image: &image ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
+
+x-core-env: &core-env
+  TMDB_API_KEY: ${TMDB_API_KEY:?set TMDB_API_KEY}
+  DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+  # Identical everywhere, or signed links 403 on another replica or after a restart.
+  PROXY_SECRET: ${PROXY_SECRET:?set PROXY_SECRET}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
+  # Unset leaves /metrics admin-only. Must equal the crimson_metrics_token secret.
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  RUN_DB_SYNC: "false"
+  RUN_CACHE_WORKER: "false"
+  RUN_DOWNLOAD_WORKER: "false"
+
+# Cached streams are pulled back through the worker's own proxies, so both api and
+# cache-worker need the source credentials.
+x-source-env: &source-env
+  JELLYFIN_URL: ${JELLYFIN_URL:-}
+  JELLYFIN_USERNAME: ${JELLYFIN_USERNAME:-}
+  JELLYFIN_PASSWORD: ${JELLYFIN_PASSWORD:-}
+  FEBBOX_UI_TOKEN: ${FEBBOX_UI_TOKEN:-}
+  FEBBOX_REGION: ${FEBBOX_REGION:-}
+
+x-aria2-env: &aria2-env
+  ARIA2_RPC_URL: ${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
+  ARIA2_RPC_SECRET: ${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET}
+
+x-health: &health
+  test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 60s
+
+x-restart: &restart
+  condition: any
+  delay: 5s
+  window: 60s
+
+# Singletons never overlap: two copies would run the same loop at once.
+x-singleton-update: &singleton-update
+  parallelism: 1
+  delay: 10s
+  order: stop-first
+  failure_action: rollback
+  monitor: 30s
+  max_failure_ratio: 0.3
+
+x-singleton-rollback: &singleton-rollback
+  parallelism: 1
+  delay: 5s
+  order: stop-first
+
 services:
-  # Serving replicas. Schema init takes an advisory lock
-  # (core/db_pool.lock_schema_init), so replicas can boot simultaneously.
   api:
-    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
-
+    image: *image
     environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
-      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
-      # Identical on every service, or signed-proxy playback 403s after a restart or
-      # on another replica.
-      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
-      # api-sync owns the resync.
-      - RUN_DB_SYNC=false
-      # Optional features live on the service that handles their ingress routes,
-      # not on api-sync. Empty disables a feature. Values come from crimson.env on
-      # the manager; Compose does not inject that file, so each must be listed.
-      - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN:-}
-      # /changelog reads GitHub Releases; unset token means 503. Read access only
-      # (fine-grained PAT with Contents:read).
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_REPO=${GITHUB_REPO:-crimsonhaven-to/crimson-backend}
-      - JELLYFIN_URL=${JELLYFIN_URL:-}
-      - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
-      - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
-      # Bearer for Prometheus scrapes of /metrics. Unset leaves /metrics admin-only,
-      # so forgetting it fails closed. Must equal the crimson_metrics_token Swarm
-      # secret, or every scrape 401s.
-      - METRICS_TOKEN=${METRICS_TOKEN:-}
-      # Only this service answers /admin, so only it needs the Prometheus URL.
-      # Unset shows the live snapshot without history. See deploy/prometheus/README.md.
-      - PROMETHEUS_URL=${PROMETHEUS_URL:-}
-      # ShowBox/Febbox direct-file source; disables itself when unset.
-      - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
-      - FEBBOX_REGION=${FEBBOX_REGION:-}
-      # Player subtitles; unset means /subtitles returns 503.
-      - OPENSUBTITLES_API_KEY=${OPENSUBTITLES_API_KEY:-}
-      - OPENSUBTITLES_APP_NAME=${OPENSUBTITLES_APP_NAME:-CrimsonHaven v1.0}
-      - REQUIRE_LOGIN=${REQUIRE_LOGIN:-true}
-      # Gates email and mnemonic signup alike, so a fresh client-side keypair
-      # cannot bypass it. Empty closes registration: every signup 403s.
-      - SIGNUP_INVITE_CODE=${SIGNUP_INVITE_CODE:-}
-      # Comma-separated; seeds /admin access.
-      - ADMIN_EMAILS=${ADMIN_EMAILS:-}
-      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://crimsonhaven.to}
-      # Verification and password-reset email.
-      - SMTP_HOST=${SMTP_HOST:-}
-      - SMTP_PORT=${SMTP_PORT:-587}
-      - SMTP_SECURITY=${SMTP_SECURITY:-starttls}
-      - SMTP_USER=${SMTP_USER:-}
-      - SMTP_FROM=${SMTP_FROM:-}
-      - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
-      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
-      # Chat provider keys live in env, not the settings table, so a database dump
-      # never holds billable credentials. Unset, /chat answers 503. Only the
-      # provider selected in Admin -> Chat needs a key. Mind the `$`: without it
-      # the literal string passes the feature gate and every call fails with 400.
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      # crimson-proxy edge relays for the no-extension path; unset, POST /sign is 503.
-      - CRIMSON_PROXY_BASE=${CRIMSON_PROXY_BASE:-}
-      # The ffmpeg loop runs in cache-worker so a long remux is not killed every
-      # time `api` rolls.
-      - RUN_CACHE_WORKER=false
-      # Serving replicas queue downloads and send pause/resume/cancel to aria2; the
-      # poll loop runs in download-worker. The secret must equal aria2's RPC_SECRET.
-      - RUN_DOWNLOAD_WORKER=false
-      - ARIA2_RPC_URL=${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
-      - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:-}
-      # cache_engine overrides; defaults are built in. The NAS is a volume, not env.
-      # - CACHE_INTERNAL_BASE=http://127.0.0.1:8000  # how ffmpeg reaches our own proxies (loopback)
-      # - CACHE_MAX_CONCURRENT=1                      # simultaneous downloads per replica
-      # - CACHE_DOWNLOAD_TIMEOUT=3600                 # per-episode ffmpeg timeout (seconds)
-      # - CACHE_MIN_FREE_BYTES=2147483648             # skip a download below this much free space (2 GiB)
-
-    # Optional NAS cache. `api` serves /cache_proxy, so it needs the mount on every
-    # node that runs it; api-sync does not. Register the in-container paths in
-    # Admin -> Cache and uncomment the volume definitions at the bottom too.
+      <<: [*core-env, *source-env, *aria2-env]
+      KOFI_VERIFICATION_TOKEN: ${KOFI_VERIFICATION_TOKEN:-}
+      # Read-only PAT for /changelog; unset answers 503.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_REPO: ${GITHUB_REPO:-crimsonhaven-to/crimson-backend}
+      # Only api answers /admin. Unset shows the live snapshot without history.
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-}
+      OPENSUBTITLES_API_KEY: ${OPENSUBTITLES_API_KEY:-}
+      OPENSUBTITLES_APP_NAME: ${OPENSUBTITLES_APP_NAME:-CrimsonHaven v1.0}
+      REQUIRE_LOGIN: ${REQUIRE_LOGIN:-true}
+      # Empty closes registration for email and mnemonic signup alike.
+      SIGNUP_INVITE_CODE: ${SIGNUP_INVITE_CODE:-}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-https://crimsonhaven.to}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURITY: ${SMTP_SECURITY:-starttls}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-CrimsonHaven}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # Env, not the settings table, so a database dump never holds billable keys.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CRIMSON_PROXY_BASE: ${CRIMSON_PROXY_BASE:-}
+    # Serves /cache_proxy, so it needs the NAS mounts (see volumes at the bottom).
     # volumes:
     #   - crimson_cache1:/crimson/cache1
     #   - crimson_cache2:/crimson/cache2
-
-    # Remove if the reverse proxy attaches to crimson_net directly. Only one service
-    # can publish :8000 on the ingress mesh.
     ports:
       - target: 8000
         published: 8000
         protocol: tcp
         mode: ingress
-
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      # Serving replicas skip the resync, so they bind :8000 within seconds.
-      start_period: 60s
-
+    healthcheck: *health
     stop_grace_period: 20s
-
     deploy:
-      mode: replicated
       replicas: 3
-      restart_policy:
-        condition: any
-        delay: 5s
-        window: 60s
+      restart_policy: *restart
       update_config:
-        parallelism: 1
-        delay: 10s
+        <<: *singleton-update
+        # Schema init takes an advisory lock, so replicas may overlap.
         order: start-first
-        failure_action: rollback
-        monitor: 30s
-        max_failure_ratio: 0.3
       rollback_config:
-        parallelism: 1
-        delay: 5s
+        <<: *singleton-rollback
         order: start-first
       resources:
-        limits:
-          cpus: "1.50"
-          memory: 768M
-        reservations:
-          cpus: "0.25"
-          memory: 256M
+        limits: {cpus: "1.50", memory: 768M}
+        reservations: {cpus: "0.25", memory: 256M}
+    networks: [crimson_net]
 
-    networks:
-      - crimson_net
-
-  # Owns the Fribb resync that rebuilds the mapping tables wholesale. Must stay at
-  # replicas: 1: a second would download and rebuild in lockstep, wasting bandwidth
-  # and contending on the shared DB.
   api-sync:
-    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
-
+    image: *image
     environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
-      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
-      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
-      - RUN_DB_SYNC=true
-      # Airing notification emails are a scheduled job, so they run here too.
-      - AIRING_NOTIFY_ENABLED=${AIRING_NOTIFY_ENABLED:-false}
-      - AIRING_NOTIFY_DRY_RUN=${AIRING_NOTIFY_DRY_RUN:-true}
-      # api-sync serves no ingress and has no NAS mount; it never downloads.
-      - RUN_CACHE_WORKER=false
-      - RUN_DOWNLOAD_WORKER=false
-      # Scraped because the resync's memory profile is the chart most worth having.
-      - METRICS_TOKEN=${METRICS_TOKEN:-}
-
+      <<: *core-env
+      RUN_DB_SYNC: "true"
+      AIRING_NOTIFY_ENABLED: ${AIRING_NOTIFY_ENABLED:-false}
+      AIRING_NOTIFY_DRY_RUN: ${AIRING_NOTIFY_DRY_RUN:-true}
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      # Uvicorn binds :8000 only after startup, which here includes the resync
-      # (several minutes, on every boot). A shorter window lets Swarm kill the
-      # container mid-sync and it loops forever.
+      <<: *health
+      # Uvicorn binds only after the resync, which takes minutes on every boot. A
+      # shorter window kills the task mid-sync, forever.
       start_period: 600s
-
     stop_grace_period: 20s
-
     deploy:
-      mode: replicated
       replicas: 1
-      restart_policy:
-        condition: any
-        delay: 5s
-        window: 60s
-      update_config:
-        parallelism: 1
-        delay: 10s
-        # start-first would briefly run two wholesale resyncs at once.
-        order: stop-first
-        failure_action: rollback
-        monitor: 30s
-        max_failure_ratio: 0.3
-      rollback_config:
-        parallelism: 1
-        delay: 5s
-        order: stop-first
+      restart_policy: *restart
+      update_config: *singleton-update
+      rollback_config: *singleton-rollback
       resources:
-        limits:
-          cpus: "1.50"
-          # The resync holds the full Fribb mapping in memory. If the task dies with
-          # "non-zero exit (137)" (OOM) during the rebuild, raise to 1024M or 1536M.
-          memory: 768M
-        reservations:
-          cpus: "0.25"
-          memory: 256M
+        # The resync holds the whole Fribb mapping. Exit 137 means raise this.
+        limits: {cpus: "1.50", memory: 768M}
+        reservations: {cpus: "0.25", memory: 256M}
+    networks: [crimson_net]
 
-    networks:
-      - crimson_net
-
-  # Optional ffmpeg cache worker. It runs uvicorn like `api`, so ffmpeg pulls
-  # through the signed proxies on its own loopback (CACHE_INTERNAL_BASE). `api`
-  # writes `pending` rows on /cache/confirm; this worker polls for them, so jobs
-  # survive an `api` roll. One replica (CACHE_MAX_CONCURRENT sets parallelism); a
-  # second would be harmless because begin_download dedupes. Needs the NAS mount
-  # and the source env its proxies replay through (e.g. Jellyfin token injection).
+  # Polls for `pending` rows that api writes, so jobs survive an api roll.
   cache-worker:
-    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
-
+    image: *image
     environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
-      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
-      # Same as api, or the proxy URLs ffmpeg pulls fail signature checks.
-      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
-      - RUN_DB_SYNC=false
-      - RUN_CACHE_WORKER=true
-      # The aria2 loop belongs to download-worker.
-      - RUN_DOWNLOAD_WORKER=false
-      # The only source of crimson_cache_worker_inflight; on api replicas
-      # that gauge is always 0.
-      - METRICS_TOKEN=${METRICS_TOKEN:-}
-      # Cached Jellyfin/ShowBox streams are pulled back through this worker's own
-      # proxies, which need the source credentials.
-      - JELLYFIN_URL=${JELLYFIN_URL:-}
-      - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
-      - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
-      - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
-      - FEBBOX_REGION=${FEBBOX_REGION:-}
-      # Overrides; defaults are built in.
-      # - CACHE_MAX_CONCURRENT=1     # simultaneous ffmpeg remuxes
-      # - CACHE_POLL_INTERVAL=10     # seconds between DB polls for new pending rows
-      # - CACHE_DOWNLOAD_TIMEOUT=3600
-      # - CACHE_MIN_FREE_BYTES=2147483648
-
-    # Same NAS volumes and paths as `api`, which serves the files via /cache_proxy.
+      <<: [*core-env, *source-env]
+      RUN_CACHE_WORKER: "true"
+    # Same NAS mounts and paths as api.
     # volumes:
     #   - crimson_cache1:/crimson/cache1
     #   - crimson_cache2:/crimson/cache2
-
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      # No resync on this service, so uvicorn binds within seconds like `api`.
-      start_period: 60s
-
-    # Lets an in-flight remux finish; a kill marks the row failed for a later retry.
+    healthcheck: *health
+    # Lets an in-flight remux finish; a kill marks the row failed for a retry.
     stop_grace_period: 120s
-
     deploy:
-      mode: replicated
       replicas: 1
-      restart_policy:
-        condition: any
-        delay: 5s
-        window: 60s
-      update_config:
-        parallelism: 1
-        delay: 10s
-        # The new worker's startup requeue (downloading -> pending) must only see
-        # orphaned rows, never one the old worker is still downloading. The brief
-        # gap is harmless: pending rows wait in Postgres.
-        order: stop-first
-        failure_action: rollback
-        monitor: 30s
-        max_failure_ratio: 0.3
-      rollback_config:
-        parallelism: 1
-        delay: 5s
-        order: stop-first
+      restart_policy: *restart
+      update_config: *singleton-update
+      rollback_config: *singleton-rollback
       resources:
-        limits:
-          # More than a serving replica: the audio re-encode fallback is heavy.
-          cpus: "2.00"
-          memory: 1024M
-        reservations:
-          cpus: "0.25"
-          memory: 256M
+        # The audio re-encode fallback is heavy.
+        limits: {cpus: "2.00", memory: 1024M}
+        reservations: {cpus: "0.25", memory: 256M}
+    networks: [crimson_net]
 
-    networks:
-      - crimson_net
+  # api, aria2 and download-worker must mount the media library at the same
+  # in-container path, so a job's <root>/crimson-downloads is valid in all three.
+  download-worker:
+    image: *image
+    environment:
+      <<: [*core-env, *aria2-env]
+      RUN_DOWNLOAD_WORKER: "true"
+    # volumes:
+    #   - crimson_media:/crimson/media
+    healthcheck: *health
+    stop_grace_period: 20s
+    deploy:
+      replicas: 1
+      restart_policy: *restart
+      update_config: *singleton-update
+      rollback_config: *singleton-rollback
+      resources:
+        limits: {cpus: "0.50", memory: 384M}
+        reservations: {cpus: "0.10", memory: 128M}
+    networks: [crimson_net]
 
-  # Optional aria2 sidecar for the admin downloader. JSON-RPC on :6800, crimson_net
-  # only. One replica, one shared queue. The backend sets seed-time=0 per download,
-  # so no inbound BitTorrent port is needed. RPC_SECRET must equal ARIA2_RPC_SECRET
-  # on api and download-worker. The media mount must use the same in-container
-  # path in all three so a job's <root>/crimson-downloads path is valid everywhere.
-  # PUID/PGID 10001 match the api image's appuser so the worker can move the files.
+  # seed-time=0 per download, so no inbound BitTorrent port. PUID/PGID match the
+  # api image's appuser so the worker can move finished files.
   aria2:
     image: p3terx/aria2-pro
     environment:
-      - RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET}
-      - RPC_PORT=6800
-      - PUID=10001
-      - PGID=10001
-      - DISK_CACHE=64M
-      - UPDATE_TRACKERS=true
-
+      RPC_SECRET: ${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET}
+      RPC_PORT: "6800"
+      PUID: "10001"
+      PGID: "10001"
+      DISK_CACHE: 64M
+      UPDATE_TRACKERS: "true"
     # volumes:
     #   - crimson_media:/crimson/media
-
     healthcheck:
       test: ["NONE"]
-
     stop_grace_period: 20s
-
     deploy:
-      mode: replicated
       replicas: 1
-      restart_policy:
-        condition: any
-        delay: 5s
-        window: 60s
-      update_config:
-        parallelism: 1
-        delay: 10s
-        order: stop-first
+      restart_policy: *restart
+      update_config: {parallelism: 1, delay: 10s, order: stop-first}
       resources:
-        limits:
-          cpus: "1.00"
-          memory: 512M
-        reservations:
-          cpus: "0.10"
-          memory: 64M
+        limits: {cpus: "1.00", memory: 512M}
+        reservations: {cpus: "0.10", memory: 64M}
+    networks: [crimson_net]
 
-    networks:
-      - crimson_net
-
-  # Optional aria2 poll loop: claims pending download_jobs rows, hands them to
-  # aria2, tracks progress and moves finished files out of staging. One replica
-  # (begin_submit dedupes if a second runs). Needs the same media mount as aria2
-  # and api, because it does the move.
-  download-worker:
-    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
-
-    environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
-      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
-      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
-      - RUN_DB_SYNC=false
-      - RUN_CACHE_WORKER=false
-      - RUN_DOWNLOAD_WORKER=true
-      - ARIA2_RPC_URL=${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
-      - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET}
-      # Source of crimson_download_jobs. It reads the shared table, so it is
-      # cluster-wide and its panel uses max(), never sum().
-      - METRICS_TOKEN=${METRICS_TOKEN:-}
-      # Overrides; defaults are built in.
-      # - DOWNLOAD_MAX_ACTIVE=3          # simultaneous downloads
-      # - DOWNLOAD_POLL_INTERVAL=5       # seconds between aria2 status polls
-      # - DOWNLOAD_MIN_FREE_BYTES=2147483648  # min free space to start (2 GiB)
-
-    # Register this path in Admin -> Local Sources with "download into this source".
-    # volumes:
-    #   - crimson_media:/crimson/media
-
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
-
-    # aria2 keeps downloading across a worker roll, so a short drain is enough.
-    stop_grace_period: 20s
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      restart_policy:
-        condition: any
-        delay: 5s
-        window: 60s
-      update_config:
-        parallelism: 1
-        delay: 10s
-        # Never two workers at once. The new one re-attaches to in-flight rows and
-        # only requeues gids aria2 has forgotten.
-        order: stop-first
-        failure_action: rollback
-        monitor: 30s
-        max_failure_ratio: 0.3
-      rollback_config:
-        parallelism: 1
-        delay: 5s
-        order: stop-first
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 384M
-        reservations:
-          cpus: "0.10"
-          memory: 128M
-
-    networks:
-      - crimson_net
-
-  # Optional Discord invite bot; idles unless DISCORD_BOT_TOKEN is set. One replica:
-  # a second gateway login with the same token fights the first and double-mints.
+  # A second gateway login with the same token fights the first and double-mints.
   discord-bot:
-    image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
+    image: *image
     command: ["python", "-m", "discord_bot"]
-
-    # Nothing listens on :8000 here, so the image's /health check would fail
-    # forever and Swarm would restart the task in a loop.
+    environment:
+      TMDB_API_KEY: ${TMDB_API_KEY:?set TMDB_API_KEY}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_OWNER_ID: ${DISCORD_OWNER_ID:-}
+      DISCORD_COMMAND_PREFIX: ${DISCORD_COMMAND_PREFIX:-!}
+      FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-https://crimsonhaven.to}
+    # Nothing listens on :8000, so the image's check would restart it forever.
     healthcheck:
       test: ["NONE"]
-
-    environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:- DEFINITELY_NOT_A_FAKE_KEY}
-      - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
-      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
-      - DISCORD_OWNER_ID=${DISCORD_OWNER_ID:-}
-      - DISCORD_COMMAND_PREFIX=${DISCORD_COMMAND_PREFIX:-!}
-      # For the "register at <url>" hint shown next to minted codes.
-      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://crimsonhaven.to}
-
     stop_grace_period: 20s
-
     deploy:
-      mode: replicated
       replicas: 1
-      restart_policy:
-        condition: any
-        delay: 5s
-        window: 60s
-      update_config:
-        parallelism: 1
-        delay: 10s
-        # Never run two gateway connections at once (start-first would overlap).
-        order: stop-first
+      restart_policy: *restart
+      update_config: {parallelism: 1, delay: 10s, order: stop-first}
       resources:
-        limits:
-          cpus: "0.25"
-          memory: 128M
-        reservations:
-          cpus: "0.05"
-          memory: 32M
+        limits: {cpus: "0.25", memory: 128M}
+        reservations: {cpus: "0.05", memory: 32M}
+    networks: [crimson_net]
 
-    networks:
-      - crimson_net
-
-  # Old-image janitor. Swarm keeps each release's image on every node and never
-  # cleans up, so dead images pile up to tens of GB per node over many releases.
-  #
-  # `mode: global` runs one task per node, including nodes that no longer run
-  # `api`. It keeps the newest 3 vX.Y.Z tags (well past Swarm's one-step rollback)
-  # and runs un-forced `docker image rm` on the rest, so the daemon itself refuses
-  # anything a running or rollback container still references. `:dev`, `:latest`
-  # and `:buildcache` never match. Pruned releases stay in the GitLab registry.
-  #
-  # It runs once and exits, so a 0/0 task count is healthy. PRUNE_RELEASE changes
-  # the spec every release, which is what makes `docker stack deploy` reschedule
-  # it. The Docker socket mount is root-equivalent on the node; it only touches
-  # this image's old tags.
+  # Swarm never removes old images, so each node piles up tens of GB of releases.
+  # Keeps the newest 3 vX.Y.Z tags and un-force removes the rest, so the daemon
+  # refuses anything a running or rollback container still uses. It runs once and
+  # exits (0/0 tasks is healthy); PRUNE_RELEASE changes every release, which is
+  # what reschedules it. The socket mount is root on the node.
   pruner:
     image: docker:28-cli
-    # Each node derives its keep-set from its own disk, so no version list is passed.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -eu
         IMAGE="registry.ramon.moe/crimsonhaven-to/crimson-backend"
         KEEP=3
-        echo "[pruner] $(hostname): keeping newest ${KEEP} release tags of ${IMAGE}"
-        # busybox (docker:cli is Alpine) lacks a reliable `sort -V`, so sort the
-        # numeric fields instead; v1.10.0 must outrank v1.9.0.
+        # busybox has no reliable `sort -V`, and v1.10.0 must outrank v1.9.0.
         tags="$(docker image ls --format '{{.Tag}}' "$IMAGE" 2>/dev/null \
                   | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
                   | sed 's/^v//' | sort -t. -k1,1nr -k2,2nr -k3,3nr \
                   | sed 's/^/v/' || true)"
-        if [ -z "$tags" ]; then
-          echo "[pruner] no vX.Y.Z release images present, nothing to do"; exit 0
-        fi
-        echo "[pruner] present (newest first):"; echo "$tags" | sed 's/^/[pruner]   /'
         old="$(echo "$tags" | tail -n +$((KEEP + 1)))"
-        if [ -z "$old" ]; then
-          echo "[pruner] <= ${KEEP} release images, nothing to remove"; exit 0
-        fi
         for t in $old; do
-          # Un-forced, so the daemon protects live and rollback images.
           if docker image rm "${IMAGE}:${t}" >/dev/null 2>&1; then
-            echo "[pruner] removed   ${IMAGE}:${t}"
+            echo "[pruner] removed ${IMAGE}:${t}"
           else
-            echo "[pruner] kept (in use / gone) ${IMAGE}:${t}"
+            echo "[pruner] kept (in use) ${IMAGE}:${t}"
           fi
         done
-        # Without -a this only removes dangling layers, never tagged images.
         docker image prune -f >/dev/null 2>&1 || true
-        echo "[pruner] done"
-
     environment:
-      # Changes every release, which re-triggers the one-shot task fleet-wide.
-      - PRUNE_RELEASE=${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
-
+      PRUNE_RELEASE: *image
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-
-    # Binds no port, so there is nothing to probe.
     healthcheck:
       test: ["NONE"]
-
     deploy:
       mode: global
-      restart_policy:
-        # A failed pass is harmless and retried at the next release.
-        condition: none
+      # A failed pass is retried at the next release.
+      restart_policy: {condition: none}
       resources:
-        limits:
-          cpus: "0.25"
-          memory: 64M
-        reservations:
-          cpus: "0.01"
-          memory: 16M
+        limits: {cpus: "0.25", memory: 64M}
+        reservations: {cpus: "0.01", memory: 16M}
 
 networks:
   crimson_net:
     driver: overlay
     attachable: true
 
-# Optional NAS volumes for the video cache. Swarm mounts a volume on every node
-# that runs a task using it, so there is no per-host mount. SMB/Samba shares use
-# type cifs; an NFS NAS uses the variant below.
-#
-#   NAS_IP=192.168.1.10 NAS_SHARE=crimson-cache \
-#   NAS_USER=crimson NAS_PASSWORD='super-secret' \
-#   TMDB_API_KEY=... PROXY_SECRET=... DATABASE_URL=... \
-#   docker stack deploy -c docker-stack.yml crimson-api
+# Optional NAS volumes for the video cache and the media library. Swarm mounts
+# them on whichever node runs the task. uid/gid 10001 is the image's appuser.
 #
 # volumes:
 #   crimson_cache1:
 #     driver: local
 #     driver_opts:
 #       type: cifs
-#       # Forward slashes even for a Windows share.
 #       device: "//${NAS_IP}/${NAS_SHARE1}"
-#       # uid/gid 10001 is the image's appuser, so ffmpeg can write. vers=3.0
-#       # suits modern Windows/Samba; use 2.1 for very old servers.
 #       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
-# 
-#   crimson_cache2:
+#   crimson_nfs_example:
 #     driver: local
 #     driver_opts:
-#       type: cifs
-#       # Forward slashes even for a Windows share.
-#       device: "//${NAS_IP}/${NAS_SHARE2}"
-#       # uid/gid 10001 is the image's appuser, so ffmpeg can write. vers=3.0
-#       # suits modern Windows/Samba; use 2.1 for very old servers.
-#       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
-#
-#   # NFS variant, instead of the cifs blocks above:
-#   # crimson_cache:
-#   #   driver: local
-#   #   driver_opts:
-#   #     type: nfs
-#   #     o: "addr=${NAS_IP},nfsvers=4,rw,hard,timeo=600"
-#   #     device: ":/export/crimson-cache"
-
-# Why two services: only one process may run the Fribb resync, but the serving
-# tier must scale, and every replica of a service shares the same env. So `api`
-# (replicas: N, RUN_DB_SYNC=false) and `api-sync` (replicas: 1, RUN_DB_SYNC=true).
-#
-# Scaling `api`: each replica opens up to DB_POOL_MAX (default 10) connections to
-# the Patroni leader, plus api-sync's pool and replication overhead, so direct to
-# Postgres the ceiling is ~8 replicas before max_connections (100). Past that,
-# run the co-located PgBouncer and point DATABASE_URL at port 6432 instead of
-# 5432 (same host list and target_session_attrs). See deploy/pgbouncer/README.md.
+#       type: nfs
+#       o: "addr=${NAS_IP},nfsvers=4,rw,hard,timeo=600"
+#       device: ":/export/crimson-cache"

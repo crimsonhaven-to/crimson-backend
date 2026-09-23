@@ -1,23 +1,27 @@
-# Single host `docker compose up` with a bundled PostgreSQL. Production (Swarm,
-# external HA PostgreSQL) is docker-stack.yml.
+# One host, bundled PostgreSQL, one backend container that serves and runs every
+# background loop. Production (Swarm, external Patroni) is docker-stack.yml.
 #
-# The API is stateless, so replicas can share the database, but keep
-# RUN_DB_SYNC=true on exactly one (the Fribb resync rebuilds the mapping tables
-# wholesale; running it everywhere only wastes bandwidth) and the same
-# PROXY_SECRET on all.
+#   cp .env.example .env            # set TMDB_API_KEY and PROXY_SECRET
+#   docker compose up --build
+#
+# Optional services are profiles: `--profile downloads` adds aria2 (set
+# ARIA2_RPC_SECRET in .env first), `--profile discord` adds the invite bot.
+#
+# If exposed publicly, keep :8000 behind a TLS-terminating proxy. The app builds
+# absolute URLs from X-Forwarded-Proto/Host, so direct access lets anyone spoof
+# X-Forwarded-Host.
+
+x-database-url: &database-url postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson}
 
 services:
   postgres:
     image: postgres:17-alpine
     environment:
-      - POSTGRES_DB=${POSTGRES_DB:-crimson}
-      - POSTGRES_USER=${POSTGRES_USER:-crimson}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crimson}
+      POSTGRES_DB: ${POSTGRES_DB:-crimson}
+      POSTGRES_USER: ${POSTGRES_USER:-crimson}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crimson}
     volumes:
       - crimson-pgdata:/var/lib/postgresql/data
-    # Unpublished: only the api needs it. Uncomment for host psql access.
-    # ports:
-    #   - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crimson} -d ${POSTGRES_DB:-crimson}"]
       interval: 10s
@@ -26,100 +30,69 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  anime-api:
-    image: crimson-backend:1.0
+  api:
+    build: .
+    image: crimson-backend:local
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "8000:8000"
+    # Every optional setting comes straight from .env (see .env.example).
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY in the environment or an .env file}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson}
-      # Signs the stream proxy URLs. Must be identical on every replica, or proxied
-      # playback 403s across restarts and replicas.
-      - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET (e.g. openssl rand -hex 32)}
-      # Compose does not inject .env into the container, so optional settings only
-      # take effect when listed here.
-      #
-      # crimson-proxy edge relays for the no-extension path. Unset, POST /sign
-      # returns 503 and clients fall back to the extension. Comma-separate hosts for
-      # failover; each proxy's NITRO_PROXY_SECRET must equal PROXY_SECRET.
-      # - CRIMSON_PROXY_BASE=https://<site>.netlify.app,https://crimson-proxy.<acct>.workers.dev
-      - RUN_DB_SYNC=true
-      # Comma-separated CORS origins; unset uses the built-in list.
-      # - ALLOWED_ORIGINS=https://crimsonhaven.to,https://www.crimsonhaven.to
-      # /changelog reads GitHub Releases; unset token means 503. Read access only
-      # (fine-grained PAT with Contents:read, or classic repo scope).
-      # - GITHUB_TOKEN=
-      # - GITHUB_REPO=crimsonhaven-to/crimson-backend
-      # Jellyfin source
-      # - JELLYFIN_URL=
-      # - JELLYFIN_USERNAME=
-      # - JELLYFIN_PASSWORD=
-      # ShowBox/Febbox direct-file source; disables itself when unset.
-      # - FEBBOX_UI_TOKEN=
-      # - FEBBOX_REGION=
-      # Player subtitles; unset means /subtitles returns 503.
-      # - OPENSUBTITLES_API_KEY=
-      # - OPENSUBTITLES_APP_NAME=CrimsonHaven v1.0
-      # Admin downloader, via the aria2 service below. The secret must equal aria2's
-      # RPC_SECRET. Files land under <root>/crimson-downloads on a download-enabled
-      # Local source, so the media volume must be mounted at the same path here and
-      # in `aria2`. RUN_DOWNLOAD_WORKER defaults to true, so this one container
-      # both queues and polls.
-      - ARIA2_RPC_URL=http://aria2:6800/jsonrpc
-      - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET (e.g. openssl rand -hex 24)}
-      # Then register it in Admin -> Local Sources with "download into this source":
-      # volumes:
-      #   - /srv/media:/crimson/media
-
+      TMDB_API_KEY: ${TMDB_API_KEY:?set TMDB_API_KEY in .env}
+      # Without it signed links break on every restart.
+      PROXY_SECRET: ${PROXY_SECRET:?set PROXY_SECRET in .env (openssl rand -hex 32)}
+      DATABASE_URL: *database-url
+      ARIA2_RPC_URL: http://aria2:6800/jsonrpc
+    # Local sources and the download target: mount, then register the in-container
+    # path in Admin. aria2 must see the media library at the same path.
+    # volumes:
+    #   - /srv/media:/crimson/media
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 40s
-
-    # Honoured by plain `docker compose`; Swarm uses deploy.restart_policy below.
+      # The resync runs before uvicorn binds :8000, so the first boot is slow.
+      start_period: 600s
+    stop_grace_period: 20s
     restart: unless-stopped
 
-    deploy:
-      replicas: 1
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
-        window: 60s
-      update_config:
-        parallelism: 1
-      resources:
-        limits:
-          cpus: "1.50"
-          memory: 768M
-        reservations:
-          cpus: "0.25"
-          memory: 256M
-
-  # JSON-RPC on :6800, internal network only. The backend sets seed-time=0 per
-  # download, so no inbound BitTorrent port is needed.
-  #
-  # The media library must be mounted at the same in-container path as in
-  # `anime-api`, so a job's <root>/crimson-downloads path is valid in both.
-  # PUID/PGID 10001 match the api image's appuser, so the backend can move the files.
+  # seed-time=0 per download, so no inbound BitTorrent port. PUID/PGID match the
+  # api image's appuser so the backend can move finished files.
   aria2:
     image: p3terx/aria2-pro
+    profiles: [downloads]
     environment:
-      - RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET (e.g. openssl rand -hex 24)}
-      - RPC_PORT=6800
-      - PUID=10001
-      - PGID=10001
-      - DISK_CACHE=64M
-      - UPDATE_TRACKERS=true
+      # Not `:?`, which would also fail a plain `up` without the profile.
+      RPC_SECRET: ${ARIA2_RPC_SECRET:-}
+      RPC_PORT: "6800"
+      PUID: "10001"
+      PGID: "10001"
+      DISK_CACHE: 64M
+      UPDATE_TRACKERS: "true"
     volumes:
       - crimson-aria2-config:/config
-      # Same volume and path as on anime-api:
       # - /srv/media:/crimson/media
+    restart: unless-stopped
+
+  # A second gateway login with the same token fights the first.
+  discord-bot:
+    image: crimson-backend:local
+    profiles: [discord]
+    command: ["python", "-m", "discord_bot"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: *database-url
     restart: unless-stopped
 
 volumes:
