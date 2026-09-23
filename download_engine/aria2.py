@@ -79,20 +79,17 @@ async def is_available() -> bool:
 
 
 # --- lifecycle --------------------------------------------------------------
-async def add_uri(uri: str, staging_dir: str, *, seed: bool = False) -> str:
-    """Queue a download of ``uri`` (http/https or magnet) into ``staging_dir``.
-    Returns the aria2 gid. For torrents/magnets, ``seed=False`` (default) makes it
-    leech-only — aria2 stops as soon as the download completes."""
+async def add_uri(uri: str, staging_dir: str) -> str:
+    """Queue a download of ``uri`` (http/https or magnet) into ``staging_dir`` and
+    return the aria2 gid. Torrents are leech-only: aria2 stops once complete."""
     options = {
         "dir": staging_dir,
         # Resume a partial from a previous run's control file instead of restarting.
         "continue": "true",
         "auto-file-renaming": "false",
-        # Torrent/magnet leech-only knobs (ignored for plain http).
-        "seed-time": "0" if not seed else "",
+        "seed-time": "0",
         "bt-remove-unselected-file": "true",
     }
-    options = {k: v for k, v in options.items() if v != ""}
     gid = await _call("aria2.addUri", [[uri], options])
     if not isinstance(gid, str):
         raise Aria2Error(f"aria2.addUri returned an unexpected gid: {gid!r}")
@@ -114,15 +111,14 @@ async def pause(gid: str) -> None:
 
 
 async def unpause(gid: str) -> None:
-    try:
-        await _call("aria2.unpause", [gid])
-    except Aria2Error as e:
-        logger.debug(f"aria2 unpause({gid}) failed: {e}")
+    """Raises ``Aria2Error`` when aria2 no longer knows the gid, so the caller can
+    requeue the job instead."""
+    await _call("aria2.unpause", [gid])
 
 
 async def remove(gid: str) -> None:
-    """Stop + forget a download (best effort). Tries a graceful remove, then a force
-    remove, then drops any lingering result row so the gid fully disappears."""
+    """Stop and forget a download, best effort, then drop its result row so the
+    gid fully disappears."""
     for method in ("aria2.forceRemove", "aria2.remove"):
         try:
             await _call(method, [gid])

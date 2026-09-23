@@ -40,6 +40,7 @@ from core.config import Config
 from core.db_pool import close_pool
 from core.http_client import close_client as close_http_client
 from core.response_cache import purge_expired_cache
+from core.background import spawn
 from resolvers import _crimson_proxy
 
 from account_engine import audit as security_audit
@@ -189,6 +190,12 @@ def _register_every_replica_jobs(scheduler: BackgroundScheduler, logger: logging
                 )
         except Exception as e:
             logger.error(f"Airing prune failed: {e}")
+        try:
+            n = telemetry_store.purge_old()
+            if n:
+                logger.info(f"Purged {n} resolve telemetry rows")
+        except Exception as e:
+            logger.error(f"Telemetry purge failed: {e}")
 
     scheduler.add_job(
         _purge_expired,
@@ -232,7 +239,7 @@ def _register_optional_service_jobs(scheduler: BackgroundScheduler, logger: logg
             except Exception as e:
                 logger.error(f"Initial changelog warm-up failed (will retry on schedule): {e}")
 
-        asyncio.create_task(_warm_changelog())  # fire-and-forget
+        spawn(_warm_changelog())  # fire-and-forget
 
         def _refresh_changelog():
             try:
@@ -260,7 +267,7 @@ def _register_optional_service_jobs(scheduler: BackgroundScheduler, logger: logg
             except Exception as e:
                 logger.error(f"Initial IPTV warm-up failed (will retry on schedule): {e}")
 
-        asyncio.create_task(_warm_iptv())  # fire-and-forget
+        spawn(_warm_iptv())  # fire-and-forget
 
         def _refresh_iptv():
             try:
@@ -288,7 +295,7 @@ def _register_optional_service_jobs(scheduler: BackgroundScheduler, logger: logg
             except Exception as e:
                 logger.error(f"Initial proxy health probe failed (will retry on schedule): {e}")
 
-        asyncio.create_task(_warm_proxy_health())  # must not delay startup
+        spawn(_warm_proxy_health())  # must not delay startup
 
         # BackgroundScheduler runs jobs in a worker thread with no running event
         # loop, so the job spins up its own.
@@ -382,7 +389,7 @@ def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.
             sync_status.set_phase("failed", result or "unknown outcome", finished=True)
             logger.warning(f"Initial database sync did not rebuild (outcome={result})")
 
-    asyncio.create_task(_initial_sync())  # runs off the boot path
+    spawn(_initial_sync())  # runs off the boot path
 
     # BackgroundScheduler runs jobs in a worker thread with no running event
     # loop, so the job spins up its own.
@@ -441,7 +448,7 @@ def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.
             except Exception as e:
                 logger.error(f"Startup metadata backfill failed: {e}")
 
-        asyncio.create_task(_run_backfill())  # paced internally
+        spawn(_run_backfill())  # paced internally
 
     # --- the airing calendar ------------------------------------------------
     # Pinned here rather than run per replica because the refresh rewrites rows
@@ -459,7 +466,7 @@ def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.
         except Exception as e:
             logger.error(f"Initial airing refresh failed (will retry on schedule): {e}")
 
-    asyncio.create_task(_warm_airing())  # must not delay startup
+    spawn(_warm_airing())  # must not delay startup
 
     # Six-hourly: a broadcast slipping is the only thing that changes here, so a
     # tighter interval spends AniList requests to learn nothing.

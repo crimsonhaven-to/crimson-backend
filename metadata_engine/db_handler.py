@@ -686,6 +686,11 @@ class MappingDatabaseEngine:
             season_map = {(t, s): a for (t, s, a) in season_rows}
             for tmdb_id, seasons in overrides.items():
                 for season_num, anilist_id in seasons.items():
+                    # tmdb_seasons references anime_entries, so an unknown id
+                    # would fail the foreign key and roll back the whole rebuild.
+                    if anilist_id not in all_anilist_ids:
+                        print(f"[DB Engine] Override skipped: AniList {anilist_id} is not in the dataset.")
+                        continue
                     season_map[(tmdb_id, season_num)] = anilist_id
             season_rows = [(t, s, a) for (t, s), a in season_map.items()]
             print(f"[DB Engine] Applied overrides for {len(overrides)} show(s).")

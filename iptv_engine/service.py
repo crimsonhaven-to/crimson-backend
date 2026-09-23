@@ -495,8 +495,11 @@ async def proxy_fetch(url: str, referrer: str = "", user_agent: str = "",
         timeout=httpx.Timeout(15.0, read=30.0),
         headers=headers,
     )
-    req = client.build_request("GET", url)
-    resp = await client.send(req, stream=True)
+    try:
+        resp = await client.send(client.build_request("GET", url), stream=True)
+    except BaseException:
+        await client.aclose()
+        raise
 
     content_type = resp.headers.get("content-type", "application/octet-stream")
     final_url = str(resp.url)

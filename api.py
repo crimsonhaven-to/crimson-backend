@@ -11,9 +11,7 @@ live in the ``web`` package (see web/__init__.py), the lifespan body lives in
 
 import os
 import hashlib
-import importlib
 import inspect
-import pkgutil
 import logging
 from typing import Dict
 from contextlib import asynccontextmanager
@@ -31,6 +29,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from core.rate_limit import limiter
+from core.private_sources import overlay_modules
 from core import lumi
 from core.version import VERSION
 from core.config import Config
@@ -587,14 +586,8 @@ def _register_overlay_stream_proxies():
         return _route
 
     public_prefixes = []
-    for info in pkgutil.iter_modules(_res_pkg.__path__):
-        name = info.name
-        if name in already_wired or name.startswith("_") or "test" in name:
-            continue
-        try:
-            module = importlib.import_module(f"resolvers.{name}")
-        except Exception:
-            continue
+    for module in overlay_modules(_res_pkg, skip=already_wired):
+        name = module.__name__.rsplit(".", 1)[1]
         fetch_fn = getattr(module, "proxy_fetch", None)
         if fetch_fn is None:
             continue

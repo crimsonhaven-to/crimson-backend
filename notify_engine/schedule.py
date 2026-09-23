@@ -92,7 +92,12 @@ async def fetch_window(
             logger.error(f"Airing schedule page {page}: AniList status {status}")
             break
 
-        payload = (response.json() or {}).get("data", {}).get("Page") or {}
+        # A GraphQL error still answers 200, with "data": null.
+        try:
+            payload = ((response.json() or {}).get("data") or {}).get("Page") or {}
+        except ValueError:
+            logger.error(f"Airing schedule page {page}: AniList sent a non-JSON body")
+            break
         for entry in payload.get("airingSchedules") or []:
             media_id = entry.get("mediaId")
             episode = entry.get("episode")

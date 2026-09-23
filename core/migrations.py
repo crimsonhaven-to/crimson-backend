@@ -257,7 +257,6 @@ def status() -> Dict[str, object]:
     by_version = {m.version: m for m in available}
     try:
         with get_connection() as conn:
-            _ensure_table(conn)
             already = _applied_rows(conn)
     except Exception as e:
         logger.error("Schema status query failed: %s", e)

@@ -920,12 +920,9 @@ async def import_favorites(
             },
         ))
 
-    def _apply() -> dict:
-        if mode == "replace":
-            store.clear_favorites(user["user_id"])
-        return store.bulk_upsert_favorites(user["user_id"], favs)
-
-    result = await run_in_threadpool(_apply)
+    result = await run_in_threadpool(
+        store.bulk_upsert_favorites, user["user_id"], favs, mode == "replace"
+    )
     skipped = skipped_no_id + result["skipped_quota"]
     return {
         "success": True,

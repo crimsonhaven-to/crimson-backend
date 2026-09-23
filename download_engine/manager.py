@@ -4,12 +4,12 @@ Background download manager (aria2-backed).
 The DB row is the queue: an admin route on any replica writes a ``pending``
 ``download_jobs`` row; only the dedicated **download-worker** (RUN_DOWNLOAD_WORKER)
 submits it to the aria2 sidecar and polls it to completion. So a download survives
-an api redeploy, and the ``begin_submit`` claim stops two workers double-adding a
-job.
+an api redeploy. Run exactly one download-worker: nothing stops two of them
+submitting the same row.
 
 The worker runs one poll loop:
 
-  1. **submit** — for each free slot, claim a ``pending`` row, pick the first
+  1. **submit** — for each free slot, take a ``pending`` row, pick the first
      download-enabled source root with free space, and ``aria2.addUri`` it into a
      per-job staging dir (``crimson-downloads/.incoming/<id>``). Record the gid.
   2. **monitor** — for each ``active`` row, ``aria2.tellStatus``: update
@@ -165,10 +165,6 @@ class DownloadManager:
             return
         rows = await run_in_threadpool(self._store.fetch_pending, free)
         for row in rows:
-            # Claim the row so no other worker submits it (single-worker today, but the
-            # claim keeps a misconfigured second worker safe).
-            if not await run_in_threadpool(self._store.begin_submit, row["id"]):
-                continue
             try:
                 await self._submit_one(row)
             except Exception as e:
@@ -192,7 +188,7 @@ class DownloadManager:
         staging_dir = fs.plan_staging_dir(target["downloads_dir"], row["id"])
         await run_in_threadpool(os.makedirs, staging_dir, exist_ok=True)
         is_torrent = row["kind"] == KIND_TORRENT
-        gid = await aria2.add_uri(row["source_url"], staging_dir, seed=False)
+        gid = await aria2.add_uri(row["source_url"], staging_dir)
         await run_in_threadpool(
             self._store.mark_active,
             row["id"],

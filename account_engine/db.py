@@ -61,6 +61,33 @@ def _public_session_id(token_hash: str) -> str:
     return hashlib.sha256(f"crimson-session:{token_hash}".encode("utf-8")).hexdigest()[:32]
 
 
+def _account_search(search: Optional[str]) -> Tuple[str, list]:
+    """The admin table's WHERE clause over ``accounts a``, shared by the page and
+    its total so the two can never disagree."""
+    term = (search or "").strip()
+    if not term:
+        return "", []
+    like = f"%{term}%"
+    return (
+        "WHERE a.email ILIKE %s OR a.label ILIKE %s OR a.username ILIKE %s"
+        " OR CAST(a.user_id AS TEXT) = %s",
+        [like, like, like, term],
+    )
+
+
+_FAVORITE_UPSERT = """
+    INSERT INTO favorites
+        (user_id, item_key, list_name, tmdb_id, anilist_id, season_number,
+         media_type, title, poster, added_at)
+    VALUES (%(user_id)s, %(item_key)s, %(list_name)s, %(tmdb_id)s, %(anilist_id)s,
+            %(season_number)s, %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
+    ON CONFLICT(user_id, item_key, list_name) DO UPDATE SET
+        tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
+        season_number=excluded.season_number, media_type=excluded.media_type,
+        title=excluded.title, poster=excluded.poster
+"""
+
+
 class AccountStore:
     """Thin PostgreSQL data layer for the account system.
 
@@ -342,16 +369,7 @@ class AccountStore:
         """Accounts (newest first) with favorite / progress / session counts for the
         admin table. Never returns password_hash. Search is case-insensitive over
         email, label, display name and numeric id."""
-        params: list = []
-        where = ""
-        if search and search.strip():
-            term = search.strip()
-            like = f"%{term}%"
-            where = (
-                "WHERE a.email ILIKE %s OR a.label ILIKE %s OR a.username ILIKE %s"
-                " OR CAST(a.user_id AS TEXT) = %s"
-            )
-            params += [like, like, like, term]
+        where, params = _account_search(search)
         now = _iso(_now())
         params += [now, limit, offset]
         with self._connect() as conn:
@@ -374,18 +392,10 @@ class AccountStore:
             return [dict(r) for r in rows]
 
     def count_accounts(self, search: Optional[str] = None) -> int:
-        params: list = []
-        where = ""
-        if search and search.strip():
-            term = search.strip()
-            like = f"%{term}%"
-            where = (
-                "WHERE email ILIKE %s OR label ILIKE %s OR CAST(user_id AS TEXT) = %s"
-            )
-            params += [like, like, term]
+        where, params = _account_search(search)
         with self._connect() as conn:
             return conn.execute(
-                f"SELECT COUNT(*) AS n FROM accounts {where}", tuple(params)
+                f"SELECT COUNT(*) AS n FROM accounts a {where}", tuple(params)
             ).fetchone()["n"]
 
     def email_recipients(self, verified_only: bool = True) -> List[Dict]:
@@ -784,17 +794,7 @@ class AccountStore:
                 if count >= MAX_FAVORITES_PER_USER:
                     raise QuotaExceeded(f"favorites limit ({MAX_FAVORITES_PER_USER}) reached")
             conn.execute(
-                """
-                INSERT INTO favorites
-                    (user_id, item_key, list_name, tmdb_id, anilist_id, season_number,
-                     media_type, title, poster, added_at)
-                VALUES (%(user_id)s, %(item_key)s, %(list_name)s, %(tmdb_id)s, %(anilist_id)s,
-                        %(season_number)s, %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
-                ON CONFLICT(user_id, item_key, list_name) DO UPDATE SET
-                    tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
-                    season_number=excluded.season_number, media_type=excluded.media_type,
-                    title=excluded.title, poster=excluded.poster
-                """,
+                _FAVORITE_UPSERT,
                 {"user_id": user_id, "list_name": list_name, "added_at": _iso(_now()), **fav},
             )
             row = conn.execute(
@@ -830,17 +830,20 @@ class AccountStore:
             return [dict(r) for r in rows]
 
     def bulk_upsert_favorites(
-        self, user_id: int, items: List[Tuple[str, Dict]]
+        self, user_id: int, items: List[Tuple[str, Dict]], replace: bool = False
     ) -> Dict:
         """Insert/update many favorites in one transaction, for import.
 
         ``items`` is a list of ``(list_name, fav)`` pairs. New keys are inserted
         only while the per-account cap has room; existing keys always update.
-        Returns ``{"imported", "skipped_quota"}``."""
+        ``replace`` clears every list first, in the same transaction, so a failed
+        import never leaves the account empty. Returns ``{"imported", "skipped_quota"}``."""
         imported = 0
         skipped_quota = 0
         now = _iso(_now())
         with self._connect() as conn:
+            if replace:
+                conn.execute("DELETE FROM favorites WHERE user_id = %s", (user_id,))
             count = conn.execute(
                 "SELECT COUNT(*) AS n FROM favorites WHERE user_id = %s", (user_id,)
             ).fetchone()["n"]
@@ -855,27 +858,11 @@ class AccountStore:
                         continue
                     count += 1
                 conn.execute(
-                    """
-                    INSERT INTO favorites
-                        (user_id, item_key, list_name, tmdb_id, anilist_id, season_number,
-                         media_type, title, poster, added_at)
-                    VALUES (%(user_id)s, %(item_key)s, %(list_name)s, %(tmdb_id)s, %(anilist_id)s,
-                            %(season_number)s, %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
-                    ON CONFLICT(user_id, item_key, list_name) DO UPDATE SET
-                        tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
-                        season_number=excluded.season_number, media_type=excluded.media_type,
-                        title=excluded.title, poster=excluded.poster
-                    """,
+                    _FAVORITE_UPSERT,
                     {"user_id": user_id, "list_name": list_name, "added_at": now, **fav},
                 )
                 imported += 1
         return {"imported": imported, "skipped_quota": skipped_quota}
-
-    def clear_favorites(self, user_id: int) -> int:
-        """Delete every favorite in every list. Returns how many rows were removed."""
-        with self._connect() as conn:
-            cur = conn.execute("DELETE FROM favorites WHERE user_id = %s", (user_id,))
-            return cur.rowcount
 
     def remove_favorite(
         self, user_id: int, item_key: str, list_name: Optional[str] = None

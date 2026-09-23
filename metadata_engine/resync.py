@@ -27,14 +27,17 @@ from metadata_engine.db_handler import MappingDatabaseEngine
 def main() -> int:
     engine = MappingDatabaseEngine()
     try:
-        asyncio.run(engine.sync_database_async(force=True))
-    except Exception as e:  # non-zero exit for `docker exec` callers
+        outcome = asyncio.run(engine.sync_database_async(force=True))
+    except Exception as e:
         print(f"[resync] Forced resync failed: {e}", file=sys.stderr)
         return 1
     finally:
         # Stop the pool's worker threads so this short-lived process exits
         # promptly instead of lingering.
         close_pool()
+    if outcome != "synced":
+        print(f"[resync] Forced resync did not complete: {outcome}", file=sys.stderr)
+        return 1
     print("[resync] Forced resync complete.")
     return 0
 

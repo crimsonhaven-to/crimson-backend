@@ -113,16 +113,16 @@ class TelemetryStore:
 
         out: List[dict] = []
         for r in rows:
-            ok = int(r[1] or 0)
-            fail = int(r[2] or 0)
+            ok = int(r["ok"] or 0)
+            fail = int(r["fail"] or 0)
             total = ok + fail
             out.append({
-                "source": r[0],
+                "source": r["source"],
                 "ok": ok,
                 "fail": fail,
                 "total": total,
                 "success_rate": round(ok / total, 4) if total else None,
-                "last_day": r[3].isoformat() if r[3] else None,
+                "last_day": r["last_day"].isoformat() if r["last_day"] else None,
             })
         return out
 

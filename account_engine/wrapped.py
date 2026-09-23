@@ -66,10 +66,8 @@ _EPISODE_SUFFIX = re.compile(r"(:s-?\d+)?(:e-?\d+)$")
 
 
 def _show_key(entry: dict) -> str:
-    """The title an entry belongs to, so twelve episodes are one show.
-
-    Keyed exactly like _dedup_by_show in account_engine.routes, which is what
-    Continue Watching already collapses on."""
+    """The title an entry belongs to, so twelve episodes are one show. TMDB
+    numbers movies and shows independently, so a movie gets its own prefix."""
     if entry["surface"] == "manga":
         return entry["item_key"]
     if entry.get("anilist_id") is not None:
@@ -77,7 +75,8 @@ def _show_key(entry: dict) -> str:
     if entry["surface"] == "local":
         return _EPISODE_SUFFIX.sub("", entry["item_key"])
     if entry.get("tmdb_id") is not None:
-        return f"tmdb:{entry['tmdb_id']}"
+        prefix = "movie" if entry["surface"] == "movie" else "tmdb"
+        return f"{prefix}:{entry['tmdb_id']}"
     return entry["item_key"]
 
 

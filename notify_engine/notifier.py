@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import logging
 
+import httpx
+
 from account_engine import mailer
 from core.config import Config
-from core.http_client import http_client
 
 from .db import store
 from .schedule import fetch_window
@@ -43,8 +44,11 @@ MAX_PER_RUN = 200
 
 
 async def refresh_schedule() -> int:
-    """Pull the airing window from AniList into ``airing_schedule``."""
-    async with http_client() as client:
+    """Pull the airing window from AniList into ``airing_schedule``.
+
+    Runs on a fresh event loop in a scheduler thread, so it cannot borrow the
+    shared client, which is bound to the main loop."""
+    async with httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT) as client:
         rows = await fetch_window(client, LOOKBACK_HOURS, HORIZON_DAYS)
     if not rows:
         logger.warning("Airing refresh returned nothing; keeping the previous window")

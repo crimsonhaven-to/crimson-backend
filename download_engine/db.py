@@ -23,9 +23,8 @@ from the shared pool (db_pool), driven from api.py's async handlers via
 
 The DB row is the queue (like the video cache): a route on any replica writes a
 ``pending`` row, and only the dedicated download-worker (RUN_DOWNLOAD_WORKER)
-submits it to aria2 and polls it — so a download survives an api redeploy, and
-``begin_submit`` is the cross-worker claim that stops two workers double-adding
-the same job.
+submits it to aria2 and polls it, so a download survives an api redeploy. Run
+exactly one download-worker: nothing stops two of them submitting the same row.
 """
 
 from __future__ import annotations
@@ -191,20 +190,6 @@ class DownloadStore:
                 """,
                 (kind, source_url, name, STATUS_PENDING, created_by, now, now),
             ).fetchone()
-
-    def begin_submit(self, job_id: int) -> bool:
-        """Atomically claim a ``pending`` row so exactly one worker submits it. Leaves
-        it ``pending`` (still) but stamps ``updated_at`` — the caller flips it to
-        ``active`` via :meth:`mark_active` once aria2 has accepted it. Returns True if
-        THIS caller won the row. Cross-worker/replica claim point (mirrors the video
-        cache's ``begin_download``)."""
-        with get_connection() as conn:
-            row = conn.execute(
-                "UPDATE download_jobs SET updated_at = %s "
-                "WHERE id = %s AND status = %s RETURNING id",
-                (_now_iso(), job_id, STATUS_PENDING),
-            ).fetchone()
-        return row is not None
 
     def mark_active(
         self,

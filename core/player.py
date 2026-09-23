@@ -18,8 +18,9 @@ PLAYER_COLOR_DEFAULT = "C20000"  # Crimson red, matching the other sources.
 
 
 def is_safe_src(src: str) -> bool:
-    """Only same-origin relative stream paths, e.g. "/jellyfin_proxy/..".."""
-    return bool(src) and src.startswith("/") and not src.startswith("//")
+    """Only same-origin relative paths, e.g. "/jellyfin_proxy/...". Browsers read
+    a backslash as a slash, so "/\\host" is as protocol-relative as "//host"."""
+    return bool(src) and src.startswith("/") and src[1:2] not in ("/", "\\")
 
 
 _TEMPLATE = Template(

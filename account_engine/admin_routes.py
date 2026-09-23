@@ -11,6 +11,7 @@ import. Mapping stats are read straight from the shared pool.
 """
 
 import asyncio
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -23,6 +24,7 @@ from core.config import Config
 from core.db_pool import get_connection
 from core import prom_query
 from core.rate_limit import limiter
+from core.background import spawn
 from metadata_engine import maintenance as metadata_maintenance
 from local_engine.db import LocalSourceStore
 from local_engine.fs import inspect_path, discover_mountpoints
@@ -44,6 +46,7 @@ from . import audit, mailer
 from .db import AccountStore
 from .routes import require_user
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 store = AccountStore()
 local_store = LocalSourceStore()
@@ -149,37 +152,28 @@ async def _run_resync(triggered_by: str) -> None:
 
 # --- content (mapping) stats ----------------------------------------------
 def _mapping_stats() -> dict:
-    """Row counts and last-sync metadata from the mapping tables. Each lookup is
-    guarded so a missing table on a fresh DB yields null rather than a 500."""
-    out: dict = {}
-    with get_connection() as conn:
-        def count(table: str):
-            try:
-                return conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
-            except Exception:
-                return None
-
-        out["anime_entries"] = count("anime_entries")
-        out["tmdb_seasons"] = count("tmdb_seasons")
-        out["tmdb_extras"] = count("tmdb_extras")
-        out["tmdb_shows"] = count("tmdb_shows")
-        out["tmdb_movies"] = count("tmdb_movies")
-        out["api_cache"] = count("api_cache")
-        try:
-            row = conn.execute(
-                "SELECT value FROM sync_meta WHERE key = 'etag'"
-            ).fetchone()
-            out["mapping_etag"] = row["value"] if row else None
-        except Exception:
-            out["mapping_etag"] = None
-        try:
-            row = conn.execute(
-                "SELECT MAX(last_synced) AS m FROM anime_entries"
-            ).fetchone()
-            out["last_synced"] = row["m"] if row else None
-        except Exception:
-            out["last_synced"] = None
-    return out
+    """Row counts and last-sync metadata from the mapping tables, all null if the
+    schema is not there yet."""
+    try:
+        with get_connection() as conn:
+            return dict(conn.execute(
+                """
+                SELECT (SELECT COUNT(*) FROM anime_entries) AS anime_entries,
+                       (SELECT COUNT(*) FROM tmdb_seasons)  AS tmdb_seasons,
+                       (SELECT COUNT(*) FROM tmdb_extras)   AS tmdb_extras,
+                       (SELECT COUNT(*) FROM tmdb_shows)    AS tmdb_shows,
+                       (SELECT COUNT(*) FROM tmdb_movies)   AS tmdb_movies,
+                       (SELECT COUNT(*) FROM api_cache)     AS api_cache,
+                       (SELECT value FROM sync_meta WHERE key = 'etag') AS mapping_etag,
+                       (SELECT MAX(last_synced) FROM anime_entries) AS last_synced
+                """
+            ).fetchone())
+    except Exception as e:
+        logger.error(f"Mapping stats failed: {e}")
+        return dict.fromkeys(
+            ("anime_entries", "tmdb_seasons", "tmdb_extras", "tmdb_shows",
+             "tmdb_movies", "api_cache", "mapping_etag", "last_synced")
+        )
 
 
 # --- stats / health --------------------------------------------------------
@@ -458,7 +452,7 @@ async def send_broadcast_email(request: Request, body: BroadcastEmail, user: dic
         subject=body.subject.strip(), total=len(recipients), sent=0, failed=0,
         triggered_by=triggered_by,
     )
-    asyncio.create_task(_run_broadcast(recipients, body.subject.strip(), body.message))
+    spawn(_run_broadcast(recipients, body.subject.strip(), body.message))
     return {
         "success": True,
         "message": f"Sending to {len(recipients)} recipient{'s' if len(recipients) != 1 else ''}",
@@ -564,7 +558,7 @@ async def trigger_resync(user: dict = Depends(require_admin)):
     if _resync_state["running"]:
         return {"success": False, "message": "A resync is already running", "resync": _resync_state}
     triggered_by = f"admin:{user.get('email') or user['user_id']}"
-    asyncio.create_task(_run_resync(triggered_by))
+    spawn(_run_resync(triggered_by))
     return {"success": True, "message": "Resync started", "resync": _resync_state}
 
 
