@@ -1,6 +1,10 @@
 #   push to `main`  build :dev-<sha> and roll the crimson-dev stack
 #   v* tag          build :<tag> + :latest, roll prod, build and roll the
 #                   sourceless demo stack
+#
+# Deploys only run deploy.sh on the manager. The stack files there
+# (~/crimson-deploy, ~/dev-crimson-deploy, ~/demo-crimson-deploy) are edited in
+# place; the ones in this repo are references and never shipped.
 
 stages:
   - security
@@ -125,14 +129,8 @@ deploy:
     name: production
     url: https://crimsonhaven.to
   script:
-    # Checked out at the release tag, so this ships the release's own stack file.
-    - echo "Ship stack file to the manager"
-    - scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new docker-stack.yml "${SWARM_MANAGER}:/home/raymond/crimson-deploy/docker-stack.yml"
-    - echo "Deploy to the swarm"
     - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/crimson-deploy/deploy.sh '${VERSION}'"
 
-# Ships no stack file: the dev stack (with its own Postgres) lives only on the
-# manager in ~/dev-crimson-deploy/.
 deploy-dev:
   extends: .main_push
   stage: deploy
@@ -173,7 +171,6 @@ build-demo:
     reports:
       dotenv: demo.env
 
-# Like deploy-dev, ships no stack file.
 deploy-demo:
   extends: .release
   stage: deploy
