@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from account_engine.routes import require_user
+from account_engine.deps import require_user
 
 from .db import store
 

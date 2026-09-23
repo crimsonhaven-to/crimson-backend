@@ -59,7 +59,7 @@ def _point_roots_at(monkeypatch, root, *, encoding):
     """Make the Local store report exactly one enabled root, with the given
     encoding flag, without a DB."""
     monkeypatch.setattr(
-        fs._store, "enabled_roots_config",
+        fs.store, "enabled_roots_config",
         lambda: [{"path": str(root), "encoding": encoding}],
     )
 

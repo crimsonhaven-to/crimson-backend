@@ -24,7 +24,7 @@ import logging
 import os
 from typing import List, Optional
 
-from .db import LocalSourceStore
+from .db import store
 from functools import cache
 from core import signing
 
@@ -86,14 +86,13 @@ _ART_MEDIA_TYPES = {
     ".bmp": "image/bmp",
 }
 
-_store = LocalSourceStore()
 
 
 
 # --- config -----------------------------------------------------------------
 def is_configured() -> bool:
     """True when at least one local source is enabled (gates scraper/resolver)."""
-    return bool(_store.enabled_roots())
+    return bool(store.enabled_roots())
 
 
 # --- token <-> path ---------------------------------------------------------
@@ -134,7 +133,7 @@ def download_roots_config() -> List[dict]:
     """Enabled source roots the downloader may write into (``download_enabled``), in
     the order it should try them for free space. Thin pass-through to the store so the
     download engine doesn't import the DB layer directly (mirrors ``enabled_roots``)."""
-    return _store.download_roots_config()
+    return store.download_roots_config()
 
 
 def is_within_enabled_root(real_path: str) -> Optional[str]:
@@ -142,7 +141,7 @@ def is_within_enabled_root(real_path: str) -> Optional[str]:
     or None. Public wrapper over the private ``_within`` traversal check so the
     download engine can verify a computed destination stays inside a registered root
     before writing to it — the same containment guarantee playback relies on."""
-    for root in _store.enabled_roots():
+    for root in store.enabled_roots():
         if _within(real_path, root):
             return root
     return None
@@ -152,7 +151,7 @@ def source_label_for(real_path: str) -> Optional[str]:
     """Human label of the enabled source root that contains ``real_path`` (already
     resolved), or None. Lets the library surface which registered source a title
     came from without a second DB read."""
-    for root in _store.enabled_roots_config():
+    for root in store.enabled_roots_config():
         if _within(real_path, root["path"]):
             return root.get("label")
     return None
@@ -162,7 +161,7 @@ def _encoding_root_for(real_path: str) -> Optional[dict]:
     """The enabled source root that contains ``real_path`` (already fully resolved),
     or None. Returns the whole config entry so callers can read its ``encoding`` flag
     without a second lookup."""
-    for root in _store.enabled_roots_config():
+    for root in store.enabled_roots_config():
         if _within(real_path, root["path"]):
             return root
     return None
@@ -209,7 +208,7 @@ def safe_resolve(token: str) -> Optional[str]:
     real = os.path.realpath(raw)
     if not os.path.isfile(real) or not is_web_playable_path(real):
         return None
-    for root in _store.enabled_roots():
+    for root in store.enabled_roots():
         if _within(real, root):
             return real
     return None
@@ -243,7 +242,7 @@ def safe_resolve_dir(token: str) -> Optional[str]:
     real = os.path.realpath(raw)
     if not os.path.isdir(real):
         return None
-    for root in _store.enabled_roots():
+    for root in store.enabled_roots():
         if _within(real, root):
             return real
     return None
@@ -285,7 +284,7 @@ def safe_resolve_art(token: str, sig: str) -> Optional[str]:
     real = os.path.realpath(raw)
     if not os.path.isfile(real) or not is_art_path(real):
         return None
-    for root in _store.enabled_roots():
+    for root in store.enabled_roots():
         if _within(real, root):
             return real
     return None

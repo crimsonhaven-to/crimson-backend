@@ -46,7 +46,7 @@ import subprocess
 from typing import Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
-from . import fs
+from .db import store
 from .fs import (
     ART_EXTENSIONS,
     art_proxy_url,
@@ -59,10 +59,6 @@ from .fs import (
 
 logger = logging.getLogger("local_engine.library")
 
-# Reuse the fs-level store instance so a single monkeypatch of its enabled-roots
-# config (tests) — and the shared process-wide cache — covers scan + playability +
-# labels alike.
-_store = fs._store
 
 # Bounds so registering a huge NAS can never hang a scan / a single title's walk.
 _MAX_TITLES = 4000            # total titles across all roots
@@ -661,7 +657,7 @@ def scan_library() -> List[Dict]:
     items: List[Dict] = []
     embed_budget = [_EMBED_PROBE_BUDGET]
     seen_ids: set = set()
-    for root in _store.enabled_roots():
+    for root in store.enabled_roots():
         if not os.path.isdir(root):
             continue
         if not _scan_dir(root, items, seen_ids, embed_budget, depth=0):
@@ -777,7 +773,7 @@ def browse_dir(token: Optional[str] = None) -> Optional[Dict]:
     # Root level: list each enabled source root as a folder.
     if not token:
         entries: List[Dict] = []
-        for r in _store.enabled_roots_config():
+        for r in store.enabled_roots_config():
             path = r["path"]
             if not os.path.isdir(path):
                 continue
@@ -831,7 +827,7 @@ def browse_dir(token: Optional[str] = None) -> Optional[Dict]:
 
     # Parent token for "up" navigation: None when this dir is itself a source root
     # (up goes to the synthetic root list), else the parent directory's token.
-    roots_real = {os.path.realpath(r) for r in _store.enabled_roots()}
+    roots_real = {os.path.realpath(r) for r in store.enabled_roots()}
     parent = None if os.path.realpath(real_dir) in roots_real else encode_token(
         os.path.realpath(os.path.dirname(real_dir))
     )

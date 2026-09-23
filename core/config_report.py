@@ -37,16 +37,6 @@ def _proxy_secret_state(s: Settings) -> Optional[bool]:
     return True if s.proxy_secret else None
 
 
-def _prometheus_state(s: Settings) -> Optional[bool]:
-    """Whether the optional prometheus-client dependency is in this build.
-    Imported lazily so diagnostics never drag metrics into an import cycle."""
-    try:
-        from core.observability import PROMETHEUS_AVAILABLE
-        return PROMETHEUS_AVAILABLE
-    except Exception:
-        return False
-
-
 def _airing_notify_state(s: Settings) -> Optional[bool]:
     """Off, on, or on-but-not-actually-delivering.
 
@@ -106,10 +96,6 @@ FEATURES: List[Feature] = [
             "set SIGNUP_INVITE_CODE for a reusable invite (bot mints single-use)"),
     Feature("Admin seed", lambda s: bool(s.admin_emails),
             "set ADMIN_EMAILS (comma-separated) to seed the first admin"),
-    # An optional import, so this reports a property of the build rather than the
-    # environment: the only place a stripped image announces /metrics will 503.
-    Feature("Prometheus metrics support", _prometheus_state,
-            "prometheus-client is not installed in this build; /metrics answers 503"),
     Feature("Metrics scrape token", lambda s: bool(s.metrics_token),
             "set METRICS_TOKEN for a Prometheus scrape; without it /metrics is "
             "reachable only with an admin session"),

@@ -2,11 +2,10 @@
 Watch-progress dedup keys (_progress_item_key) — the `local:` namespace added for
 on-disk media, and proof the existing tv/anime/movie/manga keys are unchanged.
 
-Pure function; importing account_engine.routes needs no live DB (same as the app
-import in test_contracts).
+A pure function, so no database is needed.
 """
 
-from account_engine.routes import _progress_item_key
+from account_engine.library import progress_item_key as _progress_item_key
 
 
 def test_local_movie_key_is_one_row_per_title():

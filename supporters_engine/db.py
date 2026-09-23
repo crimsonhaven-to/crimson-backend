@@ -30,14 +30,10 @@ and so never reaches the public page. Only events the supporter marked public
 (``is_public``) are aggregated into the list at all.
 """
 
-from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from core.db_pool import get_connection, lock_schema_init
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from core.clock import utc_now_iso
 
 
 def _supporter_key(email: Optional[str], from_name: Optional[str],
@@ -101,7 +97,7 @@ class SupporterStore:
         if not transaction_id:
             # Without an id we can't dedup; synthesize one from the timestamp so the
             # row still lands rather than being dropped.
-            transaction_id = "ts:" + (event.get("timestamp") or _now_iso())
+            transaction_id = "ts:" + (event.get("timestamp") or utc_now_iso())
 
         email = event.get("email")
         from_name = event.get("from_name")
@@ -122,7 +118,7 @@ class SupporterStore:
             "tier_name": event.get("tier_name"),
             "email": email,
             "kofi_timestamp": event.get("timestamp"),
-            "received_at": _now_iso(),
+            "received_at": utc_now_iso(),
         }
 
         with get_connection() as conn:
@@ -195,3 +191,6 @@ def _parse_amount(raw) -> Optional[float]:
         return float(str(raw).replace(",", "").strip())
     except (TypeError, ValueError):
         return None
+
+
+store = SupporterStore()

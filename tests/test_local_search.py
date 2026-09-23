@@ -14,8 +14,9 @@ No database and no network, as everywhere else in this suite.
 
 import pytest
 
-import web.queries as queries
-import web.routes.discovery as discovery
+import metadata_engine.catalogue as queries
+import metadata_engine.discovery_routes as discovery
+import metadata_engine.search as search
 from core.config import get_settings
 
 
@@ -39,7 +40,8 @@ class _FakeConn:
     def __init__(self, rows):
         self.cursor_obj = _FakeCursor(rows)
 
-    def cursor(self):
+    def execute(self, sql, params=None):
+        self.cursor_obj.execute(sql, params)
         return self.cursor_obj
 
     def __enter__(self):
@@ -51,7 +53,7 @@ class _FakeConn:
 
 def _with_rows(monkeypatch, rows):
     conn = _FakeConn(rows)
-    monkeypatch.setattr(queries, "get_db_connection", lambda: conn)
+    monkeypatch.setattr(queries, "get_connection", lambda: conn)
     return conn
 
 
@@ -99,7 +101,7 @@ def test_a_wildcard_query_is_bound_as_a_literal(monkeypatch):
 
 def test_a_blank_query_never_reaches_the_database(monkeypatch):
     called = []
-    monkeypatch.setattr(queries, "get_db_connection", lambda: called.append(1))
+    monkeypatch.setattr(queries, "get_connection", lambda: called.append(1))
     assert queries.search_anime_entries("   ") == []
     assert queries.search_anime_entries("") == []
     assert called == []
@@ -196,7 +198,7 @@ def test_a_database_error_degrades_to_no_results(monkeypatch):
     must not take the search bar down."""
     def _boom():
         raise RuntimeError("connection refused")
-    monkeypatch.setattr(queries, "get_db_connection", _boom)
+    monkeypatch.setattr(queries, "get_connection", _boom)
     assert queries.search_anime_entries("one piece") == []
 
 
@@ -220,9 +222,9 @@ def _wire(monkeypatch, local, remote):
         calls["remote"] += 1
         return list(remote)
 
-    monkeypatch.setattr(discovery, "search_anime_entries", _local)
-    monkeypatch.setattr(discovery, "fetch_tmdb_search_results", _remote)
-    monkeypatch.setattr(discovery, "http_client", lambda *a, **k: _FakeHTTPClient())
+    monkeypatch.setattr(search, "search_anime_entries", _local)
+    monkeypatch.setattr(search, "fetch_tmdb_search_results", _remote)
+    monkeypatch.setattr(search, "http_client", lambda *a, **k: _FakeHTTPClient())
     return calls
 
 

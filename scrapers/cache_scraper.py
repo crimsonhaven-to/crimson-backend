@@ -19,12 +19,11 @@ import asyncio
 import os
 from typing import List, Optional
 
-from cache_engine.db import CacheStore
+from cache_engine.db import store
 from cache_engine.fs import EMBED_MARKER, encode_token, is_configured
 
 from .base_scraper import BaseAnimeScraper
 
-_store = CacheStore()
 
 
 class CacheScraper(BaseAnimeScraper):
@@ -62,7 +61,7 @@ class CacheScraper(BaseAnimeScraper):
             season_num, episode_num = 0, 0
 
         rows = await asyncio.to_thread(
-            _store.ready_for_episode, tmdb_id, season_num, episode_num, media_type
+            store.ready_for_episode, tmdb_id, season_num, episode_num, media_type
         )
         embeds: List[dict] = []
         for row in rows:

@@ -24,24 +24,16 @@ DELETEs the mapping tables, so these rows are never touched by a sync.
 
 import hashlib
 import secrets
-from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from core.db_pool import get_connection, lock_schema_init
+from core.clock import utc_now_iso
 
 # Raw keys look like ``crimson_mw_<43 url-safe chars>``. The scheme prefix makes
 # a leaked key obvious in logs/secret-scanners and namespaces it away from
 # session tokens; the body is 32 random bytes (token_urlsafe(32)).
 KEY_SCHEME = "crimson_mw_"
 _PREFIX_LEN = len(KEY_SCHEME) + 6  # what we keep for display, e.g. crimson_mw_AbC1de
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    return dt.isoformat()
 
 
 def _hash_key(raw: str) -> str:
@@ -107,7 +99,7 @@ class ApiKeyStore:
         ONLY time the secret is available — store only its hash."""
         raw = KEY_SCHEME + secrets.token_urlsafe(32)
         prefix = raw[:_PREFIX_LEN]
-        now = _iso(_now())
+        now = utc_now_iso()
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -145,7 +137,7 @@ class ApiKeyStore:
             cur = conn.execute(
                 "UPDATE api_keys SET revoked_at = %s"
                 " WHERE key_hash = %s AND revoked_at IS NULL",
-                (_iso(_now()), key_hash),
+                (utc_now_iso(), key_hash),
             )
             return cur.rowcount > 0
 
@@ -160,6 +152,9 @@ class ApiKeyStore:
             cur = conn.execute(
                 "UPDATE api_keys SET last_used_at = %s"
                 " WHERE key_hash = %s AND revoked_at IS NULL",
-                (_iso(_now()), _hash_key(raw_key)),
+                (utc_now_iso(), _hash_key(raw_key)),
             )
             return cur.rowcount > 0
+
+
+store = ApiKeyStore()

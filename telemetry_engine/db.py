@@ -132,3 +132,6 @@ class TelemetryStore:
         with get_connection() as conn:
             cur = conn.execute("DELETE FROM resolve_telemetry WHERE day < %s", (cutoff,))
             return cur.rowcount or 0
+
+
+store = TelemetryStore()

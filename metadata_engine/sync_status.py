@@ -9,8 +9,8 @@ loop, so every access takes the lock. Nothing here touches the DB or network.
 """
 
 import threading
-from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from core.clock import utc_now_iso
 
 # phases:
 #   disabled     RUN_DB_SYNC is off on this replica, so it never syncs
@@ -27,10 +27,6 @@ _state: Dict[str, Any] = {
 }
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def set_phase(
     phase: str,
     detail: Optional[str] = None,
@@ -43,10 +39,10 @@ def set_phase(
         _state["phase"] = phase
         _state["detail"] = detail
         if started:
-            _state["started_at"] = _now()
+            _state["started_at"] = utc_now_iso()
             _state["finished_at"] = None
         if finished:
-            _state["finished_at"] = _now()
+            _state["finished_at"] = utc_now_iso()
 
 
 def snapshot() -> Dict[str, Any]:

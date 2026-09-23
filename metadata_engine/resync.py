@@ -21,11 +21,10 @@ import asyncio
 import sys
 
 from core.db_pool import close_pool
-from metadata_engine.db_handler import MappingDatabaseEngine
+from metadata_engine.mapping_sync import engine
 
 
 def main() -> int:
-    engine = MappingDatabaseEngine()
     try:
         outcome = asyncio.run(engine.sync_database_async(force=True))
     except Exception as e:

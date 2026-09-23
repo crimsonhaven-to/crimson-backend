@@ -1,21 +1,8 @@
-"""
-What an account holder can see and do about their own account's security.
+"""The caller's own sessions, security events, data export and deletion.
 
-The backend has kept a full security ledger and a session table since the
-beginning and showed the user none of it: ``/security/events`` and
-``/users/{id}/revoke-sessions`` are admin-only (see admin_routes). This module is
-the same information, narrowed to the caller:
-
-    GET    /account/sessions            where you are signed in
-    DELETE /account/sessions/{id}       sign out one device
-    DELETE /account/sessions            sign out everywhere else
-    GET    /account/security-events     what has happened to your account
-    GET    /account/export              every row this account owns
-    DELETE /account                     delete it, for real
-
-Two rules run through all of it. A session is addressed by a one-way derived id,
-never by ``token_hash`` (account_engine.db explains why). Events are filtered on
-``user_id`` alone and carry neither ``detail`` nor ``identity``.
+A session is addressed by a one-way derived id, never by ``token_hash``
+(account_engine.db explains why). Events are filtered on ``user_id`` alone and
+carry neither ``detail`` nor ``identity``.
 """
 
 import json
@@ -23,15 +10,18 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import audit, passwords
-from .routes import require_user, store, _verify_signed_challenge
 from core.config import get_settings
 from core.rate_limit import limiter
+from notify_engine.db import store as airing_store
+
+from . import audit, auth
+from .db import store
+from .deps import bearer_token, require_user
+from .schemas import DeleteAccountRequest
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +30,6 @@ router = APIRouter(tags=["account-security"])
 # Enough to cover "what happened while I was away" without paging a table that
 # has no per-user cursor.
 _EVENT_LIMIT = 100
-
-
-def bearer_token(authorization: Optional[str] = Header(None)) -> Optional[str]:
-    """The caller's raw session token, for the two places that must know which
-    session is theirs. Returns None rather than raising: ``require_user`` runs
-    alongside it and owns rejecting an absent or bad token."""
-    if not authorization or not authorization.lower().startswith("bearer "):
-        return None
-    return authorization.split(" ", 1)[1].strip()
 
 
 # --- sessions ---------------------------------------------------------------
@@ -129,10 +110,6 @@ _ACCOUNT_SECRETS = ("password_hash", "is_admin")
 
 def _collect_export(user_id: int) -> dict:
     account = store.get_account(user_id) or {}
-    # Imported here rather than at module scope: notify_engine imports this
-    # package's routes for require_user, so a top-level import closes the cycle.
-    from notify_engine.db import store as airing_store
-
     return {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "account": {k: v for k, v in account.items() if k not in _ACCOUNT_SECRETS},
@@ -163,48 +140,6 @@ async def export_account(request: Request, user: dict = Depends(require_user)):
 
 
 # --- deletion ---------------------------------------------------------------
-class DeleteAccountRequest(BaseModel):
-    """Proof that the person asking is the account holder, not a stolen token.
-
-    An email account confirms with its password. A mnemonic account signs a
-    one-time challenge, exactly as it does to log in, so nothing new has to be
-    invented for an identity that has no password to re-enter."""
-    password: Optional[str] = Field(None, max_length=passwords.MAX_PASSWORD_LENGTH)
-    challenge: Optional[str] = None
-    signature: Optional[str] = None
-
-
-def _confirm_owner(user: dict, body: DeleteAccountRequest, request: Request) -> None:
-    """Re-prove ownership, or raise. A bearer token alone is not enough here: it
-    is the one credential an attacker can hold without being the owner, and this
-    is the one action that cannot be undone."""
-    stored_hash = user.get("password_hash")
-    if stored_hash:
-        if not body.password or not passwords.verify_password(body.password, stored_hash):
-            audit.log_event(
-                "account_delete_failed", outcome="failure", request=request,
-                user_id=user["user_id"], detail={"reason": "bad_password"},
-            )
-            raise HTTPException(status_code=401, detail="Password is incorrect")
-        return
-
-    public_key = user.get("public_key")
-    if not public_key:
-        raise HTTPException(
-            status_code=400,
-            detail="This account has no password or key to confirm with; contact an admin",
-        )
-    if not body.challenge or not body.signature:
-        raise HTTPException(
-            status_code=400,
-            detail="Sign a challenge from /auth/challenge to confirm deletion",
-        )
-    # Raises 401 on any failure and records it, the same as a failed login.
-    _verify_signed_challenge(
-        public_key, body.challenge, body.signature, request, "delete_account"
-    )
-
-
 @router.delete("/account")
 # Bounded, but with room for a mistyped password: the confirmation is the real
 # gate, and a limit so tight that two typos lock the account holder out of a
@@ -221,7 +156,7 @@ async def delete_account(
     ``security_events.user_id`` has no foreign key precisely so the trail
     survives the account it describes (see audit.init_db). Favorites, progress
     and sessions do cascade, which is also correct."""
-    await run_in_threadpool(_confirm_owner, user, body, request)
+    await run_in_threadpool(auth.confirm_owner, user, body, request)
     await run_in_threadpool(
         audit.log_event, "account_deleted", outcome="success", request=request,
         user_id=user["user_id"],

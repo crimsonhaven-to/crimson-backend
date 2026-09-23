@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlparse
 
 from starlette.concurrency import run_in_threadpool
 
-from .db import CacheStore
+from .db import store
 from . import fs, ticket
 from core.config import get_settings
 
@@ -121,7 +121,7 @@ def _to_internal(url: str) -> str:
 
 class DownloadManager:
     def __init__(self) -> None:
-        self._store = CacheStore()
+        self.store = store
         self._queue: Optional[asyncio.Queue] = None
         self._workers: list[asyncio.Task] = []
         self._poller: Optional[asyncio.Task] = None
@@ -146,7 +146,7 @@ class DownloadManager:
         # Requeue any download a previous worker was interrupted mid-remux on (deploy
         # that outran stop_grace_period, crash) — downloading -> pending, retried.
         try:
-            n = await run_in_threadpool(self._store.reset_stale_jobs)
+            n = await run_in_threadpool(self.store.reset_stale_jobs)
             if n:
                 logger.info(f"Requeued {n} interrupted download(s) from a previous worker")
         except Exception as e:
@@ -195,7 +195,7 @@ class DownloadManager:
         }
 
     # ------------------------------------------------------------------ gate
-    async def _cacheable(self, stream: dict) -> bool:
+    async def cacheable(self, stream: dict) -> bool:
         """Shared cacheability gate: caching is on, ffmpeg is present, and the stream
         is a media URL the backend can pull back over its OWN loopback proxy. Used
         both by the ticket stamp (watch path) and the row claim (confirm/warmup path)
@@ -212,7 +212,7 @@ class DownloadManager:
         the 429 / wrong-ASN / edge-rate-limit cache failures. So caching is now
         gated *positively* on the same-origin proxy shape rather than blocklisting
         the two offload shapes we happened to know about."""
-        if not await run_in_threadpool(self._store.get_enabled):
+        if not await run_in_threadpool(self.store.get_enabled):
             return False
         url = (stream.get("url") or "")
         if any(frag in url for frag in _SKIP_URL_FRAGMENTS):
@@ -251,7 +251,7 @@ class DownloadManager:
         cache key is namespaced by media_type (see CacheStore / fs.plan_rel_path) —
         a cached movie can't collide with a same-id show."""
         try:
-            if not await self._cacheable(stream):
+            if not await self.cacheable(stream):
                 return None
             return ticket.mint(
                 url=(stream.get("url") or ""),
@@ -312,14 +312,14 @@ class DownloadManager:
         confirm path. The actual ffmpeg download happens out-of-process in the
         cache-worker service (see :meth:`start_worker` / :meth:`_poll`)."""
         try:
-            if not await self._cacheable(stream):
+            if not await self.cacheable(stream):
                 return
 
             target = await run_in_threadpool(fs.pick_write_target, get_settings().cache_min_free_bytes)
             if not target:
                 return
 
-            # _cacheable() already vetted this is a tappable media URL (non-None).
+            # cacheable() already vetted this is a tappable media URL (non-None).
             # Store the absolute (public-origin) URL; the worker rewrites it onto
             # loopback at download time via _to_internal.
             media_url = _media_url_for_stream(stream)
@@ -333,7 +333,7 @@ class DownloadManager:
             # the unique constraint dedupes across replicas, so this is safe to call
             # from every api replica that handles the /cache/confirm.
             await run_in_threadpool(
-                self._store.claim_download,
+                self.store.claim_download,
                 tmdb_id=tmdb_id,
                 media_type=media_type,
                 season_number=season_number,
@@ -366,14 +366,14 @@ class DownloadManager:
 
     async def _enqueue_pending(self) -> None:
         assert self._queue is not None
-        if not await run_in_threadpool(self._store.get_enabled):
+        if not await run_in_threadpool(self.store.get_enabled):
             return
         # Only pull as many as we have free ffmpeg slots, so the in-process queue
         # stays tiny and pending work keeps surviving in the DB until a slot frees.
         available = get_settings().cache_max_concurrent - len(self._inflight)
         if available <= 0:
             return
-        rows = await run_in_threadpool(self._store.fetch_pending, available)
+        rows = await run_in_threadpool(self.store.fetch_pending, available)
         for row in rows:
             entry_id = row["id"]
             if entry_id in self._inflight:
@@ -381,12 +381,12 @@ class DownloadManager:
             job = self._row_to_job(row)
             if not job:
                 await run_in_threadpool(
-                    self._store.mark_failed, entry_id, "uncacheable row (no media_url)"
+                    self.store.mark_failed, entry_id, "uncacheable row (no media_url)"
                 )
                 continue
             # Atomically claim pending -> downloading; lose the race (another slot or
             # replica grabbed it first) -> skip it.
-            if not await run_in_threadpool(self._store.begin_download, entry_id):
+            if not await run_in_threadpool(self.store.begin_download, entry_id):
                 continue
             self._inflight.add(entry_id)
             try:
@@ -394,7 +394,7 @@ class DownloadManager:
             except asyncio.QueueFull:
                 # We only ever fetch `available` <= free slots, so this is defensive.
                 self._inflight.discard(entry_id)
-                await run_in_threadpool(self._store.mark_failed, entry_id, "cache queue full")
+                await run_in_threadpool(self.store.mark_failed, entry_id, "cache queue full")
                 return
 
     @staticmethod
@@ -435,7 +435,7 @@ class DownloadManager:
             except Exception as e:
                 logger.error(f"Cache download crashed for {job['label']}: {e}")
                 try:
-                    await run_in_threadpool(self._store.mark_failed, entry_id, str(e))
+                    await run_in_threadpool(self.store.mark_failed, entry_id, str(e))
                 except Exception:
                     pass
             finally:
@@ -458,19 +458,19 @@ class DownloadManager:
         if rc != 0:
             await run_in_threadpool(_unlink_quiet, part_path)
             msg = f"ffmpeg exit {rc}: {stderr_tail}" if stderr_tail else f"ffmpeg exit {rc}"
-            await run_in_threadpool(self._store.mark_failed, entry_id, msg)
+            await run_in_threadpool(self.store.mark_failed, entry_id, msg)
             logger.warning(f"[cache] failed {job['label']}: {msg}")
             return
 
         size = await run_in_threadpool(_size_or_zero, part_path)
         if size <= 0:
             await run_in_threadpool(_unlink_quiet, part_path)
-            await run_in_threadpool(self._store.mark_failed, entry_id, "empty output")
+            await run_in_threadpool(self.store.mark_failed, entry_id, "empty output")
             logger.warning(f"[cache] failed {job['label']}: empty output")
             return
 
         await run_in_threadpool(os.replace, part_path, abs_path)  # atomic publish
-        await run_in_threadpool(self._store.mark_ready, entry_id, size)
+        await run_in_threadpool(self.store.mark_ready, entry_id, size)
         logger.info(f"[cache] ready {job['label']} ({size / 1_048_576:.1f} MiB) -> {abs_path}")
 
     async def _run_ffmpeg(self, media_url: str, out_path: str) -> tuple[int, str]:

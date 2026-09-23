@@ -15,7 +15,7 @@ def _point_roots_at(monkeypatch, root, *, label="Media", encoding=False):
     """Make the Local store report exactly one enabled root (no DB). library._store
     IS fs._store, so this single patch covers scan + playability + labels."""
     monkeypatch.setattr(
-        fs._store, "enabled_roots_config",
+        fs.store, "enabled_roots_config",
         lambda: [{"path": str(root), "encoding": encoding, "label": label}],
     )
 

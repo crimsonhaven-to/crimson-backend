@@ -28,10 +28,10 @@ from the shared pool (db_pool), driven from api.py's async handlers via
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
 from typing import List, Optional
 
 from core.db_pool import get_connection, lock_schema_init
+from core.clock import utc_now_iso
 
 _TARGET_COLS = "id, name, path, enabled, created_at"
 _EP_COLS = (
@@ -46,10 +46,6 @@ STATUS_DOWNLOADING = "downloading"
 STATUS_READY = "ready"
 STATUS_FAILED = "failed"
 _ACTIVE_STATES = (STATUS_PENDING, STATUS_DOWNLOADING, STATUS_READY)
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class CacheStore:
@@ -94,7 +90,7 @@ class CacheStore:
                 VALUES (1, FALSE, %s)
                 ON CONFLICT (id) DO NOTHING
                 """,
-                (_now_iso(),),
+                (utc_now_iso(),),
             )
             conn.execute(
                 """
@@ -197,7 +193,7 @@ class CacheStore:
                 VALUES (1, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at
                 """,
-                (enabled, _now_iso()),
+                (enabled, utc_now_iso()),
             )
         return enabled
 
@@ -241,7 +237,7 @@ class CacheStore:
                 VALUES (%s, %s, TRUE, %s)
                 RETURNING {_TARGET_COLS}
                 """,
-                (name, path, _now_iso()),
+                (name, path, utc_now_iso()),
             ).fetchone()
         self._bump()
         return row
@@ -381,7 +377,7 @@ class CacheStore:
 
         The caller does NOT download here; the dedicated cache-worker service polls
         for ``pending`` rows (see :meth:`fetch_pending` / :meth:`begin_download`)."""
-        now = _now_iso()
+        now = utc_now_iso()
         with get_connection() as conn:
             return conn.execute(
                 f"""
@@ -440,7 +436,7 @@ class CacheStore:
             row = conn.execute(
                 "UPDATE cached_episodes SET status = %s, updated_at = %s "
                 "WHERE id = %s AND status = %s RETURNING id",
-                (STATUS_DOWNLOADING, _now_iso(), entry_id, STATUS_PENDING),
+                (STATUS_DOWNLOADING, utc_now_iso(), entry_id, STATUS_PENDING),
             ).fetchone()
         return row is not None
 
@@ -448,14 +444,14 @@ class CacheStore:
         with get_connection() as conn:
             conn.execute(
                 "UPDATE cached_episodes SET status = %s, file_size = %s, error = NULL, updated_at = %s WHERE id = %s",
-                (STATUS_READY, file_size, _now_iso(), entry_id),
+                (STATUS_READY, file_size, utc_now_iso(), entry_id),
             )
 
     def mark_failed(self, entry_id: int, error: str) -> None:
         with get_connection() as conn:
             conn.execute(
                 "UPDATE cached_episodes SET status = %s, error = %s, updated_at = %s WHERE id = %s",
-                (STATUS_FAILED, (error or "")[:500], _now_iso(), entry_id),
+                (STATUS_FAILED, (error or "")[:500], utc_now_iso(), entry_id),
             )
 
     def delete_episode(self, entry_id: int) -> Optional[dict]:
@@ -486,7 +482,7 @@ class CacheStore:
                 WHERE status = %s
                 RETURNING id
                 """,
-                (STATUS_PENDING, _now_iso(), STATUS_DOWNLOADING),
+                (STATUS_PENDING, utc_now_iso(), STATUS_DOWNLOADING),
             ).fetchall()
         return len(rows)
 
@@ -495,3 +491,6 @@ class CacheStore:
     def _bump() -> None:
         CacheStore._targets_cache = None
         CacheStore._targets_cache_at = 0.0
+
+
+store = CacheStore()

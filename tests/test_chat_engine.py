@@ -110,17 +110,13 @@ def test_build_route_clamps_nonsense_season_and_episode():
     assert tools.build_route("anime", anilist_id=1, season=0, episode=-5) == "/watch/1/1/1"
 
 
-def test_item_key_matches_the_account_engine_scheme():
-    """The watchlist dedup key must match account_engine.routes._favorite_item_key.
-
-    They are separate implementations on purpose (that helper is private to the
-    routes module), so the shapes are asserted equal here instead.
-    """
-    from account_engine.routes import _favorite_item_key
-
-    assert tools._item_key("anime", 108465, None) == _favorite_item_key(None, 108465)
-    assert tools._item_key("movie", None, 1014505) == _favorite_item_key(1014505, None, "movie")
-    assert tools._item_key("show", None, 1399) == _favorite_item_key(1399, None)
+def test_item_key_uses_the_account_engine_scheme():
+    assert tools._item_key("anime", 108465, None) == "anilist:108465"
+    assert tools._item_key("movie", None, 1014505) == "movie:1014505"
+    assert tools._item_key("show", None, 1399) == "tmdb:1399"
+    # Only anime key by AniList id, so a stray id on a movie changes nothing.
+    assert tools._item_key("movie", 5, 1014505) == "movie:1014505"
+    assert tools._item_key("manga", 5, None) is None
 
 
 # --- tool schemas ----------------------------------------------------------

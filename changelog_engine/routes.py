@@ -1,35 +1,24 @@
-"""
-Changelog API — a public, read-only view of the project's GitHub Releases.
+"""The public /changelog, so a landing page can show release notes without a
+session."""
 
-``GET /changelog`` returns the cached release notes (newest first). It's public
-(listed in api.py's login-wall allowlist) so a landing/about page can show it
-without a session. The heavy lifting — fetching + caching from GitHub — lives in
-``changelog_engine.service`` (see there for configuration).
-"""
-
+import asyncio
 
 from fastapi import APIRouter, HTTPException
-from starlette.concurrency import run_in_threadpool
 
-from .service import ChangelogService
 from core.config import get_settings
 
+from .service import service
+
 router = APIRouter(tags=["changelog"])
-service = ChangelogService()
 
 
 @router.get("/changelog")
 async def get_changelog():
-    """Release notes for the haven, newest first.
-
-    Returns 503 until a ``GITHUB_TOKEN`` is configured (see the service module).
-    Each entry carries ``{tag, name, body (Markdown), published_at, url,
-    prerelease, author}``. ``stale: true`` means GitHub was unreachable on the last
-    refresh and these are the last-known notes (served rather than failing).
-    """
+    """Newest first; 503 until GITHUB_TOKEN is set. ``stale`` means GitHub was
+    unreachable on the last refresh and these are the last known notes."""
     if not service.configured():
         raise HTTPException(status_code=503, detail="Changelog is not configured")
-    data = await run_in_threadpool(service.get)
+    data = await asyncio.to_thread(service.get)
     return {
         "success": True,
         "repo": get_settings().github_repo,

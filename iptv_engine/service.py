@@ -509,3 +509,6 @@ async def proxy_fetch(url: str, referrer: str = "", user_agent: str = "",
             await client.aclose()
 
     return resp.status_code, content_type, forward, body_iter()
+
+
+service = IptvService()

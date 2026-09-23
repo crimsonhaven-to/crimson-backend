@@ -36,7 +36,7 @@ from starlette.concurrency import run_in_threadpool
 from . import aria2, fs
 from .aria2 import Aria2Error
 from .db import (
-    DownloadStore,
+    store,
     KIND_TORRENT,
     STATUS_ACTIVE,
     STATUS_PAUSED,
@@ -55,14 +55,14 @@ def _int(value, default: int = 0) -> int:
 
 
 # --- route-facing controls (any replica; aria2 is reachable over the network) ---
-async def pause_job(store: DownloadStore, job: dict) -> Optional[dict]:
+async def pause_job(job: dict) -> Optional[dict]:
     """Pause a job. If it has already started, pause it in aria2 too."""
     if job.get("gid"):
         await aria2.pause(job["gid"])
     return await run_in_threadpool(store.set_status, job["id"], STATUS_PAUSED)
 
 
-async def resume_job(store: DownloadStore, job: dict) -> Optional[dict]:
+async def resume_job(job: dict) -> Optional[dict]:
     """Resume a paused job. If aria2 still holds its gid, unpause in place; otherwise
     re-queue it for the worker to (re-)submit."""
     if job.get("gid"):
@@ -74,9 +74,8 @@ async def resume_job(store: DownloadStore, job: dict) -> Optional[dict]:
     return await run_in_threadpool(store.requeue, job["id"])
 
 
-async def cancel_and_delete_job(store: DownloadStore, job: dict) -> None:
-    """Remove a job from aria2 (if running) and clean its staging dir. The row itself
-    is deleted by the caller (the route already did the DB delete to get ``job``)."""
+async def cancel_job(job: dict) -> None:
+    """Stop a job in aria2 and clean its staging dir. The caller deletes the row."""
     if job.get("gid"):
         await aria2.remove(job["gid"])
     if job.get("staging_dir"):
@@ -85,7 +84,7 @@ async def cancel_and_delete_job(store: DownloadStore, job: dict) -> None:
 
 class DownloadManager:
     def __init__(self) -> None:
-        self._store = DownloadStore()
+        self.store = store
         self._poller: Optional[asyncio.Task] = None
         self._started = False
         self._warned_no_space = False
@@ -134,7 +133,7 @@ class DownloadManager:
         loop; the collector already runs in a threadpool."""
         by_status = {}
         try:
-            raw = self._store.stats()
+            raw = self.store.stats()
             # stats() returns the per-status counts flat alongside total_bytes;
             # split them so the collector can label by status without inventing a
             # "total_bytes" status.
@@ -156,16 +155,16 @@ class DownloadManager:
             await asyncio.sleep(get_settings().download_poll_interval)
 
     async def _submit_pending(self) -> None:
-        free = get_settings().download_max_active - await run_in_threadpool(self._store.count_active)
+        free = get_settings().download_max_active - await run_in_threadpool(self.store.count_active)
         if free <= 0:
             return
-        rows = await run_in_threadpool(self._store.fetch_pending, free)
+        rows = await run_in_threadpool(self.store.fetch_pending, free)
         for row in rows:
             try:
                 await self._submit_one(row)
             except Exception as e:
                 logger.error(f"submit failed for job {row['id']}: {e}")
-                await run_in_threadpool(self._store.mark_failed, row["id"], str(e))
+                await run_in_threadpool(self.store.mark_failed, row["id"], str(e))
 
     async def _submit_one(self, row: dict) -> None:
         target = await run_in_threadpool(fs.pick_write_target, get_settings().download_min_free_bytes)
@@ -186,7 +185,7 @@ class DownloadManager:
         is_torrent = row["kind"] == KIND_TORRENT
         gid = await aria2.add_uri(row["source_url"], staging_dir)
         await run_in_threadpool(
-            self._store.mark_active,
+            self.store.mark_active,
             row["id"],
             gid=gid,
             target_source_id=target["id"],
@@ -200,7 +199,7 @@ class DownloadManager:
         )
 
     async def _monitor_active(self) -> None:
-        rows = await run_in_threadpool(self._store.fetch_active)
+        rows = await run_in_threadpool(self.store.fetch_active)
         for row in rows:
             gid = row.get("gid")
             if not gid:
@@ -211,7 +210,7 @@ class DownloadManager:
                 # aria2 forgot this gid (restart) — requeue; it resumes from the
                 # staging control file on the next submit.
                 logger.info(f"[download] job {row['id']} gid {gid} unknown to aria2; requeuing")
-                await run_in_threadpool(self._store.requeue, row["id"])
+                await run_in_threadpool(self.store.requeue, row["id"])
                 continue
             await self._apply_status(row, status)
 
@@ -227,23 +226,23 @@ class DownloadManager:
             followed = aria2.followed_gid(status)
             if followed:
                 logger.info(f"[download] job {row['id']} metadata resolved; following gid {followed}")
-                await run_in_threadpool(self._store.update_gid, row["id"], followed)
+                await run_in_threadpool(self.store.update_gid, row["id"], followed)
                 return
             await self._finalize(row, done)
             return
 
         if state == "error":
             msg = status.get("errorMessage") or f"aria2 error code {status.get('errorCode')}"
-            await run_in_threadpool(self._store.mark_failed, row["id"], msg)
+            await run_in_threadpool(self.store.mark_failed, row["id"], msg)
             logger.warning(f"[download] job {row['id']} failed: {msg}")
             return
 
         if state == "removed":
-            await run_in_threadpool(self._store.mark_failed, row["id"], "cancelled in aria2")
+            await run_in_threadpool(self.store.mark_failed, row["id"], "cancelled in aria2")
             return
 
         # active / waiting / paused: just record progress.
-        await run_in_threadpool(self._store.update_progress, row["id"], done, total, speed)
+        await run_in_threadpool(self.store.update_progress, row["id"], done, total, speed)
 
     async def _finalize(self, row: dict, done_bytes: int) -> None:
         """Move the finished payload out of staging into crimson-downloads and mark the
@@ -254,11 +253,11 @@ class DownloadManager:
             )
         except Exception as e:
             logger.error(f"[download] publish failed for job {row['id']}: {e}")
-            await run_in_threadpool(self._store.mark_failed, row["id"], f"publish failed: {e}")
+            await run_in_threadpool(self.store.mark_failed, row["id"], f"publish failed: {e}")
             return
         if row.get("gid"):
             await aria2.remove(row["gid"])
-        await run_in_threadpool(self._store.mark_complete, row["id"], final_path, done_bytes)
+        await run_in_threadpool(self.store.mark_complete, row["id"], final_path, done_bytes)
         logger.info(
             f"[download] job {row['id']} complete ({done_bytes / 1_048_576:.1f} MiB) -> {final_path}"
         )

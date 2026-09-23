@@ -17,8 +17,8 @@ from core.http_client import http_client, fetch_with_retry
 from core.response_cache import (
     CACHE_TTL,
     TRENDING_CACHE_TTL,
-    _local_get,
-    _local_set,
+    local_get,
+    local_set,
     get_cached_response,
     set_cached_response,
 )
@@ -39,7 +39,7 @@ logger = logging.getLogger("crimson.tmdb")
 TMDB_CACHE_VERSION = "v3"
 
 
-def _tmdb_img(path: Optional[str], size: str = "w500") -> Optional[str]:
+def tmdb_img(path: Optional[str], size: str = "w500") -> Optional[str]:
     return f"https://image.tmdb.org/t/p/{size}{path}" if path else None
 
 
@@ -52,13 +52,13 @@ async def fetch_tmdb_genre_map(client: httpx.AsyncClient, kind: str) -> Dict[int
     if kind not in ("tv", "movie"):
         return {}
     cache_key = f"tmdb:genremap:{kind}"
-    local = _local_get(cache_key)
+    local = local_get(cache_key)
     if local is not None:
         return local
     cached = await get_cached_response(cache_key)
     if cached and "map" in cached:
         gmap = {int(k): v for k, v in cached["map"].items()}
-        _local_set(cache_key, gmap)
+        local_set(cache_key, gmap)
         return gmap
 
     data = await fetch_with_retry(
@@ -70,7 +70,7 @@ async def fetch_tmdb_genre_map(client: httpx.AsyncClient, kind: str) -> Dict[int
             cache_key, {"map": {str(k): v for k, v in gmap.items()}},
             ttl_seconds=CACHE_TTL,
         )
-        _local_set(cache_key, gmap)
+        local_set(cache_key, gmap)
     return gmap
 
 
@@ -103,7 +103,7 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int,
             "name": s.get("name") or f"Season {num}",
             "episode_count": s.get("episode_count"),
             "air_date": s.get("air_date"),
-            "poster": _tmdb_img(s.get("poster_path")),
+            "poster": tmdb_img(s.get("poster_path")),
             "overview": s.get("overview"),
         })
 
@@ -113,8 +113,8 @@ async def fetch_tmdb_show(client: httpx.AsyncClient, tmdb_id: int,
         "overview": data.get("overview"),
         "poster_path": data.get("poster_path"),
         "backdrop_path": data.get("backdrop_path"),
-        "poster": _tmdb_img(data.get("poster_path")),
-        "backdrop": _tmdb_img(data.get("backdrop_path"), "original"),
+        "poster": tmdb_img(data.get("poster_path")),
+        "backdrop": tmdb_img(data.get("backdrop_path"), "original"),
         "first_air_date": data.get("first_air_date"),
         # Stored so the recommend engine can score shows by genre too.
         "genres": [g.get("name") for g in (data.get("genres") or []) if g.get("name")],
@@ -152,8 +152,8 @@ async def fetch_tmdb_movie(client: httpx.AsyncClient, tmdb_id: int,
         "overview": data.get("overview"),
         "poster_path": data.get("poster_path"),
         "backdrop_path": data.get("backdrop_path"),
-        "poster": _tmdb_img(data.get("poster_path")),
-        "backdrop": _tmdb_img(data.get("backdrop_path"), "original"),
+        "poster": tmdb_img(data.get("poster_path")),
+        "backdrop": tmdb_img(data.get("backdrop_path"), "original"),
         "release_date": data.get("release_date"),
         "original_title": data.get("original_title"),
         "runtime": data.get("runtime"),
@@ -201,7 +201,7 @@ async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: i
         episodes = [{
             "episode_number": ep.get("episode_number"),
             "title": ep.get("name") or f"Episode {ep.get('episode_number')}",
-            "thumbnail": _tmdb_img(ep.get("still_path")),
+            "thumbnail": tmdb_img(ep.get("still_path")),
             "overview": ep.get("overview"),
             "air_date": ep.get("air_date"),
             "url": None,
@@ -209,7 +209,7 @@ async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: i
 
         result = {
             "summary": data.get("overview") or show.get("overview"),
-            "poster": _tmdb_img(data.get("poster_path")) or show.get("poster"),
+            "poster": tmdb_img(data.get("poster_path")) or show.get("poster"),
             "backdrop": show.get("backdrop"),
             "season_name": data.get("name") or f"Season {season}",
             "air_date": data.get("air_date"),
@@ -222,14 +222,14 @@ async def fetch_tmdb_metadata(client: httpx.AsyncClient, tmdb_id: int, season: i
     return result
 
 
-async def _season_episode_info(tmdb_id: int, season_number: int) -> Dict:
+async def season_episode_info(tmdb_id: int, season_number: int) -> Dict:
     """Episode count and per-episode air dates for a TMDB season.
 
     Derived from the cached season metadata and also held in L1, since both the
     unaired gate and the progress enricher hit it on hot paths. Returns {} when
     the season cannot be loaded, so callers degrade to no gating."""
     key = f"epinfo:{tmdb_id}:s{season_number}"
-    cached = _local_get(key)
+    cached = local_get(key)
     if cached is not None:
         return cached
     try:
@@ -243,7 +243,7 @@ async def _season_episode_info(tmdb_id: int, season_number: int) -> Dict:
         "count": len(eps),
         "air_dates": {e.get("episode_number"): e.get("air_date") for e in eps},
     }
-    _local_set(key, info)
+    local_set(key, info)
     return info
 
 
@@ -293,14 +293,14 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
     cache_key = "tmdb:trending"
 
     # L1, so a hit costs no DB round-trip.
-    local = _local_get(cache_key)
+    local = local_get(cache_key)
     if local is not None:
         return local
 
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         results = cached_data.get("results", [])
-        _local_set(cache_key, results)
+        local_set(cache_key, results)
         return results
 
     async def _load() -> List[Dict]:
@@ -340,7 +340,7 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
 
         # The DB for cross-replica reuse, L1 for this process.
         await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=TRENDING_CACHE_TTL)
-        _local_set(cache_key, trending_list)
+        local_set(cache_key, trending_list)
         return trending_list
 
     # Coalesced: one global key that every homepage load lands on at once.
@@ -389,14 +389,14 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
     """Trending non-anime TV shows: popular, excluding animation."""
     cache_key = "tmdb:trending_shows"
 
-    local = _local_get(cache_key)
+    local = local_get(cache_key)
     if local is not None:
         return local
 
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         results = cached_data.get("results", [])
-        _local_set(cache_key, results)
+        local_set(cache_key, results)
         return results
 
     url = "https://api.themoviedb.org/3/discover/tv"
@@ -430,7 +430,7 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
             break
 
     await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=TRENDING_CACHE_TTL)
-    _local_set(cache_key, trending_list)
+    local_set(cache_key, trending_list)
     return trending_list
 
 
@@ -467,14 +467,14 @@ async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> L
     """Trending general movies: popular, excluding animation."""
     cache_key = "tmdb:trending_movies"
 
-    local = _local_get(cache_key)
+    local = local_get(cache_key)
     if local is not None:
         return local
 
     cached_data = await get_cached_response(cache_key)
     if cached_data:
         results = cached_data.get("results", [])
-        _local_set(cache_key, results)
+        local_set(cache_key, results)
         return results
 
     url = "https://api.themoviedb.org/3/discover/movie"
@@ -503,7 +503,7 @@ async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> L
             break
 
     await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=TRENDING_CACHE_TTL)
-    _local_set(cache_key, trending_list)
+    local_set(cache_key, trending_list)
     return trending_list
 
 
@@ -517,7 +517,7 @@ async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -
     extra search candidates. Cached, since they are stable, and an empty list on
     failure just falls matching back to the English title."""
     cache_key = f"tmdb:detitles:{tmdb_id}"
-    cached = _local_get(cache_key)
+    cached = local_get(cache_key)
     if cached is not None:
         return cached
 
@@ -542,7 +542,7 @@ async def fetch_tmdb_localized_titles(client: httpx.AsyncClient, tmdb_id: int) -
         if a.get("iso_3166_1") in ("DE", "AT", "CH"):
             _add(a.get("title"))
 
-    _local_set(cache_key, titles, ttl=86400)
+    local_set(cache_key, titles, ttl=86400)
     return titles
 
 
@@ -552,14 +552,14 @@ async def fetch_tmdb_imdb_id(client: httpx.AsyncClient, tmdb_id: int,
     sources. Cached, and None on failure so callers skip that source."""
     path = "movie" if media_type == "movie" else "tv"
     cache_key = f"tmdb:imdb:{path}:{tmdb_id}"
-    cached = _local_get(cache_key)
+    cached = local_get(cache_key)
     if cached is not None:
         return cached or None
     data = await fetch_with_retry(
         client, f"https://api.themoviedb.org/3/{path}/{tmdb_id}/external_ids"
     )
     imdb = ((data or {}).get("imdb_id") or "").strip()
-    _local_set(cache_key, imdb, ttl=86400)
+    local_set(cache_key, imdb, ttl=86400)
     return imdb or None
 
 
@@ -586,7 +586,7 @@ def _show_item(item: Dict) -> Dict:
         "tmdb_id": item.get("id"),
         "anilist_id": None,
         "kind": "show",
-        "poster": _tmdb_img(item.get("poster_path")) if item.get("poster_path") else None,
+        "poster": tmdb_img(item.get("poster_path")) if item.get("poster_path") else None,
         "year": item.get("first_air_date", "")[:4] if item.get("first_air_date") else None,
         "vote_average": item.get("vote_average"),
     }
@@ -617,7 +617,7 @@ def _movie_item(item: Dict) -> Dict:
         "tmdb_id": item.get("id"),
         "anilist_id": None,
         "kind": "movie",
-        "poster": _tmdb_img(item.get("poster_path")) if item.get("poster_path") else None,
+        "poster": tmdb_img(item.get("poster_path")) if item.get("poster_path") else None,
         "year": item.get("release_date", "")[:4] if item.get("release_date") else None,
         "vote_average": item.get("vote_average"),
     }

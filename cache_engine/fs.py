@@ -26,7 +26,7 @@ import re
 import shutil
 from typing import Optional
 
-from .db import CacheStore
+from .db import store
 
 # The scraper emits ``crimson-cache:{token}``; the resolver matches on this
 # keyword and the ``/cache_proxy`` route serves it.
@@ -43,7 +43,6 @@ _MEDIA_TYPES = {
     ".webm": "video/webm",
 }
 
-_store = CacheStore()
 
 
 # --- token <-> path ---------------------------------------------------------
@@ -83,7 +82,7 @@ def target_for_path(abs_path: str) -> Optional[dict]:
     or None. Used by the resolver to label the cached source with the target name,
     and by ``safe_resolve``."""
     real = os.path.realpath(abs_path)
-    for target in _store.enabled_targets():
+    for target in store.enabled_targets():
         if _within(real, target["path"]):
             return target
     return None
@@ -189,13 +188,13 @@ def is_configured() -> bool:
     """True when at least one cache target is enabled (gates the scraper/resolver
     regardless of the global download switch — a target may be disabled for new
     writes yet still serve already-cached files only while enabled)."""
-    return bool(_store.enabled_targets())
+    return bool(store.enabled_targets())
 
 
 def pick_write_target(min_free_bytes: int = 0) -> Optional[dict]:
     """Choose an enabled, writable target for a new download (first one with
     enough free space). Returns None when none qualify."""
-    for target in _store.enabled_targets():
+    for target in store.enabled_targets():
         info = inspect_target(target["path"], count_cap=1)
         if info["exists"] and info["is_dir"] and info["writable"]:
             free = info["free_bytes"]

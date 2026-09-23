@@ -136,3 +136,6 @@ class ChangelogService:
                 "stale": stale,
                 "error": self._last_error,
             }
+
+
+service = ChangelogService()

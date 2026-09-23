@@ -29,7 +29,10 @@ from typing import Callable, Dict, List, Optional
 
 from starlette.concurrency import run_in_threadpool
 
+from account_engine.db import QuotaExceeded, store
+from account_engine.library import favorite_item_key
 from core.http_client import http_client
+from recommend_engine.service import recommend
 from metadata_engine.tmdb import (
     fetch_tmdb_movie_search_results,
     fetch_tmdb_search_results,
@@ -226,20 +229,11 @@ def build_route(
 
 
 def _item_key(kind: str, anilist_id: Optional[int], tmdb_id: Optional[int]) -> Optional[str]:
-    """Dedup key for a watchlist row.
-
-    Mirrors ``account_engine.routes._favorite_item_key``. It is reproduced rather
-    than imported because that helper is private to the routes module and
-    importing it here would couple two engines through a private name; the shapes
-    are asserted equal in the tests instead.
-    """
-    if kind == "anime" and anilist_id is not None:
-        return f"anilist:{anilist_id}"
-    if kind == "movie" and tmdb_id is not None:
-        return f"movie:{tmdb_id}"
-    if tmdb_id is not None:
-        return f"tmdb:{tmdb_id}"
-    return None
+    """The watchlist key, matching the account engine's. Only anime key by AniList id."""
+    anilist_id = anilist_id if kind == "anime" else None
+    if anilist_id is None and tmdb_id is None:
+        return None
+    return favorite_item_key(tmdb_id, anilist_id, kind)
 
 
 def _clamp(value, default: int, high: int = MAX_ITEMS) -> int:
@@ -256,13 +250,8 @@ def _clamp(value, default: int, high: int = MAX_ITEMS) -> int:
 
 
 async def _recommend_titles(user_id: int, args: Dict):
-    # Imported lazily: recommend_engine.routes imports account_engine.routes at
-    # module scope, and a top-level import here would drag that whole chain into
-    # chat_engine's import time for a tool that may never be called.
-    from recommend_engine.routes import _recommend
-
     limit = _clamp(args.get("limit"), 5)
-    payload = await run_in_threadpool(_recommend, user_id, limit)
+    payload = await run_in_threadpool(recommend, user_id, limit)
     items = payload.get("recommendations", [])[:limit]
 
     slim = [
@@ -362,8 +351,6 @@ async def _open_title(user_id: int, args: Dict):
 
 
 async def _watch_progress(user_id: int, args: Dict):
-    from account_engine.routes import store
-
     status = args.get("status") or "in_progress"
     limit = _clamp(args.get("limit"), 5)
     rows = await run_in_threadpool(
@@ -388,9 +375,6 @@ async def _watch_progress(user_id: int, args: Dict):
 
 
 async def _manage_watchlist(user_id: int, args: Dict):
-    from account_engine.db import QuotaExceeded
-    from account_engine.routes import store
-
     action = args.get("action")
     kind = args.get("kind") or "anime"
     anilist_id = args.get("anilist_id")

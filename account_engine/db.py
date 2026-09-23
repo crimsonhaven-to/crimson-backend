@@ -12,10 +12,11 @@ are stored as SHA-256 hashes so a DB leak can't be replayed.
 import hashlib
 import json
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from core.db_pool import get_connection, lock_schema_init
+from core.clock import utc_now, utc_now_iso
 
 # Lifetimes.
 SESSION_TTL = timedelta(days=30)
@@ -36,14 +37,6 @@ WATCH_EVENTS_RETENTION_DAYS = 3 * 365
 
 class QuotaExceeded(Exception):
     """Raised when a per-account row cap would be exceeded (surfaced as HTTP 409)."""
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    return dt.isoformat()
 
 
 def _hash_token(raw: str) -> str:
@@ -266,7 +259,7 @@ class AccountStore:
         with self._connect() as conn:
             row = conn.execute(
                 "INSERT INTO accounts (public_key, label, created_at) VALUES (%s, %s, %s) RETURNING user_id",
-                (public_key, label, _iso(_now())),
+                (public_key, label, utc_now_iso()),
             ).fetchone()
             user_id = row["user_id"]
         return self.get_account(user_id)
@@ -275,7 +268,7 @@ class AccountStore:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE accounts SET last_login_at = %s WHERE user_id = %s",
-                (_iso(_now()), user_id),
+                (utc_now_iso(), user_id),
             )
 
     # -- preferences ----------------------------------------------------
@@ -370,7 +363,7 @@ class AccountStore:
         admin table. Never returns password_hash. Search is case-insensitive over
         email, label, display name and numeric id."""
         where, params = _account_search(search)
-        now = _iso(_now())
+        now = utc_now_iso()
         params += [now, limit, offset]
         with self._connect() as conn:
             rows = conn.execute(
@@ -411,15 +404,25 @@ class AccountStore:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def email_recipient_counts(self) -> Dict[str, int]:
+        with self._connect() as conn:
+            return dict(conn.execute(
+                """
+                SELECT COUNT(*) FILTER (WHERE email_verified = TRUE) AS verified,
+                       COUNT(*) AS "all"
+                FROM accounts WHERE email IS NOT NULL
+                """
+            ).fetchone())
+
     def admin_overview(self) -> Dict:
         """Aggregate account-system stats for the admin health dashboard."""
         with self._connect() as conn:
             def scalar(sql: str, p: tuple = ()) -> int:
                 return conn.execute(sql, p).fetchone()["n"]
 
-            now = _iso(_now())
-            day_ago = _iso(_now() - timedelta(days=1))
-            week_ago = _iso(_now() - timedelta(days=7))
+            now = utc_now_iso()
+            day_ago = (utc_now() - timedelta(days=1)).isoformat()
+            week_ago = (utc_now() - timedelta(days=7)).isoformat()
             return {
                 "users_total": scalar("SELECT COUNT(*) AS n FROM accounts"),
                 "users_verified": scalar("SELECT COUNT(*) AS n FROM accounts WHERE email_verified = TRUE"),
@@ -458,7 +461,7 @@ class AccountStore:
                 INSERT INTO accounts (email, password_hash, label, email_verified, created_at)
                 VALUES (%s, %s, %s, FALSE, %s) RETURNING user_id
                 """,
-                (email, password_hash, label, _iso(_now())),
+                (email, password_hash, label, utc_now_iso()),
             ).fetchone()
             user_id = row["user_id"]
         return self.get_account(user_id)
@@ -483,7 +486,7 @@ class AccountStore:
         it raw. Earlier tokens of the same purpose are dropped so only the newest
         link works."""
         raw = secrets.token_urlsafe(32)
-        expires = _now() + ttl
+        expires = utc_now() + ttl
         with self._connect() as conn:
             conn.execute(
                 "DELETE FROM email_tokens WHERE user_id = %s AND purpose = %s",
@@ -492,7 +495,7 @@ class AccountStore:
             conn.execute(
                 "INSERT INTO email_tokens (token_hash, user_id, purpose, created_at, expires_at)"
                 " VALUES (%s, %s, %s, %s, %s)",
-                (_hash_token(raw), user_id, purpose, _iso(_now()), _iso(expires)),
+                (_hash_token(raw), user_id, purpose, utc_now_iso(), expires.isoformat()),
             )
         return raw
 
@@ -515,7 +518,7 @@ class AccountStore:
             if cur.rowcount == 0 or row["purpose"] != purpose:
                 return None
             try:
-                if datetime.fromisoformat(row["expires_at"]) <= _now():
+                if datetime.fromisoformat(row["expires_at"]) <= utc_now():
                     return None
             except ValueError:
                 return None
@@ -527,20 +530,23 @@ class AccountStore:
             conn.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
 
     # -- single-use invite tokens (minted by the Discord bot) -----------
-    def create_invite_token(
-        self, created_by: Optional[str] = None, ttl: Optional[timedelta] = None
-    ) -> str:
-        """Mint a single-use invite code. ``created_by`` is the Discord user id that
-        requested it; a ``ttl`` of None never expires (still single-use)."""
-        code = secrets.token_hex(8)  # unguessable but easy to paste
-        expires = _iso(_now() + ttl) if ttl else None
+    def create_invite_tokens(
+        self, count: int, created_by: Optional[str] = None, ttl: Optional[timedelta] = None
+    ) -> List[str]:
+        """Single-use invite codes: unguessable but easy to paste. A ``ttl`` of
+        None never expires."""
+        codes = [secrets.token_hex(8) for _ in range(count)]
+        now = utc_now()
+        expires = (now + ttl).isoformat() if ttl else None
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO invite_tokens (code, created_by, created_at, expires_at)"
-                " VALUES (%s, %s, %s, %s)",
-                (code, created_by, _iso(_now()), expires),
+            conn.cursor().executemany(
+                "INSERT INTO invite_tokens (code, created_by, created_at, expires_at) VALUES (%s, %s, %s, %s)",
+                [(code, created_by, now.isoformat(), expires) for code in codes],
             )
-        return code
+        return codes
+
+    def create_invite_token(self, created_by: Optional[str] = None, ttl: Optional[timedelta] = None) -> str:
+        return self.create_invite_tokens(1, created_by, ttl)[0]
 
     def invite_token_is_available(self, code: str) -> bool:
         """Read-only pre-check for a clean error message. Consumption is gated
@@ -555,7 +561,7 @@ class AccountStore:
             return False
         if row["expires_at"]:
             try:
-                if datetime.fromisoformat(row["expires_at"]) <= _now():
+                if datetime.fromisoformat(row["expires_at"]) <= utc_now():
                     return False
             except ValueError:
                 return False
@@ -567,7 +573,7 @@ class AccountStore:
         concurrent signups contend on the row and only one UPDATE matches."""
         if not code:
             return False
-        now = _iso(_now())
+        now = utc_now_iso()
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -611,13 +617,13 @@ class AccountStore:
     # -- challenges (one-time login nonces) -----------------------------
     def create_challenge(self, public_key: str, purpose: str) -> Tuple[str, str]:
         challenge = secrets.token_urlsafe(32)
-        expires = _now() + CHALLENGE_TTL
+        expires = utc_now() + CHALLENGE_TTL
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO challenges (challenge, public_key, purpose, expires_at) VALUES (%s, %s, %s, %s)",
-                (challenge, public_key, purpose, _iso(expires)),
+                (challenge, public_key, purpose, expires.isoformat()),
             )
-        return challenge, _iso(expires)
+        return challenge, expires.isoformat()
 
     def consume_challenge(self, challenge: str, public_key: str, purpose: str) -> bool:
         """Validate and delete a challenge; true only if it matched and was fresh."""
@@ -640,7 +646,7 @@ class AccountStore:
                 expires = datetime.fromisoformat(row["expires_at"])
             except ValueError:
                 return False
-            return expires > _now()
+            return expires > utc_now()
 
     # -- sessions -------------------------------------------------------
     def create_session(
@@ -653,7 +659,7 @@ class AccountStore:
         they are optional so the callers that have no request context still work.
         """
         raw = secrets.token_urlsafe(32)
-        now = _now()
+        now = utc_now()
         expires = now + SESSION_TTL
         with self._connect() as conn:
             conn.execute(
@@ -662,10 +668,10 @@ class AccountStore:
                                       user_agent, ip, last_seen_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
-                (_hash_token(raw), user_id, _iso(now), _iso(expires),
-                 (user_agent or None), (ip or None), _iso(now)),
+                (_hash_token(raw), user_id, now.isoformat(), expires.isoformat(),
+                 (user_agent or None), (ip or None), now.isoformat()),
             )
-        return raw, _iso(expires)
+        return raw, expires.isoformat()
 
     def get_user_by_session(self, raw_token: str) -> Optional[Dict]:
         if not raw_token:
@@ -682,7 +688,7 @@ class AccountStore:
             if row is None:
                 return None
             try:
-                if datetime.fromisoformat(row["session_expires_at"]) <= _now():
+                if datetime.fromisoformat(row["session_expires_at"]) <= utc_now():
                     conn.execute(
                         "DELETE FROM sessions WHERE token_hash = %s", (_hash_token(raw_token),)
                     )
@@ -706,7 +712,7 @@ class AccountStore:
         nothing beyond the check that was happening anyway."""
         if not raw_token:
             return False
-        now = _iso(_now())
+        now = utc_now_iso()
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE sessions SET last_seen_at = %s"
@@ -730,7 +736,7 @@ class AccountStore:
                 WHERE user_id = %s AND expires_at > %s
                 ORDER BY created_at DESC
                 """,
-                (user_id, _iso(_now())),
+                (user_id, utc_now_iso()),
             ).fetchall()
         return [
             {
@@ -795,7 +801,7 @@ class AccountStore:
                     raise QuotaExceeded(f"favorites limit ({MAX_FAVORITES_PER_USER}) reached")
             conn.execute(
                 _FAVORITE_UPSERT,
-                {"user_id": user_id, "list_name": list_name, "added_at": _iso(_now()), **fav},
+                {"user_id": user_id, "list_name": list_name, "added_at": utc_now_iso(), **fav},
             )
             row = conn.execute(
                 "SELECT * FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
@@ -819,6 +825,16 @@ class AccountStore:
                 ).fetchall()
             return [dict(r) for r in rows]
 
+    def library_counts(self, user_id: int) -> Dict[str, int]:
+        with self._connect() as conn:
+            return dict(conn.execute(
+                """
+                SELECT (SELECT COUNT(*) FROM favorites WHERE user_id = %s)      AS favorites,
+                       (SELECT COUNT(*) FROM watch_progress WHERE user_id = %s) AS progress
+                """,
+                (user_id, user_id),
+            ).fetchone())
+
     def list_watchlists(self, user_id: int) -> List[Dict]:
         """Distinct list names with each list's item count."""
         with self._connect() as conn:
@@ -840,7 +856,7 @@ class AccountStore:
         import never leaves the account empty. Returns ``{"imported", "skipped_quota"}``."""
         imported = 0
         skipped_quota = 0
-        now = _iso(_now())
+        now = utc_now_iso()
         with self._connect() as conn:
             if replace:
                 conn.execute("DELETE FROM favorites WHERE user_id = %s", (user_id,))
@@ -927,7 +943,7 @@ class AccountStore:
                     status=excluded.status, title=excluded.title, poster=excluded.poster,
                     media_type=excluded.media_type, local_id=excluded.local_id, updated_at=excluded.updated_at
                 """,
-                {"user_id": user_id, "updated_at": _iso(_now()),
+                {"user_id": user_id, "updated_at": utc_now_iso(),
                  "media_type": None, "local_id": None, **prog},
             )
             # The history half of the same save. watch_progress is keyed
@@ -987,7 +1003,7 @@ class AccountStore:
     # -- maintenance ----------------------------------------------------
     def purge_expired(self) -> None:
         """Drop expired sessions, challenges, email tokens and old watch events."""
-        now = _iso(_now())
+        now = utc_now_iso()
         with self._connect() as conn:
             conn.execute("DELETE FROM sessions WHERE expires_at <= %s", (now,))
             conn.execute("DELETE FROM challenges WHERE expires_at <= %s", (now,))
@@ -999,5 +1015,8 @@ class AccountStore:
             if conn.execute("SELECT to_regclass('public.watch_events') AS t").fetchone()["t"]:
                 conn.execute(
                     "DELETE FROM watch_events WHERE watched_on < %s",
-                    ((_now() - timedelta(days=WATCH_EVENTS_RETENTION_DAYS)).date(),),
+                    ((utc_now() - timedelta(days=WATCH_EVENTS_RETENTION_DAYS)).date(),),
                 )
+
+
+store = AccountStore()

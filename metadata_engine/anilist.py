@@ -16,8 +16,8 @@ from core.http_client import MAX_RETRIES, REQUEST_TIMEOUT, RETRY_BACKOFF
 from core.response_cache import (
     CACHE_TTL,
     TRENDING_CACHE_TTL,
-    _local_get,
-    _local_set,
+    local_get,
+    local_set,
     get_cached_response,
     get_stale_response,
     set_cached_response_shadowed,
@@ -31,7 +31,7 @@ ANILIST_URL = "https://graphql.anilist.co"
 _MAX_RETRY_WAIT = 8.0
 
 
-async def _empty() -> Dict:
+async def empty() -> Dict:
     """Resolves to ``{}``, so an optional fetch can be gathered without branching."""
     return {}
 
@@ -418,12 +418,12 @@ async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
     """AniList's genre vocabulary, for the browse hubs' filter chips. Tiny and
     very stable, so cached aggressively."""
     cache_key = "anilist:genres"
-    local = _local_get(cache_key)
+    local = local_get(cache_key)
     if local is not None:
         return local
     cached = await get_cached_response(cache_key)
     if cached and "genres" in cached:
-        _local_set(cache_key, cached["genres"])
+        local_set(cache_key, cached["genres"])
         return cached["genres"]
     query = "query { GenreCollection }"
 
@@ -431,7 +431,7 @@ async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
         """The last known good vocabulary, so chips still render during an outage."""
         stale = await get_stale_response(cache_key)
         if stale and stale.get("genres"):
-            _local_set(cache_key, stale["genres"])
+            local_set(cache_key, stale["genres"])
             return stale["genres"]
         return []
 
@@ -442,7 +442,7 @@ async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
         genres = (response.json().get("data") or {}).get("GenreCollection") or []
         if genres:
             await set_cached_response_shadowed(cache_key, {"genres": genres}, ttl_seconds=CACHE_TTL)
-            _local_set(cache_key, genres)
+            local_set(cache_key, genres)
             return genres
         return await _stale_genres()
     except Exception as e:

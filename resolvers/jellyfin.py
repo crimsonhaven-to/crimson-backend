@@ -29,7 +29,7 @@ backend, the Jellyfin server can stay private/LAN-only and needs no CORS.
 
 import asyncio
 import re
-from typing import AsyncIterator, Optional, Tuple, Union
+from typing import AsyncIterator, List, Optional, Tuple, Union
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 import httpx
@@ -421,7 +421,7 @@ class JellyfinResolver(BaseResolver):
         print(f"[JellyfinResolver] SUCCESS (hls): {proxy_path}")
         return proxy_path
 
-    async def resolve_direct(self, embed_url: str) -> Optional[dict]:
+    async def resolve_direct(self, embed_url: str) -> List[dict]:
         """Resolve to the **raw, token-less** absolute Jellyfin URL so the bytes are
         delivered off-backend via the crimson-proxy edge, which injects the token
         itself (New System edge-token-injection — see crimson-proxy/utils/inject.ts).
@@ -430,24 +430,24 @@ class JellyfinResolver(BaseResolver):
         token is an edge secret, so the companion extension (which can't hold it)
         can't play the raw URL — only the edge can. The URL therefore carries NO
         api_key; the edge appends it. Returns
-        ``{"url","streamType"}`` (mp4 direct-play / hls transcode) or None."""
+        one ``{"url","streamType"}`` (mp4 direct-play or hls transcode), or none."""
         if not is_configured():
-            return None
+            return []
 
         item_id = embed_url.split(":", 1)[1] if ":" in embed_url else embed_url
         item_id = item_id.strip().strip("/")
         if not item_id:
-            return None
+            return []
 
         try:
             info = await playback_info(item_id)
         except Exception as e:
             print(f"[JellyfinResolver] direct PlaybackInfo failed: {type(e).__name__} - {e}")
-            return None
+            return []
 
         sources = info.get("MediaSources") or []
         if not sources:
-            return None
+            return []
         ms = sources[0]
         ms_id = ms.get("Id") or item_id
         play_session = info.get("PlaySessionId") or ""
@@ -458,7 +458,7 @@ class JellyfinResolver(BaseResolver):
             if play_session:
                 params["playSessionId"] = play_session
             url = f"{jf_url}/Videos/{item_id}/stream?{urlencode(params)}"
-            return {"url": url, "streamType": "mp4"}
+            return [{"url": url, "streamType": "mp4"}]
 
         # HLS transcode: prefer Jellyfin's ready-made TranscodingUrl (absolutized +
         # token-stripped), else hand-build the master.m3u8 request.
@@ -479,4 +479,4 @@ class JellyfinResolver(BaseResolver):
             if play_session:
                 params["playSessionId"] = play_session
             url = f"{jf_url}/Videos/{item_id}/master.m3u8?{urlencode(params)}"
-        return {"url": url, "streamType": "hls"}
+        return [{"url": url, "streamType": "hls"}]

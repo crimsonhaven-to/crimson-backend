@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Dict, List, Optional
 
 from core.db_pool import get_connection
 
 from .models import DEFAULT_MODEL, PROVIDERS, resolve
+from core.clock import utc_now, utc_now_iso
 
 logger = logging.getLogger("crimson.chat.db")
 
@@ -31,17 +32,9 @@ CONVERSATION_TTL_DAYS = 30
 USAGE_TTL_DAYS = 180
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    return dt.isoformat()
-
-
 def _month_start() -> str:
-    now = _now()
-    return _iso(now.replace(day=1, hour=0, minute=0, second=0, microsecond=0))
+    now = utc_now()
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
 class ChatStore:
@@ -97,7 +90,7 @@ class ChatStore:
             return self.get_settings()
 
         sets.append("updated_at = %s")
-        params.append(_iso(_now()))
+        params.append(utc_now_iso())
         sets.append("updated_by = %s")
         params.append(updated_by)
 
@@ -133,7 +126,7 @@ class ChatStore:
         than raising, so a stale browser tab cannot probe for someone else's
         thread.
         """
-        now = _iso(_now())
+        now = utc_now_iso()
         with self._connect() as conn:
             if conversation_id:
                 row = conn.execute(
@@ -173,7 +166,7 @@ class ChatStore:
                     role,
                     content,
                     json.dumps(actions) if actions else None,
-                    _iso(_now()),
+                    utc_now_iso(),
                 ),
             )
 
@@ -243,7 +236,7 @@ class ChatStore:
                     output_tokens,
                     cached_tokens,
                     cost_micros,
-                    _iso(_now()),
+                    utc_now_iso(),
                 ),
             )
 
@@ -261,16 +254,9 @@ class ChatStore:
             ).fetchone()
         return int(row["n"] or 0)
 
-    def effective_budget(self, user: Dict, settings: Dict) -> int:
-        """This account's ceiling: its own if set, else the global one."""
-        own = user.get("chat_monthly_token_budget")
-        if own is not None:
-            return int(own)
-        return int(settings.get("monthly_token_budget") or 0)
-
     def usage_overview(self, days: int = 30) -> Dict:
         """Aggregates for the admin Lumi tab."""
-        since = _iso(_now() - timedelta(days=days))
+        since = (utc_now() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             totals = conn.execute(
                 "SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,"
@@ -319,8 +305,8 @@ class ChatStore:
         Scheduled on the sync replica only, so it runs once per cluster rather
         than once per container. Messages cascade with their conversation.
         """
-        conv_cutoff = _iso(_now() - timedelta(days=CONVERSATION_TTL_DAYS))
-        usage_cutoff = _iso(_now() - timedelta(days=USAGE_TTL_DAYS))
+        conv_cutoff = (utc_now() - timedelta(days=CONVERSATION_TTL_DAYS)).isoformat()
+        usage_cutoff = (utc_now() - timedelta(days=USAGE_TTL_DAYS)).isoformat()
         with self._connect() as conn:
             conversations = conn.execute(
                 "DELETE FROM chat_conversations WHERE updated_at < %s", (conv_cutoff,)
@@ -333,3 +319,6 @@ class ChatStore:
                 "chat prune: removed %s conversations, %s usage rows", conversations, usage
             )
         return {"conversations": conversations, "usage": usage}
+
+
+store = ChatStore()

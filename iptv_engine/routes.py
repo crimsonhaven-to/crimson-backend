@@ -20,9 +20,9 @@ from starlette.concurrency import run_in_threadpool
 
 from core import lumi
 from core.config import Settings, get_settings
-from web.routes.proxies import _proxy_response
+from core.proxy_response import proxy_response
 
-from .service import IptvService, proxy_fetch, verify_stream_sig
+from .service import proxy_fetch, service, verify_stream_sig
 
 logger = logging.getLogger("crimson.iptv")
 
@@ -32,7 +32,6 @@ def _require_enabled(settings: Settings = Depends(get_settings)) -> None:
 
 
 router = APIRouter(tags=["iptv"], dependencies=[Depends(_require_enabled)])
-service = IptvService()
 
 
 def _warming_payload() -> dict:
@@ -122,4 +121,4 @@ async def iptv_proxy(
     except httpx.RequestError as e:
         logger.warning(f"IPTV upstream fetch failed for {u}: {e}")
         raise HTTPException(status_code=502, detail="Upstream broadcast unreachable")
-    return _proxy_response(*result)
+    return proxy_response(*result)

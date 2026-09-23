@@ -16,16 +16,12 @@ handlers via ``run_in_threadpool``. Volumes are tiny (a handful of rows).
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
 from typing import List, Optional
 
 from core.db_pool import get_connection, lock_schema_init
+from core.clock import utc_now_iso
 
 _COLS = "id, label, path, enabled, encoding, download_enabled, created_at"
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class LocalSourceStore:
@@ -143,7 +139,7 @@ class LocalSourceStore:
                 VALUES (%s, %s, TRUE, %s, %s, %s)
                 RETURNING {_COLS}
                 """,
-                (label, path, encoding, download_enabled, _now_iso()),
+                (label, path, encoding, download_enabled, utc_now_iso()),
             ).fetchone()
         self._bump()
         return row
@@ -194,3 +190,6 @@ class LocalSourceStore:
         """Invalidate the enabled-roots cache after any write."""
         LocalSourceStore._roots_cache = None
         LocalSourceStore._roots_cache_at = 0.0
+
+
+store = LocalSourceStore()

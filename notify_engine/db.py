@@ -12,10 +12,11 @@ everything from version 0 onward is a numbered migration (see
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from core.db_pool import get_connection
+from core.clock import utc_now
 
 logger = logging.getLogger("crimson.airing")
 
@@ -28,10 +29,6 @@ SCHEDULE_RETENTION_DAYS = 30
 # schedule and then re-fetching it would make an already-sent episode look
 # unsent. A season is thirteen weeks; a year covers a rewatch of a long run.
 LEDGER_RETENTION_DAYS = 365
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class AiringStore:
@@ -278,7 +275,7 @@ class AiringStore:
                    SET status = %s, sent_at = %s
                  WHERE user_id = %s AND anilist_id = %s AND episode = %s
                 """,
-                ("sent" if sent else "failed", _now() if sent else None,
+                ("sent" if sent else "failed", utc_now() if sent else None,
                  user_id, anilist_id, episode),
             )
 
@@ -291,12 +288,12 @@ class AiringStore:
                 cursor = conn.cursor()
                 cursor.execute(
                     "DELETE FROM airing_schedule WHERE airing_at < %s",
-                    (_now() - timedelta(days=SCHEDULE_RETENTION_DAYS),),
+                    (utc_now() - timedelta(days=SCHEDULE_RETENTION_DAYS),),
                 )
                 removed["schedule"] = cursor.rowcount or 0
                 cursor.execute(
                     "DELETE FROM airing_notifications WHERE claimed_at < %s",
-                    (_now() - timedelta(days=LEDGER_RETENTION_DAYS),),
+                    (utc_now() - timedelta(days=LEDGER_RETENTION_DAYS),),
                 )
                 removed["notifications"] = cursor.rowcount or 0
         except Exception as e:

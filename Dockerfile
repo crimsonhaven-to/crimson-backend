@@ -61,36 +61,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the application code.
-COPY api.py .
-# What api.py's lifespan runs: schema init, migrations, the background jobs and
-# the cache/download workers. Sits beside api.py because it assembles the app's
-# runtime the way api.py assembles its routes.
-COPY startup.py .
-# The HTTP layer (FastAPI routers + the shared web helpers) that api.py assembles.
-COPY web ./web
-# Shared infrastructure: config, db pool, rate limiter, HTTP client, response
-# cache, plus the small app-wide modules (lumi, player, source_health).
+COPY api.py startup.py ./
 COPY core ./core
 COPY scrapers ./scrapers
 COPY resolvers ./resolvers
-COPY metadata_engine ./metadata_engine
 COPY account_engine ./account_engine
-COPY supporters_engine ./supporters_engine
-COPY discord_bot ./discord_bot
-COPY local_engine ./local_engine
-COPY cache_engine ./cache_engine
-COPY download_engine ./download_engine
-COPY changelog_engine ./changelog_engine
-COPY recommend_engine ./recommend_engine
-COPY chat_engine ./chat_engine
 COPY apikey_engine ./apikey_engine
-COPY subtitles_engine ./subtitles_engine
-COPY skiptimes_engine ./skiptimes_engine
-COPY telemetry_engine ./telemetry_engine
-COPY manga_engine ./manga_engine
+COPY cache_engine ./cache_engine
+COPY changelog_engine ./changelog_engine
+COPY chat_engine ./chat_engine
+COPY discord_bot ./discord_bot
+COPY download_engine ./download_engine
 COPY iptv_engine ./iptv_engine
+COPY local_engine ./local_engine
+COPY manga_engine ./manga_engine
+COPY metadata_engine ./metadata_engine
 COPY notify_engine ./notify_engine
+COPY playback_engine ./playback_engine
+COPY recommend_engine ./recommend_engine
+COPY skiptimes_engine ./skiptimes_engine
+COPY subtitles_engine ./subtitles_engine
+COPY supporters_engine ./supporters_engine
+COPY system_engine ./system_engine
+COPY telemetry_engine ./telemetry_engine
 # Versioned schema migrations (.sql, not Python, so the import-graph guard in
 # tests/test_dockerfile_copies.py cannot catch a missing line here; see the
 # dedicated assertion in tests/test_migrations.py instead). Without this COPY the

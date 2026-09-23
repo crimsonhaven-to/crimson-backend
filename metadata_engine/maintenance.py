@@ -102,9 +102,8 @@ async def refresh_daily_slice(buckets: Optional[int] = None) -> Tuple[int, int]:
     is swept back into agreement with TMDB."""
     buckets = buckets or get_settings().metadata_refresh_buckets
 
-    loop = asyncio.get_event_loop()
-    show_ids = await loop.run_in_executor(None, _slice_oldest_ids, "tmdb_shows", buckets)
-    movie_ids = await loop.run_in_executor(None, _slice_oldest_ids, "tmdb_movies", buckets)
+    show_ids = await asyncio.to_thread(_slice_oldest_ids, "tmdb_shows", buckets)
+    movie_ids = await asyncio.to_thread(_slice_oldest_ids, "tmdb_movies", buckets)
     if not show_ids and not movie_ids:
         return (0, 0)
 
@@ -280,8 +279,7 @@ def _finish_backfill_job(job_id: int, ok: bool, shows: Optional[int],
 async def run_pending_backfill() -> Optional[Tuple[int, int]]:
     """Claim and run one queued backfill, if any. Polled on a short interval by the
     sync replica. None when there was nothing to run."""
-    loop = asyncio.get_event_loop()
-    row = await loop.run_in_executor(None, _claim_backfill_job)
+    row = await asyncio.to_thread(_claim_backfill_job)
     if not row:
         return None
     job_id = row["id"]
@@ -289,10 +287,10 @@ async def run_pending_backfill() -> Optional[Tuple[int, int]]:
     logger.info(f"Draining backfill job #{job_id} ({pages} pages, by {row.get('requested_by')})")
     try:
         shows, movies = await backfill_catalogue(max_pages=pages)
-        await loop.run_in_executor(None, _finish_backfill_job, job_id, True, shows, movies, None)
+        await asyncio.to_thread(_finish_backfill_job, job_id, True, shows, movies, None)
         logger.info(f"Backfill job #{job_id} done: {shows} shows, {movies} movies")
         return (shows, movies)
     except Exception as e:
-        await loop.run_in_executor(None, _finish_backfill_job, job_id, False, None, None, str(e))
+        await asyncio.to_thread(_finish_backfill_job, job_id, False, None, None, str(e))
         logger.error(f"Backfill job #{job_id} failed: {e}")
         return None

@@ -15,7 +15,7 @@ These pin both recoveries (the tvdb_id bridge and the AniList relations pass)
 against fixtures shaped exactly like the real records. No network, no DB.
 """
 
-from metadata_engine.db_handler import MappingDatabaseEngine as Engine
+from metadata_engine.mapping_sync import MappingDatabaseEngine as Engine
 
 TMDB_SHOW = 64196   # Overlord, on TMDB /tv
 TVDB_SHOW = 294002  # ...and the same series on TVDB

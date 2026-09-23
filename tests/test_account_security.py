@@ -19,7 +19,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi import HTTPException
 
-from account_engine import audit, passwords, security_routes
+from account_engine import audit, auth, passwords, security_routes
+from account_engine.deps import parse_bearer
+from account_engine.schemas import DeleteAccountRequest
 from account_engine.db import AccountStore, _hash_token, _public_session_id
 
 
@@ -273,29 +275,29 @@ class _Req:
 def test_password_account_must_supply_the_right_password(monkeypatch):
     monkeypatch.setattr(audit, "log_event", lambda *a, **k: None)
     user = {"user_id": 7, "password_hash": passwords.hash_password("correct horse")}
-    body = security_routes.DeleteAccountRequest(password="wrong horse")
+    body = DeleteAccountRequest(password="wrong horse")
     with pytest.raises(HTTPException) as excinfo:
-        security_routes._confirm_owner(user, body, _Req())
+        auth.confirm_owner(user, body, _Req())
     assert excinfo.value.status_code == 401
 
 
 def test_password_account_passes_with_the_right_password():
     user = {"user_id": 7, "password_hash": passwords.hash_password("correct horse")}
-    body = security_routes.DeleteAccountRequest(password="correct horse")
-    security_routes._confirm_owner(user, body, _Req())
+    body = DeleteAccountRequest(password="correct horse")
+    auth.confirm_owner(user, body, _Req())
 
 
 def test_a_bearer_token_alone_never_confirms():
     """The whole point: the credential an attacker can steal is not enough."""
     user = {"user_id": 7, "password_hash": passwords.hash_password("pw")}
     with pytest.raises(HTTPException):
-        security_routes._confirm_owner(user, security_routes.DeleteAccountRequest(), _Req())
+        auth.confirm_owner(user, DeleteAccountRequest(), _Req())
 
 
 def test_mnemonic_account_needs_a_signature():
     user = {"user_id": 7, "password_hash": None, "public_key": "ab" * 32}
     with pytest.raises(HTTPException) as excinfo:
-        security_routes._confirm_owner(user, security_routes.DeleteAccountRequest(), _Req())
+        auth.confirm_owner(user, DeleteAccountRequest(), _Req())
     assert excinfo.value.status_code == 400
 
 
@@ -305,17 +307,17 @@ def test_mnemonic_account_verifies_the_signature(monkeypatch):
     def fake_verify(public_key, challenge, signature, request, flow):
         seen.update(public_key=public_key, challenge=challenge, flow=flow)
 
-    monkeypatch.setattr(security_routes, "_verify_signed_challenge", fake_verify)
+    monkeypatch.setattr(auth, "verify_signed_challenge", fake_verify)
     user = {"user_id": 7, "password_hash": None, "public_key": "ab" * 32}
-    body = security_routes.DeleteAccountRequest(challenge="c", signature="s")
-    security_routes._confirm_owner(user, body, _Req())
+    body = DeleteAccountRequest(challenge="c", signature="s")
+    auth.confirm_owner(user, body, _Req())
     assert seen["public_key"] == "ab" * 32 and seen["flow"] == "delete_account"
 
 
 def test_an_account_with_neither_credential_is_refused():
     user = {"user_id": 7, "password_hash": None, "public_key": None}
     with pytest.raises(HTTPException) as excinfo:
-        security_routes._confirm_owner(user, security_routes.DeleteAccountRequest(), _Req())
+        auth.confirm_owner(user, DeleteAccountRequest(), _Req())
     assert excinfo.value.status_code == 400
 
 
@@ -353,4 +355,4 @@ def test_export_omits_the_credential_and_the_admin_flag(monkeypatch):
     ("", None),
 ])
 def test_bearer_token_parsing(header, expected):
-    assert security_routes.bearer_token(header) == expected
+    assert parse_bearer(header) == expected

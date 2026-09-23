@@ -1,8 +1,7 @@
 """
 Shared slowapi rate limiter for the abuse-prone endpoints.
 
-Its own module so api.py and account_engine.routes get the *same* ``Limiter``
-without a circular import.
+Its own module so every route module gets the same ``Limiter``.
 
 Keyed on client IP. uvicorn runs with ``--proxy-headers``, so that is the real
 X-Forwarded-For client rather than the proxy's address.

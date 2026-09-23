@@ -29,21 +29,17 @@ from urllib.parse import parse_qs
 from fastapi import APIRouter, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
-from .db import SupporterStore
+from .db import store
 from core.config import get_settings
+from core.clock import utc_now
 
 router = APIRouter(tags=["supporters"])
-store = SupporterStore()
 
 # Tiny in-process TTL cache for the public list — a fan page can get bursty
 # traffic and the aggregation, while cheap, doesn't need to run per request. Held
 # per replica (no cross-replica coordination needed; each just refreshes lazily).
 _cache: Dict[str, object] = {"at": 0.0, "rows": None}
 _cache_lock = threading.Lock()
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _is_active(row: Dict, cutoff: datetime) -> bool:
@@ -146,7 +142,7 @@ async def list_supporters(
     """Public list for the 'Lumi's Loved Mortals' page. No auth. Most-recent
     payment first. Lapsed subscribers are hidden unless ``include_lapsed=true``."""
     rows = await run_in_threadpool(_cached_rows)
-    cutoff = _now() - timedelta(days=get_settings().kofi_active_window_days)
+    cutoff = utc_now() - timedelta(days=get_settings().kofi_active_window_days)
     if not include_lapsed:
         rows = [r for r in rows if _is_active(r, cutoff)]
     supporters = [_public_view(r) for r in rows]
@@ -162,7 +158,7 @@ async def supporters_stats():
     Sums over *active* supporters (same rule as /supporters). ``total_raised`` is
     a naive cross-currency sum; ``currency`` is the most common one seen."""
     rows = await run_in_threadpool(_cached_rows)
-    cutoff = _now() - timedelta(days=get_settings().kofi_active_window_days)
+    cutoff = utc_now() - timedelta(days=get_settings().kofi_active_window_days)
     active = [r for r in rows if _is_active(r, cutoff)]
 
     total_raised = round(sum((r.get("total_amount") or 0) for r in active), 2)

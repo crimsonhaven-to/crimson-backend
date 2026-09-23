@@ -5,7 +5,7 @@ Builds an in-process "catalogue index" from the metadata tables the rest of the
 backend already maintains:
 
   * anime    — genres on ``anime_entries`` mapped to shows via ``tmdb_seasons`` /
-               ``tmdb_extras`` (see metadata_engine.db_handler).
+               ``tmdb_extras`` (see metadata_engine.mapping_sync).
   * shows    — genres on ``tmdb_shows`` (lazily populated by fetch_tmdb_show and
                the trending/search discovery, see api.py).
   * movies   — genres on ``tmdb_movies`` (same lazy population).

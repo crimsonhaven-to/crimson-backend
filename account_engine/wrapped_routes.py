@@ -7,7 +7,7 @@ Crimson Wrapped: the year-in-review endpoint.
 "longest streak" are the two stats that change meaning with where you are. The
 client sends what its browser reports; omitting it answers in UTC.
 
-The aggregation and every counting rule live in account_engine.wrapped.
+The aggregation and every counting rule live in wrapped.py.
 """
 
 from datetime import datetime, timezone
@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, Query
 from starlette.concurrency import run_in_threadpool
 
 from . import wrapped
-from .routes import require_user
+from .deps import require_user
 
 router = APIRouter(tags=["account-wrapped"])
 

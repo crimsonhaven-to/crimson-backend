@@ -30,12 +30,11 @@ import os
 import re
 from typing import List, Optional
 
-from local_engine.db import LocalSourceStore
+from local_engine.db import store
 from local_engine.fs import EMBED_MARKER, encode_token, is_configured, is_playable_path
 
 from .base_scraper import BaseAnimeScraper
 
-_store = LocalSourceStore()
 
 # How close a folder name must be to a title to count as the show (0..1).
 _DIR_MATCH_THRESHOLD = 0.78
@@ -167,7 +166,7 @@ class LocalScraper(BaseAnimeScraper):
 
         # TTL-cached, but a cache miss is a real DB round-trip and this runs inside
         # the /watch fan-out, so keep it off the event loop like the listing below.
-        roots = await asyncio.to_thread(_store.enabled_roots)
+        roots = await asyncio.to_thread(store.enabled_roots)
         # Directory listing is blocking I/O — keep it off the event loop.
         candidates = await asyncio.to_thread(self._find_show_dirs, roots, norm_titles)
         if not candidates:

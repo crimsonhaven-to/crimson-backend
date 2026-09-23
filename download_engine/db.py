@@ -29,10 +29,10 @@ exactly one download-worker: nothing stops two of them submitting the same row.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import List, Optional
 
 from core.db_pool import get_connection, lock_schema_init
+from core.clock import utc_now_iso
 
 _COLS = (
     "id, kind, source_url, name, target_source_id, target_path, dest_dir, "
@@ -50,10 +50,6 @@ STATUS_FAILED = "failed"
 # Download kinds.
 KIND_HTTP = "http"
 KIND_TORRENT = "torrent"
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class DownloadStore:
@@ -180,7 +176,7 @@ class DownloadStore:
         """Write a fresh ``pending`` job (the target root + staging dir are chosen
         later, by the worker, so free space is checked when the download actually
         starts)."""
-        now = _now_iso()
+        now = utc_now_iso()
         with get_connection() as conn:
             return conn.execute(
                 f"""
@@ -213,7 +209,7 @@ class DownloadStore:
                 RETURNING {_COLS}
                 """,
                 (STATUS_ACTIVE, gid, target_source_id, target_path, dest_dir,
-                 staging_dir, _now_iso(), job_id),
+                 staging_dir, utc_now_iso(), job_id),
             ).fetchone()
 
     def update_gid(self, job_id: int, gid: str) -> None:
@@ -222,7 +218,7 @@ class DownloadStore:
         with get_connection() as conn:
             conn.execute(
                 "UPDATE download_jobs SET gid = %s, updated_at = %s WHERE id = %s",
-                (gid, _now_iso(), job_id),
+                (gid, utc_now_iso(), job_id),
             )
 
     def update_progress(
@@ -232,7 +228,7 @@ class DownloadStore:
             conn.execute(
                 "UPDATE download_jobs SET bytes_done = %s, bytes_total = %s, "
                 "download_speed = %s, updated_at = %s WHERE id = %s",
-                (bytes_done, bytes_total, speed, _now_iso(), job_id),
+                (bytes_done, bytes_total, speed, utc_now_iso(), job_id),
             )
 
     def mark_complete(self, job_id: int, final_path: str, bytes_done: int) -> None:
@@ -240,7 +236,7 @@ class DownloadStore:
             conn.execute(
                 "UPDATE download_jobs SET status = %s, final_path = %s, bytes_done = %s, "
                 "download_speed = 0, error = NULL, updated_at = %s WHERE id = %s",
-                (STATUS_COMPLETE, final_path, bytes_done, _now_iso(), job_id),
+                (STATUS_COMPLETE, final_path, bytes_done, utc_now_iso(), job_id),
             )
 
     def mark_failed(self, job_id: int, error: str) -> None:
@@ -248,7 +244,7 @@ class DownloadStore:
             conn.execute(
                 "UPDATE download_jobs SET status = %s, download_speed = 0, error = %s, "
                 "updated_at = %s WHERE id = %s",
-                (STATUS_FAILED, (error or "")[:500], _now_iso(), job_id),
+                (STATUS_FAILED, (error or "")[:500], utc_now_iso(), job_id),
             )
 
     def set_status(self, job_id: int, status: str) -> Optional[dict]:
@@ -257,7 +253,7 @@ class DownloadStore:
             return conn.execute(
                 f"UPDATE download_jobs SET status = %s, updated_at = %s WHERE id = %s "
                 f"RETURNING {_COLS}",
-                (status, _now_iso(), job_id),
+                (status, utc_now_iso(), job_id),
             ).fetchone()
 
     def requeue(self, job_id: int) -> Optional[dict]:
@@ -269,7 +265,7 @@ class DownloadStore:
             return conn.execute(
                 f"UPDATE download_jobs SET status = %s, gid = NULL, download_speed = 0, "
                 f"error = NULL, updated_at = %s WHERE id = %s RETURNING {_COLS}",
-                (STATUS_PENDING, _now_iso(), job_id),
+                (STATUS_PENDING, utc_now_iso(), job_id),
             ).fetchone()
 
     def delete_job(self, job_id: int) -> Optional[dict]:
@@ -279,3 +275,6 @@ class DownloadStore:
             return conn.execute(
                 f"DELETE FROM download_jobs WHERE id = %s RETURNING {_COLS}", (job_id,)
             ).fetchone()
+
+
+store = DownloadStore()

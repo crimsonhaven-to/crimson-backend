@@ -10,7 +10,7 @@ Plain is the default because changing how a running deployment logs quietly
 breaks somebody's grep, so switching costs an explicit env var.
 
 The id is minted by ``RequestContextMiddleware`` and read from the ContextVar in
-core.observability.
+core.request_id.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import logging
 
 import orjson
 
-from core.observability import current_request_id
+from core import request_id
 from core.config import get_settings
 
 # Verbatim from the basicConfig this replaced, so default output is unchanged.
@@ -46,7 +46,7 @@ class RequestIdFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "request_id"):
-            record.request_id = current_request_id()
+            record.request_id = request_id.current()
         return True
 
 

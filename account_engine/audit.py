@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Dict, List, Optional
 
+from core import errors
 from core.config import get_settings
 from core.db_pool import get_connection, lock_schema_init
+from core.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +57,6 @@ EVENT_TYPES = (
 # 'failure' marks every denial, which is the attack signal; 'info' is for
 # neutral events worth a paper trail that deny nothing.
 OUTCOMES = ("success", "failure", "info")
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def client_ip(request) -> Optional[str]:
@@ -220,7 +218,7 @@ def list_events(
         params.extend([like, like])
     if hours:
         where.append("ts >= %s")
-        params.append(_now() - timedelta(hours=hours))
+        params.append(utc_now() - timedelta(hours=hours))
     clause = f"WHERE {' AND '.join(where)}" if where else ""
 
     with get_connection() as conn:
@@ -281,7 +279,7 @@ def stats(days: int = 14) -> dict:
     """Everything the Security tab needs in one payload: 24h tiles, a per-day
     series, per-type totals, top offending IPs and most-targeted identities."""
     days = max(1, min(days, 90))
-    now = _now()
+    now = utc_now()
     since = now - timedelta(days=days - 1)
     day_start = since.replace(hour=0, minute=0, second=0, microsecond=0)
     last_24h = now - timedelta(hours=24)
@@ -380,9 +378,24 @@ def stats(days: int = 14) -> dict:
     }
 
 
+def admin_identity(user: dict) -> str:
+    """How an admin is named in audit rows and ``created_by`` columns."""
+    return f"admin:{user.get('email') or user['user_id']}"
+
+
+def log_admin_action(request, user: dict, action: str, **detail) -> None:
+    """Who did what to whom, from where, for a sensitive admin change."""
+    log_event(
+        "admin_action", outcome="success", request=request,
+        user_id=user["user_id"],
+        identity=admin_identity(user),
+        detail={"action": action, **{k: v for k, v in detail.items() if v is not None}},
+    )
+
+
 def purge_old() -> int:
     """Drop events past retention. Returns rows removed."""
-    cutoff = _now() - timedelta(days=get_settings().security_events_retention_days)
+    cutoff = utc_now() - timedelta(days=get_settings().security_events_retention_days)
     with get_connection() as conn:
         cur = conn.execute("DELETE FROM security_events WHERE ts < %s", (cutoff,))
         return cur.rowcount or 0
@@ -449,3 +462,10 @@ def list_events_for_user(user_id: int, limit: int = 50) -> List[dict]:
             (user_id, list(USER_VISIBLE_EVENTS), limit),
         ).fetchall()
     return [_row_for_owner(dict(r)) for r in rows]
+
+
+async def rate_limit_handler(request, exc):
+    """A tripped limiter is the strongest flood signal there is, so it goes in the
+    ledger before the voiced 429 goes out."""
+    log_event("rate_limited", outcome="failure", request=request, detail={"path": request.url.path})
+    return errors.rate_limited(request, exc)

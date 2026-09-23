@@ -8,7 +8,7 @@ thin SELECT + project loops exercised end-to-end by the running service.
 """
 
 import metadata_engine.anilist as anilist
-from web.queries import _decode_genres
+from metadata_engine.catalogue import decode_genres as _decode_genres
 from metadata_engine.anilist import (
     _MEDIA_SORTS,
     CATALOGUE_DEFAULT_SORT,
@@ -113,7 +113,7 @@ def test_local_anime_fallback_ordering():
     # The AniList-outage fallback (_order_local_anime): non-title sorts surface
     # poster-bearing, newest titles first (a 'trending' stand-in); title sorts stay
     # purely alphabetical regardless of poster/year.
-    from web.routes.discovery import _order_local_anime
+    from metadata_engine.browse import order_local_anime as _order_local_anime
 
     items = [
         {"title": "z-old-poster", "year": 2000, "poster": "p"},
