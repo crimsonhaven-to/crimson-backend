@@ -1,3 +1,2 @@
-# The real auth file holds the crimson login secret — never commit it.
-# Track only the template (.example).
+# Holds the crimson login secret. Only the .example template is tracked.
 userlist.txt

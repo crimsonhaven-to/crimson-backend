@@ -30,7 +30,7 @@ RUN --mount=type=secret,id=sources_token --mount=type=secret,id=sources_repo \
           "https://gitlab-ci-token:$(cat /run/secrets/sources_token)@$(cat /run/secrets/sources_repo).git" /tmp/src && \
         cp /tmp/src/resolvers/*.py resolvers/ && \
         cp /tmp/src/scrapers/*.py scrapers/ && \
-        # The manga provider dir is optional in the overlay repo (older overlays lack it).
+        # Older overlays have no manga directory.
         if [ -d /tmp/src/manga ]; then cp /tmp/src/manga/*.py manga/ 2>/dev/null || true; fi && \
         rm -rf /tmp/src && \
         echo ">> overlay applied: $(ls resolvers | wc -l) resolver / $(ls scrapers | wc -l) scraper / $(ls manga | wc -l) manga file(s)"; \
@@ -41,23 +41,17 @@ RUN --mount=type=secret,id=sources_token --mount=type=secret,id=sources_repo \
 # ---------------------------------------------------------------------------
 FROM python:3.14-slim
 
-# Don't write .pyc files; flush stdout/stderr so container logs are real-time.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install system dependencies required by lxml and other native packages.
-# ffmpeg powers the server-side video cache (remuxes played HLS/mp4 streams to a
-# single .mp4 on the NAS — see cache_engine/).
+# ffmpeg remuxes streams for the server-side video cache and local transcoding.
+# No compiler: every Python dependency ships a wheel.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libxml2 \
-    libxslt1.1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies first (better layer caching).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -84,38 +78,28 @@ COPY subtitles_engine ./subtitles_engine
 COPY supporters_engine ./supporters_engine
 COPY system_engine ./system_engine
 COPY telemetry_engine ./telemetry_engine
-# Versioned schema migrations (.sql, not Python, so the import-graph guard in
-# tests/test_dockerfile_copies.py cannot catch a missing line here; see the
-# dedicated assertion in tests/test_migrations.py instead). Without this COPY the
-# container finds zero migration files and reports itself up to date while being
-# unmigrated, which is the exact failure core/migrations.py exists to prevent.
+# Without the .sql files the container finds no migrations and reports itself
+# up to date while unmigrated. tests/core/test_migrations.py guards this line,
+# since tests/test_dockerfile_copies.py follows only Python imports.
 COPY migrations ./migrations
 
-# Apply the optional build-time source overlay on top of the base packages. In a
-# build without the overlay secrets these directories are empty, so this is a no-op.
-# The manga overlay (if any) drops a private MangaProvider module into manga_engine/,
-# discovered at runtime by manga_engine.provider.get_provider(); absent by default.
+# Empty without the overlay secrets. manga_engine.provider discovers an overlay
+# MangaProvider at runtime.
 COPY --from=private-sources /injected/resolvers/ ./resolvers/
 COPY --from=private-sources /injected/scrapers/ ./scrapers/
 COPY --from=private-sources /injected/manga/ ./manga_engine/
 
-# Run as a non-root user. State now lives in PostgreSQL (see db_pool.py), so the
-# container is stateless and needs no writable data volume.
+# State lives in PostgreSQL, so the container needs no writable data volume.
 RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
-# Expose FastAPI default port.
 EXPOSE 8000
 
-# Container-level health check (no curl in slim — use stdlib urllib). Marks the
-# task unhealthy if /health stops returning 200, so Swarm can reschedule it.
+# The slim image has no curl. An unhealthy task is rescheduled by Swarm.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
 
-# Run the application with uvicorn.
-# --proxy-headers + --forwarded-allow-ips=* make uvicorn trust the
-# X-Forwarded-Proto/Host set by our TLS-terminating reverse proxy, so the app
-# sees the real https scheme (otherwise proxied iframe URLs are emitted as http
-# and blocked as mixed content on the https frontend).
+# Trust X-Forwarded-Proto/Host from the TLS-terminating proxy, or proxied iframe
+# URLs come out as http and the https frontend blocks them as mixed content.
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]

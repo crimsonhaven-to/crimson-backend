@@ -1,35 +1,16 @@
-# Single-node DEV stack for the Crimsonhaven backend.
+# Single-node dev stack: same image and env contract as docker-stack.yml, but with
+# a bundled PostgreSQL and one backend container that both serves and owns the
+# resync (production splits that into `api` and `api-sync`).
 #
-# Same SHAPE as production (docker-stack.yml) — same image, same env contract,
-# same signed-proxy / CORS / sync semantics — but collapsed to the smallest thing
-# that runs end-to-end:
-#
-#   * ONE PostgreSQL container (no Patroni HA cluster, no replication, no external
-#     managed DB). Data lives in a local named volume.
-#   * ONE backend container that BOTH serves ingress AND owns the Fribb resync
-#     (RUN_DB_SYNC=true). Production splits these into `api` (replicas: N,
-#     RUN_DB_SYNC=false) + `api-sync` (replicas: 1, RUN_DB_SYNC=true); here a
-#     single replica plays both roles, so there's no two-service split to make.
-#
-# Run it (plain Docker, no Swarm needed):
 #   TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) \
 #   docker compose -f docker-compose-dev.yml up --build
 #
-# vs. docker-stack.yml (production): that expects an EXTERNAL managed/HA Postgres
-# via DATABASE_URL and never bundles a database. This file bundles one so a single
-# `up` gives you a working backend with zero external dependencies.
-#
-# Like production, keep this BEHIND a TLS-terminating reverse proxy if you expose
-# it publicly: the app emits absolute iframe URLs from X-Forwarded-Proto/Host, so
-# a directly-reachable published port lets an attacker spoof X-Forwarded-Host. For
-# local dev on loopback that's a non-issue.
+# If exposed publicly, keep it behind a TLS-terminating reverse proxy: the app
+# builds absolute iframe URLs from X-Forwarded-Proto/Host, so a directly reachable
+# port lets anyone spoof X-Forwarded-Host.
 version: "3.8"
 
 services:
-  # --- Single PostgreSQL node ------------------------------------------------
-  # No HA, no replication. The production doctrine (every replica identical,
-  # pointing at one external DB) is preserved — the backend still talks only to
-  # DATABASE_URL — we've just made that "one DB" a local container.
   postgres:
     image: postgres:17-alpine
     environment:
@@ -38,8 +19,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crimson}
     volumes:
       - crimson-pgdata-dev:/var/lib/postgresql/data
-    # Publish to loopback only so you can inspect with psql from the host without
-    # exposing the DB to the LAN. Comment out if you don't need host access.
+    # Loopback only, so host psql access never exposes the DB to the LAN.
     # ports:
     #   - "127.0.0.1:5432:5432"
     healthcheck:
@@ -50,10 +30,8 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # --- Single backend container (serves + syncs) -----------------------------
   api:
-    # Pull the same image production runs, but allow a local build so a dev
-    # checkout works with `--build` without first pushing to the registry.
+    # Uncomment build: so `--build` works from a checkout without pushing an image.
     image: crimson-backend:1.0
     # build:
     #   context: .
@@ -65,55 +43,44 @@ services:
       - "8000:8000"
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY in the environment or an .env file}
-      # Point the pool at the bundled single-node postgres above.
       - DATABASE_URL=postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson}
-      # Stable, shared secret for the signed stream proxies. A single dev instance
-      # could omit it (a random per-process secret is then used), but setting it
-      # mirrors production and survives a container restart. openssl rand -hex 32
+      # Without it a random per-process secret is used, and signed proxy URLs
+      # break on every restart.
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET (e.g. openssl rand -hex 32)}
-      # External crimson-proxy edge relay(s) — the E2 (no-extension) offload path.
-      # MUST be listed here (Compose does NOT auto-inject .env into the container)
-      # or the app sees CRIMSON_PROXY_BASE unset, _crimson_proxy.is_enabled() is
-      # False, and POST /sign returns 503 → the whole client-side proxy path goes
-      # dark (clients silently fall back to E0/extension). Comma-separate hosts for
-      # free failover; the proxy's NITRO_PROXY_SECRET must equal PROXY_SECRET above.
+      # Compose does not inject .env into the container, so every optional setting
+      # below must be listed to take effect.
+      #
+      # crimson-proxy edge relays for the no-extension path. Unset, POST /sign
+      # returns 503 and clients fall back to the extension. Comma-separate hosts for
+      # failover; each proxy's NITRO_PROXY_SECRET must equal PROXY_SECRET.
       - CRIMSON_PROXY_BASE=${CRIMSON_PROXY_BASE:-}
-      # This lone replica owns the Fribb resync (in prod that's api-sync's job).
+      # The only replica, so it owns the Fribb resync (api-sync in production).
       - RUN_DB_SYNC=true
-      # Dev CORS: defaults to the built-in dev + crimsonhaven list when unset.
+      # Unset uses the built-in dev + crimsonhaven origins.
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
-      # Optional features (parity with production), disabled when unset.
+      # Optional features, disabled when unset.
       - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN:-}
-      # Public /changelog — cached view of this repo's GitHub Releases. MUST be
-      # listed here (Compose does NOT auto-inject .env into the container) or the
-      # app sees GITHUB_TOKEN unset and /changelog returns 503. The token only
-      # needs read access (fine-grained PAT with Contents:read, or classic repo).
+      # /changelog reads GitHub Releases; unset token means 503. Read access only
+      # (fine-grained PAT with Contents:read, or classic repo scope).
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - GITHUB_REPO=${GITHUB_REPO:-crimsonhaven-to/crimson-backend}
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
-      # ShowBox/Febbox direct-file source. MUST be listed here (Compose does NOT
-      # auto-inject .env into the container) or the app sees FEBBOX_UI_TOKEN unset
-      # and the source disables itself (is_configured() False => never surfaces).
+      # ShowBox/Febbox direct-file source; disables itself when unset.
       - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
       - FEBBOX_REGION=${FEBBOX_REGION:-}
-      # OpenSubtitles player subtitles. MUST be listed here (Compose does NOT
-      # auto-inject .env) or /subtitles returns 503. Unset => feature disabled.
+      # Player subtitles; unset means /subtitles returns 503.
       - OPENSUBTITLES_API_KEY=${OPENSUBTITLES_API_KEY:-}
       - OPENSUBTITLES_APP_NAME=${OPENSUBTITLES_APP_NAME:-CrimsonHaven v1.0}
-      # Login wall (email+password). These come from your host env / .env via
-      # substitution — Compose does NOT auto-inject the .env into the container,
-      # so they MUST be listed here or the app sees them as unset (an empty
-      # SIGNUP_INVITE_CODE means registration is closed → every signup 403s).
       - REQUIRE_LOGIN=${REQUIRE_LOGIN:-true}
-      # Gates BOTH email and mnemonic signup — mnemonic /auth/register is
-      # invite-gated too now, so a fresh client-side keypair can't bypass it.
+      # Gates email and mnemonic signup alike, so a fresh client-side keypair
+      # cannot bypass it. Empty closes registration: every signup 403s.
       - SIGNUP_INVITE_CODE=${SIGNUP_INVITE_CODE:-}
-      # Seed admin accounts for the /admin dashboard (comma-separated emails).
+      # Comma-separated; seeds /admin access.
       - ADMIN_EMAILS=${ADMIN_EMAILS:-}
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:5173}
-      # SMTP (verification + password-reset email).
+      # Verification and password-reset email.
       - SMTP_HOST=${SMTP_HOST:-}
       - SMTP_PORT=${SMTP_PORT:-587}
       - SMTP_SECURITY=${SMTP_SECURITY:-starttls}
@@ -121,22 +88,16 @@ services:
       - SMTP_FROM=${SMTP_FROM:-}
       - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
-      # Lumi's oracles. Keys stay OUT of the settings table so a database dump
-      # never contains billable credentials. MUST be listed here (Compose does
-      # NOT auto-inject .env into the container) or the app sees them unset and
-      # /chat answers 503 "no oracle configured". Only the provider selected in
-      # Admin -> Chat needs a key. Mind the `$`: {GEMINI_API_KEY:-} without it is
-      # passed through as that literal string, which looks "present" to the
-      # feature gate and then fails every call with 400 API_KEY_INVALID.
+      # Chat provider keys live in env, not the settings table, so a database dump
+      # never holds billable credentials. Unset, /chat answers 503. Only the
+      # provider selected in Admin -> Chat needs a key. Mind the `$`: without it
+      # the literal string passes the feature gate and every call fails with 400.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
 
-    # --- Local media sources (the "Local" direct-play source) ----------------
-    # Bind-mount any directory / NAS share you want the haven to stream from,
-    # then register the IN-CONTAINER path from the Admin Dashboard → Sources tab
-    # (e.g. mount below, then add "/crimson/movies1"). Read-only (:ro) is
-    # recommended — the backend only ever reads these files. MVP is direct play
-    # only: browser-playable containers (mp4/m4v/mov/webm).
+    # Local direct-play source: mount a directory, then register the in-container
+    # path (e.g. /crimson/movies1) in Admin -> Sources. :ro is enough because the
+    # backend only reads. Direct play only: mp4/m4v/mov/webm.
     # volumes:
     #   - /movies:/crimson/movies1:ro
     #   - /mnt/nas/anime:/crimson/anime:ro
@@ -146,8 +107,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      # This replica runs the resync (download + wholesale rebuild) before uvicorn
-      # binds :8000, so give the first boot room like api-sync does in production.
+      # The resync runs before uvicorn binds :8000, so the first boot is slow.
       start_period: 600s
 
     stop_grace_period: 20s
@@ -163,12 +123,8 @@ services:
           cpus: "0.25"
           memory: 256M
 
-  # --- Discord invite bot (optional) -----------------------------------------
-  # Same image as the API, but runs the gateway bot instead of uvicorn. It only
-  # talks to PostgreSQL (mints single-use invite tokens), so it doesn't publish a
-  # port. Disabled unless DISCORD_BOT_TOKEN is set — with it blank the process
-  # logs "disabled" and idles. Keep it at a SINGLE replica (a second gateway
-  # login with the same token fights the first).
+  # Optional Discord invite bot: idles unless DISCORD_BOT_TOKEN is set. One
+  # replica only, since a second gateway login with the same token fights the first.
   discord-bot:
     image: crimson-backend:1.0
     command: ["python", "-m", "discord_bot"]
@@ -180,7 +136,7 @@ services:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
       - DISCORD_OWNER_ID=${DISCORD_OWNER_ID:-}
       - DISCORD_COMMAND_PREFIX=${DISCORD_COMMAND_PREFIX:-!}
-      # Used to print a "register at <url>" hint alongside minted invite codes.
+      # For the "register at <url>" hint next to minted invite codes.
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:5173}
     restart: unless-stopped
     deploy:
@@ -191,4 +147,4 @@ services:
           memory: 128M
 
 volumes:
-  crimson-pgdata-dev:   # PostgreSQL data directory (named volume)
+  crimson-pgdata-dev:

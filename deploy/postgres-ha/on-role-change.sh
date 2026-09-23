@@ -1,36 +1,27 @@
 #!/usr/bin/env bash
-# Patroni callback: refresh the local PgBouncer whenever this node's role changes.
-# Stack: crimson (PgBouncer on 127.0.0.1:6432).
+# Patroni callback: make the local PgBouncer (127.0.0.1:6432) drop its server
+# connections whenever this node's role changes.
 #
-# Why this exists
-# ---------------
-# The application connects with a multi-host DATABASE_URL and
-# target_session_attrs=read-write, so libpq is responsible for finding the primary.
-# On PostgreSQL 14+ libpq decides that from the startup parameters the server reports
-# rather than by asking every time. PgBouncer caches those parameters from the server
-# connection it happened to open first and replays them to new clients, so after a
-# role change the pooler on a node keeps advertising the role that node used to have:
+# The app relies on target_session_attrs=read-write to find the primary. Since
+# PostgreSQL 14, libpq judges writability from the server's startup parameters, and
+# PgBouncer caches those from its first server connection and replays them. After a
+# role change the pooler therefore advertises the node's previous role:
 #
-#   * on the DEMOTED node it still claims to be writable, so libpq picks it and every
-#     write fails with "cannot execute ... in a read-only transaction";
-#   * on the PROMOTED node it still claims to be read-only, so libpq skips the actual
-#     primary and the whole URL fails with "session is read-only".
+#   * a demoted node still claims writable: libpq picks it and writes fail with
+#     "cannot execute ... in a read-only transaction";
+#   * a promoted node still claims read-only: libpq skips it and the URL fails
+#     with "session is read-only".
 #
-# Both clear the moment PgBouncer opens fresh server connections. RECONNECT does
-# exactly that. See pgbouncer/pgbouncer#859 and nekomini-api/docs/07-deployment.md,
-# where this was first diagnosed and fixed on the nekominidb cluster.
+# Fresh server connections fix both, and RECONNECT opens them. See pgbouncer#859.
 #
-# Patroni invokes this as: on-role-change.sh <action> <role> <cluster>. It runs on the
-# node whose role changed, which is precisely the node whose pooler is now stale.
+# Patroni calls this as: on-role-change.sh <action> <role> <cluster>, on the node
+# whose role changed, which is exactly the node whose pooler is stale.
 #
-# It lives in the pgdata bind mount rather than a bind mount of its own so it could be
-# retrofitted onto the running cluster with `patronictl reload` alone -- no container
-# recreate and no failover. nekominidb mounts it at /etc/patroni/on-role-change.sh
-# instead; both work, that stack simply had it from day one.
+# It lives in the pgdata bind mount so it can be added to a running cluster with
+# `patronictl reload` alone, with no container recreate and no failover.
 #
-# A failure here must never take the database down: the cluster is healthy either way,
-# the pooler self-heals within server_lifetime (600s), and Patroni is not the right
-# place to escalate. So this logs and exits 0.
+# Failure must never take the database down: the cluster is healthy either way and
+# the pooler self-heals within server_lifetime (600s). So this logs and exits 0.
 set -uo pipefail
 
 PGBOUNCER_PORT=6432

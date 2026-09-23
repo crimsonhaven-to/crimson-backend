@@ -1,96 +1,71 @@
-# Docker Swarm stack for the Crimsonhaven backend (API).
+# Docker Swarm stack for the backend.
 #
-# Deploy:
 #   TMDB_API_KEY=... PROXY_SECRET=$(openssl rand -hex 32) \
 #   DATABASE_URL=postgresql://user:pass@db-host:5432/crimson \
 #   docker stack deploy -c docker-stack.yml crimson-api
 #
-# Unlike docker-compose.yml (which bundles a postgres container for local/dev),
-# this stack expects an EXTERNAL managed PostgreSQL via DATABASE_URL — the IaC
-# doctrine goal: every replica is identical and stateless, pointing at one DB.
-#
-# For a redundant, self-hosted PostgreSQL (Patroni HA cluster) plus the dev->prod
-# data migration, see deploy/postgres-ha/README.md. With that cluster, point
-# DATABASE_URL at all three DB hosts and let psycopg find the primary itself:
+# Expects an external PostgreSQL via DATABASE_URL so every replica is identical and
+# stateless. For the self-hosted Patroni cluster (deploy/postgres-ha/README.md),
+# list all three hosts and let psycopg find the primary:
 #   DATABASE_URL=postgresql://crimson:PASS@db-1,db-2,db-3:5432/crimson?target_session_attrs=read-write
 #
-# Two services, one image (see "Why two services" at the bottom):
-#   api       — N stateless serving replicas (RUN_DB_SYNC=false), publishes :8000
-#   api-sync  — exactly ONE replica that owns the Fribb resync (RUN_DB_SYNC=true),
-#               no published port (it doesn't serve ingress traffic)
+# One image, several services (see "Why two services" at the bottom):
+#   api       N serving replicas, RUN_DB_SYNC=false, publishes :8000
+#   api-sync  exactly one replica that owns the Fribb resync, no published port
 #
-# Production fronting: keep this BEHIND your TLS-terminating reverse proxy. The
-# app emits absolute iframe URLs from X-Forwarded-Proto/Host, so it must only be
-# reachable via that proxy — do NOT expose the published port below straight to
-# the internet (an attacker could spoof X-Forwarded-Host). Either remove the
-# `ports:` block and attach your proxy to `crimson_net`, or bind-publish to
-# loopback and have the host proxy forward to it.
+# Keep it behind a TLS-terminating reverse proxy and never expose :8000 directly:
+# the app builds absolute iframe URLs from X-Forwarded-Proto/Host, so direct access
+# lets anyone spoof X-Forwarded-Host. Either drop `ports:` and attach the proxy to
+# `crimson_net`, or publish to loopback and forward from the host proxy.
 version: "3.8"
 
 services:
-  # --- Serving replicas ------------------------------------------------------
-  # Stateless, horizontally scalable. They do NOT run the Fribb resync; they just
-  # read the mapping tables that api-sync keeps fresh in the shared DB. Scale via
-  # `replicas` below. Schema init is concurrency-safe (db_pool.lock_schema_init),
-  # so multiple replicas can boot simultaneously without racing on DDL.
+  # Serving replicas. Schema init takes an advisory lock
+  # (core/db_pool.lock_schema_init), so replicas can boot simultaneously.
   api:
     image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
       - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
-      # Stable + identical across replicas, or signed-proxy playback 403s after a
-      # restart / on another replica. Generate: openssl rand -hex 32
+      # Identical on every service, or signed-proxy playback 403s after a restart or
+      # on another replica.
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
-      # Lock CORS down to the real frontend origins in production.
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
-      # Serving replicas never run the resync — api-sync owns it.
+      # api-sync owns the resync.
       - RUN_DB_SYNC=false
-      # Ko-fi webhook + Jellyfin source live on the serving service (it handles
-      # the ingress POST /kofi/webhook + playback requests), not on api-sync.
-      # These are optional (`:-` => empty when unset disables the feature), but
-      # are supplied via crimson.env on the manager to match production.
+      # Optional features live on the service that handles their ingress routes,
+      # not on api-sync. Empty disables a feature. Values come from crimson.env on
+      # the manager; Compose does not inject that file, so each must be listed.
       - KOFI_VERIFICATION_TOKEN=${KOFI_VERIFICATION_TOKEN:-}
-      # Public /changelog — cached view of this repo's GitHub Releases. Lives on
-      # the serving service (it answers the ingress GET /changelog), not api-sync.
-      # Supplied via crimson.env on the manager; unset => /changelog returns 503.
-      # The token only needs read access (fine-grained PAT with Contents:read).
+      # /changelog reads GitHub Releases; unset token means 503. Read access only
+      # (fine-grained PAT with Contents:read).
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - GITHUB_REPO=${GITHUB_REPO:-crimsonhaven-to/crimson-backend}
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
-      # --- Observability (optional) --------------------------------------------
-      # METRICS_TOKEN is the shared secret a Prometheus scrape presents as a
-      # bearer to /metrics. Unset leaves /metrics reachable only with an admin
-      # session, which is the safe default: forgetting it makes the endpoint MORE
-      # closed, never open. It must be IDENTICAL to the crimson_metrics_token
-      # Swarm secret the scraper reads, or every scrape 401s.
+      # Bearer for Prometheus scrapes of /metrics. Unset leaves /metrics admin-only,
+      # so forgetting it fails closed. Must equal the crimson_metrics_token Swarm
+      # secret, or every scrape 401s.
       - METRICS_TOKEN=${METRICS_TOKEN:-}
-      # Points the Admin > Metrics History charts at the private Prometheus. Only
-      # this service needs it (the workers below serve no ingress and answer no
-      # /admin route). Unset => the tab shows the live snapshot only, no charts.
-      # See deploy/prometheus/README.md.
+      # Only this service answers /admin, so only it needs the Prometheus URL.
+      # Unset shows the live snapshot without history. See deploy/prometheus/README.md.
       - PROMETHEUS_URL=${PROMETHEUS_URL:-}
-      # ShowBox/Febbox direct-file source. Like Jellyfin it disables itself when
-      # unset (no FEBBOX_UI_TOKEN => is_configured() False => the source never
-      # surfaces). Supplied via crimson.env on the manager. Optional region cookie.
+      # ShowBox/Febbox direct-file source; disables itself when unset.
       - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
       - FEBBOX_REGION=${FEBBOX_REGION:-}
-      # OpenSubtitles player subtitles. Disables itself when unset (no API key =>
-      # /subtitles returns 503). Supplied via crimson.env on the manager.
+      # Player subtitles; unset means /subtitles returns 503.
       - OPENSUBTITLES_API_KEY=${OPENSUBTITLES_API_KEY:-}
       - OPENSUBTITLES_APP_NAME=${OPENSUBTITLES_APP_NAME:-CrimsonHaven v1.0}
-      # Login wall (email+password) — lives on the serving service. Supplied via
-      # crimson.env on the manager. An empty SIGNUP_INVITE_CODE closes signups
-      # (every register 403s), so set it. SMTP powers verification/reset email.
       - REQUIRE_LOGIN=${REQUIRE_LOGIN:-true}
-      # Gates BOTH email and mnemonic signup — mnemonic /auth/register is
-      # invite-gated too now, so a fresh client-side keypair can't bypass it.
+      # Gates email and mnemonic signup alike, so a fresh client-side keypair
+      # cannot bypass it. Empty closes registration: every signup 403s.
       - SIGNUP_INVITE_CODE=${SIGNUP_INVITE_CODE:-}
-      # Seed admin accounts for the /admin dashboard (comma-separated emails).
+      # Comma-separated; seeds /admin access.
       - ADMIN_EMAILS=${ADMIN_EMAILS:-}
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://crimsonhaven.to}
+      # Verification and password-reset email.
       - SMTP_HOST=${SMTP_HOST:-}
       - SMTP_PORT=${SMTP_PORT:-587}
       - SMTP_SECURITY=${SMTP_SECURITY:-starttls}
@@ -98,53 +73,37 @@ services:
       - SMTP_FROM=${SMTP_FROM:-}
       - SMTP_FROM_NAME=${SMTP_FROM_NAME:-CrimsonHaven}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
-      # Lumi's oracles. Keys stay OUT of the settings table so a database dump
-      # never contains billable credentials — they MUST be listed here (Compose
-      # does NOT auto-inject crimson.env into the container) or the app sees them
-      # unset and /chat answers 503 "no oracle configured". Only the provider the
-      # operator selected in Admin -> Chat needs a key. Mind the `$`: writing
-      # {GEMINI_API_KEY:-} instead of ${GEMINI_API_KEY:-} passes that literal
-      # string through as the key, which reads as "present" to the feature gate
-      # and then fails every call with 400 API_KEY_INVALID.
+      # Chat provider keys live in env, not the settings table, so a database dump
+      # never holds billable credentials. Unset, /chat answers 503. Only the
+      # provider selected in Admin -> Chat needs a key. Mind the `$`: without it
+      # the literal string passes the feature gate and every call fails with 400.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      # CORS Proxy Stuff (optional)
+      # crimson-proxy edge relays for the no-extension path; unset, POST /sign is 503.
       - CRIMSON_PROXY_BASE=${CRIMSON_PROXY_BASE:-}
-      # --- Server-side video cache (optional) ----------------------------------
-      # The serving replicas mint cache tickets and claim pending rows, but they do
-      # NOT run the ffmpeg download loop — that lives in the dedicated cache-worker
-      # service below, so a long remux isn't killed every time `api` rolls. Keep
-      # this false here; only cache-worker sets it true.
+      # The ffmpeg loop runs in cache-worker so a long remux is not killed every
+      # time `api` rolls.
       - RUN_CACHE_WORKER=false
-      # --- Background downloader (aria2) ---------------------------------------
-      # Serving replicas QUEUE downloads and issue pause/resume/cancel straight to
-      # the aria2 sidecar, but they do NOT run the poll loop — that's the dedicated
-      # download-worker below. The secret MUST equal the aria2 service's RPC_SECRET.
+      # Serving replicas queue downloads and send pause/resume/cancel to aria2; the
+      # poll loop runs in download-worker. The secret must equal aria2's RPC_SECRET.
       - RUN_DOWNLOAD_WORKER=false
       - ARIA2_RPC_URL=${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
       - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:-}
-      # Downloader tuning for cache_engine. All have sane defaults baked in, so
-      # you only need these to override them. The NAS itself is mounted via the
-      # `crimson_cache` volume below — NOT through these env vars. Uncomment to tune.
+      # cache_engine overrides; defaults are built in. The NAS is a volume, not env.
       # - CACHE_INTERNAL_BASE=http://127.0.0.1:8000  # how ffmpeg reaches our own proxies (loopback)
       # - CACHE_MAX_CONCURRENT=1                      # simultaneous downloads per replica
       # - CACHE_DOWNLOAD_TIMEOUT=3600                 # per-episode ffmpeg timeout (seconds)
       # - CACHE_MIN_FREE_BYTES=2147483648             # skip a download below this much free space (2 GiB)
-      # - CACHE_QUEUE_MAX=200                         # queued downloads before new ones are dropped
 
-    # --- NAS cache mount (optional) ------------------------------------------
-    # The serving replicas BOTH trigger downloads and serve /cache_proxy, so the
-    # cache must be mounted on every node that runs `api`. (api-sync serves no
-    # ingress traffic, so it does NOT need the mount.) Register the in-container
-    # path — /crimson/cache — in Admin → Cache. Uncomment this together with the
-    # `crimson_cache` volume definition at the bottom of the file.
+    # Optional NAS cache. `api` serves /cache_proxy, so it needs the mount on every
+    # node that runs it; api-sync does not. Register the in-container paths in
+    # Admin -> Cache and uncomment the volume definitions at the bottom too.
     # volumes:
     #   - crimson_cache1:/crimson/cache1
     #   - crimson_cache2:/crimson/cache2
 
-    # Front this with your reverse proxy. Remove if you attach the proxy directly
-    # to crimson_net instead of publishing a host port. Only THIS service may
-    # publish :8000 — two services can't share an ingress port.
+    # Remove if the reverse proxy attaches to crimson_net directly. Only one service
+    # can publish :8000 on the ingress mesh.
     ports:
       - target: 8000
         published: 8000
@@ -190,11 +149,9 @@ services:
     networks:
       - crimson_net
 
-  # --- Sync owner (exactly one) ----------------------------------------------
-  # Owns the periodic Fribb resync that rebuilds the mapping tables wholesale.
-  # MUST stay at replicas: 1 — two of these would download + rebuild in lockstep,
-  # wasting bandwidth and contending on the shared DB. No published port: it does
-  # not serve ingress traffic, it only keeps the DB fresh for the api replicas.
+  # Owns the Fribb resync that rebuilds the mapping tables wholesale. Must stay at
+  # replicas: 1: a second would download and rebuild in lockstep, wasting bandwidth
+  # and contending on the shared DB.
   api-sync:
     image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
@@ -203,16 +160,14 @@ services:
       - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
-      # The one process that runs the Fribb resync.
       - RUN_DB_SYNC=true
-      # Next to the DB-Sync, it also handles the airing notification via mailer
+      # Airing notification emails are a scheduled job, so they run here too.
       - AIRING_NOTIFY_ENABLED=${AIRING_NOTIFY_ENABLED:-false}
       - AIRING_NOTIFY_DRY_RUN=${AIRING_NOTIFY_DRY_RUN:-true}
       # api-sync serves no ingress and has no NAS mount; it never downloads.
       - RUN_CACHE_WORKER=false
       - RUN_DOWNLOAD_WORKER=false
-      # Scraped like every other replica: this is the process whose resync memory
-      # profile you most want a chart of. No PROMETHEUS_URL, it answers no /admin.
+      # Scraped because the resync's memory profile is the chart most worth having.
       - METRICS_TOKEN=${METRICS_TOKEN:-}
 
     healthcheck:
@@ -220,11 +175,9 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      # Uvicorn binds :8000 only AFTER lifespan startup finishes, and here that
-      # includes the first-boot Fribb resync (download + wholesale rebuild), which
-      # can take several minutes. Until it's done /health is connection-refused,
-      # so the grace window must cover it or Swarm kills the container mid-sync
-      # and it loops forever. The resync re-runs on every boot of this service.
+      # Uvicorn binds :8000 only after startup, which here includes the resync
+      # (several minutes, on every boot). A shorter window lets Swarm kill the
+      # container mid-sync and it loops forever.
       start_period: 600s
 
     stop_grace_period: 20s
@@ -239,8 +192,7 @@ services:
       update_config:
         parallelism: 1
         delay: 10s
-        # stop-first: never run two syncers at once (start-first would briefly
-        # overlap the old + new container, both doing the wholesale resync).
+        # start-first would briefly run two wholesale resyncs at once.
         order: stop-first
         failure_action: rollback
         monitor: 30s
@@ -252,9 +204,8 @@ services:
       resources:
         limits:
           cpus: "1.50"
-          # The resync loads the full Fribb mapping into memory. If this container
-          # gets OOM-killed (task error "non-zero exit (137)") during the rebuild,
-          # raise this limit (e.g. 1024M / 1536M).
+          # The resync holds the full Fribb mapping in memory. If the task dies with
+          # "non-zero exit (137)" (OOM) during the rebuild, raise to 1024M or 1536M.
           memory: 768M
         reservations:
           cpus: "0.25"
@@ -263,55 +214,42 @@ services:
     networks:
       - crimson_net
 
-  # --- Cache download worker (optional, exactly one) -------------------------
-  # The ffmpeg remux job, moved off the serving tier. Same image, same default CMD
-  # (uvicorn) as `api` — so its OWN loopback (CACHE_INTERNAL_BASE=127.0.0.1:8000)
-  # serves the signed stream proxies ffmpeg pulls through, exactly like a serving
-  # replica would; nothing about signing/CORS changes. It just sets
-  # RUN_CACHE_WORKER=true (runs the background download loop) and publishes no port
-  # (serves no ingress). The api replicas mint cache tickets and write `pending`
-  # rows on /cache/confirm; this worker polls Postgres for them and runs ffmpeg —
-  # so the job is DB-durable and a download is no longer killed every time `api`
-  # rolls. MUST stay replicas: 1 (CACHE_MAX_CONCURRENT bounds parallelism within
-  # it); a second instance is harmless though — the DB claim (begin_download)
-  # dedupes. Needs the NAS mount (it writes the files) and the same source env the
-  # proxies it replays through require (e.g. Jellyfin token injection).
+  # Optional ffmpeg cache worker. It runs uvicorn like `api`, so ffmpeg pulls
+  # through the signed proxies on its own loopback (CACHE_INTERNAL_BASE). `api`
+  # writes `pending` rows on /cache/confirm; this worker polls for them, so jobs
+  # survive an `api` roll. One replica (CACHE_MAX_CONCURRENT sets parallelism); a
+  # second would be harmless because begin_download dedupes. Needs the NAS mount
+  # and the source env its proxies replay through (e.g. Jellyfin token injection).
   cache-worker:
     image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY}
       - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
-      # Same secret as api, or the proxy URLs ffmpeg pulls won't verify their sig.
+      # Same as api, or the proxy URLs ffmpeg pulls fail signature checks.
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://crimsonhaven.to,https://www.crimsonhaven.to}
-      # Never the resync owner; always the download worker.
       - RUN_DB_SYNC=false
       - RUN_CACHE_WORKER=true
-      # This is the CACHE worker, not the aria2 download worker.
+      # The aria2 loop belongs to download-worker.
       - RUN_DOWNLOAD_WORKER=false
-      # Scraped so crimson_cache_worker_queue_depth/inflight have a real source.
-      # On the api replicas those gauges are always 0; only this one does the work.
+      # The only source of crimson_cache_worker_inflight; on api replicas
+      # that gauge is always 0.
       - METRICS_TOKEN=${METRICS_TOKEN:-}
-      # Source env the replayed proxies may need on this worker's own loopback
-      # (a cached Jellyfin/ShowBox stream is pulled back through these proxies).
+      # Cached Jellyfin/ShowBox streams are pulled back through this worker's own
+      # proxies, which need the source credentials.
       - JELLYFIN_URL=${JELLYFIN_URL:-}
       - JELLYFIN_USERNAME=${JELLYFIN_USERNAME:-}
       - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD:-}
       - FEBBOX_UI_TOKEN=${FEBBOX_UI_TOKEN:-}
       - FEBBOX_REGION=${FEBBOX_REGION:-}
-      # Downloader tuning (same knobs as api's commented block). Defaults are baked
-      # in; uncomment to override. CACHE_INTERNAL_BASE stays loopback — this worker
-      # runs its own uvicorn, so the proxies are right here on 127.0.0.1:8000.
+      # Overrides; defaults are built in.
       # - CACHE_MAX_CONCURRENT=1     # simultaneous ffmpeg remuxes
       # - CACHE_POLL_INTERVAL=10     # seconds between DB polls for new pending rows
       # - CACHE_DOWNLOAD_TIMEOUT=3600
       # - CACHE_MIN_FREE_BYTES=2147483648
-      # - CACHE_QUEUE_MAX=200
 
-    # Writes the cached files — needs the same NAS mount the serving replicas use
-    # to read them back via /cache_proxy. Same volumes, so register the same
-    # in-container paths (/crimson/cache1, /crimson/cache2) in Admin → Cache.
+    # Same NAS volumes and paths as `api`, which serves the files via /cache_proxy.
     # volumes:
     #   - crimson_cache1:/crimson/cache1
     #   - crimson_cache2:/crimson/cache2
@@ -324,8 +262,7 @@ services:
       # No resync on this service, so uvicorn binds within seconds like `api`.
       start_period: 60s
 
-    # Give an in-flight remux time to finish on graceful shutdown rather than being
-    # killed mid-download (which would just mark the row failed for a later retry).
+    # Lets an in-flight remux finish; a kill marks the row failed for a later retry.
     stop_grace_period: 120s
 
     deploy:
@@ -338,12 +275,9 @@ services:
       update_config:
         parallelism: 1
         delay: 10s
-        # stop-first: never run two workers at once. The old one drains its current
-        # remux within stop_grace_period and exits BEFORE the new one starts, so the
-        # new worker's startup requeue (downloading -> pending) only ever sees
-        # genuinely-orphaned rows — it can't grab a row the old worker is still
-        # downloading. A brief no-worker gap is fine (this serves no ingress; pending
-        # rows just wait in Postgres).
+        # The new worker's startup requeue (downloading -> pending) must only see
+        # orphaned rows, never one the old worker is still downloading. The brief
+        # gap is harmless: pending rows wait in Postgres.
         order: stop-first
         failure_action: rollback
         monitor: 30s
@@ -354,9 +288,7 @@ services:
         order: stop-first
       resources:
         limits:
-          # ffmpeg is the workload here (mostly -c copy remux; the audio-only
-          # re-encode fallback is the heaviest path), so give it more headroom than
-          # a serving replica.
+          # More than a serving replica: the audio re-encode fallback is heavy.
           cpus: "2.00"
           memory: 1024M
         reservations:
@@ -366,15 +298,12 @@ services:
     networks:
       - crimson_net
 
-  # --- aria2 downloader sidecar (optional, exactly one) ----------------------
-  # Does the byte-pulling for the admin downloader (http/https + magnet), exposing
-  # JSON-RPC on :6800 on crimson_net ONLY — never published to the internet. Keep it
-  # replicas: 1 (one shared queue); leech-only is enforced per-download by the
-  # backend (seed-time=0), so no inbound BitTorrent port is published. RPC_SECRET
-  # MUST equal the api/download-worker ARIA2_RPC_SECRET. Needs the SAME media NAS
-  # mount, at the SAME in-container path, as the download-worker and api (a job's
-  # <root>/crimson-downloads path must be valid in all three). PUID/PGID 10001 match
-  # the api image's appuser so the files aria2 writes stay movable by the worker.
+  # Optional aria2 sidecar for the admin downloader. JSON-RPC on :6800, crimson_net
+  # only. One replica, one shared queue. The backend sets seed-time=0 per download,
+  # so no inbound BitTorrent port is needed. RPC_SECRET must equal ARIA2_RPC_SECRET
+  # on api and download-worker. The media mount must use the same in-container
+  # path in all three so a job's <root>/crimson-downloads path is valid everywhere.
+  # PUID/PGID 10001 match the api image's appuser so the worker can move the files.
   aria2:
     image: p3terx/aria2-pro
     environment:
@@ -385,8 +314,6 @@ services:
       - DISK_CACHE=64M
       - UPDATE_TRACKERS=true
 
-    # Mount the SAME media volume the download-worker + api use, at the SAME path,
-    # so aria2 writes into <root>/crimson-downloads/.incoming where the worker reads.
     # volumes:
     #   - crimson_media:/crimson/media
 
@@ -417,14 +344,10 @@ services:
     networks:
       - crimson_net
 
-  # --- Download worker (optional, exactly one) -------------------------------
-  # Same image + default CMD (uvicorn) as `api`, but it runs the aria2 poll loop
-  # (RUN_DOWNLOAD_WORKER=true): claim pending download_jobs rows, hand the URL to the
-  # aria2 sidecar, track progress, and move the finished payload out of staging into
-  # crimson-downloads (leech-only). The api replicas only queue rows + issue
-  # pause/resume/cancel. MUST stay replicas: 1 (the begin_submit claim dedupes if a
-  # second ever runs). Needs the SAME media NAS mount as aria2 + api (it does the
-  # move), and the ARIA2_* env pointing at the sidecar.
+  # Optional aria2 poll loop: claims pending download_jobs rows, hands them to
+  # aria2, tracks progress and moves finished files out of staging. One replica
+  # (begin_submit dedupes if a second runs). Needs the same media mount as aria2
+  # and api, because it does the move.
   download-worker:
     image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
@@ -438,18 +361,15 @@ services:
       - RUN_DOWNLOAD_WORKER=true
       - ARIA2_RPC_URL=${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
       - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET}
-      # Scraped so the crimson_download_jobs gauge has a source. That gauge is
-      # CLUSTER-wide (it reads the shared jobs table), which is exactly why the
-      # panel behind it uses max() and never sum().
+      # Source of crimson_download_jobs. It reads the shared table, so it is
+      # cluster-wide and its panel uses max(), never sum().
       - METRICS_TOKEN=${METRICS_TOKEN:-}
-      # Downloader tuning (defaults baked in; uncomment to override).
+      # Overrides; defaults are built in.
       # - DOWNLOAD_MAX_ACTIVE=3          # simultaneous downloads
       # - DOWNLOAD_POLL_INTERVAL=5       # seconds between aria2 status polls
       # - DOWNLOAD_MIN_FREE_BYTES=2147483648  # min free space to start (2 GiB)
 
-    # Writes the finished files — needs the SAME media NAS mount as aria2 + api, at
-    # the SAME in-container path. Register that path in Admin → Local Sources with
-    # "download into this source" enabled.
+    # Register this path in Admin -> Local Sources with "download into this source".
     # volumes:
     #   - crimson_media:/crimson/media
 
@@ -460,8 +380,7 @@ services:
       retries: 3
       start_period: 60s
 
-    # aria2 keeps running in the sidecar across a worker roll; the next worker
-    # reclaims (resumes) any in-flight row, so a short drain is enough.
+    # aria2 keeps downloading across a worker roll, so a short drain is enough.
     stop_grace_period: 20s
 
     deploy:
@@ -474,9 +393,8 @@ services:
       update_config:
         parallelism: 1
         delay: 10s
-        # stop-first: never two workers at once. aria2 keeps running in its own
-        # container across the roll, so the new worker re-attaches to in-flight rows
-        # via the monitor (it only requeues gids aria2 has genuinely forgotten).
+        # Never two workers at once. The new one re-attaches to in-flight rows and
+        # only requeues gids aria2 has forgotten.
         order: stop-first
         failure_action: rollback
         monitor: 30s
@@ -496,29 +414,20 @@ services:
     networks:
       - crimson_net
 
-  # --- Discord invite bot (optional, exactly one) ----------------------------
-  # Same image as the API but runs the gateway bot (python -m discord_bot) rather
-  # than uvicorn. It only needs the DB (it mints single-use invite tokens into the
-  # same PostgreSQL the api reads at /auth/email/register), so it publishes no
-  # port. MUST stay at replicas: 1 — a second gateway login with the same token
-  # fights the first (and would double-mint). With DISCORD_BOT_TOKEN unset the
-  # process just logs "disabled" and idles, so it's harmless to leave deployed.
+  # Optional Discord invite bot; idles unless DISCORD_BOT_TOKEN is set. One replica:
+  # a second gateway login with the same token fights the first and double-mints.
   discord-bot:
     image: ${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
     command: ["python", "-m", "discord_bot"]
 
-    # Disable the image's baked-in HEALTHCHECK (it probes http://127.0.0.1:8000/
-    # health). This service runs the gateway bot, NOT uvicorn, so nothing listens
-    # on :8000 — the inherited check would fail forever, Swarm would mark the task
-    # unhealthy and keep restarting it (stuck "starting" -> error loop). ["NONE"]
-    # turns the healthcheck off so the bot is judged by its process staying up.
+    # Nothing listens on :8000 here, so the image's /health check would fail
+    # forever and Swarm would restart the task in a loop.
     healthcheck:
       test: ["NONE"]
 
     environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:- DEFINITELY_NOT_A_FAKE_KEY} # for some reason my discord bot container wants a TMDB API key. Since it doesn't make any requests, this should be fine?
+      - TMDB_API_KEY=${TMDB_API_KEY:- DEFINITELY_NOT_A_FAKE_KEY}
       - DATABASE_URL=${DATABASE_URL:?set DATABASE_URL to the external PostgreSQL}
-      # Supplied via crimson.env on the manager. Empty token => bot stays off.
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
       - DISCORD_OWNER_ID=${DISCORD_OWNER_ID:-}
       - DISCORD_COMMAND_PREFIX=${DISCORD_COMMAND_PREFIX:-!}
@@ -550,38 +459,22 @@ services:
     networks:
       - crimson_net
 
-  # --- Old-image janitor (global, one-shot per release) ----------------------
-  # Swarm keeps the previously-deployed image on every node so it can roll back
-  # instantly, and it never cleans the one before that — so each release leaves
-  # another full backend image (~hundreds of MB) stranded on disk forever. Over
-  # dozens of releases that grows into tens of GB of dead images per node.
+  # Old-image janitor. Swarm keeps each release's image on every node and never
+  # cleans up, so dead images pile up to tens of GB per node over many releases.
   #
-  # This service reclaims it WITHOUT breaking rollback. It is `mode: global`, so
-  # Swarm runs exactly one task per node — including nodes that don't run `api`,
-  # which may still hold images from past schedulings. On each node it:
-  #   1. lists the locally-present release tags (vX.Y.Z) of our image,
-  #   2. version-sorts them and KEEPS the newest 3 (this release + 2 to roll back
-  #      to — well past Swarm's single-step rollback target),
-  #   3. `docker image rm` (NOT `-f`) every older one. Un-forced removal is the
-  #      safety net: Docker refuses to delete an image any container — running OR
-  #      a draining/old rollback task — still references, so "not used anymore"
-  #      is enforced by the daemon, not guessed by us. Refusals are logged, not
-  #      fatal, and that image is simply retried on the next release.
-  # `:dev`, `:dev-<sha>`, `:latest` and `:buildcache` never match the vX.Y.Z
-  # filter, so they're untouched. The image stays in GHCR regardless, so even a
-  # pruned release can be re-pulled if you ever force a deeper rollback.
+  # `mode: global` runs one task per node, including nodes that no longer run
+  # `api`. It keeps the newest 3 vX.Y.Z tags (well past Swarm's one-step rollback)
+  # and runs un-forced `docker image rm` on the rest, so the daemon itself refuses
+  # anything a running or rollback container still references. `:dev`, `:latest`
+  # and `:buildcache` never match. Pruned releases stay in the GitLab registry.
   #
-  # It runs once and exits (restart_policy condition: none) — a batch janitor,
-  # not a daemon, so a completed 0/0 task count is expected and healthy. Because
-  # PRUNE_RELEASE is pinned to the new image ref, the service spec changes every
-  # release, which is what makes `docker stack deploy` re-schedule this one-shot
-  # task across all nodes. It mounts the host Docker socket (root-equivalent on
-  # that node) — that's required to talk to the daemon and is standard for a
-  # cluster maintenance task; it touches only our own repo's old tags.
+  # It runs once and exits, so a 0/0 task count is healthy. PRUNE_RELEASE changes
+  # the spec every release, which is what makes `docker stack deploy` reschedule
+  # it. The Docker socket mount is root-equivalent on the node; it only touches
+  # this image's old tags.
   pruner:
     image: docker:28-cli
-    # POSIX sh on docker:cli. Self-contained: each node derives its own keep-set
-    # from what it actually has on disk, so no version list needs to be passed in.
+    # Each node derives its keep-set from its own disk, so no version list is passed.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -589,15 +482,14 @@ services:
         IMAGE="registry.ramon.moe/crimsonhaven-to/crimson-backend"
         KEEP=3
         echo "[pruner] $(hostname): keeping newest ${KEEP} release tags of ${IMAGE}"
-        # Numeric key sort (newest first) instead of `sort -V`, which busybox
-        # (docker:cli is Alpine-based) doesn't reliably ship — strip the leading
-        # v, sort major/minor/patch numerically so v1.10.0 outranks v1.9.0, re-add.
+        # busybox (docker:cli is Alpine) lacks a reliable `sort -V`, so sort the
+        # numeric fields instead; v1.10.0 must outrank v1.9.0.
         tags="$(docker image ls --format '{{.Tag}}' "$IMAGE" 2>/dev/null \
                   | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
                   | sed 's/^v//' | sort -t. -k1,1nr -k2,2nr -k3,3nr \
                   | sed 's/^/v/' || true)"
         if [ -z "$tags" ]; then
-          echo "[pruner] no vX.Y.Z release images present — nothing to do"; exit 0
+          echo "[pruner] no vX.Y.Z release images present, nothing to do"; exit 0
         fi
         echo "[pruner] present (newest first):"; echo "$tags" | sed 's/^/[pruner]   /'
         old="$(echo "$tags" | tail -n +$((KEEP + 1)))"
@@ -605,37 +497,32 @@ services:
           echo "[pruner] <= ${KEEP} release images, nothing to remove"; exit 0
         fi
         for t in $old; do
-          # Un-forced: the daemon refuses if any container still references it,
-          # which protects the live + draining rollback targets automatically.
+          # Un-forced, so the daemon protects live and rollback images.
           if docker image rm "${IMAGE}:${t}" >/dev/null 2>&1; then
             echo "[pruner] removed   ${IMAGE}:${t}"
           else
             echo "[pruner] kept (in use / gone) ${IMAGE}:${t}"
           fi
         done
-        # Sweep dangling (untagged) layers left behind when a tag was overwritten;
-        # without -a this only touches unreferenced images, never tagged ones.
+        # Without -a this only removes dangling layers, never tagged images.
         docker image prune -f >/dev/null 2>&1 || true
         echo "[pruner] done"
 
     environment:
-      # Pinned to the rolled-out image ref so the spec — and thus the one-shot
-      # task — changes on every release, re-triggering the prune fleet-wide.
+      # Changes every release, which re-triggers the one-shot task fleet-wide.
       - PRUNE_RELEASE=${CRIMSON_API_IMAGE:-registry.ramon.moe/crimsonhaven-to/crimson-backend:latest}
 
-    # Talk to the node's own daemon to list/remove its local images.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
-    # Batch job, not a server — it never binds a port, so no healthcheck.
+    # Binds no port, so there is nothing to probe.
     healthcheck:
       test: ["NONE"]
 
     deploy:
       mode: global
       restart_policy:
-        # Run once per (re)deploy and stop. Don't relaunch on exit — a failed
-        # pass is harmless and simply retried at the next release.
+        # A failed pass is harmless and retried at the next release.
         condition: none
       resources:
         limits:
@@ -650,13 +537,9 @@ networks:
     driver: overlay
     attachable: true
 
-# --- Optional: NAS volume for the server-side video cache --------------------
-# Windows / Samba shares speak SMB (the Linux mount type is "cifs"); a Unix/Linux
-# NAS exporting NFS uses "nfs" instead (see the NFS variant below). Swarm mounts
-# the volume on every node that runs a task referencing it, so you do NOT have to
-# hand-mount the share on each of the 3 hosts — define it once here and uncomment
-# the `volumes:` block under the `api` service above.
-#
+# Optional NAS volumes for the video cache. Swarm mounts a volume on every node
+# that runs a task using it, so there is no per-host mount. SMB/Samba shares use
+# type cifs; an NFS NAS uses the variant below.
 #
 #   NAS_IP=192.168.1.10 NAS_SHARE=crimson-cache \
 #   NAS_USER=crimson NAS_PASSWORD='super-secret' \
@@ -668,23 +551,23 @@ networks:
 #     driver: local
 #     driver_opts:
 #       type: cifs
-#       # // <host-or-ip>/<share> — forward slashes even for a Windows share.
+#       # Forward slashes even for a Windows share.
 #       device: "//${NAS_IP}/${NAS_SHARE1}"
-#       # uid/gid 10001 == the image's non-root `appuser`, so ffmpeg may write;
-#       # vers=3.0 suits modern Windows/Samba (drop to 2.1 for very old servers).
+#       # uid/gid 10001 is the image's appuser, so ffmpeg can write. vers=3.0
+#       # suits modern Windows/Samba; use 2.1 for very old servers.
 #       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
 # 
 #   crimson_cache2:
 #     driver: local
 #     driver_opts:
 #       type: cifs
-#       # // <host-or-ip>/<share> — forward slashes even for a Windows share.
+#       # Forward slashes even for a Windows share.
 #       device: "//${NAS_IP}/${NAS_SHARE2}"
-#       # uid/gid 10001 == the image's non-root `appuser`, so ffmpeg may write;
-#       # vers=3.0 suits modern Windows/Samba (drop to 2.1 for very old servers).
+#       # uid/gid 10001 is the image's appuser, so ffmpeg can write. vers=3.0
+#       # suits modern Windows/Samba; use 2.1 for very old servers.
 #       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
 #
-#   # NFS variant (Unix/Linux NAS) — use THIS block instead of the cifs one above:
+#   # NFS variant, instead of the cifs blocks above:
 #   # crimson_cache:
 #   #   driver: local
 #   #   driver_opts:
@@ -692,22 +575,12 @@ networks:
 #   #     o: "addr=${NAS_IP},nfsvers=4,rw,hard,timeo=600"
 #   #     device: ":/export/crimson-cache"
 
-# --- Why two services --------------------------------------------------------
-# Only ONE process may run the Fribb resync, but the serving tier must scale. A
-# single service can't do both: every replica of a service shares the same env,
-# so you can't have one with RUN_DB_SYNC=true and the rest false. Hence the split
-# — `api` (replicas: N, RUN_DB_SYNC=false) and `api-sync` (replicas: 1,
-# RUN_DB_SYNC=true). Both run from the same image and both run the cheap
-# expired-session purge on their own schedule; only api-sync runs the resync.
+# Why two services: only one process may run the Fribb resync, but the serving
+# tier must scale, and every replica of a service shares the same env. So `api`
+# (replicas: N, RUN_DB_SYNC=false) and `api-sync` (replicas: 1, RUN_DB_SYNC=true).
 #
-# To scale the serving tier, change `replicas` under `api`. Mind the DB
-# connection ceiling: each replica opens up to DB_POOL_MAX (default 10)
-# connections to the Patroni leader, plus api-sync's pool, plus replication/
-# Patroni overhead — so direct-to-Postgres you top out at ~8 api replicas before
-# hitting max_connections (default 100).
-#
-# To scale past that, run the co-located PgBouncer pooler (deploy/pgbouncer): it
-# multiplexes the whole API tier onto a small, fixed set of Postgres connections,
-# so replica count stops driving connection count. After standing it up, just
-# point DATABASE_URL at port 6432 instead of 5432 (same host list, same
-# target_session_attrs=read-write). See deploy/pgbouncer/README.md.
+# Scaling `api`: each replica opens up to DB_POOL_MAX (default 10) connections to
+# the Patroni leader, plus api-sync's pool and replication overhead, so direct to
+# Postgres the ceiling is ~8 replicas before max_connections (100). Past that,
+# run the co-located PgBouncer and point DATABASE_URL at port 6432 instead of
+# 5432 (same host list and target_session_attrs). See deploy/pgbouncer/README.md.

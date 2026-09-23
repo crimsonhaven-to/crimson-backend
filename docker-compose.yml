@@ -1,14 +1,10 @@
-# Works with `docker compose up` (local / dev). For a real Swarm production
-# deploy you'll likely point DATABASE_URL at a managed/external PostgreSQL
-# instead of the bundled `postgres` service below — but for dev-testing a second
-# container is the simplest thing that works.
+# Single host `docker compose up` with a bundled PostgreSQL. Production (Swarm,
+# external HA PostgreSQL) is docker-stack.yml.
 #
-# State now lives in PostgreSQL (mapping tables + account/user data, one DB), so
-# the API is stateless and can be scaled to multiple replicas pointing at the
-# same database — the SQLite single-writer/shared-volume limitation is gone.
-# Keep RUN_DB_SYNC=true on exactly ONE replica (the Fribb resync rebuilds the
-# mapping tables wholesale; running it everywhere just wastes bandwidth) and a
-# shared PROXY_SECRET on all.
+# The API is stateless, so replicas can share the database, but keep
+# RUN_DB_SYNC=true on exactly one (the Fribb resync rebuilds the mapping tables
+# wholesale; running it everywhere only wastes bandwidth) and the same
+# PROXY_SECRET on all.
 
 services:
   postgres:
@@ -19,8 +15,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-crimson}
     volumes:
       - crimson-pgdata:/var/lib/postgresql/data
-    # Not published to the host by default; only the api service needs it on the
-    # internal network. Uncomment to inspect with psql from the host.
+    # Unpublished: only the api needs it. Uncomment for host psql access.
     # ports:
     #   - "5432:5432"
     healthcheck:
@@ -40,57 +35,45 @@ services:
       - "8000:8000"
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY in the environment or an .env file}
-      # Point the pool at the bundled postgres service (or override with a full
-      # DATABASE_URL to use a managed/external database in production).
       - DATABASE_URL=postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson}
-      # Stable, shared secret for the signed stream proxies (PlayIMDb/AnimeSuge).
-      # MUST be set (and identical on every replica) or proxied playback 403s
-      # across restarts/replicas. Generate one: `openssl rand -hex 32`.
+      # Signs the stream proxy URLs. Must be identical on every replica, or proxied
+      # playback 403s across restarts and replicas.
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET (e.g. openssl rand -hex 32)}
-      # External crimson-proxy edge relay(s) — the E2 (no-extension) client offload
-      # path behind POST /sign. Must be listed here to reach the container; unset =>
-      # _crimson_proxy.is_enabled() is False and /sign returns 503 (clients fall back
-      # to the extension/backend). Comma-separate hosts for failover; each proxy's
-      # NITRO_PROXY_SECRET must equal PROXY_SECRET above.
+      # Compose does not inject .env into the container, so optional settings only
+      # take effect when listed here.
+      #
+      # crimson-proxy edge relays for the no-extension path. Unset, POST /sign
+      # returns 503 and clients fall back to the extension. Comma-separate hosts for
+      # failover; each proxy's NITRO_PROXY_SECRET must equal PROXY_SECRET.
       # - CRIMSON_PROXY_BASE=https://<site>.netlify.app,https://crimson-proxy.<acct>.workers.dev
-      # Only one replica should own the periodic Fribb resync.
       - RUN_DB_SYNC=true
-      # Optional: comma-separated CORS origins (defaults to the built-in list).
+      # Comma-separated CORS origins; unset uses the built-in list.
       # - ALLOWED_ORIGINS=https://crimsonhaven.to,https://www.crimsonhaven.to
-      # Optional public /changelog from this repo's GitHub Releases. Must be listed
-      # here to reach the container; unset => /changelog returns 503. Read-only
-      # token (fine-grained PAT with Contents:read, or classic repo scope).
+      # /changelog reads GitHub Releases; unset token means 503. Read access only
+      # (fine-grained PAT with Contents:read, or classic repo scope).
       # - GITHUB_TOKEN=
       # - GITHUB_REPO=crimsonhaven-to/crimson-backend
-      # Optional Jellyfin source (see .env.example).
+      # Jellyfin source
       # - JELLYFIN_URL=
       # - JELLYFIN_USERNAME=
       # - JELLYFIN_PASSWORD=
-      # Optional ShowBox/Febbox direct-file source (see .env.example). Must be
-      # listed here to reach the container — disables itself when unset.
+      # ShowBox/Febbox direct-file source; disables itself when unset.
       # - FEBBOX_UI_TOKEN=
       # - FEBBOX_REGION=
-      # Optional OpenSubtitles player subtitles (see .env.example). Must be listed
-      # here to reach the container; unset => /subtitles returns 503.
+      # Player subtitles; unset means /subtitles returns 503.
       # - OPENSUBTITLES_API_KEY=
       # - OPENSUBTITLES_APP_NAME=CrimsonHaven v1.0
-      # --- Background downloader (aria2 sidecar) -------------------------------
-      # The admin downloader hands http/magnet links to the aria2 service below over
-      # the internal network. The secret MUST equal aria2's RPC_SECRET. Finished
-      # media lands under <root>/crimson-downloads on a *download-enabled* Local
-      # source, so mount your media volume into BOTH this service and `aria2` at the
-      # SAME in-container path (see the aria2 service note) and enable the source in
-      # Admin → Local Sources. RUN_DOWNLOAD_WORKER defaults true, so this single
-      # container both queues and runs the aria2 poll loop.
+      # Admin downloader, via the aria2 service below. The secret must equal aria2's
+      # RPC_SECRET. Files land under <root>/crimson-downloads on a download-enabled
+      # Local source, so the media volume must be mounted at the same path here and
+      # in `aria2`. RUN_DOWNLOAD_WORKER defaults to true, so this one container
+      # both queues and polls.
       - ARIA2_RPC_URL=http://aria2:6800/jsonrpc
       - ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET:?set ARIA2_RPC_SECRET (e.g. openssl rand -hex 24)}
-      # Mount your media library here (same path as on the aria2 service) and
-      # register it in Admin → Local Sources with "download into this source" on:
+      # Then register it in Admin -> Local Sources with "download into this source":
       # volumes:
       #   - /srv/media:/crimson/media
 
-    # Container-level health is also defined in the Dockerfile; declared here too
-    # so `docker compose` reports it without relying on the image default.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
       interval: 30s
@@ -118,16 +101,12 @@ services:
           cpus: "0.25"
           memory: 256M
 
-  # --- aria2 downloader sidecar ----------------------------------------------
-  # Does the actual byte-pulling for the admin downloader (http/https + magnet),
-  # exposing JSON-RPC on :6800 over the internal network only (never published to
-  # the host / public proxy). Leech-only is enforced per-download by the backend
-  # (seed-time=0), so no inbound BitTorrent port needs publishing.
+  # JSON-RPC on :6800, internal network only. The backend sets seed-time=0 per
+  # download, so no inbound BitTorrent port is needed.
   #
-  # IMPORTANT: mount your media library into this service at the SAME in-container
-  # path as `anime-api`, so a job's <root>/crimson-downloads path is valid in both.
-  # PUID/PGID 10001 match the api image's non-root appuser so the files aria2 writes
-  # stay readable/movable by the backend.
+  # The media library must be mounted at the same in-container path as in
+  # `anime-api`, so a job's <root>/crimson-downloads path is valid in both.
+  # PUID/PGID 10001 match the api image's appuser, so the backend can move the files.
   aria2:
     image: p3terx/aria2-pro
     environment:
@@ -139,10 +118,10 @@ services:
       - UPDATE_TRACKERS=true
     volumes:
       - crimson-aria2-config:/config
-      # Mount the SAME media volume here as on anime-api, at the SAME path:
+      # Same volume and path as on anime-api:
       # - /srv/media:/crimson/media
     restart: unless-stopped
 
 volumes:
-  crimson-pgdata:        # PostgreSQL data directory (named volume)
-  crimson-aria2-config:  # aria2 session/config (named volume)
+  crimson-pgdata:
+  crimson-aria2-config:

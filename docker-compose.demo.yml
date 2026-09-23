@@ -1,20 +1,16 @@
-# Demo deployment (e.g. demo.crimsonhaven.org) — a deliberately "weak" instance:
+# Demo instance (e.g. demo.crimsonhaven.org):
+#   docker compose -f docker-compose.demo.yml up -d
 #
-#   * DEMO_MODE=1            -> signup is OPEN (the invite gate is bypassed) and all
-#                              non-admin account data (accounts, sessions, favorites,
-#                              watch progress, invites, challenges) is WIPED NIGHTLY,
-#                              so an open-signup demo can't grow without bound. Admin
-#                              accounts (ADMIN_EMAILS) survive the reset.
-#   * NO sources             -> PRIVATE_SOURCES_ENABLED=0 and no Jellyfin/Febbox/Local/
-#                              Cache configured, so NOTHING resolves. The demo shows the
-#                              catalogue + account UX only; it never serves a stream.
-#   * REQUIRE_LOGIN=true      -> still members-only (the point of the demo is to show the
-#                              login-walled experience), but anyone can self-register.
+#   DEMO_MODE=1                open signup (invite gate bypassed); non-admin account
+#                              data is wiped nightly so open signup cannot grow
+#                              without bound. ADMIN_EMAILS accounts survive.
+#   PRIVATE_SOURCES_ENABLED=0  with no Jellyfin/Febbox/Local/Cache configured,
+#                              nothing resolves: the demo never serves a stream.
+#   REQUIRE_LOGIN=true         shows the login-walled experience; anyone can register.
 #
-# This is self-contained: `docker compose -f docker-compose.demo.yml up -d`. It uses
-# its OWN postgres volume so it never touches production data. Point the demo frontend
-# build at this backend (VITE_API_BASE_URL=https://demo-backend...) — the login page
-# reads GET /config and drops the invite field automatically when demo_mode is true.
+# Its own postgres volume keeps it away from production data. Build the demo
+# frontend with VITE_API_BASE_URL pointing here; the login page drops the invite
+# field when GET /config reports demo_mode.
 
 services:
   postgres:
@@ -44,26 +40,19 @@ services:
       - TMDB_API_KEY=${TMDB_API_KEY:?set TMDB_API_KEY in the environment or an .env file}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-crimson}:${POSTGRES_PASSWORD:-crimson}@postgres:5432/${POSTGRES_DB:-crimson_demo}
       - PROXY_SECRET=${PROXY_SECRET:?set PROXY_SECRET (e.g. openssl rand -hex 32)}
-      # --- demo switches ---------------------------------------------------
-      # Open signup + nightly reset of non-admin data.
       - DEMO_MODE=1
-      # Hour (container/UTC) the nightly reset runs. Default 4 if unset.
+      # Hour (container time, UTC) of the nightly reset.
       # - DEMO_RESET_HOUR=4
-      # No third-party source overlay — the demo resolves nothing.
       - PRIVATE_SOURCES_ENABLED=0
-      # Members-only experience, but anyone may register (DEMO_MODE opens the gate).
       - REQUIRE_LOGIN=true
-      # Owns the nightly reset job + the mapping resync so the catalogue populates.
-      # A demo runs a single replica, so keep this on.
+      # The single replica owns the nightly reset and the mapping resync.
       - RUN_DB_SYNC=true
-      # Seed an admin so you can still reach /admin on the demo (survives the reset).
+      # Survives the reset, so /admin stays reachable.
       # - ADMIN_EMAILS=you@example.com
-      # Lock CORS to the demo frontend origin.
       # - ALLOWED_ORIGINS=https://demo.crimsonhaven.org
       #
-      # Deliberately UNSET on a demo (leaving every source inert):
-      #   JELLYFIN_*, FEBBOX_*, OPENSUBTITLES_*, CRIMSON_PROXY_BASE
-      # and no Local/Cache directories registered in the admin dashboard.
+      # Leave JELLYFIN_*, FEBBOX_*, OPENSUBTITLES_* and CRIMSON_PROXY_BASE unset and
+      # register no Local/Cache directories, so every source stays inert.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
       interval: 30s
@@ -74,9 +63,9 @@ services:
     deploy:
       resources:
         limits:
-          # A demo never transcodes (no sources), so it needs very little.
+          # No sources means no transcoding, so it needs little.
           cpus: "0.75"
           memory: 512M
 
 volumes:
-  crimson-demo-pgdata:   # separate from production — demo data is disposable
+  crimson-demo-pgdata:   # disposable, separate from production

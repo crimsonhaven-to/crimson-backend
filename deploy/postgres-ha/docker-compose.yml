@@ -1,13 +1,8 @@
-# Crimsonhaven PostgreSQL HA stack — run ONE copy of this on EACH of the three
-# database hosts. Everything host-specific lives in a per-host .env file
-# (copy .env.example -> .env on each host and edit it).
+# One copy per database host; host-specific values live in .env. First bring-up:
+# etcd on all three hosts, then Patroni on all three (README §6).
 #
-#   docker compose build           # build the Patroni image (first time only)
-#   docker compose up -d etcd      # bring up etcd first, on ALL three hosts
-#   docker compose up -d patroni   # then Patroni, on ALL three hosts
-#
-# Host networking is used so etcd peers and Patroni reach each other across hosts
-# by their plain LAN IPs, with no Docker overlay to coordinate. Linux hosts only.
+# Host networking so etcd and Patroni reach each other by plain LAN IPs, with no
+# Docker overlay to coordinate. Linux hosts only.
 
 services:
   etcd:
@@ -37,7 +32,7 @@ services:
     depends_on:
       - etcd
     environment:
-      # --- identity / addresses (per host) ---
+      # per host
       PATRONI_NAME: ${PATRONI_NAME}
       PATRONI_SCOPE: ${PATRONI_SCOPE:-crimson-cluster}
       PATRONI_NAMESPACE: /crimson
@@ -46,19 +41,20 @@ services:
       PATRONI_RESTAPI_CONNECT_ADDRESS: ${HOST_IP}:8008
       PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
       PATRONI_POSTGRESQL_CONNECT_ADDRESS: ${HOST_IP}:5432
-      # --- secrets (same on all hosts) ---
+      # same on all hosts
       PATRONI_RESTAPI_USERNAME: ${PATRONI_RESTAPI_USERNAME:-admin}
       PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD:?set PATRONI_RESTAPI_PASSWORD}
       PATRONI_SUPERUSER_USERNAME: postgres
       PATRONI_SUPERUSER_PASSWORD: ${SUPERUSER_PASSWORD:?set SUPERUSER_PASSWORD}
       PATRONI_REPLICATION_USERNAME: replicator
       PATRONI_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?set REPLICATION_PASSWORD}
-      # --- consumed by init-app-db.sh (post_init) ---
+      # read by init-app-db.sh and on-role-change.sh
       CRIMSON_APP_USER: ${CRIMSON_APP_USER:-crimson}
       CRIMSON_APP_PASSWORD: ${CRIMSON_APP_PASSWORD:?set CRIMSON_APP_PASSWORD}
       CRIMSON_APP_DB: ${CRIMSON_APP_DB:-crimson}
     volumes:
-      # Point PGDATA_DIR / PGBACKREST_REPO at your RAID1 mount (see .env).
+      # PGDATA_DIR also carries on-role-change.sh, so it can be added without a
+      # new mount (README §6e).
       - ${PGDATA_DIR:-/srv/crimson-pgdata}:/var/lib/postgresql/data
       - ${PGBACKREST_REPO:-/srv/crimson-pgbackrest}:/var/lib/pgbackrest
       - ./patroni.yml:/etc/patroni/patroni.yml:ro

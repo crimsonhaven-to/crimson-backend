@@ -1,8 +1,6 @@
-# GitLab CI/CD for crimson-backend.
-#
-#   * push to `main` -> build :dev-<sha> and roll the crimson-dev stack.
-#   * a v* tag       -> build :<tag> + :latest, roll prod, and build/roll the
-#                       sourceless demo stack.
+#   push to `main`  build :dev-<sha> and roll the crimson-dev stack
+#   v* tag          build :<tag> + :latest, roll prod, build and roll the
+#                   sourceless demo stack
 
 stages:
   - security
@@ -12,12 +10,10 @@ stages:
 
 variables:
   IMAGE: $CI_REGISTRY_IMAGE
-  # The swarm manager the deploy is driven against (reachable from the runner).
-  # The runner runs as the `gitlab-runner` user, so the login user is explicit here.
+  # The runner runs as `gitlab-runner`, so the login user must be explicit.
   SWARM_MANAGER: raymond@crimsonswarm01
 
-# Never let two builds/deploys of the same ref run concurrently (a second release
-# must wait, not race the rolling update).
+# A second release must wait, not race the rolling update.
 default:
   interruptible: false
 
@@ -46,10 +42,10 @@ gate:
     - echo "Install dev + runtime deps"
     - python -m pip install --upgrade pip --no-cache-dir
     - pip install --no-cache-dir -r requirements-dev.txt
-    - echo "Lint (ruff — correctness rules)"
+    - echo "Lint (ruff, correctness rules)"
     - ruff check .
-    - echo "Type-check (mypy — informational, non-blocking)"
-    - mypy . || true
+    - echo "Type-check (mypy)"
+    - mypy .
     - echo "Unit tests (pytest)"
     - pytest
 
@@ -86,24 +82,21 @@ build:
         echo "IMAGE_TAG=dev-${SHORT_SHA}" >> build.env
       fi
       echo "Building ${TAGS}"
-      # Optional build-time source overlay (see self-hosting docs). Set the CI/CD
-      # variable SOURCES_REPO to "group/project" on this GitLab and the Dockerfile's
-      # private-sources stage bakes that repo's resolvers/, scrapers/ and manga/ into
-      # the image. Leave it unset and the --secret flags are omitted entirely, so the
-      # stage copies nothing and the build is the plain public image.
+      # Optional source overlay (https://docs.crimsonhaven.org). With the CI/CD
+      # variable SOURCES_REPO set to "group/project" on this GitLab, the Dockerfile
+      # bakes that repo's resolvers/, scrapers/ and manga/ into the image. Unset,
+      # no --secret flags are passed and the build is the plain public image.
       #
-      # Auth is this pipeline's own CI_JOB_TOKEN, so there is no PAT to mint, mask or
-      # rotate. It only needs the overlay project to allow this one:
+      # Auth is CI_JOB_TOKEN, so there is no PAT to rotate. The overlay project must
+      # allow this one:
       #   <overlay project> > Settings > CI/CD > Job token permissions > add crimson-backend
-      # Same mechanism crimson-client uses to bundle crimson-sources.
       OVERLAY_ARGS=""
       if [ -n "${SOURCES_REPO:-}" ]; then
         export SOURCES_TOKEN="$CI_JOB_TOKEN"
         export SOURCES_TARGET="${CI_SERVER_HOST}/${SOURCES_REPO}"
-        # OVERLAY_REV is load-bearing, not cosmetic: BuildKit does NOT hash secret
-        # CONTENT into the cache key, and the clone RUN is byte-identical every
-        # time, so without a value that changes per pipeline the cached layer is
-        # reused and a new overlay commit is silently never baked in.
+        # BuildKit does not hash secret content into the cache key and the clone RUN
+        # never changes, so without a per-pipeline OVERLAY_REV the cached layer is
+        # reused and new overlay commits are silently never baked in.
         OVERLAY_ARGS="--secret id=sources_token,env=SOURCES_TOKEN"
         OVERLAY_ARGS="$OVERLAY_ARGS --secret id=sources_repo,env=SOURCES_TARGET"
         OVERLAY_ARGS="$OVERLAY_ARGS --build-arg OVERLAY_REV=${CI_PIPELINE_ID}"
@@ -120,7 +113,6 @@ build:
         .
   artifacts:
     reports:
-      # The GitHub job outputs, carried the GitLab way.
       dotenv: build.env
 
 deploy:
@@ -133,16 +125,14 @@ deploy:
     name: production
     url: https://crimsonhaven.to
   script:
-    # Checked out at the release tag, so we ship THIS release's stack definition.
+    # Checked out at the release tag, so this ships the release's own stack file.
     - echo "Ship stack file to the manager"
     - scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new docker-stack.yml "${SWARM_MANAGER}:/home/raymond/crimson-deploy/docker-stack.yml"
     - echo "Deploy to the swarm"
     - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/crimson-deploy/deploy.sh '${VERSION}'"
 
-# Dev auto-deploy: a push to `main` rolls the just-built dev-<sha> image onto the
-# crimson-dev stack. Unlike the prod deploy this ships NO stack file — the dev
-# docker-stack.yml lives only on the manager (~/dev-crimson-deploy/), bundling
-# its own Postgres; CI just triggers its deploy.sh.
+# Ships no stack file: the dev stack (with its own Postgres) lives only on the
+# manager in ~/dev-crimson-deploy/.
 deploy-dev:
   extends: .main_push
   stage: deploy
@@ -155,13 +145,9 @@ deploy-dev:
   script:
     - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/dev-crimson-deploy/deploy.sh '${IMAGE_TAG}'"
 
-# --- Demo image: a CLEAN build with NO private source overlay -----------------
-# Built only on a release tag, alongside the prod `build`. It deliberately OMITS the
-# sources_token/sources_repo BuildKit secrets, so the Dockerfile's private-sources
-# stage copies nothing and NO private source repo is baked into the image. A
-# SEPARATE buildcache ref (:democache) guarantees the clean build can never restore
-# a source-bearing layer from the prod cache. The crimson-demo stack runs this with
-# DEMO_MODE=1 + PRIVATE_SOURCES_ENABLED=0, so the demo resolves nothing.
+# The demo image must carry no private sources, so it gets no overlay secrets and
+# its own cache ref (:democache) so it can never restore a source-bearing layer
+# from the prod cache. The demo stack also sets PRIVATE_SOURCES_ENABLED=0.
 build-demo:
   extends:
     - .release
@@ -174,11 +160,8 @@ build-demo:
     - |
       set -eu
       VER="$CI_COMMIT_TAG"
-      # Deploy the immutable per-release demo tag, not the rolling :demo.
+      # Deploy the immutable tag, not the rolling :demo.
       echo "DEMO_IMAGE_TAG=demo-${VER}" >> demo.env
-      # NOTE: no --secret flags on purpose. Without sources_token/sources_repo the
-      # Dockerfile skips the overlay clone, so the demo image carries none of the
-      # private backend sources. Its own buildcache ref keeps it source-free.
       docker buildx build \
         --push \
         --tag "${IMAGE}:demo" \
@@ -190,8 +173,7 @@ build-demo:
     reports:
       dotenv: demo.env
 
-# Demo auto-deploy on release: roll the just-built demo-<tag> image onto the
-# crimson-demo stack. Like the dev deploy it ships NO stack file.
+# Like deploy-dev, ships no stack file.
 deploy-demo:
   extends: .release
   stage: deploy
@@ -204,16 +186,12 @@ deploy-demo:
   script:
     - ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SWARM_MANAGER}" "/home/raymond/demo-crimson-deploy/deploy.sh '${DEMO_IMAGE_TAG}'"
 
-# --- Dependency vulnerability scan ---------------------------------------------
-# GitLab's own Dependency Scanning is Ultimate-only: every job in its template is
-# gated on $GITLAB_FEATURES, which a CE instance never sets, so including it would
-# quietly scan nothing. Trivy reads the committed lockfiles directly instead and
-# needs no licence.
+# GitLab Dependency Scanning is gated on $GITLAB_FEATURES, which CE never sets, so
+# it would silently scan nothing. Trivy needs no licence.
 #
-# Two passes on purpose. The first prints every severity for the record; only the
-# second is allowed to fail, so HIGH and CRITICAL block a deploy and the rest do
-# not. This scans DEPENDENCIES, not the built image: base-image OS findings are
-# usually not actionable here and would wedge every deploy.
+# The first pass prints every severity; only the second can fail, so HIGH and
+# CRITICAL block a deploy. Dependencies only, not the image: base-image OS findings
+# are rarely actionable here and would wedge every deploy.
 scan-deps:
   stage: security
   tags: [docker]
@@ -235,14 +213,9 @@ scan-deps:
     - trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --exit-code 0 .
     - trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 .
 
-# --- Automated dependency updates ----------------------------------------------
-# Dependabot does not exist here, so Renovate fills the same role: it opens one
-# merge request per available update, which then runs the gate like any other MR.
-#
-# Runs ONLY from a pipeline schedule, and self-skips when RENOVATE_TOKEN is unset,
-# so an ordinary push never triggers it and the pipeline stays green before setup.
-# One-time setup: add a group CI/CD variable RENOVATE_TOKEN (a personal access
-# token with the `api` scope), then create a pipeline schedule on this project.
+# Renovate opens one MR per available update. Schedule-only, and skipped without
+# RENOVATE_TOKEN so the pipeline stays green before setup. Setup: add a group CI/CD
+# variable RENOVATE_TOKEN (PAT with `api` scope), then create a pipeline schedule.
 renovate:
   stage: security
   tags: [docker]
