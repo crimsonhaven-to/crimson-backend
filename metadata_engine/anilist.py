@@ -12,8 +12,10 @@ from typing import Dict, Optional
 import httpx
 
 from core import single_flight
-from core.config import Config
+from core.http_client import MAX_RETRIES, REQUEST_TIMEOUT, RETRY_BACKOFF
 from core.response_cache import (
+    CACHE_TTL,
+    TRENDING_CACHE_TTL,
     _local_get,
     _local_set,
     get_cached_response,
@@ -65,29 +67,29 @@ async def anilist_post(
     payload: Dict = {"query": query}
     if variables is not None:
         payload["variables"] = variables
-    timeout = timeout or Config.REQUEST_TIMEOUT
+    timeout = timeout or REQUEST_TIMEOUT
 
     response: Optional[httpx.Response] = None
-    for attempt in range(Config.MAX_RETRIES):
-        last = attempt == Config.MAX_RETRIES - 1
+    for attempt in range(MAX_RETRIES):
+        last = attempt == MAX_RETRIES - 1
         try:
             response = await client.post(ANILIST_URL, json=payload, timeout=timeout)
         except (httpx.TimeoutException, httpx.TransportError) as e:
             if last:
                 raise
             logger.warning(
-                f"AniList request error ({type(e).__name__}); retry {attempt + 1}/{Config.MAX_RETRIES}"
+                f"AniList request error ({type(e).__name__}); retry {attempt + 1}/{MAX_RETRIES}"
             )
-            await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
+            await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
             continue
 
         if response.status_code == 429:
             if last:
                 return response
             wait = _retry_after_seconds(response)
-            wait = min(wait, _MAX_RETRY_WAIT) if wait is not None else Config.RETRY_BACKOFF_FACTOR * (2 ** attempt)
+            wait = min(wait, _MAX_RETRY_WAIT) if wait is not None else RETRY_BACKOFF * (2 ** attempt)
             logger.warning(
-                f"AniList rate limited (429); waiting {wait}s before retry {attempt + 1}/{Config.MAX_RETRIES}"
+                f"AniList rate limited (429); waiting {wait}s before retry {attempt + 1}/{MAX_RETRIES}"
             )
             await asyncio.sleep(wait)
             continue
@@ -96,9 +98,9 @@ async def anilist_post(
             if last:
                 return response
             logger.warning(
-                f"AniList upstream {response.status_code}; retry {attempt + 1}/{Config.MAX_RETRIES}"
+                f"AniList upstream {response.status_code}; retry {attempt + 1}/{MAX_RETRIES}"
             )
-            await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
+            await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
             continue
 
         return response
@@ -214,7 +216,7 @@ async def fetch_anilist_metadata(client: httpx.AsyncClient, anilist_id: int) -> 
 
             # Plus a long-lived shadow, for serve-stale-on-error.
             if result:
-                await set_cached_response_shadowed(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
+                await set_cached_response_shadowed(cache_key, result, ttl_seconds=CACHE_TTL)
 
             return result
 
@@ -310,7 +312,7 @@ async def fetch_anilist_manga_metadata(client: httpx.AsyncClient, anilist_id: in
             "start_date": media.get("startDate"),
             "end_date": media.get("endDate"),
         }
-        await set_cached_response_shadowed(cache_key, result, ttl_seconds=Config.CACHE_TTL_SECONDS)
+        await set_cached_response_shadowed(cache_key, result, ttl_seconds=CACHE_TTL)
         return result
     except Exception as e:
         logger.error(f"Error fetching manga from AniList: {e}")
@@ -379,7 +381,7 @@ async def fetch_trending_manga(client: httpx.AsyncClient, limit: int = 12) -> di
 
     if result:
         await set_cached_response_shadowed(
-            cache_key, result, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS
+            cache_key, result, ttl_seconds=TRENDING_CACHE_TTL
         )
         return {"items": result, "stale": False}
 
@@ -410,8 +412,6 @@ _MEDIA_SORTS = {
     "title": "TITLE_ROMAJI",
 }
 CATALOGUE_DEFAULT_SORT = "trending"
-# Back-compat alias for older imports.
-MANGA_DEFAULT_SORT = CATALOGUE_DEFAULT_SORT
 
 
 async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
@@ -441,7 +441,7 @@ async def fetch_anilist_genres(client: httpx.AsyncClient) -> list:
             return await _stale_genres()
         genres = (response.json().get("data") or {}).get("GenreCollection") or []
         if genres:
-            await set_cached_response_shadowed(cache_key, {"genres": genres}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+            await set_cached_response_shadowed(cache_key, {"genres": genres}, ttl_seconds=CACHE_TTL)
             _local_set(cache_key, genres)
             return genres
         return await _stale_genres()
@@ -536,7 +536,7 @@ async def _fetch_media_catalogue(
         }
         if result["items"]:
             await set_cached_response_shadowed(
-                cache_key, result, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS
+                cache_key, result, ttl_seconds=TRENDING_CACHE_TTL
             )
         return result
     except Exception as e:

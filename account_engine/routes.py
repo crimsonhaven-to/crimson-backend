@@ -24,7 +24,6 @@ import csv
 import io
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -36,7 +35,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import audit, ed25519, mailer, passwords
 from .db import AccountStore, QuotaExceeded, VERIFY_TOKEN_TTL, RESET_TOKEN_TTL
-from core.config import Config
+from core.config import get_settings
 from core.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -89,8 +88,7 @@ CHALLENGE_PURPOSE = "auth"
 def _allowed_invite_codes() -> set:
     """Shared invite codes from SIGNUP_INVITE_CODE. Unset means no code matches,
     closing registration, which fails safe for an invite-only site."""
-    raw = os.getenv("SIGNUP_INVITE_CODE", "")
-    return {c.strip() for c in raw.split(",") if c.strip()}
+    return set(get_settings().signup_invite_code)
 
 
 def _check_invite_code(code: str, request: Optional[Request] = None,
@@ -105,7 +103,7 @@ def _check_invite_code(code: str, request: Optional[Request] = None,
     audit context for the ``invite_invalid`` event."""
     # Demo deployments accept any code so anyone can try the site; growth is
     # bounded by the nightly reset instead. True keeps _consume_invite_code a no-op.
-    if Config.DEMO_MODE:
+    if get_settings().demo_mode:
         return True
     code = (code or "").strip()
     static_codes = _allowed_invite_codes()
@@ -513,7 +511,7 @@ async def email_register(request: Request, body: EmailRegisterRequest):
 
     # Demo deployments have no SMTP, so skip verification and sign the user
     # straight in. The nightly reset wipes these accounts anyway.
-    if Config.DEMO_MODE:
+    if get_settings().demo_mode:
         await run_in_threadpool(store.set_email_verified, account["user_id"], True)
         account = await run_in_threadpool(store.get_account, account["user_id"])
         payload = await run_in_threadpool(_session_payload, account, created=True, request=request)

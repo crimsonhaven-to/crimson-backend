@@ -28,7 +28,6 @@ backend, the Jellyfin server can stay private/LAN-only and needs no CORS.
 """
 
 import asyncio
-import os
 import re
 from typing import AsyncIterator, Optional, Tuple, Union
 from urllib.parse import parse_qsl, urlencode, urlparse
@@ -36,6 +35,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 import httpx
 
 from .base_resolver import BaseResolver
+from core.config import get_settings
 
 # --- Proxy routing ---------------------------------------------------------
 PROXY_PREFIX = "/jellyfin_proxy"
@@ -93,12 +93,9 @@ _WEB_VCODECS = {"h264", "avc1", "vp8", "vp9", "av1"}
 _WEB_ACODECS = {"aac", "mp3", "opus", "vorbis", "flac", ""}
 
 
-# --- Config (read lazily; api.py calls load_dotenv() AFTER importing us) ----
 def get_config() -> Tuple[str, str, str]:
-    url = (os.getenv("JELLYFIN_URL") or "").rstrip("/")
-    user = os.getenv("JELLYFIN_USERNAME") or ""
-    pw = os.getenv("JELLYFIN_PASSWORD")
-    return url, user, ("" if pw is None else pw)
+    settings = get_settings()
+    return settings.jellyfin_url, settings.jellyfin_username, settings.jellyfin_password or ""
 
 
 def is_configured() -> bool:

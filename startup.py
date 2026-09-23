@@ -36,7 +36,7 @@ from fastapi import FastAPI
 from starlette.concurrency import run_in_threadpool
 
 from core import config_report, migrations, observability
-from core.config import Config
+from core.config import get_settings
 from core.db_pool import close_pool
 from core.http_client import close_client as close_http_client
 from core.response_cache import purge_expired_cache
@@ -50,7 +50,6 @@ from cache_engine.downloader import manager as cache_manager
 from changelog_engine import service as changelog_service
 from chat_engine import store as chat_store
 from download_engine.manager import manager as download_manager
-from iptv_engine import enabled as iptv_enabled
 from iptv_engine import service as iptv_service
 from metadata_engine import maintenance as metadata_maintenance
 from metadata_engine import sync_status
@@ -69,11 +68,13 @@ from web.context import (
 
 
 def report_config(logger: logging.Logger) -> None:
-    """Log which features are configured.
+    """Log which features are configured, and refuse to start without TMDB.
 
     Presence only, never values, so a dark source is diagnosable from the boot
     log at a glance."""
     config_report.log_report(logger)
+    if not get_settings().tmdb_api_key:
+        raise RuntimeError("TMDB_API_KEY is not set")
 
 
 def init_schema(logger: logging.Logger) -> None:
@@ -119,10 +120,10 @@ def bootstrap_admins(logger: logging.Logger) -> None:
 
     Idempotent, and only promotes accounts that already exist, so the operator
     reaches /admin without hand-editing the DB."""
-    if not Config.ADMIN_EMAILS:
+    if not get_settings().admin_emails:
         return
     try:
-        promoted = account_store.bootstrap_admins(Config.ADMIN_EMAILS)
+        promoted = account_store.bootstrap_admins(get_settings().admin_emails)
         if promoted:
             logger.info(f"Promoted {promoted} account(s) to admin from ADMIN_EMAILS")
     except Exception as e:
@@ -259,7 +260,7 @@ def _register_optional_service_jobs(scheduler: BackgroundScheduler, logger: logg
     # The warm-up is a ~25 MB JSON pull, so it runs off the event loop; upstream
     # publishes daily, so the refresh interval matches. Routes also self-heal by
     # kicking a refresh when asked while stale.
-    if iptv_enabled():
+    if get_settings().iptv_enabled:
         async def _warm_iptv():
             try:
                 await run_in_threadpool(iptv_service.refresh)
@@ -330,12 +331,12 @@ def _register_optional_service_jobs(scheduler: BackgroundScheduler, logger: logg
 def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.Logger) -> None:
     # Signup is open in demo mode, so all non-admin data is wiped nightly to
     # bound growth. Pinned so replicas don't race the DELETE.
-    if Config.DEMO_MODE:
+    if get_settings().demo_mode:
         logger.warning(
             "DEMO_MODE is ON: signup invite gate is bypassed, non-admin data resets "
-            f"nightly at {Config.DEMO_RESET_HOUR:02d}:00 (server time)"
+            f"nightly at {get_settings().demo_reset_hour:02d}:00 (server time)"
         )
-        if Config.RUN_DB_SYNC:
+        if get_settings().run_db_sync:
             def _demo_reset():
                 try:
                     res = account_store.wipe_demo_data()
@@ -345,14 +346,14 @@ def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.
 
             scheduler.add_job(
                 _demo_reset,
-                trigger=CronTrigger(hour=Config.DEMO_RESET_HOUR, minute=0),
+                trigger=CronTrigger(hour=get_settings().demo_reset_hour, minute=0),
                 id="demo_reset_job",
                 replace_existing=True,
             )
         else:
             logger.info("DEMO_MODE: this replica is not RUN_DB_SYNC, the nightly reset runs on the sync replica")
 
-    if not Config.RUN_DB_SYNC:
+    if not get_settings().run_db_sync:
         logger.info("RUN_DB_SYNC is disabled, this replica will not run the mapping resync")
         sync_status.set_phase("disabled", "RUN_DB_SYNC is off on this replica")
         return
@@ -418,7 +419,7 @@ def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.
 
     scheduler.add_job(
         _nightly_metadata_refresh,
-        trigger=CronTrigger(hour=Config.METADATA_REFRESH_HOUR, minute=0),
+        trigger=CronTrigger(hour=get_settings().metadata_refresh_hour, minute=0),
         id="metadata_nightly_refresh_job",
         replace_existing=True,
     )
@@ -440,7 +441,7 @@ def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.
         replace_existing=True,
     )
 
-    if Config.RUN_METADATA_BACKFILL:
+    if get_settings().run_metadata_backfill:
         async def _run_backfill():
             try:
                 shows, movies = await metadata_maintenance.backfill_catalogue()
@@ -483,14 +484,14 @@ def _register_sync_replica_jobs(scheduler: BackgroundScheduler, logger: logging.
         replace_existing=True,
     )
 
-    if not Config.AIRING_NOTIFY_ENABLED:
+    if not get_settings().airing_notify_enabled:
         logger.info(
             "AIRING_NOTIFY_ENABLED is off, the calendar and follows work but "
             "nobody is mailed when an episode airs"
         )
         return
 
-    if Config.AIRING_NOTIFY_DRY_RUN:
+    if get_settings().airing_notify_dry_run:
         logger.warning(
             "AIRING_NOTIFY_DRY_RUN is ON: notifications are claimed and logged, "
             "but no SMTP connection is opened and nobody receives anything"
@@ -525,7 +526,7 @@ async def start_workers(logger: logging.Logger) -> None:
     just don't run the loop."""
     # Only the dedicated cache-worker runs the ffmpeg loop; api replicas just
     # mint tickets and claim rows.
-    if Config.RUN_CACHE_WORKER:
+    if get_settings().run_cache_worker:
         await cache_manager.start_worker()
     else:
         logger.info(
@@ -535,7 +536,7 @@ async def start_workers(logger: logging.Logger) -> None:
 
     # The same split as the cache worker: only the download-worker submits and
     # polls, while other replicas write pending rows and issue pause/resume.
-    if Config.RUN_DOWNLOAD_WORKER:
+    if get_settings().run_download_worker:
         await download_manager.start_worker()
     else:
         logger.info(

@@ -26,6 +26,7 @@ from starlette.concurrency import run_in_threadpool
 
 from account_engine import store as account_store
 from core import observability
+from core.config import get_settings
 
 logger = logging.getLogger("crimson.metrics")
 
@@ -40,7 +41,7 @@ def _bearer(request: Request) -> str:
 
 
 async def _authorized(request: Request) -> bool:
-    token = observability.metrics_token()
+    token = get_settings().metrics_token
     bearer = _bearer(request)
 
     if token:

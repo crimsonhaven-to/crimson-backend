@@ -78,9 +78,6 @@ services:
       # dark (clients silently fall back to E0/extension). Comma-separate hosts for
       # free failover; the proxy's NITRO_PROXY_SECRET must equal PROXY_SECRET above.
       - CRIMSON_PROXY_BASE=${CRIMSON_PROXY_BASE:-}
-      # Optional per-source A/B allowlist (e.g. cinema.bz,PlayIMDb). Unset => every
-      # wired E2 source offloads.
-      - CRIMSON_PROXY_SOURCES=${CRIMSON_PROXY_SOURCES:-}
       # This lone replica owns the Fribb resync (in prod that's api-sync's job).
       - RUN_DB_SYNC=true
       # Dev CORS: defaults to the built-in dev + crimsonhaven list when unset.

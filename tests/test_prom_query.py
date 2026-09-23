@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from core import prom_query
+from core.config import get_settings
 
 
 # --- catalogue integrity ----------------------------------------------------
@@ -35,11 +36,10 @@ def test_every_panel_has_a_unique_id_and_a_known_unit():
         assert panel.series, panel.id
 
 
-def test_no_panel_leaves_a_placeholder_unexpanded(monkeypatch):
+def test_no_panel_leaves_a_placeholder_unexpanded():
     """$JOB / $WINDOW are substituted by _expand. One that survives expansion is a
     typo (say `$job`) that Prometheus would reject at query time, which shows up
     as a permanently broken card rather than a crash."""
-    monkeypatch.delenv("PROMETHEUS_JOB", raising=False)
     for panel in prom_query.PANELS.values():
         for _, promql in panel.series:
             expanded = prom_query._expand(promql, "5m")
@@ -60,10 +60,9 @@ def test_cluster_wide_metrics_are_never_summed():
                     assert "sum" not in promql.split(metric)[0], f"{panel.id} sums {metric}"
 
 
-def test_every_panel_filters_on_the_scrape_job(monkeypatch):
+def test_every_panel_filters_on_the_scrape_job():
     """A Prometheus shared with another project must not blend foreign series into
     our charts."""
-    monkeypatch.delenv("PROMETHEUS_JOB", raising=False)
     for panel in prom_query.PANELS.values():
         for _, promql in panel.series:
             assert 'job="$JOB"' in promql, f"{panel.id} does not scope to the job"
@@ -83,7 +82,7 @@ def test_range_catalogue_lists_every_range():
 
 
 def test_unset_prometheus_url_is_unavailable_not_an_error(monkeypatch):
-    monkeypatch.delenv("PROMETHEUS_URL", raising=False)
+    monkeypatch.setattr(get_settings(), "prometheus_url", "")
     assert prom_query.available() is False
     assert prom_query.base_url() == ""
 
@@ -91,27 +90,13 @@ def test_unset_prometheus_url_is_unavailable_not_an_error(monkeypatch):
 def test_a_url_without_a_scheme_is_refused(monkeypatch):
     """Reported as "not configured" rather than half-working: the module builds
     URLs by concatenation, and a bare host would produce nonsense requests."""
-    monkeypatch.setenv("PROMETHEUS_URL", "prometheus:9090")
+    monkeypatch.setattr(get_settings(), "prometheus_url", "prometheus:9090")
     assert prom_query.available() is False
 
 
 def test_trailing_slash_is_stripped(monkeypatch):
-    monkeypatch.setenv("PROMETHEUS_URL", "http://prometheus:9090/")
+    monkeypatch.setattr(get_settings(), "prometheus_url", "http://prometheus:9090/")
     assert prom_query.base_url() == "http://prometheus:9090"
-
-
-def test_job_label_is_filtered_before_it_reaches_promql(monkeypatch):
-    """The job name is operator-supplied rather than client-supplied, so this is
-    defence in depth, not the main gate. It is still the only non-literal fragment
-    in an otherwise static query."""
-    monkeypatch.setenv("PROMETHEUS_JOB", 'evil"} or up{x="')
-    assert '"' not in prom_query.job_label()
-    assert prom_query.job_label() == "evilorupx"
-
-
-def test_a_blank_job_falls_back_to_the_default(monkeypatch):
-    monkeypatch.setenv("PROMETHEUS_JOB", "   ")
-    assert prom_query.job_label() == prom_query.DEFAULT_JOB
 
 
 # --- legends ----------------------------------------------------------------
@@ -179,8 +164,7 @@ def _matrix(*series):
 
 @pytest.fixture
 def prom(monkeypatch):
-    monkeypatch.setenv("PROMETHEUS_URL", "http://prometheus:9090")
-    monkeypatch.delenv("PROMETHEUS_JOB", raising=False)
+    monkeypatch.setattr(get_settings(), "prometheus_url", "http://prometheus:9090")
 
     def _install(payload, status=200):
         client = _StubClient(payload, status)

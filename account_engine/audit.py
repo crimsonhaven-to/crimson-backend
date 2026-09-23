@@ -19,16 +19,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
+from core.config import get_settings
 from core.db_pool import get_connection, lock_schema_init
 
 logger = logging.getLogger(__name__)
 
-# Retention for the prune job, scheduled in api.py.
-RETENTION_DAYS = int(os.getenv("SECURITY_EVENTS_RETENTION_DAYS", "90"))
 
 # Caps so a hostile client can't bloat rows with crafted inputs.
 MAX_IDENTITY_LEN = 200
@@ -363,7 +361,7 @@ def stats(days: int = 14) -> dict:
 
     return {
         "days": days,
-        "retention_days": RETENTION_DAYS,
+        "retention_days": get_settings().security_events_retention_days,
         "tiles": tiles,
         "series": zero_filled_series(series_rows, days, now.date()),
         "by_type": [
@@ -382,9 +380,9 @@ def stats(days: int = 14) -> dict:
     }
 
 
-def purge_old(keep_days: int = RETENTION_DAYS) -> int:
+def purge_old() -> int:
     """Drop events past retention. Returns rows removed."""
-    cutoff = _now() - timedelta(days=max(1, keep_days))
+    cutoff = _now() - timedelta(days=get_settings().security_events_retention_days)
     with get_connection() as conn:
         cur = conn.execute("DELETE FROM security_events WHERE ts < %s", (cutoff,))
         return cur.rowcount or 0

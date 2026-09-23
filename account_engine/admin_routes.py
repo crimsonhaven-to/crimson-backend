@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from core.config import Config
+from core.config import get_settings
 from core.db_pool import get_connection
 from core import prom_query
 from core.rate_limit import limiter
@@ -580,7 +580,7 @@ async def backfill_status(user: dict = Depends(require_admin)):
     return {
         "success": True,
         "backfill": metadata_maintenance.job_status_payload(row),
-        "default_pages": Config.METADATA_BACKFILL_PAGES,
+        "default_pages": get_settings().metadata_backfill_pages,
     }
 
 
@@ -590,7 +590,7 @@ async def trigger_backfill(body: Optional[BackfillTrigger] = None, user: dict = 
     into tmdb_shows / tmdb_movies. The job is written to the DB and claimed within
     about a minute by api-sync, so only that container churns the metadata. Poll
     /admin/backfill/status for progress. A no-op if one is already queued."""
-    pages = body.pages if (body and body.pages) else Config.METADATA_BACKFILL_PAGES
+    pages = body.pages if (body and body.pages) else get_settings().metadata_backfill_pages
     triggered_by = f"admin:{user.get('email') or user['user_id']}"
     row, created = await run_in_threadpool(metadata_maintenance.request_backfill, pages, triggered_by)
     payload = metadata_maintenance.job_status_payload(row)
@@ -754,10 +754,10 @@ async def cache_overview(user: dict = Depends(require_admin)):
         "enabled_targets": target_count,
         "stats": stats,
         "config": {
-            "max_concurrent": cache_dl.MAX_CONCURRENT,
-            "download_timeout": cache_dl.DOWNLOAD_TIMEOUT,
-            "min_free_bytes": cache_dl.MIN_FREE_BYTES,
-            "internal_base": cache_dl.INTERNAL_BASE,
+            "max_concurrent": get_settings().cache_max_concurrent,
+            "download_timeout": get_settings().cache_download_timeout,
+            "min_free_bytes": get_settings().cache_min_free_bytes,
+            "internal_base": get_settings().cache_internal_base,
         },
     }
 
@@ -949,13 +949,13 @@ async def downloads_overview(user: dict = Depends(require_admin)):
     return {
         "success": True,
         "aria2_available": aria2_ok,
-        "aria2_rpc_url": download_aria2.RPC_URL,
+        "aria2_rpc_url": get_settings().aria2_rpc_url,
         "download_targets": targets,
         "stats": stats,
         "config": {
-            "max_active": download_manager.MAX_ACTIVE,
-            "min_free_bytes": download_manager.MIN_FREE_BYTES,
-            "poll_interval": download_manager.POLL_INTERVAL,
+            "max_active": get_settings().download_max_active,
+            "min_free_bytes": get_settings().download_min_free_bytes,
+            "poll_interval": get_settings().download_poll_interval,
         },
     }
 

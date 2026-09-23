@@ -14,11 +14,13 @@ from typing import Dict, Optional, Tuple
 
 import orjson
 
-from core.config import Config
 from core.db_pool import get_connection
 from core import observability
 
 logger = logging.getLogger("crimson.cache")
+
+CACHE_TTL = 24 * 3600
+TRENDING_CACHE_TTL = 6 * 3600
 
 
 def _utcnow_iso() -> str:
@@ -83,7 +85,7 @@ async def get_cached_response(cache_key: str) -> Optional[Dict]:
         return None
 
 
-async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = Config.CACHE_TTL_SECONDS):
+async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = CACHE_TTL):
     """Upsert an L2 entry. A no-op on empty data."""
     if not data:
         return
@@ -121,7 +123,7 @@ def _stale_key(cache_key: str) -> str:
     return f"stale:{cache_key}"
 
 
-async def set_cached_response_shadowed(cache_key: str, data: Dict, ttl_seconds: int = Config.CACHE_TTL_SECONDS):
+async def set_cached_response_shadowed(cache_key: str, data: Dict, ttl_seconds: int = CACHE_TTL):
     """Write the fresh entry and its long-lived shadow.
 
     A no-op on empty data, like ``set_cached_response``, so a failed fetch never

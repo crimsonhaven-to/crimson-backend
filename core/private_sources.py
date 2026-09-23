@@ -9,10 +9,11 @@ without naming them. A base build finds nothing. Off via
 import importlib
 import inspect
 import logging
-import os
 import pkgutil
 from types import ModuleType
 from typing import Iterator
+
+from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ def overlay_modules(package, skip=()) -> Iterator[ModuleType]:
     ``_``-prefixed helpers, tests and the ``skip`` names are left out. A module
     that fails to import is logged and skipped, because one dead source must not
     take boot down."""
-    if os.getenv("PRIVATE_SOURCES_ENABLED", "1") == "0":
+    if not get_settings().private_sources_enabled:
         return
     for info in pkgutil.iter_modules(package.__path__):
         name = info.name

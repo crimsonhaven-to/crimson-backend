@@ -9,7 +9,6 @@ scrape/resolve pipeline lives in ``web.pipeline``.
 """
 
 import logging
-import os
 import re
 import json
 from typing import Dict, List, Optional, Tuple
@@ -39,6 +38,7 @@ from web.queries import (
     get_tmdb_season,
 )
 from web.util import _STREAM_HEADERS, _public_base_url
+from core.config import get_settings
 
 logger = logging.getLogger("crimson.watch")
 
@@ -223,16 +223,10 @@ def _make_offload_grant_runner(scraper_ref: str, resolver_ref: str):
     return _runner
 
 
-def _jellyfin_edge_inject_enabled() -> bool:
-    """Opt-in switch for delivering Jellyfin off-backend through edge token
-    injection. Off by default, leaving Jellyfin on the backend /watch proxy. Turn
-    it on only once the proxy is deployed with its Jellyfin host and token, since
-    the edge rather than the browser holds that token."""
-    return (os.getenv("JELLYFIN_EDGE_INJECT", "").strip().lower() in ("1", "true", "yes", "on"))
-
-
 def _jellyfin_grant_configured() -> bool:
-    return jellyfin_is_configured() and _jellyfin_edge_inject_enabled()
+    """Jellyfin goes off-backend only once the edge proxy holds its host and
+    token (``JELLYFIN_EDGE_INJECT``), since the edge, not the browser, injects it."""
+    return jellyfin_is_configured() and get_settings().jellyfin_edge_inject
 
 
 async def _grant_jellyfin(

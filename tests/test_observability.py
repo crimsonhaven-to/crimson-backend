@@ -19,6 +19,7 @@ import os
 import pytest
 
 from core import logging_setup, observability
+from core.config import get_settings
 
 
 # --- request id -------------------------------------------------------------
@@ -230,12 +231,11 @@ def test_request_id_filter_stamps_the_active_id():
         observability.reset_request_id(token)
 
 
-def test_log_format_env_selects_the_formatter(monkeypatch):
-    monkeypatch.setenv("LOG_FORMAT", "json")
+def test_log_format_setting_selects_the_formatter(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "log_format", "json")
     assert isinstance(logging_setup._formatter(), logging_setup.JsonFormatter)
-    monkeypatch.setenv("LOG_FORMAT", "plain")
-    assert isinstance(logging_setup._formatter(), logging_setup.PlainFormatter)
-    monkeypatch.delenv("LOG_FORMAT")
+    monkeypatch.setattr(settings, "log_format", "plain")
     assert isinstance(logging_setup._formatter(), logging_setup.PlainFormatter)
 
 
@@ -258,21 +258,21 @@ async def _auth(headers, monkeypatch, user=None):
 async def test_metrics_denies_by_default(monkeypatch):
     """No METRICS_TOKEN configured means admin-session-only. Forgetting to set the
     token must make the endpoint MORE closed, never open."""
-    monkeypatch.delenv("METRICS_TOKEN", raising=False)
+    monkeypatch.setattr(get_settings(), "metrics_token", "")
     assert await _auth({}, monkeypatch) is False
     assert await _auth({"X-Metrics-Token": "guess"}, monkeypatch) is False
     assert await _auth({"Authorization": "Bearer anything"}, monkeypatch) is False
 
 
 async def test_metrics_accepts_the_configured_token(monkeypatch):
-    monkeypatch.setenv("METRICS_TOKEN", "s3cret")
+    monkeypatch.setattr(get_settings(), "metrics_token", "s3cret")
     assert await _auth({"X-Metrics-Token": "s3cret"}, monkeypatch) is True
     assert await _auth({"Authorization": "Bearer s3cret"}, monkeypatch) is True
     assert await _auth({"X-Metrics-Token": "wrong"}, monkeypatch) is False
 
 
 async def test_metrics_accepts_an_admin_session_but_not_a_plain_user(monkeypatch):
-    monkeypatch.delenv("METRICS_TOKEN", raising=False)
+    monkeypatch.setattr(get_settings(), "metrics_token", "")
     admin = {"user_id": 1, "is_admin": True}
     plain = {"user_id": 2, "is_admin": False}
     assert await _auth({"Authorization": "Bearer sess"}, monkeypatch, user=admin) is True
@@ -291,7 +291,7 @@ async def test_metrics_token_scrape_costs_no_database_lookup(monkeypatch):
         calls.append(token)
         return None
 
-    monkeypatch.setenv("METRICS_TOKEN", "s3cret")
+    monkeypatch.setattr(get_settings(), "metrics_token", "s3cret")
     monkeypatch.setattr(metrics_route.account_store, "get_user_by_session", _tracked)
     assert await metrics_route._authorized(
         _FakeRequest({"Authorization": "Bearer s3cret"})

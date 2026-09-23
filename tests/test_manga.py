@@ -13,6 +13,7 @@ The MangaDex client itself (search / chapter feed / @Home / the signed relay + i
 SSRF guards) now lives in the private overlay repo; its security tests moved there.
 """
 
+from core.config import get_settings
 from metadata_engine.anilist import _manga_item
 
 
@@ -40,18 +41,20 @@ def test_manga_item_handles_missing_score():
     assert item["title"] == "X"
 
 
-def test_no_provider_in_base_build(monkeypatch):
-    # A base build ships no manga source: discovery must return None so the routes
-    # report "unmapped" and the browser resolves chapters/pages instead. The provider
-    # cache is process-wide, so reset it before asserting.
+def test_no_provider_in_base_build():
+    # A base build ships no manga source, so the routes report "unmapped" and the
+    # browser resolves chapters and pages instead.
     import manga_engine.provider as provider
 
-    provider._provider_cache.clear()
+    provider.get_provider.cache_clear()
     assert provider.get_provider() is None
-    # Preference config is public (names no host) and has sane defaults.
-    assert provider.manga_enabled() is True
-    assert provider.default_language() == "en"
-    assert "safe" in provider.content_ratings()
+
+
+def test_manga_preferences_have_sane_defaults():
+    settings = get_settings()
+    assert settings.manga_enabled is True
+    assert settings.manga_languages[0] == "en"
+    assert "safe" in settings.manga_content_rating
 
 
 def test_candidate_titles_priority_and_dedup():

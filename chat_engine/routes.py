@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from account_engine.routes import require_user
-from core.config import Config
+from core.config import get_settings
 from core.rate_limit import limiter
 
 from . import persona, providers, tools
@@ -58,9 +58,9 @@ def provider_key(provider: str) -> Optional[str]:
     each one is present.
     """
     if provider == ANTHROPIC:
-        return Config.ANTHROPIC_API_KEY
+        return get_settings().anthropic_api_key
     if provider == GEMINI:
-        return Config.GEMINI_API_KEY
+        return get_settings().gemini_api_key
     return None
 
 

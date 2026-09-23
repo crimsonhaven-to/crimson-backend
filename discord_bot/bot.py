@@ -26,15 +26,14 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import random
 import signal
 from typing import List, Optional
 
 import httpx
-from dotenv import load_dotenv
 
 from account_engine.db import AccountStore
+from core.config import get_settings
 
 logger = logging.getLogger("discord_bot")
 
@@ -71,7 +70,7 @@ class InviteBot:
         self.owner_id = str(owner_id)
         self.prefix = prefix or "!"
         self.store = AccountStore()
-        self.frontend_url = (os.getenv("FRONTEND_BASE_URL") or "").rstrip("/")
+        self.frontend_url = get_settings().frontend_base_url
 
         self._seq: Optional[int] = None          # last dispatch sequence (for heartbeats)
         self._bot_user_id: Optional[str] = None
@@ -282,11 +281,10 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    load_dotenv()
-
-    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-    owner_id = os.getenv("DISCORD_OWNER_ID", "").strip()
-    prefix = os.getenv("DISCORD_COMMAND_PREFIX", "!").strip() or "!"
+    settings = get_settings()
+    token = settings.discord_bot_token
+    owner_id = settings.discord_owner_id
+    prefix = settings.discord_command_prefix or "!"
 
     if not token or not owner_id:
         logger.error(

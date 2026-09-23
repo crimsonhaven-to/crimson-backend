@@ -24,7 +24,7 @@ import httpx
 import pytest
 
 import api
-from core.config import Config
+from core.config import get_settings
 
 # Read from the module rather than restated here: _DYNAMIC_PUBLIC_PREFIXES is
 # populated at import time by the optional private overlay and is empty only in a
@@ -204,7 +204,7 @@ async def test_options_is_never_walled(monkeypatch):
 
 async def test_require_login_false_disables_the_wall(monkeypatch):
     _no_valid_credentials(monkeypatch)
-    monkeypatch.setattr(Config, "REQUIRE_LOGIN", False)
+    monkeypatch.setattr(get_settings(), "require_login", False)
     async with _client() as client:
         for path in GATED_PATHS:
             assert (await client.get(path)).status_code == 200, path
@@ -216,9 +216,9 @@ async def test_the_wall_is_read_per_request_not_at_import(monkeypatch):
     _no_valid_credentials(monkeypatch)
     async with _client() as client:
         assert (await client.get("/trending")).status_code == 401
-        monkeypatch.setattr(Config, "REQUIRE_LOGIN", False)
+        monkeypatch.setattr(get_settings(), "require_login", False)
         assert (await client.get("/trending")).status_code == 200
-        monkeypatch.setattr(Config, "REQUIRE_LOGIN", True)
+        monkeypatch.setattr(get_settings(), "require_login", True)
         assert (await client.get("/trending")).status_code == 401
 
 
@@ -261,7 +261,7 @@ async def test_cors_headers_reach_the_401(monkeypatch):
     browser read the 401 instead of reporting an opaque CORS failure. Reorder the
     two and this is how you find out."""
     _no_valid_credentials(monkeypatch)
-    origin = Config.ALLOWED_ORIGINS[0]
+    origin = get_settings().allowed_origins[0]
     transport = httpx.ASGITransport(app=api.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.get("/trending", headers={"Origin": origin})

@@ -132,7 +132,7 @@ def fake_db(monkeypatch):
 def test_apply_pending_applies_in_order_and_records_each(tmp_path, monkeypatch, fake_db):
     _write(tmp_path, "001_a.sql", "CREATE TABLE a (id INT);\n")
     _write(tmp_path, "002_b.sql", "CREATE TABLE b (id INT);\n")
-    monkeypatch.setenv("MIGRATIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(migrations, "MIGRATIONS_DIR", tmp_path)
 
     result = migrations.apply_pending()
 
@@ -145,7 +145,7 @@ def test_apply_pending_applies_in_order_and_records_each(tmp_path, monkeypatch, 
 
 def test_apply_pending_is_idempotent(tmp_path, monkeypatch, fake_db):
     _write(tmp_path, "001_a.sql", "CREATE TABLE a (id INT);\n")
-    monkeypatch.setenv("MIGRATIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(migrations, "MIGRATIONS_DIR", tmp_path)
 
     first = migrations.apply_pending()
     assert first["applied_now"] == ["001_a.sql"]
@@ -162,7 +162,7 @@ def test_apply_pending_skips_comment_only_file_but_records_it(tmp_path, monkeypa
     """The baseline file is comment-only plus a no-op; Postgres rejects an empty
     query string, so such a file must be recorded without being executed."""
     _write(tmp_path, "000_baseline.sql", "-- nothing to do here\n")
-    monkeypatch.setenv("MIGRATIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(migrations, "MIGRATIONS_DIR", tmp_path)
 
     result = migrations.apply_pending()
 
@@ -175,7 +175,7 @@ def test_apply_pending_skips_comment_only_file_but_records_it(tmp_path, monkeypa
 def test_apply_pending_reports_drift_without_reapplying(tmp_path, monkeypatch, fake_db):
     """Editing an already-applied migration must be reported, not silently re-run."""
     _write(tmp_path, "001_a.sql", "CREATE TABLE a (id INT);\n")
-    monkeypatch.setenv("MIGRATIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(migrations, "MIGRATIONS_DIR", tmp_path)
     migrations.apply_pending()
 
     _write(tmp_path, "001_a.sql", "CREATE TABLE a (id BIGINT);\n")  # edited after the fact
@@ -194,7 +194,7 @@ def test_apply_pending_survives_a_broken_directory(tmp_path, monkeypatch, fake_d
     than propagating it."""
     _write(tmp_path, "001_a.sql")
     _write(tmp_path, "001_b.sql")
-    monkeypatch.setenv("MIGRATIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(migrations, "MIGRATIONS_DIR", tmp_path)
 
     result = migrations.apply_pending()
     assert result["available"] is False
@@ -203,7 +203,7 @@ def test_apply_pending_survives_a_broken_directory(tmp_path, monkeypatch, fake_d
 
 def test_cached_status_reflects_last_apply(tmp_path, monkeypatch, fake_db):
     _write(tmp_path, "007_seven.sql", "SELECT 1;\n")
-    monkeypatch.setenv("MIGRATIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(migrations, "MIGRATIONS_DIR", tmp_path)
     migrations.apply_pending()
     assert migrations.cached_status()["version"] == 7
 

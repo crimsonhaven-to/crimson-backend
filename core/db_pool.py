@@ -1,34 +1,14 @@
-"""
-Shared PostgreSQL connection pool (psycopg 3).
+"""The process-wide PostgreSQL connection pool (psycopg 3).
 
-The mapping engine and the account engine share one database through one
-process-wide pool, so every replica in a Swarm deploy points at the same external
-database and the containers stay identical. That is what SQLite on a volume could
-not offer.
-
-Both concerns share a database because a Fribb resync only DELETEs the three
-mapping tables inside one transaction and never touches the account tables. The
-historical reason to keep them in separate files no longer applies.
-
-Configuration, read lazily on first use so ``load_dotenv()`` has run:
-
-``DATABASE_URL``    full libpq URL, taking precedence when set
-otherwise assembled from ``POSTGRES_HOST`` (localhost), ``POSTGRES_PORT`` (5432),
-``POSTGRES_DB`` / ``POSTGRES_USER`` / ``POSTGRES_PASSWORD`` (all crimson).
-Sizing is ``DB_POOL_MIN`` (1) and ``DB_POOL_MAX`` (10); startup waits
-``DB_CONNECT_TIMEOUT`` seconds (30) for the DB to accept connections.
-
-``DB_PREPARE_THRESHOLD`` defaults to disabled. psycopg auto-prepares a statement
-after a few uses, but prepared statements do not survive PgBouncer's transaction
-pooling, where a later EXECUTE can land on a different backend than the PREPARE.
-Since the documented topology puts the app behind a transaction-mode PgBouncer,
-off is correct either way and these queries are simple enough that the lost plan
-caching is negligible. Set an integer to re-enable it for a direct connection.
+Connection settings come from ``DATABASE_URL``, or else the ``POSTGRES_*``
+parts. ``DB_PREPARE_THRESHOLD`` stays disabled by default: prepared statements do
+not survive PgBouncer's transaction pooling, where a later EXECUTE can land on a
+different backend than the PREPARE, and these queries gain little from plan
+caching. Set an integer to re-enable it on a direct connection.
 """
 
 from __future__ import annotations
 
-import os
 import threading
 from contextlib import contextmanager
 from typing import Iterator, Optional
@@ -36,6 +16,8 @@ from typing import Iterator, Optional
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+
+from core.config import Settings, get_settings
 
 # Created on first use, double-checked so a burst of concurrent first callers
 # from the thread pool only builds one.
@@ -56,28 +38,13 @@ def lock_schema_init(conn) -> None:
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_INIT_LOCK,))
 
 
-def _dsn() -> str:
-    url = os.getenv("DATABASE_URL")
-    if url:
-        return url
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = os.getenv("POSTGRES_PORT", "5432")
-    db = os.getenv("POSTGRES_DB", "crimson")
-    user = os.getenv("POSTGRES_USER", "crimson")
-    password = os.getenv("POSTGRES_PASSWORD", "crimson")
-    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
-
-
-def _prepare_threshold() -> Optional[int]:
-    """psycopg ``prepare_threshold`` for pooled connections; see the module
-    docstring for why it defaults to disabled."""
-    raw = os.getenv("DB_PREPARE_THRESHOLD")
-    if raw is None or raw.strip().lower() in ("", "none", "disabled", "off"):
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+def _dsn(s: Settings) -> str:
+    if s.database_url:
+        return s.database_url
+    return (
+        f"postgresql://{s.postgres_user}:{s.postgres_password}"
+        f"@{s.postgres_host}:{s.postgres_port}/{s.postgres_db}"
+    )
 
 
 def get_pool() -> ConnectionPool:
@@ -89,14 +56,14 @@ def get_pool() -> ConnectionPool:
     if _pool is None:
         with _lock:
             if _pool is None:
+                settings = get_settings()
                 pool = ConnectionPool(
-                    conninfo=_dsn(),
-                    min_size=int(os.getenv("DB_POOL_MIN", "1")),
-                    max_size=int(os.getenv("DB_POOL_MAX", "10")),
+                    conninfo=_dsn(settings),
+                    min_size=settings.db_pool_min,
+                    max_size=settings.db_pool_max,
                     kwargs={
                         "row_factory": dict_row,
-                        # Off by default so transaction-mode PgBouncer is safe.
-                        "prepare_threshold": _prepare_threshold(),
+                        "prepare_threshold": settings.db_prepare_threshold,
                     },
                     name="crimson",
                     open=False,
@@ -104,7 +71,7 @@ def get_pool() -> ConnectionPool:
                 pool.open()
                 # Block briefly so a cold start reports an unreachable DB here
                 # rather than as a confusing first-request 500.
-                pool.wait(timeout=float(os.getenv("DB_CONNECT_TIMEOUT", "30")))
+                pool.wait(timeout=settings.db_connect_timeout)
                 _pool = pool
     return _pool
 

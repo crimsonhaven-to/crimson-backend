@@ -10,21 +10,23 @@ import importlib
 import pytest
 
 import resolvers._crimson_proxy as cp
+from core.config import Settings, get_settings
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    # Each test sets exactly the env it needs; start from a known-empty state and
-    # a fresh health cache so failover assertions are deterministic.
-    for var in ("CRIMSON_PROXY_BASE", "PROXY_SECRET", "CRIMSON_PROXY_SOURCES"):
-        monkeypatch.delenv(var, raising=False)
+def settings(monkeypatch):
+    # Each test sets exactly what it needs; start empty, with a fresh health cache
+    # so failover assertions are deterministic.
+    settings = get_settings()
+    monkeypatch.setattr(settings, "crimson_proxy_base", [])
+    monkeypatch.setattr(settings, "proxy_secret", "")
     cp._health.clear()
-    yield
+    yield settings
     cp._health.clear()
 
 
-def test_signed_query_is_stable_and_covers_all_fields(monkeypatch):
-    monkeypatch.setenv("PROXY_SECRET", "shared-secret")
+def test_signed_query_is_stable_and_covers_all_fields(settings):
+    settings.proxy_secret = "shared-secret"
     q = cp._signed_query("https://cdn/x.m3u8", "https://ref/", "https://orig", "UA/1")
     # url/referer/origin/ua all present, plus a 32-char hex signature.
     assert "u=https%3A%2F%2Fcdn%2Fx.m3u8" in q
@@ -35,13 +37,13 @@ def test_signed_query_is_stable_and_covers_all_fields(monkeypatch):
     assert len(sig) == 32 and all(c in "0123456789abcdef" for c in sig)
 
 
-def test_signature_matches_documented_hmac(monkeypatch):
+def test_signature_matches_documented_hmac(settings):
     # Re-derive the signature the documented way (HMAC-SHA256 over the
     # newline-joined fields, hex[:32]) and assert the module agrees.
     import hashlib
     import hmac
 
-    monkeypatch.setenv("PROXY_SECRET", "shared-secret")
+    settings.proxy_secret = "shared-secret"
     url, ref, orig, ua = "https://cdn/x.m3u8", "https://ref/", "", ""
     expected = hmac.new(
         b"shared-secret", "\n".join([url, ref, orig, ua]).encode(), hashlib.sha256
@@ -50,39 +52,30 @@ def test_signature_matches_documented_hmac(monkeypatch):
     assert dict(p.split("=", 1) for p in q.split("&"))["s"] == expected
 
 
-def test_signature_changes_with_secret(monkeypatch):
-    monkeypatch.setenv("PROXY_SECRET", "secret-a")
+def test_signature_changes_with_secret(settings):
+    settings.proxy_secret = "secret-a"
     a = cp._signed_query("https://cdn/x", "", "", "")
-    monkeypatch.setenv("PROXY_SECRET", "secret-b")
+    settings.proxy_secret = "secret-b"
     b = cp._signed_query("https://cdn/x", "", "", "")
     assert a != b
 
 
-def test_is_enabled_requires_base_and_secret(monkeypatch):
+def test_is_enabled_requires_base_and_secret(settings):
     assert cp.is_enabled() is False  # nothing set
-    monkeypatch.setenv("CRIMSON_PROXY_BASE", "https://edge.example")
+    settings.crimson_proxy_base = ["https://edge.example"]
     assert cp.is_enabled() is False  # base but no secret
-    monkeypatch.setenv("PROXY_SECRET", "s")
+    settings.proxy_secret = "s"
     assert cp.is_enabled() is True
 
 
-def test_is_enabled_honours_per_source_allowlist(monkeypatch):
-    monkeypatch.setenv("CRIMSON_PROXY_BASE", "https://edge.example")
-    monkeypatch.setenv("PROXY_SECRET", "s")
-    monkeypatch.setenv("CRIMSON_PROXY_SOURCES", "cinema.bz")
-    assert cp.is_enabled("cinema.bz") is True
-    assert cp.is_enabled("PlayIMDb") is False  # not in the allowlist
-    assert cp.is_enabled() is True  # global check ignores the allowlist
+def test_proxy_bases_parse_a_comma_list_and_strip_slashes():
+    parsed = Settings(crimson_proxy_base=" https://a.example/ , https://b.example ")
+    assert parsed.crimson_proxy_base == ["https://a.example", "https://b.example"]
 
 
-def test_proxy_bases_parses_comma_list_and_strips_slashes(monkeypatch):
-    monkeypatch.setenv("CRIMSON_PROXY_BASE", " https://a.example/ , https://b.example ")
-    assert cp.proxy_bases() == ["https://a.example", "https://b.example"]
-
-
-def test_proxy_url_routes_only_to_healthy_hosts(monkeypatch):
-    monkeypatch.setenv("CRIMSON_PROXY_BASE", "https://up.example,https://down.example")
-    monkeypatch.setenv("PROXY_SECRET", "s")
+def test_proxy_url_routes_only_to_healthy_hosts(settings):
+    settings.crimson_proxy_base = ["https://up.example", "https://down.example"]
+    settings.proxy_secret = "s"
     import time
 
     now = time.time()
@@ -93,10 +86,10 @@ def test_proxy_url_routes_only_to_healthy_hosts(monkeypatch):
         assert cp.proxy_url("https://cdn/x.m3u8").startswith("https://up.example/?")
 
 
-def test_proxy_url_falls_back_to_all_when_health_unknown(monkeypatch):
+def test_proxy_url_falls_back_to_all_when_health_unknown(settings):
     # Cold cache => degrade to "try anything" rather than giving up.
-    monkeypatch.setenv("CRIMSON_PROXY_BASE", "https://only.example")
-    monkeypatch.setenv("PROXY_SECRET", "s")
+    settings.crimson_proxy_base = ["https://only.example"]
+    settings.proxy_secret = "s"
     assert cp.proxy_url("https://cdn/x.m3u8").startswith("https://only.example/?")
 
 

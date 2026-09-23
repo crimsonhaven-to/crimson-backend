@@ -34,10 +34,7 @@ the changelog cache; a refresh is ~25 MB of JSON twice a day.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import logging
-import os
 import re
 import threading
 import time
@@ -47,8 +44,10 @@ from urllib.parse import quote, urljoin
 
 import httpx
 
-from resolvers._proxy_secret import resolve_secret
+from core import signing
 from resolvers._ssrf_guard import guarded_client
+from core.config import get_settings
+from functools import cache
 
 logger = logging.getLogger("crimson.iptv")
 
@@ -65,47 +64,27 @@ DEFAULT_UA = (
 )
 
 
-def enabled() -> bool:
-    """Master switch — IPTV needs no secrets, so it defaults on."""
-    return (os.getenv("IPTV_ENABLED") or "true").strip().lower() not in ("0", "false", "no")
-
-
-def _include_nsfw() -> bool:
-    return (os.getenv("IPTV_INCLUDE_NSFW") or "").strip().lower() in ("1", "true", "yes")
-
-
-def _refresh_hours() -> float:
-    try:
-        return max(1.0, float(os.getenv("IPTV_REFRESH_HOURS", "12")))
-    except ValueError:
-        return 12.0
-
-
 # --- Signed proxy links ------------------------------------------------------
 # Same shape as the other operator proxies: every upstream URL the player may
 # ask /iptv_proxy to fetch is HMAC-signed, so the proxy is not an open relay.
 # The signature covers the optional Referer/User-Agent too — otherwise a caller
 # could replay a valid stream signature with attacker-chosen headers.
 
-_secret: Optional[bytes] = None
-
-
+@cache
 def _proxy_secret() -> bytes:
-    global _secret
-    if _secret is None:
-        _secret = resolve_secret("IPTV_PROXY_SECRET")
-    return _secret
+    return signing.resolve_secret("IPTV_PROXY_SECRET")
+
+
+def _stream_payload(url: str, referrer: str, user_agent: str) -> str:
+    return "\n".join((url, referrer or "", user_agent or ""))
 
 
 def sign_stream(url: str, referrer: str = "", user_agent: str = "") -> str:
-    payload = "\n".join((url, referrer or "", user_agent or "")).encode("utf-8")
-    return hmac.new(_proxy_secret(), payload, hashlib.sha256).hexdigest()[:32]
+    return signing.sign(_proxy_secret(), _stream_payload(url, referrer, user_agent))
 
 
 def verify_stream_sig(url: str, sig: str, referrer: str = "", user_agent: str = "") -> bool:
-    if not sig:
-        return False
-    return hmac.compare_digest(sign_stream(url, referrer, user_agent), sig)
+    return signing.verify(_proxy_secret(), _stream_payload(url, referrer, user_agent), sig)
 
 
 def proxy_path(url: str, referrer: str = "", user_agent: str = "") -> str:
@@ -314,7 +293,7 @@ class IptvService:
                 blocklist = self._fetch_json(client, "blocklist")
             catalog = build_catalog(
                 channels, streams, categories, countries, logos, blocklist,
-                include_nsfw=_include_nsfw(),
+                include_nsfw=get_settings().iptv_include_nsfw,
             )
             with self._lock:
                 self._catalog = catalog
@@ -336,7 +315,7 @@ class IptvService:
         with self._lock:
             fresh = (
                 self._catalog is not None
-                and (time.monotonic() - self._fetched_at) < _refresh_hours() * 3600
+                and (time.monotonic() - self._fetched_at) < get_settings().iptv_refresh_hours * 3600
             )
             if fresh or self._refreshing:
                 return

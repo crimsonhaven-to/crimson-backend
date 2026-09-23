@@ -23,6 +23,7 @@ lxml==6.1.1
 selectolax==0.4.10
 # Direct dependency of account_engine.routes (also pulled in by fastapi); pin it.
 pydantic==2.13.4
+pydantic-settings==2.15.0
 # Per-IP rate limiting on the abusable endpoints (/watch fan-out, /auth/*).
 # Pure-Python; in-memory storage by default (see rate_limit.py).
 slowapi==0.1.9

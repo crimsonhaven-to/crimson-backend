@@ -13,9 +13,10 @@ from typing import Dict, List, Optional
 import httpx
 
 from core import single_flight
-from core.config import Config
 from core.http_client import http_client, fetch_with_retry
 from core.response_cache import (
+    CACHE_TTL,
+    TRENDING_CACHE_TTL,
     _local_get,
     _local_set,
     get_cached_response,
@@ -67,7 +68,7 @@ async def fetch_tmdb_genre_map(client: httpx.AsyncClient, kind: str) -> Dict[int
     if gmap:
         await set_cached_response(
             cache_key, {"map": {str(k): v for k, v in gmap.items()}},
-            ttl_seconds=Config.CACHE_TTL_SECONDS,
+            ttl_seconds=CACHE_TTL,
         )
         _local_set(cache_key, gmap)
     return gmap
@@ -279,7 +280,7 @@ async def fetch_tmdb_search_results(client: httpx.AsyncClient, query: str, limit
                     "vote_average": item.get("vote_average")
                 })
 
-        await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+        await set_cached_response(cache_key, {"results": results}, ttl_seconds=CACHE_TTL)
         return results
 
     # Coalesced: the client searches per keystroke, so one typed title arrives
@@ -338,7 +339,7 @@ async def fetch_trending_anime(client: httpx.AsyncClient, limit: int = 12) -> Li
                 })
 
         # The DB for cross-replica reuse, L1 for this process.
-        await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+        await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=TRENDING_CACHE_TTL)
         _local_set(cache_key, trending_list)
         return trending_list
 
@@ -380,7 +381,7 @@ async def fetch_tmdb_show_search_results(client: httpx.AsyncClient, query: str, 
         if len(results) >= limit:
             break
 
-    await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+    await set_cached_response(cache_key, {"results": results}, ttl_seconds=CACHE_TTL)
     return results
 
 
@@ -428,7 +429,7 @@ async def fetch_trending_shows(client: httpx.AsyncClient, limit: int = 10) -> Li
         if len(trending_list) >= limit:
             break
 
-    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=TRENDING_CACHE_TTL)
     _local_set(cache_key, trending_list)
     return trending_list
 
@@ -458,7 +459,7 @@ async def fetch_tmdb_movie_search_results(client: httpx.AsyncClient, query: str,
         if len(results) >= limit:
             break
 
-    await set_cached_response(cache_key, {"results": results}, ttl_seconds=Config.CACHE_TTL_SECONDS)
+    await set_cached_response(cache_key, {"results": results}, ttl_seconds=CACHE_TTL)
     return results
 
 
@@ -501,7 +502,7 @@ async def fetch_trending_movies(client: httpx.AsyncClient, limit: int = 10) -> L
         if len(trending_list) >= limit:
             break
 
-    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+    await set_cached_response(cache_key, {"results": trending_list}, ttl_seconds=TRENDING_CACHE_TTL)
     _local_set(cache_key, trending_list)
     return trending_list
 

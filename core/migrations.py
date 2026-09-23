@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
@@ -43,18 +42,11 @@ from core.db_pool import get_connection, lock_schema_init
 
 logger = logging.getLogger("crimson.migrations")
 
-# Overridable so tests can point at a temp directory without touching the real set.
-DEFAULT_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 
 # NNN_name.sql: three digits so a shell listing sorts sanely too, and a restricted
 # charset so nothing odd reaches a log line.
 _FILENAME_RE = re.compile(r"^(\d{3,})_([A-Za-z0-9][A-Za-z0-9._-]*)\.sql$")
-
-
-def migrations_dir() -> Path:
-    """The migrations directory, overridable via ``MIGRATIONS_DIR``."""
-    override = os.getenv("MIGRATIONS_DIR")
-    return Path(override) if override else DEFAULT_MIGRATIONS_DIR
 
 
 class Migration(NamedTuple):
@@ -86,7 +78,7 @@ def discover(directory: Optional[Path] = None) -> List[Migration]:
 
     Raises ``ValueError`` on a duplicate version: two files claiming one version
     would apply in arbitrary order, which is never intended."""
-    directory = directory or migrations_dir()
+    directory = directory or MIGRATIONS_DIR
     if not directory.is_dir():
         return []
 
@@ -168,7 +160,7 @@ def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
         log.warning(
             "No migration files found in %s. If this is a deployed container, the "
             "Dockerfile is missing its `COPY migrations ./migrations` line.",
-            migrations_dir(),
+            MIGRATIONS_DIR,
         )
 
     applied_now: List[str] = []

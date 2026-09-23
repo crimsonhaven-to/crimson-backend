@@ -30,6 +30,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import audit, passwords
 from .routes import require_user, store, _verify_signed_challenge
+from core.config import get_settings
 from core.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ async def security_events(
         "count": len(events),
         "events": events,
         "event_types": list(audit.USER_VISIBLE_EVENTS),
-        "retention_days": audit.RETENTION_DAYS,
+        "retention_days": get_settings().security_events_retention_days,
     }
 
 

@@ -19,7 +19,6 @@ listed while their last payment is within ``KOFI_ACTIVE_WINDOW_DAYS`` (default
 """
 
 import json
-import os
 import secrets
 import threading
 import time
@@ -31,24 +30,16 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
 from .db import SupporterStore
+from core.config import get_settings
 
 router = APIRouter(tags=["supporters"])
 store = SupporterStore()
 
-# How long after their last payment a *subscriber* still counts as active.
-# One-time tippers ignore this (they're kept forever).
-_ACTIVE_WINDOW_DAYS = int(os.getenv("KOFI_ACTIVE_WINDOW_DAYS", "35"))
-
 # Tiny in-process TTL cache for the public list — a fan page can get bursty
 # traffic and the aggregation, while cheap, doesn't need to run per request. Held
 # per replica (no cross-replica coordination needed; each just refreshes lazily).
-_CACHE_TTL = int(os.getenv("KOFI_LIST_CACHE_TTL", "60"))
 _cache: Dict[str, object] = {"at": 0.0, "rows": None}
 _cache_lock = threading.Lock()
-
-
-def _verification_token() -> Optional[str]:
-    return os.getenv("KOFI_VERIFICATION_TOKEN")
 
 
 def _now() -> datetime:
@@ -75,11 +66,11 @@ def _is_active(row: Dict, cutoff: datetime) -> bool:
 
 def _cached_rows() -> List[Dict]:
     """All public supporters (unfiltered aggregate), refreshed at most every
-    ``_CACHE_TTL`` seconds."""
+    ``KOFI_LIST_CACHE_TTL`` seconds."""
     now = time.monotonic()
     with _cache_lock:
         rows = _cache["rows"]
-        if rows is not None and (now - float(_cache["at"])) < _CACHE_TTL:
+        if rows is not None and (now - float(_cache["at"])) < get_settings().kofi_list_cache_ttl:
             return rows  # type: ignore[return-value]
     rows = store.list_supporters()
     with _cache_lock:
@@ -113,7 +104,7 @@ async def kofi_webhook(request: Request):
     whose value is the event JSON (including a ``verification_token`` we match
     against ``KOFI_VERIFICATION_TOKEN``). Always answers 200 on a duplicate so
     Ko-fi stops retrying; rejects a bad/absent token with 401."""
-    expected = _verification_token()
+    expected = get_settings().kofi_verification_token
     if not expected:
         # Fail closed: without a configured token we can't trust any caller.
         raise HTTPException(status_code=503, detail="Ko-fi webhook not configured")
@@ -155,7 +146,7 @@ async def list_supporters(
     """Public list for the 'Lumi's Loved Mortals' page. No auth. Most-recent
     payment first. Lapsed subscribers are hidden unless ``include_lapsed=true``."""
     rows = await run_in_threadpool(_cached_rows)
-    cutoff = _now() - timedelta(days=_ACTIVE_WINDOW_DAYS)
+    cutoff = _now() - timedelta(days=get_settings().kofi_active_window_days)
     if not include_lapsed:
         rows = [r for r in rows if _is_active(r, cutoff)]
     supporters = [_public_view(r) for r in rows]
@@ -171,7 +162,7 @@ async def supporters_stats():
     Sums over *active* supporters (same rule as /supporters). ``total_raised`` is
     a naive cross-currency sum; ``currency`` is the most common one seen."""
     rows = await run_in_threadpool(_cached_rows)
-    cutoff = _now() - timedelta(days=_ACTIVE_WINDOW_DAYS)
+    cutoff = _now() - timedelta(days=get_settings().kofi_active_window_days)
     active = [r for r in rows if _is_active(r, cutoff)]
 
     total_raised = round(sum((r.get("total_amount") or 0) for r in active), 2)

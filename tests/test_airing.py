@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from account_engine import mailer
-from core.config import Config
+from core.config import get_settings
 from notify_engine import notifier
 from notify_engine.schedule import fetch_window
 
@@ -75,7 +75,7 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(mailer, "is_configured", lambda: True)
     monkeypatch.setattr(notifier.mailer, "send_airing_batch", _send)
-    monkeypatch.setattr(Config, "AIRING_NOTIFY_DRY_RUN", False)
+    monkeypatch.setattr(get_settings(), "airing_notify_dry_run", False)
     return sent
 
 
@@ -161,7 +161,7 @@ def test_each_outcome_is_recorded_individually(monkeypatch, wired):
 def test_a_dry_run_claims_and_logs_but_opens_no_connection(monkeypatch):
     store = FakeStore([_pending(episode=9)])
     monkeypatch.setattr(notifier, "store", store)
-    monkeypatch.setattr(Config, "AIRING_NOTIFY_DRY_RUN", True)
+    monkeypatch.setattr(get_settings(), "airing_notify_dry_run", True)
 
     def _explode(*args, **kwargs):
         raise AssertionError("a dry run must not reach the mailer")

@@ -1,19 +1,19 @@
 """
 DEMO_MODE signup gating: a demo deployment opens registration by bypassing the
 invite gate, while a normal deployment still enforces it. Pure logic — the invite
-check is exercised with Config + the store method monkeypatched, so no DB is needed
+check is exercised with the settings + the store method monkeypatched, so no DB is needed
 (matching the suite's no-fixtures philosophy).
 """
 
 import pytest
 from fastapi import HTTPException
 
-from core.config import Config
+from core.config import get_settings
 from account_engine import routes
 
 
 def test_demo_mode_bypasses_the_invite_gate(monkeypatch):
-    monkeypatch.setattr(Config, "DEMO_MODE", True)
+    monkeypatch.setattr(get_settings(), "demo_mode", True)
     # Any code — including an empty one — is accepted, and returned as "static" so
     # _consume_invite_code is a no-op (there's no single-use token to burn).
     assert routes._check_invite_code("") is True
@@ -21,7 +21,7 @@ def test_demo_mode_bypasses_the_invite_gate(monkeypatch):
 
 
 def test_invite_gate_enforced_when_not_demo(monkeypatch):
-    monkeypatch.setattr(Config, "DEMO_MODE", False)
+    monkeypatch.setattr(get_settings(), "demo_mode", False)
     monkeypatch.setattr(routes, "_allowed_invite_codes", lambda: {"goodcode"})
     # A shared static code is accepted (and flagged static).
     assert routes._check_invite_code("goodcode") is True

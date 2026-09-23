@@ -16,24 +16,24 @@ Keyed by scraper class ``__name__``.
 
 from __future__ import annotations
 
-import os
+from core.config import get_settings
 
-# Chosen to exist on as many sources as possible and to carry both an AniList and
-# a TMDB mapping, so every kind of scraper can attempt it.
-CANARY = {
-    "title": os.getenv("HEALTH_CANARY_TITLE", "Attack on Titan"),
-    "tmdb_id": int(os.getenv("HEALTH_CANARY_TMDB", "1429")),       # AoT (TMDB tv)
-    "season": int(os.getenv("HEALTH_CANARY_SEASON", "1")),
-    "episode": int(os.getenv("HEALTH_CANARY_EPISODE", "1")),
-    "anilist_id": int(os.getenv("HEALTH_CANARY_ANILIST", "16498")),  # AoT (AniList)
-}
 
-# ``env_gate`` names an env var that must be set for the source to be live;
-# probing it while unset reports "disabled" rather than red.
-#
+def canary() -> dict:
+    """The title every scrape source is probed with. The default carries both an
+    AniList and a TMDB mapping, so every kind of scraper can attempt it."""
+    s = get_settings()
+    return {
+        "title": s.health_canary_title,
+        "tmdb_id": s.health_canary_tmdb,
+        "season": s.health_canary_season,
+        "episode": s.health_canary_episode,
+        "anilist_id": s.health_canary_anilist,
+    }
+
 # Only ``library`` sources remain, since the public backend no longer scrapes
 # third-party sites (that moved to the private crimson-sources package, see
-# New_System.md). The ``scrape`` category and CANARY stay for the contract and any
+# New_System.md). The ``scrape`` category and canary stay for the contract and any
 # future operator-owned source wanting an end-to-end probe.
 SOURCE_META = {
     # --- operator-provided library sources ---------------------------------

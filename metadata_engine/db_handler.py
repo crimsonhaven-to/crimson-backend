@@ -37,7 +37,6 @@ Reaching the specials and movies Fribb hides
 
 import asyncio
 import json
-import os
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,11 +71,6 @@ class MappingDatabaseEngine:
     # re-measuring will 400 the whole chunk.
     ANILIST_CHUNK_SIZE = 20
     ANILIST_CHUNK_DELAY = 0.7  # rate-limit friendly
-
-    def __init__(self, db_name: str = "anime_mappings.db", tmdb_api_key: Optional[str] = None):
-        # Ignored; kept for call-site compatibility. Storage is the shared pool.
-        self.db_name = db_name
-        self.tmdb_api_key = tmdb_api_key or os.getenv("TMDB_API_KEY")
 
     # --- helpers ------------------------------------------------------- #
     @staticmethod

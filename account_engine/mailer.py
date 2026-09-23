@@ -12,39 +12,42 @@ still succeeds while mail is down and the user can ask for a resend later.
 
 import html
 import logging
-import os
 import smtplib
 import ssl
 from contextlib import contextmanager
 from email.message import EmailMessage
 from email.utils import formataddr
 
+from core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
 def is_configured() -> bool:
-    return bool(os.getenv("SMTP_HOST"))
+    return bool(get_settings().smtp_host)
 
 
 def frontend_base_url() -> str:
-    return (os.getenv("FRONTEND_BASE_URL") or "https://crimsonhaven.to").rstrip("/")
+    return get_settings().frontend_base_url
 
 
 def _from_address() -> str:
-    return os.getenv("SMTP_FROM") or os.getenv("SMTP_USER") or "service@agony.ch"
+    settings = get_settings()
+    return settings.smtp_from or settings.smtp_user or "service@agony.ch"
 
 
 @contextmanager
 def _connection():
     """A logged-in SMTP connection. Raises on any failure; callers decide how
     soft to fail."""
-    host = os.getenv("SMTP_HOST")
+    settings = get_settings()
+    host = settings.smtp_host
     if not host:
         raise RuntimeError("SMTP_HOST unset")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    security = (os.getenv("SMTP_SECURITY") or "starttls").lower()
-    user = os.getenv("SMTP_USER") or _from_address()
-    password = os.getenv("SMTP_PASSWORD") or ""
+    port = settings.smtp_port
+    security = settings.smtp_security
+    user = settings.smtp_user or _from_address()
+    password = settings.smtp_password
     context = ssl.create_default_context()
     if security == "ssl":
         with smtplib.SMTP_SSL(host, port, timeout=20, context=context) as server:
@@ -62,7 +65,7 @@ def _connection():
 
 def _build_message(to: str, subject: str, text: str, html_body: str | None = None) -> EmailMessage:
     msg = EmailMessage()
-    msg["From"] = formataddr((os.getenv("SMTP_FROM_NAME", "CrimsonHaven"), _from_address()))
+    msg["From"] = formataddr((get_settings().smtp_from_name, _from_address()))
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(text)

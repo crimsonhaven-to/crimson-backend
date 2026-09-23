@@ -7,12 +7,12 @@ without a session. The heavy lifting — fetching + caching from GitHub — live
 ``changelog_engine.service`` (see there for configuration).
 """
 
-import os
 
 from fastapi import APIRouter, HTTPException
 from starlette.concurrency import run_in_threadpool
 
-from .service import ChangelogService, DEFAULT_REPO
+from .service import ChangelogService
+from core.config import get_settings
 
 router = APIRouter(tags=["changelog"])
 service = ChangelogService()
@@ -32,7 +32,7 @@ async def get_changelog():
     data = await run_in_threadpool(service.get)
     return {
         "success": True,
-        "repo": (os.getenv("GITHUB_REPO") or DEFAULT_REPO).strip(),
+        "repo": get_settings().github_repo,
         "count": len(data["entries"]),
         "stale": data["stale"],
         "changelog": data["entries"],

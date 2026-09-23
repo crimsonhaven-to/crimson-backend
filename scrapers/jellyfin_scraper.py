@@ -1,5 +1,4 @@
 import difflib
-import os
 import re
 from typing import Optional
 
@@ -9,6 +8,8 @@ from .base_scraper import BaseAnimeScraper
 # The Jellyfin client (auth + API + config) lives with the resolver, which owns
 # the heavy lifting — the scraper just locates the episode item.
 from resolvers.jellyfin import EMBED_MARKER, api_get, is_configured, _ensure_auth
+from core.config import get_settings
+from core.http_client import tmdb_headers
 
 
 def _tmdb_of(item: dict) -> str:
@@ -28,14 +29,13 @@ async def _tmdb_episode_identity(tmdb_id, season_num: int, episode_num: int) -> 
     folders are named identically, the episode's TMDB id / air date pin down the
     exact episode regardless of how the library is organised.
     """
-    key = os.getenv("TMDB_API_KEY")
-    if not key or tmdb_id is None:
+    if not get_settings().tmdb_api_key or tmdb_id is None:
         return None
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(
                 f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season_num}",
-                headers={"Authorization": f"Bearer {key}", "accept": "application/json"},
+                headers=tmdb_headers(),
             )
         if r.status_code != 200:
             return None

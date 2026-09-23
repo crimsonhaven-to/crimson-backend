@@ -13,16 +13,27 @@ from typing import Dict, Optional
 
 import httpx
 
-from core.config import Config, TMDB_HEADERS
+from core.config import get_settings
 
 logger = logging.getLogger("crimson.http")
+
+REQUEST_TIMEOUT = 30.0
+MAX_RETRIES = 3
+RETRY_BACKOFF = 1.0
+
+
+def tmdb_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {get_settings().tmdb_api_key}",
+        "accept": "application/json",
+    }
 
 
 def open_client() -> None:
     """Open the shared client; called from api.py's lifespan startup."""
     global _http_client
     _http_client = httpx.AsyncClient(
-        timeout=Config.REQUEST_TIMEOUT,
+        timeout=REQUEST_TIMEOUT,
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
     )
 
@@ -46,7 +57,7 @@ def get_http_client() -> httpx.AsyncClient:
     """The shared AsyncClient, with a transient fallback if the lifespan has not
     run yet, which only happens outside the request path."""
     if _http_client is None:
-        return httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT)
+        return httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
     return _http_client
 
 
@@ -59,14 +70,14 @@ async def http_client():
 
 async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
     """GET with backoff on 429 and transient 5xx. None once retries are spent."""
-    for attempt in range(Config.MAX_RETRIES):
+    for attempt in range(MAX_RETRIES):
         try:
-            response = await client.get(url, headers=TMDB_HEADERS, params=params, timeout=Config.REQUEST_TIMEOUT)
+            response = await client.get(url, headers=tmdb_headers(), params=params, timeout=REQUEST_TIMEOUT)
             
             if response.status_code == 200:
                 return response.json()
             elif response.status_code == 429:
-                wait_time = Config.RETRY_BACKOFF_FACTOR * (2 ** attempt)
+                wait_time = RETRY_BACKOFF * (2 ** attempt)
                 logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}")
                 await asyncio.sleep(wait_time)
                 continue
@@ -75,11 +86,11 @@ async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional
                 # so back off rather than treating this as a hard failure.
                 logger.warning(
                     f"TMDB upstream {response.status_code} for URL {url} "
-                    f"(attempt {attempt + 1}/{Config.MAX_RETRIES})"
+                    f"(attempt {attempt + 1}/{MAX_RETRIES})"
                 )
-                if attempt == Config.MAX_RETRIES - 1:
+                if attempt == MAX_RETRIES - 1:
                     return None
-                await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
+                await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
                 continue
             else:
                 logger.warning(f"TMDB API error: Status {response.status_code} for URL {url}")
@@ -87,13 +98,13 @@ async def fetch_with_retry(client: httpx.AsyncClient, url: str, params: Optional
                 
         except httpx.TimeoutException:
             logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
-            if attempt == Config.MAX_RETRIES - 1:
+            if attempt == MAX_RETRIES - 1:
                 return None
-            await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
+            await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
         except Exception as e:
             logger.error(f"Request error on attempt {attempt + 1}: {e}")
-            if attempt == Config.MAX_RETRIES - 1:
+            if attempt == MAX_RETRIES - 1:
                 return None
-            await asyncio.sleep(Config.RETRY_BACKOFF_FACTOR * (2 ** attempt))
+            await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
     
     return None

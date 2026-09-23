@@ -4,13 +4,8 @@
 # [build-system] table.
 
 [tool.pytest.ini_options]
-# `tests/` holds fixture-based unit tests for the pure parsing/crypto/signing
-# logic — the bits that silently break when an upstream host rotates its markup.
-# They make NO network calls and need NO database, so the suite runs anywhere
-# (locally + CI) in well under a second.
+# No test needs the network or a database, so the suite runs anywhere.
 testpaths = ["tests"]
-# pytest-asyncio in auto mode: `async def test_*` are collected without a
-# per-test @pytest.mark.asyncio decorator.
 asyncio_mode = "auto"
 addopts = "-q --strict-markers"
 

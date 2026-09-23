@@ -16,6 +16,7 @@ import pytest
 
 import web.queries as queries
 import web.routes.discovery as discovery
+from core.config import get_settings
 
 
 # --- fakes ------------------------------------------------------------------
@@ -234,7 +235,7 @@ async def test_enough_local_hits_skip_tmdb_entirely(monkeypatch):
     local = [_suggestion(i, f"t{i}") for i in range(1, 6)]
     calls = _wire(monkeypatch, local, [_suggestion(99, "remote")])
 
-    body = await discovery.search_anime_by_name(query_name="one piece")
+    body = await discovery.search_anime_by_name(settings=get_settings(), query_name="one piece")
 
     assert calls["remote"] == 0, "the whole point is not making this call"
     assert body["count"] == 5
@@ -246,7 +247,7 @@ async def test_too_few_local_hits_fall_through_to_tmdb(monkeypatch):
     yet, so the remote search still has to run."""
     calls = _wire(monkeypatch, [], [_suggestion(99, "brand new")])
 
-    body = await discovery.search_anime_by_name(query_name="brand new")
+    body = await discovery.search_anime_by_name(settings=get_settings(), query_name="brand new")
 
     assert calls["remote"] == 1
     assert [s["anilist_id"] for s in body["suggestions"]] == [99]
@@ -259,7 +260,7 @@ async def test_the_merge_dedups_on_anilist_id_and_keeps_local_first(monkeypatch)
     remote = [_suggestion(1, "remote duplicate"), _suggestion(2, "remote only")]
     _wire(monkeypatch, local, remote)
 
-    body = await discovery.search_anime_by_name(query_name="x")
+    body = await discovery.search_anime_by_name(settings=get_settings(), query_name="x")
 
     assert [s["anilist_id"] for s in body["suggestions"]] == [1, 2]
     assert body["suggestions"][0]["title"] == "local one"
@@ -270,7 +271,7 @@ async def test_the_response_envelope_is_unchanged(monkeypatch):
     what the endpoint returned before it went local-first."""
     _wire(monkeypatch, [_suggestion(1, "a"), _suggestion(2, "b"), _suggestion(3, "c")], [])
 
-    body = await discovery.search_anime_by_name(query_name="abc")
+    body = await discovery.search_anime_by_name(settings=get_settings(), query_name="abc")
 
     assert set(body) == {"success", "query", "count", "suggestions"}
     assert body["success"] is True

@@ -63,13 +63,13 @@ def test_anilist_post_returns_last_response_after_exhausting_5xx(monkeypatch):
     resp = asyncio.run(anilist.anilist_post(client, "query {}"))
     # Exhausted → caller still sees a real response (503) and degrades itself.
     assert resp.status_code == 503
-    assert client.calls == anilist.Config.MAX_RETRIES
+    assert client.calls == anilist.MAX_RETRIES
 
 
 def test_anilist_post_reraises_network_error_when_never_answered(monkeypatch):
     _no_sleep(monkeypatch)
     import httpx
-    client = FakeClient([httpx.ConnectError("boom")] * anilist.Config.MAX_RETRIES)
+    client = FakeClient([httpx.ConnectError("boom")] * anilist.MAX_RETRIES)
     try:
         asyncio.run(anilist.anilist_post(client, "query {}"))
         assert False, "expected the network error to propagate"

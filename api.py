@@ -9,7 +9,6 @@ live in the ``web`` package (see web/__init__.py), the lifespan body lives in
 ``startup.py``, and the engines own their own routers.
 """
 
-import os
 import hashlib
 import inspect
 import logging
@@ -22,7 +21,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, ORJSONResponse
 from fastapi.requests import Request
-from dotenv import load_dotenv
 from starlette.concurrency import run_in_threadpool
 
 from slowapi import _rate_limit_exceeded_handler
@@ -32,7 +30,7 @@ from core.rate_limit import limiter
 from core.private_sources import overlay_modules
 from core import lumi
 from core.version import VERSION
-from core.config import Config
+from core.config import get_settings
 from core import logging_setup
 from core import observability
 from core.http_client import (
@@ -77,10 +75,6 @@ import startup
 # opt-in JSON format. See core/logging_setup.py.
 logging_setup.configure(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-# Defensive: core.config already loads its own.
-load_dotenv()
 
 
 @asynccontextmanager
@@ -271,7 +265,7 @@ class LoginWallMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not Config.REQUIRE_LOGIN:
+        if scope["type"] != "http" or not get_settings().require_login:
             return await self.app(scope, receive, send)
 
         path = scope.get("path", "")
@@ -325,7 +319,7 @@ app.add_middleware(LoginWallMiddleware)
 # --- CORS -------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=Config.ALLOWED_ORIGINS,
+    allow_origins=get_settings().allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -641,6 +635,6 @@ async def general_exception_handler(request: Request, exc: Exception):
             "success": False,
             "error": "Internal server error",
             "message": lumi.voiced_error(500),
-            "detail": str(exc) if os.getenv("DEBUG") else None
+            "detail": str(exc) if get_settings().debug else None
         }
     )

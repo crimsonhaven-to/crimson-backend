@@ -13,16 +13,16 @@ and flooding /auth/challenge to grow the challenges table. For exact limits
 across a Swarm, point ``RATE_LIMIT_STORAGE_URI`` at a shared Redis.
 """
 
-import os
-
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+
+from core.config import get_settings
 
 # headers_enabled stays False: slowapi can only inject X-RateLimit-* headers if
 # every decorated endpoint declares a ``response: Response`` parameter, and
 # without that it raises at request time. The 429 still fires either way.
 limiter = Limiter(
     key_func=get_remote_address,
-    storage_uri=os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
+    storage_uri=get_settings().rate_limit_storage_uri,
     headers_enabled=False,
 )

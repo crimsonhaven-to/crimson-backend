@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import re
 import time
 from dataclasses import dataclass
@@ -41,41 +40,32 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from core.http_client import get_http_client
+from core.config import get_settings
 
 logger = logging.getLogger("crimson.metrics.query")
 
 # The scrape job name in deploy/prometheus/prometheus.yml. Every panel filters on
 # it, so a Prometheus shared with other projects cannot blend foreign timeseries
 # into these charts.
-DEFAULT_JOB = "crimson-api"
-
-# Interpolated into PromQL. It comes from the operator's environment, not a
-# request, but it is the one non-literal fragment in an otherwise static query,
-# so it is filtered rather than trusted.
-_JOB_SAFE = re.compile(r"[^A-Za-z0-9_:-]")
+JOB = "crimson-api"
 
 # A `by (route)` panel can fan out wider than a chart can legibly draw. The widest
 # are already topk() in the query; this is the backstop for the rest. Series are
 # kept by peak value, so the cap drops the quiet ones.
 MAX_SERIES = 8
 
-_TIMEOUT = float(os.getenv("PROMETHEUS_TIMEOUT", "12") or 12)
+_TIMEOUT = 12.0
 
 
 def base_url() -> str:
     """The private Prometheus base URL, or "" when the feature is not deployed."""
-    raw = os.getenv("PROMETHEUS_URL", "").strip().rstrip("/")
+    raw = get_settings().prometheus_url.rstrip("/")
     if not raw:
         return ""
     if not raw.startswith(("http://", "https://")):
         logger.warning("PROMETHEUS_URL must start with http:// or https://; ignoring %r", raw)
         return ""
     return raw
-
-
-def job_label() -> str:
-    raw = os.getenv("PROMETHEUS_JOB", DEFAULT_JOB).strip() or DEFAULT_JOB
-    return _JOB_SAFE.sub("", raw)[:64] or DEFAULT_JOB
 
 
 def available() -> bool:
@@ -360,7 +350,7 @@ def render_legend(template: str, metric: Dict[str, str]) -> str:
 
 
 def _expand(promql: str, window: str) -> str:
-    return promql.replace("$JOB", job_label()).replace("$WINDOW", window)
+    return promql.replace("$JOB", JOB).replace("$WINDOW", window)
 
 
 def _finite(raw: Any) -> Optional[float]:
@@ -476,11 +466,10 @@ async def scrape_targets() -> Dict[str, Any]:
         logger.warning("target listing failed: %s", exc)
         return {"ok": False, "error": str(exc)[:200] or exc.__class__.__name__, "targets": []}
 
-    job = job_label()
     targets = []
     for entry in data.get("activeTargets") or []:
         labels = entry.get("labels") or {}
-        if labels.get("job") != job:
+        if labels.get("job") != JOB:
             continue
         targets.append({
             "instance": labels.get("instance") or "?",

@@ -9,12 +9,13 @@ import asyncio
 import logging
 from typing import Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.requests import Request
 
-from core.config import Config
+from core.config import Settings, get_settings
 from core.http_client import http_client
 from core.response_cache import (
+    TRENDING_CACHE_TTL,
     _local_cache,
     _local_get,
     _local_set,
@@ -56,7 +57,10 @@ _LOCAL_SEARCH_FLOOR = 3
 
 
 @router.get("/search/anime")
-async def search_anime_by_name(query_name: str = Query(..., min_length=1, description="Anime name to search")):
+async def search_anime_by_name(
+    query_name: str = Query(..., min_length=1, description="Anime name to search"),
+    settings: Settings = Depends(get_settings),
+):
     """Search anime by name, from the local catalogue first.
 
     The client fires a search per keystroke across five surfaces, so the cost
@@ -65,16 +69,13 @@ async def search_anime_by_name(query_name: str = Query(..., min_length=1, descri
     downstream regardless, so the local table answers most searches outright and
     TMDB is consulted only when it returns few enough hits to be worth it.
     """
-    if not Config.TMDB_API_KEY:
-        raise HTTPException(status_code=500, detail="TMDB API key not configured")
-
     try:
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(
             None, lambda: search_anime_entries(query_name)
         )
 
-        if len(results) < _LOCAL_SEARCH_FLOOR:
+        if len(results) < _LOCAL_SEARCH_FLOOR and settings.tmdb_api_key:
             async with http_client() as client:
                 remote = await fetch_tmdb_search_results(client, query_name)
             seen = {r["anilist_id"] for r in results}
@@ -115,9 +116,12 @@ async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Nu
 # playback path, so only discovery and an overview are needed here.
 
 @router.get("/search/shows")
-async def search_shows_by_name(query_name: str = Query(..., min_length=1, description="TV show name to search")):
+async def search_shows_by_name(
+    query_name: str = Query(..., min_length=1, description="TV show name to search"),
+    settings: Settings = Depends(get_settings),
+):
     """Search non-anime TV shows by name; ``kind='show'``, keyed by tmdb_id."""
-    if not Config.TMDB_API_KEY:
+    if not settings.tmdb_api_key:
         raise HTTPException(status_code=500, detail="TMDB API key not configured")
     try:
         async with http_client() as client:
@@ -154,9 +158,12 @@ async def get_trending_shows(limit: int = Query(10, ge=1, le=50, description="Nu
 # since a movie has no season or episode.
 
 @router.get("/search/movies")
-async def search_movies_by_name(query_name: str = Query(..., min_length=1, description="Movie name to search")):
+async def search_movies_by_name(
+    query_name: str = Query(..., min_length=1, description="Movie name to search"),
+    settings: Settings = Depends(get_settings),
+):
     """Search general movies by name; ``kind='movie'``, keyed by tmdb_id."""
-    if not Config.TMDB_API_KEY:
+    if not settings.tmdb_api_key:
         raise HTTPException(status_code=500, detail="TMDB API key not configured")
     try:
         async with http_client() as client:
@@ -218,7 +225,7 @@ async def get_catalogue(
                 loop = asyncio.get_event_loop()
                 items = await loop.run_in_executor(None, get_catalogue_items)
                 if items:
-                    await set_cached_response(cache_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+                    await set_cached_response(cache_key, {"items": items}, ttl_seconds=TRENDING_CACHE_TTL)
             items = items or []
             _local_set(cache_key, items)
 
@@ -304,7 +311,7 @@ async def _load_catalogue_items_cached() -> list:
             loop = asyncio.get_event_loop()
             items = await loop.run_in_executor(None, get_catalogue_items)
             if items:
-                await set_cached_response(cache_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+                await set_cached_response(cache_key, {"items": items}, ttl_seconds=TRENDING_CACHE_TTL)
         items = items or []
         _local_set(cache_key, items)
     return items
@@ -471,7 +478,7 @@ async def _serve_local_catalogue(request, *, cache_prefix, builder, list_key, ge
                 loop = asyncio.get_event_loop()
                 items = await loop.run_in_executor(None, builder)
                 if items:
-                    await set_cached_response(items_key, {"items": items}, ttl_seconds=Config.TRENDING_CACHE_TTL_SECONDS)
+                    await set_cached_response(items_key, {"items": items}, ttl_seconds=TRENDING_CACHE_TTL)
             items = items or []
             _local_set(items_key, items)
 

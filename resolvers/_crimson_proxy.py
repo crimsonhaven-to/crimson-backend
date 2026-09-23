@@ -1,92 +1,40 @@
-"""External CORS proxy (crimson-proxy) URL builder + health probe.
+"""Signed links to the external crimson-proxy edge, and its health probe.
 
-Phase 1 of moving stream-segment bandwidth off the backend: when
-``CRIMSON_PROXY_BASE`` is set, the simple *static-header HLS* sources (VOE,
-cinema.bz, PlayIMDb) hand the player a signed link to the external edge proxy
-(Netlify / Cloudflare Workers) instead of a same-origin ``/{source}_proxy``
-path. Segment bytes then flow ``CDN → edge proxy → viewer`` and never touch us.
+Powers ``/sign``, the cache downloader and the dashboard's proxy-health ping.
+The signature is byte-for-byte the crimson-proxy contract: HMAC-SHA256 over
+``url\nreferer\norigin\nuser-agent``, hex truncated to 32 characters, keyed with
+``PROXY_SECRET`` (the proxy's ``NITRO_PROXY_SECRET``). It covers the query and not
+the host, so one link is valid on every configured base, which is what lets
+``CRIMSON_PROXY_BASE`` list several hosts for failover.
 
-The signature contract is **byte-for-byte** the crimson-proxy one (see that
-repo's README): HMAC-SHA256 over ``url\\nreferer\\norigin\\nuser-agent``, hex
-truncated to 32 chars. The proxy holds the *same* secret (``NITRO_PROXY_SECRET``
-== our ``PROXY_SECRET``), so it can re-sign the playlist's child segments itself
-— we only ever sign the top-level stream URL.
-
-Because the signature covers the query fields and **not** the host, one signed
-link is valid on every proxy that shares the secret. So ``CRIMSON_PROXY_BASE``
-may be a comma-separated list and we pick one host per request — free
-round-robin load-balancing / failover across the free tiers.
-
-Gating: this is OFF unless BOTH ``CRIMSON_PROXY_BASE`` and ``PROXY_SECRET`` are
-set. Leave either unset and every source keeps proxying itself (same-origin
-``/{source}_proxy``), so this is a safe, flag-gated, A/B-per-source swap. A blank
-secret would mean the proxy is in open mode, which we never sign for.
+Off unless both ``CRIMSON_PROXY_BASE`` and ``PROXY_SECRET`` are set: a blank
+secret would mean the proxy runs in open mode, which is never signed for.
 """
 
-import hashlib
-import hmac
 import logging
-import os
 import random
 import time
 from urllib.parse import quote
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from core import signing
+from core.config import get_settings
 
-# Display labels of backend sources wired to prefer the external proxy when
-# enabled (shown by the admin dashboard). The backend no longer resolves any
-# third-party sources, so this is empty: source resolving + proxy offload now
-# happen client-side (the client mints its own signed links via POST /sign, and
-# the crimson-proxy helper here only powers /sign, the cache downloader, and the
-# dashboard's proxy-health ping).
-ROUTED_SOURCES: list[str] = []
+logger = logging.getLogger(__name__)
 
 
 def proxy_bases() -> list[str]:
-    """Configured proxy origins (comma-separated), trailing slashes stripped."""
-    return [
-        b.strip().rstrip("/")
-        for b in os.getenv("CRIMSON_PROXY_BASE", "").split(",")
-        if b.strip()
-    ]
+    return get_settings().crimson_proxy_base
 
 
-def _source_allowlist() -> list[str]:
-    """Optional per-source A/B allowlist (``CRIMSON_PROXY_SOURCES``). Empty/unset
-    means *all* wired sources offload; set it to a comma-separated subset (e.g.
-    ``cinema.bz,PlayIMDb``) to offload only those and keep the rest same-origin."""
-    return [s.strip() for s in os.getenv("CRIMSON_PROXY_SOURCES", "").split(",") if s.strip()]
-
-
-def _secret() -> bytes:
-    """The shared signing secret — specifically ``PROXY_SECRET`` (the value the
-    edge proxy carries as ``NITRO_PROXY_SECRET``), never a per-source secret."""
-    return (os.getenv("PROXY_SECRET") or "").encode("utf-8")
-
-
-def is_enabled(source: str | None = None) -> bool:
-    """True only when we have at least one proxy host AND a secret to sign with.
-
-    When ``source`` is given, also honour the optional ``CRIMSON_PROXY_SOURCES``
-    allowlist so individual sources can be A/B'd on/off without code changes
-    (unset allowlist = every wired source offloads). Call with no ``source`` for
-    the global "is the proxy configured at all" check (used by the dashboard)."""
-    if not (proxy_bases() and os.getenv("PROXY_SECRET")):
-        return False
-    if source is not None:
-        allow = _source_allowlist()
-        if allow and source not in allow:
-            return False
-    return True
+def is_enabled() -> bool:
+    return bool(proxy_bases() and get_settings().proxy_secret)
 
 
 def _signed_query(url: str, referer: str, origin: str, user_agent: str) -> str:
-    """The ``u=…&r=…&o=…&ua=…&s=…`` query string, signed per the crimson-proxy
-    contract (HMAC over ``url\\nreferer\\norigin\\nuser-agent``, hex[:32])."""
     payload = "\n".join([url, referer, origin, user_agent])
-    sig = hmac.new(_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    sig = signing.sign(get_settings().proxy_secret.encode("utf-8"), payload)
     return (
         f"u={quote(url, safe='')}"
         f"&r={quote(referer, safe='')}"
@@ -129,18 +77,6 @@ def _candidate_bases() -> list[str]:
     return healthy or bases
 
 
-def health_snapshot() -> dict:
-    """Current cached health view (for diagnostics/admin)."""
-    now = time.time()
-    return {
-        b: {
-            "known_healthy": _is_known_healthy(b, now),
-            "raw": _health.get(b),
-        }
-        for b in proxy_bases()
-    }
-
-
 def proxy_url(url: str, *, referer: str = "", origin: str = "", user_agent: str = "") -> str:
     """Build a signed link to the external proxy for ``url`` with the upstream
     headers the gated CDN requires. Picks one *healthy* configured host at random
@@ -170,7 +106,7 @@ async def probe_bases(timeout: float = 5.0) -> list[dict]:
     if not bases:
         return []
 
-    have_secret = bool(os.getenv("PROXY_SECRET"))
+    have_secret = bool(get_settings().proxy_secret)
     canary_q = _signed_query(_CANARY_URL, "", "", "") if have_secret else ""
 
     results: list[dict] = []

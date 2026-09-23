@@ -16,12 +16,11 @@ core.observability.
 from __future__ import annotations
 
 import logging
-import os
-from typing import Optional
 
 import orjson
 
 from core.observability import current_request_id
+from core.config import get_settings
 
 # Verbatim from the basicConfig this replaced, so default output is unchanged.
 PLAIN_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -98,9 +97,8 @@ class JsonFormatter(logging.Formatter):
             return super().format(record)
 
 
-def _formatter(name: Optional[str] = None) -> logging.Formatter:
-    fmt = (name if name is not None else os.getenv("LOG_FORMAT", "plain")).strip().lower()
-    return JsonFormatter() if fmt == "json" else PlainFormatter()
+def _formatter() -> logging.Formatter:
+    return JsonFormatter() if get_settings().log_format == "json" else PlainFormatter()
 
 
 def configure(level: int = logging.INFO) -> None:

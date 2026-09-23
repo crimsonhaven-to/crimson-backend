@@ -25,7 +25,6 @@ of raising a duplicate timeseries error.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 import uuid
@@ -527,9 +526,3 @@ def render_metrics() -> Tuple[bytes, str]:
     if not PROMETHEUS_AVAILABLE:
         return b"", CONTENT_TYPE_LATEST
     return generate_latest(REGISTRY), CONTENT_TYPE_LATEST
-
-
-def metrics_token() -> str:
-    """The shared secret a Prometheus scraper presents. Empty means no token is
-    configured, in which case /metrics is reachable by an admin session only."""
-    return os.getenv("METRICS_TOKEN", "").strip()

@@ -41,14 +41,10 @@ from .db import (
     STATUS_ACTIVE,
     STATUS_PAUSED,
 )
+from core.config import get_settings
 
 logger = logging.getLogger("download_engine.manager")
 
-# Tunables.
-MAX_ACTIVE = max(1, int(os.getenv("DOWNLOAD_MAX_ACTIVE", "3")))
-POLL_INTERVAL = max(2, int(os.getenv("DOWNLOAD_POLL_INTERVAL", "5")))  # seconds
-# Don't start a download unless the chosen root has at least this much headroom.
-MIN_FREE_BYTES = int(os.getenv("DOWNLOAD_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024)))  # 2 GiB
 
 
 def _int(value, default: int = 0) -> int:
@@ -104,7 +100,7 @@ class DownloadManager:
         self._started = True
         if not await aria2.is_available():
             logger.warning(
-                f"aria2 sidecar not reachable at {aria2.RPC_URL} — downloads will stay "
+                f"aria2 sidecar not reachable at {get_settings().aria2_rpc_url} — downloads will stay "
                 "pending until it is. Check the aria2 service + ARIA2_RPC_SECRET."
             )
         # NB: unlike the cache worker (which IS the ffmpeg process), aria2 runs in a
@@ -116,7 +112,7 @@ class DownloadManager:
         # the staging control file. So a worker-only roll seamlessly re-attaches.
         self._poller = asyncio.create_task(self._poll())
         logger.info(
-            f"Download worker started (max {MAX_ACTIVE} active, polling every {POLL_INTERVAL}s)"
+            f"Download worker started (max {get_settings().download_max_active} active, polling every {get_settings().download_poll_interval}s)"
         )
 
     async def stop(self) -> None:
@@ -157,10 +153,10 @@ class DownloadManager:
                 raise
             except Exception as e:
                 logger.error(f"download poll failed: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(get_settings().download_poll_interval)
 
     async def _submit_pending(self) -> None:
-        free = MAX_ACTIVE - await run_in_threadpool(self._store.count_active)
+        free = get_settings().download_max_active - await run_in_threadpool(self._store.count_active)
         if free <= 0:
             return
         rows = await run_in_threadpool(self._store.fetch_pending, free)
@@ -172,14 +168,14 @@ class DownloadManager:
                 await run_in_threadpool(self._store.mark_failed, row["id"], str(e))
 
     async def _submit_one(self, row: dict) -> None:
-        target = await run_in_threadpool(fs.pick_write_target, MIN_FREE_BYTES)
+        target = await run_in_threadpool(fs.pick_write_target, get_settings().download_min_free_bytes)
         if not target:
             # No download-enabled root with room right now — leave the row pending and
             # retry next tick. Warn once so the log isn't spammed every poll.
             if not self._warned_no_space:
                 logger.warning(
                     "No download-enabled local source has enough free space — "
-                    f"holding downloads (need {MIN_FREE_BYTES // (1024*1024)} MiB free)"
+                    f"holding downloads (need {get_settings().download_min_free_bytes // (1024*1024)} MiB free)"
                 )
                 self._warned_no_space = True
             return

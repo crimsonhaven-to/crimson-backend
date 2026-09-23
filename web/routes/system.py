@@ -4,13 +4,12 @@ All four are whitelisted on the login wall; see api.py's ``_PUBLIC_EXACT``.
 """
 
 import logging
-import os
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from core.config import Config
+from core.config import Settings, get_settings
 from core.version import VERSION
 from core import lumi
 from core import migrations
@@ -49,35 +48,14 @@ async def lumi_blessing():
 
 
 @router.get("/config")
-async def public_config():
-    """Feature flags the frontend needs *before* login.
-
-    Notably ``demo_mode``, which drops the login page's invite-code requirement.
-    Booleans only: this is reachable without a session, so no secrets, counts or
-    paths may leak through it."""
-    # The frontend hides its trending row, results and routes when off. Imported
-    # lazily so /config never hard-depends on the manga engine loading.
-    try:
-        from manga_engine.provider import manga_enabled as _manga_enabled
-        manga_enabled = _manga_enabled()
-    except Exception:
-        manga_enabled = False
-
-    # Drives the frontend's nav entry and /live routes. Lazy for the same reason
-    # as the manga flag above.
-    try:
-        from iptv_engine import enabled as _iptv_enabled
-        live_tv_enabled = _iptv_enabled()
-    except Exception:
-        live_tv_enabled = False
-
+async def public_config(settings: Settings = Depends(get_settings)):
+    """Feature flags the frontend needs before login, such as ``demo_mode``, which
+    drops the invite-code field. Reachable without a session, so booleans only."""
     return {
-        "demo_mode": Config.DEMO_MODE,
-        "require_login": Config.REQUIRE_LOGIN,
-        "manga_enabled": manga_enabled,
-        "live_tv_enabled": live_tv_enabled,
-        # Drives the Index's "Local" toggle and search surface, both hidden when
-        # off. A cached, DB-backed check.
+        "demo_mode": settings.demo_mode,
+        "require_login": settings.require_login,
+        "manga_enabled": settings.manga_enabled,
+        "live_tv_enabled": settings.iptv_enabled,
         "local_library_enabled": local_is_configured(),
     }
 
@@ -124,6 +102,6 @@ async def health_check():
             status_code=503,
             content={
                 "status": "unhealthy",
-                "error": str(e) if os.getenv("DEBUG") else "database unavailable",
+                "error": str(e) if get_settings().debug else "database unavailable",
             },
         )

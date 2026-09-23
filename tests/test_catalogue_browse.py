@@ -12,7 +12,6 @@ from web.queries import _decode_genres
 from metadata_engine.anilist import (
     _MEDIA_SORTS,
     CATALOGUE_DEFAULT_SORT,
-    MANGA_DEFAULT_SORT,
     _fetch_media_catalogue,
     _manga_item,
 )
@@ -69,8 +68,6 @@ def test_media_sort_tokens_map_to_anilist_enums():
     assert set(_MEDIA_SORTS) == {"trending", "popular", "score", "newest", "title"}
     assert _MEDIA_SORTS[CATALOGUE_DEFAULT_SORT] == "TRENDING_DESC"
     assert _MEDIA_SORTS["score"] == "SCORE_DESC"
-    # Back-compat alias still points at the default.
-    assert MANGA_DEFAULT_SORT == CATALOGUE_DEFAULT_SORT
 
 
 async def test_anilist_browse_flags_upstream_error_as_unavailable(monkeypatch):

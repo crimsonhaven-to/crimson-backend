@@ -21,7 +21,8 @@ import logging
 import httpx
 
 from account_engine import mailer
-from core.config import Config
+from core.config import get_settings
+from core.http_client import REQUEST_TIMEOUT
 
 from .db import store
 from .schedule import fetch_window
@@ -48,7 +49,7 @@ async def refresh_schedule() -> int:
 
     Runs on a fresh event loop in a scheduler thread, so it cannot borrow the
     shared client, which is bound to the main loop."""
-    async with httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         rows = await fetch_window(client, LOOKBACK_HOURS, HORIZON_DAYS)
     if not rows:
         logger.warning("Airing refresh returned nothing; keeping the previous window")
@@ -68,7 +69,7 @@ def send_due_notifications() -> dict:
     if not pending:
         return result
 
-    dry_run = Config.AIRING_NOTIFY_DRY_RUN
+    dry_run = get_settings().airing_notify_dry_run
     base = mailer.frontend_base_url()
 
     messages = []

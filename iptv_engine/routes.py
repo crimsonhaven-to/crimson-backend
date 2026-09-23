@@ -15,23 +15,24 @@ import logging
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
 from core import lumi
+from core.config import Settings, get_settings
 from web.routes.proxies import _proxy_response
 
-from .service import IptvService, enabled, proxy_fetch, verify_stream_sig
+from .service import IptvService, proxy_fetch, verify_stream_sig
 
 logger = logging.getLogger("crimson.iptv")
 
-router = APIRouter(tags=["iptv"])
-service = IptvService()
-
-
-def _require_enabled() -> None:
-    if not enabled():
+def _require_enabled(settings: Settings = Depends(get_settings)) -> None:
+    if not settings.iptv_enabled:
         raise HTTPException(status_code=503, detail="Live TV is not enabled on this haven")
+
+
+router = APIRouter(tags=["iptv"], dependencies=[Depends(_require_enabled)])
+service = IptvService()
 
 
 def _warming_payload() -> dict:
@@ -50,7 +51,6 @@ def _warming_payload() -> dict:
 async def iptv_browse():
     """The browse facets: categories + countries (with channel counts) and the
     catalogue total. Drives the Live TV hub's filter chips."""
-    _require_enabled()
     service.ensure_refresh_started()
     if not service.ready:
         return {**_warming_payload(), "categories": [], "countries": []}
@@ -73,7 +73,6 @@ async def iptv_channels(
     page_size: int = Query(60, ge=1, le=200),
 ):
     """Paged channel cards, filtered by category/country and/or a search term."""
-    _require_enabled()
     service.ensure_refresh_started()
     if not service.ready:
         return {**_warming_payload(), "channels": [], "page": page, "page_size": page_size}
@@ -87,7 +86,6 @@ async def iptv_channels(
 async def iptv_channel(channel_id: str):
     """Full channel detail for the watch page — every known stream, best
     quality first, each with its signed same-origin proxy path."""
-    _require_enabled()
     service.ensure_refresh_started()
     if not service.ready:
         return {**_warming_payload(), "channel": None}
@@ -115,7 +113,6 @@ async def iptv_proxy(
     fetch runs through the SSRF-guarded client (untrusted hosts + redirects).
     Playlists come back rewritten so every sub-resource flows through here too.
     """
-    _require_enabled()
     if not verify_stream_sig(u, s, r, a):
         raise HTTPException(status_code=403, detail=lumi.voiced_error(403))
     try:

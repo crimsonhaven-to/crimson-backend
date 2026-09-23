@@ -23,9 +23,9 @@ from typing import List, Optional, Tuple
 
 import httpx
 
-from core.config import Config
+from core.config import get_settings
 from core.db_pool import get_connection
-from core.http_client import fetch_with_retry
+from core.http_client import REQUEST_TIMEOUT, fetch_with_retry
 from metadata_engine.store import (
     get_first_anilist_ids,
     _persist_discovered_show,
@@ -56,7 +56,7 @@ async def _dedicated_client():
     identically; it just misses the warm pool, which is fine for a background
     sweep."""
     async with httpx.AsyncClient(
-        timeout=Config.REQUEST_TIMEOUT,
+        timeout=REQUEST_TIMEOUT,
         limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
     ) as client:
         yield client
@@ -67,8 +67,6 @@ def _slice_oldest_ids(table: str, buckets: int) -> List[int]:
     """The oldest ceil(rowcount / buckets) tmdb_ids in ``table``: one night's
     slice. Rows never refreshed sort first. ``table`` is a trusted literal.
     """
-    if buckets < 1:
-        buckets = 1
     with get_connection() as conn:
         cursor = conn.cursor()
         total = cursor.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"] or 0
@@ -97,12 +95,12 @@ async def _refresh_ids(client, kind: str, ids: List[int]) -> int:
     return done
 
 
-async def refresh_daily_slice(buckets: int = None) -> Tuple[int, int]:
+async def refresh_daily_slice(buckets: Optional[int] = None) -> Tuple[int, int]:
     """Refresh one night's slice of each metadata table.
 
     Re-pulling stamps last_updated, so over ``buckets`` nights the whole catalogue
     is swept back into agreement with TMDB."""
-    buckets = buckets if buckets is not None else Config.METADATA_REFRESH_BUCKETS
+    buckets = buckets or get_settings().metadata_refresh_buckets
 
     loop = asyncio.get_event_loop()
     show_ids = await loop.run_in_executor(None, _slice_oldest_ids, "tmdb_shows", buckets)
@@ -165,10 +163,10 @@ async def _backfill_discover(client, kind: str, genre_map: dict, max_pages: int)
     return persisted
 
 
-async def backfill_catalogue(max_pages: int = None) -> Tuple[int, int]:
+async def backfill_catalogue(max_pages: Optional[int] = None) -> Tuple[int, int]:
     """One-shot pre-population of both tables from TMDB discover, paced between
     pages. Returns how many of each were persisted."""
-    max_pages = max_pages if max_pages is not None else Config.METADATA_BACKFILL_PAGES
+    max_pages = max_pages or get_settings().metadata_backfill_pages
     async with _dedicated_client() as client:
         tv_genre_map = await fetch_tmdb_genre_map(client, "tv")
         movie_genre_map = await fetch_tmdb_genre_map(client, "movie")
@@ -287,7 +285,7 @@ async def run_pending_backfill() -> Optional[Tuple[int, int]]:
     if not row:
         return None
     job_id = row["id"]
-    pages = row.get("pages") or Config.METADATA_BACKFILL_PAGES
+    pages = row.get("pages") or get_settings().metadata_backfill_pages
     logger.info(f"Draining backfill job #{job_id} ({pages} pages, by {row.get('requested_by')})")
     try:
         shows, movies = await backfill_catalogue(max_pages=pages)

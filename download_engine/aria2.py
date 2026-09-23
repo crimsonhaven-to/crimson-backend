@@ -19,16 +19,14 @@ seeding immediately (no inbound port needed), and each job runs in its own stagi
 from __future__ import annotations
 
 import logging
-import os
 from typing import List, Optional
 
 import httpx
+from core.config import get_settings
 
 logger = logging.getLogger("download_engine.aria2")
 
-RPC_URL = os.getenv("ARIA2_RPC_URL", "http://aria2:6800/jsonrpc").rstrip("/")
-RPC_SECRET = os.getenv("ARIA2_RPC_SECRET", "")
-_TIMEOUT = float(os.getenv("ARIA2_RPC_TIMEOUT", "15"))
+_TIMEOUT = 15.0
 
 # Status fields we ask aria2 for (keeps responses small).
 _STATUS_KEYS = [
@@ -42,7 +40,7 @@ class Aria2Error(RuntimeError):
 
 
 def _token() -> str:
-    return f"token:{RPC_SECRET}"
+    return f"token:{get_settings().aria2_rpc_secret}"
 
 
 async def _call(method: str, params: Optional[list] = None, *, timeout: Optional[float] = None):
@@ -55,7 +53,7 @@ async def _call(method: str, params: Optional[list] = None, *, timeout: Optional
     }
     try:
         async with httpx.AsyncClient(timeout=timeout or _TIMEOUT) as client:
-            resp = await client.post(RPC_URL, json=payload)
+            resp = await client.post(get_settings().aria2_rpc_url, json=payload)
         resp.raise_for_status()
         data = resp.json()
     except (httpx.HTTPError, ValueError) as e:

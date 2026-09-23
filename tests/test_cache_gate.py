@@ -17,8 +17,8 @@ from cache_engine.downloader import (
     _is_loopback_proxy_url,
     _media_url_for_stream,
     _to_internal,
-    INTERNAL_BASE,
 )
+from core.config import get_settings
 
 
 # --- same-origin proxy shapes we CAN pull over loopback --------------------
@@ -53,7 +53,7 @@ def test_malformed_url_is_not_pullable():
 def test_to_internal_rewrites_exactly_the_loopback_pullable_urls():
     # Same-origin proxy -> rewritten onto loopback (query preserved).
     internal = _to_internal("https://api.crimson.to/overlay_proxy?u=x&s=y")
-    assert internal == f"{INTERNAL_BASE}/overlay_proxy?u=x&s=y"
+    assert internal == f"{get_settings().cache_internal_base}/overlay_proxy?u=x&s=y"
 
     # A raw CDN URL is left untouched (and the gate rejects it upstream, so a job
     # like this never actually reaches _to_internal).

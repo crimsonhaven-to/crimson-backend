@@ -9,7 +9,6 @@ assembler thin. Every DB call hops the threadpool, so the event loop never block
 
 import asyncio
 import logging
-import os
 import platform
 import time
 from datetime import datetime, timezone
@@ -17,7 +16,7 @@ from typing import Dict, List
 
 from starlette.concurrency import run_in_threadpool
 
-from core.config import Config
+from core.config import get_settings
 from core.db_pool import pool_stats
 from core.http_client import http_client
 from core.version import PROCESS_STARTED_AT, VERSION
@@ -78,17 +77,18 @@ async def admin_system_info() -> Dict:
     proxy_hosts = await _crimson_proxy.refresh_health()
     schema_state = await run_in_threadpool(migrations.status)
 
+    settings = get_settings()
     flags = {
-        "require_login": bool(getattr(Config, "REQUIRE_LOGIN", False)),
+        "require_login": settings.require_login,
         "jellyfin_configured": jellyfin_is_configured(),
         "local_configured": local_is_configured(),
         "cache_enabled": bool(cache_enabled),
         "ffmpeg_available": ffmpeg_available(),
         "aria2_available": aria2_ok,
         "downloads_enabled_sources": download_enabled,
-        "tmdb_key_set": bool(getattr(Config, "TMDB_API_KEY", None)),
-        "rate_limit_storage": os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
-        "github_token_set": bool(os.getenv("GITHUB_TOKEN")),
+        "tmdb_key_set": bool(settings.tmdb_api_key),
+        "rate_limit_storage": settings.rate_limit_storage_uri,
+        "github_token_set": bool(settings.github_token),
         "crimson_proxy_enabled": _crimson_proxy.is_enabled(),
     }
     # A base build discovers none, so the flag is absent and the frontend badge
@@ -116,8 +116,7 @@ async def admin_system_info() -> Dict:
         "flags": flags,
         "proxies": {
             "enabled": _crimson_proxy.is_enabled(),
-            "secret_set": bool(os.getenv("PROXY_SECRET")),
-            "routed_sources": _crimson_proxy.ROUTED_SOURCES,
+            "secret_set": bool(settings.proxy_secret),
             "hosts": proxy_hosts,
         },
         "db_pool": pool,
@@ -144,7 +143,7 @@ async def admin_system_info() -> Dict:
 # search-to-embeds pipeline, so green means it would actually play, and reports
 # the library sources' configuration. Cached for a few minutes so opening the tab
 # does not re-hammer every upstream; "Re-probe" passes force=True.
-_SOURCE_HEALTH_TTL = float(os.getenv("SOURCE_HEALTH_TTL", "300"))
+_SOURCE_HEALTH_TTL = 300.0
 _source_health_cache: Dict[str, object] = {"at": 0.0, "data": None}
 _source_health_lock = asyncio.Lock()
 
@@ -164,12 +163,7 @@ async def _probe_scrape_source(scraper_class, anilist_data: Dict) -> Dict:
         "latency_ms": None,
         "embeds": 0,
     }
-    gate = meta.get("env_gate")
-    if gate and not os.getenv(gate):
-        entry.update(status="disabled", detail=f"{gate} not configured, source is dormant")
-        return entry
-
-    c = source_health.CANARY
+    c = source_health.canary()
     t0 = time.perf_counter()
     try:
         embeds = await run_single_scraper(
@@ -245,14 +239,15 @@ async def _probe_library_sources() -> List[Dict]:
 async def _do_source_health() -> Dict:
     """The full sweep: canary metadata once, then every scrape source
     concurrently, plus the library sources, with a summary tally."""
+    canary = source_health.canary()
     anilist_data: Dict = {}
     try:
         async with http_client() as client:
-            anilist_data = await fetch_anilist_metadata(client, source_health.CANARY["anilist_id"]) or {}
+            anilist_data = await fetch_anilist_metadata(client, canary["anilist_id"]) or {}
     except Exception as e:
         logger.warning(f"source-health canary metadata fetch failed: {e}")
     if not anilist_data.get("title"):
-        anilist_data = {**anilist_data, "title": source_health.CANARY["title"]}
+        anilist_data = {**anilist_data, "title": canary["title"]}
 
     scrape_classes = [
         c for c in ALL_SCRAPERS
@@ -274,7 +269,7 @@ async def _do_source_health() -> Dict:
     summary["slowest_ms"] = max(lats) if lats else None
 
     return {
-        "canary": dict(source_health.CANARY),
+        "canary": canary,
         "sources": sources,
         "summary": summary,
     }

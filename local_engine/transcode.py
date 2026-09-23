@@ -34,20 +34,19 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger("local_engine.transcode")
 
-# Segment length (seconds). 6s is the HLS convention — long enough to amortise the
-# per-segment ffmpeg spawn, short enough to keep seeks snappy.
-SEGMENT_SECONDS = max(2, int(os.getenv("LOCAL_HLS_SEGMENT_SECONDS", "6")))
+# The HLS convention: long enough to amortise the per-segment ffmpeg spawn, short
+# enough to keep seeks snappy.
+SEGMENT_SECONDS = 6
 
-# x264 knobs. ``veryfast`` keeps a single 1080p transcode within ~1 core (the api
-# container's budget); raise quality with a slower preset / lower CRF if you have
-# the headroom.
-_PRESET = os.getenv("LOCAL_HLS_PRESET", "veryfast")
-_CRF = os.getenv("LOCAL_HLS_CRF", "21")
-_AUDIO_BITRATE = os.getenv("LOCAL_HLS_AUDIO_BITRATE", "160k")
+# ``veryfast`` keeps one 1080p transcode within about one core, the api
+# container's budget.
+_PRESET = "veryfast"
+_CRF = "21"
+_AUDIO_BITRATE = "160k"
 
-# Hard ceiling on a single segment transcode so a pathological file can't pin a
-# worker forever. A 6s segment that needs >120s to encode is broken, not slow.
-_SEGMENT_TIMEOUT = int(os.getenv("LOCAL_HLS_SEGMENT_TIMEOUT", "120"))
+# A 6s segment that needs more than this to encode is broken, not slow, and must
+# not pin a worker forever.
+_SEGMENT_TIMEOUT = 120
 
 # Bounded (path, mtime, size) -> duration cache so the playlist (and every segment
 # request, which re-validates the count) doesn't re-probe the file each time.

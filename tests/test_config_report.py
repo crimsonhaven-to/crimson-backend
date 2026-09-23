@@ -1,10 +1,11 @@
 """Startup feature report (core/config_report.py).
 
 It's diagnostics that runs on every boot, so it must never raise and must
-honestly reflect which env-gated features are on/off.
+honestly reflect which features are on or off.
 """
 
 from core import config_report
+from core.config import get_settings
 
 
 def test_report_has_header_and_a_line_per_feature():
@@ -15,27 +16,26 @@ def test_report_has_header_and_a_line_per_feature():
     assert len(lines) == 1 + len(config_report.FEATURES) + len(config_report._overlay_features())
 
 
-def test_feature_toggles_track_env(monkeypatch):
-    # A representative env-gated feature flips on/off with its env var. (The overlay
-    # sources are gated the same way but aren't present in a base build.)
-    monkeypatch.delenv("OPENSUBTITLES_API_KEY", raising=False)
+def test_feature_toggles_track_settings(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "opensubtitles_api_key", "")
     off = "\n".join(config_report.build_report())
     assert "[ off] OpenSubtitles subtitles" in off
 
-    monkeypatch.setenv("OPENSUBTITLES_API_KEY", "tok")
+    monkeypatch.setattr(settings, "opensubtitles_api_key", "tok")
     on = "\n".join(config_report.build_report())
     assert "[  on] OpenSubtitles subtitles" in on
 
 
 def test_missing_proxy_secret_is_a_warning(monkeypatch):
-    monkeypatch.delenv("PROXY_SECRET", raising=False)
+    monkeypatch.setattr(get_settings(), "proxy_secret", "")
     report = "\n".join(config_report.build_report())
     assert "[WARN] Proxy signing secret" in report
 
 
 def test_report_never_leaks_secret_values(monkeypatch):
-    monkeypatch.setenv("SMTP_PASSWORD", "super-secret-token-value")
-    monkeypatch.setenv("PROXY_SECRET", "another-secret")
+    monkeypatch.setattr(get_settings(), "smtp_password", "super-secret-token-value")
+    monkeypatch.setattr(get_settings(), "proxy_secret", "another-secret")
     report = "\n".join(config_report.build_report())
     assert "super-secret-token-value" not in report
     assert "another-secret" not in report

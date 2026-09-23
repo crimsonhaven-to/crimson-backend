@@ -32,16 +32,14 @@ Config (all optional — unset disables the feature, GET /subtitles -> 503):
   * ``SUBTITLES_SEARCH_TTL`` — seconds to cache a search result (default 3600).
 """
 
-import hashlib
-import hmac
 import logging
-import os
 import time
 from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from resolvers._proxy_secret import resolve_secret as _resolve_proxy_secret
+from core import signing
+from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -67,13 +65,7 @@ class OpenSubtitlesService:
     so quota is spent at most once per (search) / per (file_id)."""
 
     def __init__(self) -> None:
-        self._api_key = (os.getenv("OPENSUBTITLES_API_KEY") or "").strip()
-        self._app_name = (os.getenv("OPENSUBTITLES_APP_NAME") or "CrimsonHaven v1.0").strip()
-        try:
-            self._search_ttl = float(os.getenv("SUBTITLES_SEARCH_TTL") or 3600)
-        except ValueError:
-            self._search_ttl = 3600.0
-        self._secret = _resolve_proxy_secret("SUBTITLES_PROXY_SECRET")
+        self._secret = signing.resolve_secret("SUBTITLES_PROXY_SECRET")
 
         # search cache: key -> (expires_at, list[track dict])
         self._search_cache: Dict[str, Tuple[float, List[dict]]] = {}
@@ -84,22 +76,22 @@ class OpenSubtitlesService:
         self._VTT_CACHE_MAX = 512
 
     def configured(self) -> bool:
-        return bool(self._api_key)
+        return bool(get_settings().opensubtitles_api_key)
 
     # -- signing ------------------------------------------------------------
     # The proxy mints a fresh download (spending quota) for whatever file_id it's
     # handed, so an unsigned proxy would let anyone drain our OpenSubtitles quota.
     # Every file_id we hand out is HMAC-signed; the proxy refuses unsigned ids.
     def _sign(self, file_id: str) -> str:
-        return hmac.new(self._secret, file_id.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+        return signing.sign(self._secret, file_id)
 
     def verify(self, file_id: str, sig: str) -> bool:
-        return bool(file_id) and hmac.compare_digest(self._sign(file_id), sig or "")
+        return bool(file_id) and signing.verify(self._secret, file_id, sig)
 
     def _headers(self) -> dict:
         return {
-            "Api-Key": self._api_key,
-            "User-Agent": self._app_name,
+            "Api-Key": get_settings().opensubtitles_api_key,
+            "User-Agent": get_settings().opensubtitles_app_name,
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
@@ -168,7 +160,7 @@ class OpenSubtitlesService:
             return []
 
         tracks = self._best_per_language(data.get("data") or [], langs)
-        self._search_cache[cache_key] = (now + self._search_ttl, tracks)
+        self._search_cache[cache_key] = (now + get_settings().subtitles_search_ttl, tracks)
         return tracks
 
     def _best_per_language(self, results: List[dict], langs: List[str]) -> List[dict]:
@@ -237,7 +229,7 @@ class OpenSubtitlesService:
         # 2. Fetch the actual subtitle file from the CDN link.
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-                sub = await client.get(link, headers={"User-Agent": self._app_name})
+                sub = await client.get(link, headers={"User-Agent": get_settings().opensubtitles_app_name})
         except httpx.RequestError as e:
             logger.warning(f"[opensubtitles] subtitle fetch failed: {type(e).__name__} - {e}")
             return None

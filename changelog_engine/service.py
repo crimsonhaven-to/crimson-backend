@@ -25,41 +25,14 @@ The cache lives per replica (no cross-replica coordination); conditional request
 (ETag → 304) keep the periodic refresh near-free against GitHub's rate limit.
 """
 
-import os
 import threading
 import time
 from typing import Dict, List, Optional
 
 import httpx
+from core.config import get_settings
 
 GITHUB_API = "https://api.github.com"
-DEFAULT_REPO = "crimsonhaven-to/crimson-backend"
-
-
-def _repo() -> str:
-    return (os.getenv("GITHUB_REPO") or DEFAULT_REPO).strip()
-
-
-def _token() -> Optional[str]:
-    return (os.getenv("GITHUB_TOKEN") or "").strip() or None
-
-
-def _max_entries() -> int:
-    try:
-        return max(1, min(100, int(os.getenv("CHANGELOG_MAX_ENTRIES", "30"))))
-    except ValueError:
-        return 30
-
-
-def _cache_ttl() -> int:
-    try:
-        return max(0, int(os.getenv("CHANGELOG_CACHE_TTL", "1800")))
-    except ValueError:
-        return 1800
-
-
-def _include_prereleases() -> bool:
-    return os.getenv("CHANGELOG_INCLUDE_PRERELEASES", "true").lower() not in ("0", "false", "no")
 
 
 class ChangelogService:
@@ -80,7 +53,7 @@ class ChangelogService:
 
     def configured(self) -> bool:
         """True once a GitHub token is present — otherwise /changelog 503s."""
-        return _token() is not None
+        return bool(get_settings().github_token)
 
     @staticmethod
     def _shape(rel: Dict) -> Dict:
@@ -98,7 +71,7 @@ class ChangelogService:
     def _fetch(self) -> List[Dict]:
         """Blocking GitHub fetch. Honours ETag (returns the cached list unchanged on
         304). Raises on a missing token or any HTTP error."""
-        token = _token()
+        token = get_settings().github_token
         if not token:
             raise RuntimeError("GITHUB_TOKEN is not configured")
         headers = {
@@ -109,9 +82,9 @@ class ChangelogService:
         }
         if self._etag and self._entries is not None:
             headers["If-None-Match"] = self._etag
-        url = f"{GITHUB_API}/repos/{_repo()}/releases"
+        url = f"{GITHUB_API}/repos/{get_settings().github_repo}/releases"
         with httpx.Client(timeout=15.0) as client:
-            resp = client.get(url, headers=headers, params={"per_page": _max_entries()})
+            resp = client.get(url, headers=headers, params={"per_page": get_settings().changelog_max_entries})
         if resp.status_code == 304 and self._entries is not None:
             return self._entries  # not modified since last fetch
         resp.raise_for_status()
@@ -119,14 +92,14 @@ class ChangelogService:
         releases = resp.json()
         if not isinstance(releases, list):
             raise ValueError("Unexpected GitHub releases payload")
-        include_pre = _include_prereleases()
+        include_pre = get_settings().changelog_include_prereleases
         entries = [
             self._shape(r)
             for r in releases
             if isinstance(r, dict) and not r.get("draft")
             and (include_pre or not r.get("prerelease"))
         ]
-        return entries[: _max_entries()]
+        return entries[: get_settings().changelog_max_entries]
 
     def refresh(self) -> List[Dict]:
         """Force a fetch and update the cache. On failure, keeps any previously
@@ -149,14 +122,14 @@ class ChangelogService:
         with self._lock:
             have = self._entries is not None
             age = time.monotonic() - self._fetched_at
-        if not have or age >= _cache_ttl():
+        if not have or age >= get_settings().changelog_cache_ttl:
             try:
                 self.refresh()
             except Exception as e:  # fall back to stale/empty cache
                 with self._lock:
                     self._last_error = f"{type(e).__name__}: {e}"
         with self._lock:
-            stale = self._entries is None or (time.monotonic() - self._fetched_at) >= _cache_ttl()
+            stale = self._entries is None or (time.monotonic() - self._fetched_at) >= get_settings().changelog_cache_ttl
             return {
                 "entries": list(self._entries or []),
                 "fetched": self._entries is not None,

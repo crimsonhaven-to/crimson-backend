@@ -5,7 +5,6 @@ circular import. Nothing opens a connection or touches the network at import
 time; the stores are schema-init'd in api.py's lifespan.
 """
 
-from core.config import Config
 from core.db_pool import get_pool
 from metadata_engine.db_handler import MappingDatabaseEngine
 from local_engine.db import LocalSourceStore
@@ -14,7 +13,7 @@ from download_engine.db import DownloadStore
 from telemetry_engine import TelemetryStore
 
 # Mapping/metadata engine, stored in the shared pool.
-db_engine = MappingDatabaseEngine(tmdb_api_key=Config.TMDB_API_KEY)
+db_engine = MappingDatabaseEngine()
 
 # The "Local" direct-play source. Schema-init'd in lifespan; the scraper and
 # resolver read enabled roots via their own store, whose cache is class-wide.

@@ -20,13 +20,13 @@ crucially, one security model:
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
 import logging
 import os
 from typing import List, Optional
 
 from .db import LocalSourceStore
+from functools import cache
+from core import signing
 
 logger = logging.getLogger("local_engine.fs")
 
@@ -88,11 +88,6 @@ _ART_MEDIA_TYPES = {
 
 _store = LocalSourceStore()
 
-# Stable-within-process fallback secret for /local_art signatures when neither
-# PROXY_SECRET nor LOCAL_PROXY_SECRET is set (single-instance dev). Production /
-# multi-replica deploys MUST set PROXY_SECRET so a link minted by one replica
-# verifies on another — same requirement as the other signed proxies.
-_DEV_ART_SECRET: Optional[bytes] = None
 
 
 # --- config -----------------------------------------------------------------
@@ -255,33 +250,18 @@ def safe_resolve_dir(token: str) -> Optional[str]:
 
 
 # --- signed local artwork (/local_art) --------------------------------------
+@cache
 def _art_secret() -> bytes:
-    """Signing secret for /local_art URLs. Shared PROXY_SECRET first (so it's stable
-    across restarts + identical on every replica), then LOCAL_PROXY_SECRET, then a
-    random per-process fallback (single-instance dev only)."""
-    value = os.getenv("PROXY_SECRET") or os.getenv("LOCAL_PROXY_SECRET")
-    if value:
-        return value.encode("utf-8")
-    global _DEV_ART_SECRET
-    if _DEV_ART_SECRET is None:
-        logger.warning(
-            "PROXY_SECRET/LOCAL_PROXY_SECRET not set — using a random per-process "
-            "secret for /local_art signatures. Local poster links break on restart "
-            "and won't verify across replicas. Set PROXY_SECRET for production."
-        )
-        _DEV_ART_SECRET = os.urandom(32)
-    return _DEV_ART_SECRET
+    return signing.resolve_secret("LOCAL_PROXY_SECRET")
 
 
 def sign_art_token(token: str) -> str:
     """HMAC signature (hex) for an art path token."""
-    return hmac.new(_art_secret(), token.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return signing.sign(_art_secret(), token)
 
 
 def verify_art_sig(token: str, sig: str) -> bool:
-    if not token or not sig:
-        return False
-    return hmac.compare_digest(sign_art_token(token), sig)
+    return bool(token) and signing.verify(_art_secret(), token, sig)
 
 
 def art_proxy_url(path: str) -> str:

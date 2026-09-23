@@ -8,6 +8,6 @@ scheduler keeps warm.
 """
 
 from .routes import router, service
-from .service import IptvService, enabled
+from .service import IptvService
 
-__all__ = ["router", "service", "IptvService", "enabled"]
+__all__ = ["router", "service", "IptvService"]

@@ -36,23 +36,10 @@ from starlette.concurrency import run_in_threadpool
 
 from .db import CacheStore
 from . import fs, ticket
+from core.config import get_settings
 
 logger = logging.getLogger("cache_engine.downloader")
 
-# Internal base the downloader uses to reach our own proxy routes. Loopback by
-# default (uvicorn binds 0.0.0.0:8000) so segment traffic never leaves the host
-# or hits the public reverse proxy / login wall. Override if uvicorn binds
-# elsewhere.
-INTERNAL_BASE = os.getenv("CACHE_INTERNAL_BASE", "http://127.0.0.1:8000").rstrip("/")
-
-# Tunables.
-MAX_CONCURRENT = max(1, int(os.getenv("CACHE_MAX_CONCURRENT", "1")))
-DOWNLOAD_TIMEOUT = int(os.getenv("CACHE_DOWNLOAD_TIMEOUT", "3600"))  # seconds, per episode
-QUEUE_MAX = int(os.getenv("CACHE_QUEUE_MAX", "200"))
-# How often the cache-worker polls the DB for newly-claimed (pending) downloads.
-POLL_INTERVAL = max(2, int(os.getenv("CACHE_POLL_INTERVAL", "10")))  # seconds
-# Don't start a download unless the target has at least this much headroom.
-MIN_FREE_BYTES = int(os.getenv("CACHE_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024)))  # 2 GiB
 
 # Stream URL fragments that mean "don't cache this": our own cache output and the
 # on-disk Local source — direct play (/local_proxy) AND its on-the-fly transcode
@@ -120,7 +107,7 @@ def _is_loopback_proxy_url(url: str) -> bool:
 
 
 def _to_internal(url: str) -> str:
-    """Rewrite an absolute backend URL onto the loopback INTERNAL_BASE so the
+    """Rewrite an absolute backend URL onto the loopback get_settings().cache_internal_base so the
     download stays on-host. Leaves third-party URLs (direct-play streams) alone."""
     parsed = urlparse(url)
     # Only same-backend proxy/player paths are rewritten; a raw CDN URL (direct
@@ -128,7 +115,7 @@ def _to_internal(url: str) -> str:
     # practice every job that reaches here is a loopback-proxy URL.)
     if _is_loopback_proxy_url(url):
         q = f"?{parsed.query}" if parsed.query else ""
-        return f"{INTERNAL_BASE}{parsed.path}{q}"
+        return f"{get_settings().cache_internal_base}{parsed.path}{q}"
     return url
 
 
@@ -150,7 +137,7 @@ class DownloadManager:
         if self._started:
             return
         self._started = True
-        self._queue = asyncio.Queue(maxsize=QUEUE_MAX)
+        self._queue = asyncio.Queue(maxsize=get_settings().cache_queue_max)
         if not ffmpeg_available():
             logger.warning(
                 "ffmpeg not found on PATH — video caching is inert (downloads will "
@@ -165,12 +152,12 @@ class DownloadManager:
         except Exception as e:
             logger.error(f"Stale-job requeue failed: {e}")
         self._workers = [
-            asyncio.create_task(self._worker(i)) for i in range(MAX_CONCURRENT)
+            asyncio.create_task(self._worker(i)) for i in range(get_settings().cache_max_concurrent)
         ]
         self._poller = asyncio.create_task(self._poll())
         logger.info(
-            f"Cache download worker started ({MAX_CONCURRENT} ffmpeg slot(s), "
-            f"polling every {POLL_INTERVAL}s)"
+            f"Cache download worker started ({get_settings().cache_max_concurrent} ffmpeg slot(s), "
+            f"polling every {get_settings().cache_poll_interval}s)"
         )
 
     async def stop(self, drain_timeout: float = 110.0) -> None:
@@ -204,7 +191,7 @@ class DownloadManager:
             "running": self._started,
             "queued": self._queue.qsize() if self._queue is not None else 0,
             "inflight": len(self._inflight),
-            "slots": MAX_CONCURRENT,
+            "slots": get_settings().cache_max_concurrent,
         }
 
     # ------------------------------------------------------------------ gate
@@ -328,7 +315,7 @@ class DownloadManager:
             if not await self._cacheable(stream):
                 return
 
-            target = await run_in_threadpool(fs.pick_write_target, MIN_FREE_BYTES)
+            target = await run_in_threadpool(fs.pick_write_target, get_settings().cache_min_free_bytes)
             if not target:
                 return
 
@@ -375,7 +362,7 @@ class DownloadManager:
                 raise
             except Exception as e:
                 logger.error(f"cache poll failed: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(get_settings().cache_poll_interval)
 
     async def _enqueue_pending(self) -> None:
         assert self._queue is not None
@@ -383,7 +370,7 @@ class DownloadManager:
             return
         # Only pull as many as we have free ffmpeg slots, so the in-process queue
         # stays tiny and pending work keeps surviving in the DB until a slot frees.
-        available = MAX_CONCURRENT - len(self._inflight)
+        available = get_settings().cache_max_concurrent - len(self._inflight)
         if available <= 0:
             return
         rows = await run_in_threadpool(self._store.fetch_pending, available)
@@ -538,11 +525,11 @@ class DownloadManager:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _out, err = await asyncio.wait_for(proc.communicate(), timeout=DOWNLOAD_TIMEOUT)
+            _out, err = await asyncio.wait_for(proc.communicate(), timeout=get_settings().cache_download_timeout)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return 124, f"timed out after {DOWNLOAD_TIMEOUT}s"
+            return 124, f"timed out after {get_settings().cache_download_timeout}s"
         # Keep the last few stderr lines, not just one: the actionable mp4 error
         # ("Could not find tag for codec …") prints above the generic trailing
         # "Error opening output files" line.
