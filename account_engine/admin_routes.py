@@ -1066,7 +1066,7 @@ async def metrics_panels(user: dict = Depends(require_admin)):
     return {
         "success": True,
         "available": True,
-        "job": prom_query.job_label(),
+        "job": prom_query.JOB,
         "retention": await prom_query.retention_hint(),
         "panels": prom_query.panel_catalogue(),
         "ranges": prom_query.range_catalogue(),
