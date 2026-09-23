@@ -17,6 +17,7 @@ bug rather than a billing one.
 
 from __future__ import annotations
 
+from dataclasses import KW_ONLY, dataclass
 from typing import Dict, List, Optional
 
 ANTHROPIC = "anthropic"
@@ -25,56 +26,31 @@ GEMINI = "gemini"
 PROVIDERS = (ANTHROPIC, GEMINI)
 
 
+@dataclass(frozen=True, slots=True)
 class ChatModel:
-    """One selectable model.
+    """One selectable model. ``supports_effort`` and ``supports_thinking`` gate
+    the two request fields that hard-error on a model that does not take them."""
 
-    ``cache_min_tokens`` is the smallest prefix the provider will actually cache.
-    A shorter prefix is not an error; it simply never becomes a cache entry, so
-    this is the difference between caching working and silently doing nothing.
-    Lumi's stable prefix is roughly 1.8k tokens, clearing every model but Haiku.
-
-    ``supports_effort`` and ``supports_thinking`` gate the two request fields that
-    hard-error on a model that does not take them.
-    """
-
-    def __init__(
-        self,
-        model_id: str,
-        provider: str,
-        label: str,
-        input_per_mtok: float,
-        output_per_mtok: float,
-        cached_input_per_mtok: float,
-        *,
-        cache_min_tokens: int = 1024,
-        supports_effort: bool = False,
-        supports_thinking: bool = False,
-        note: str = "",
-    ):
-        self.model_id = model_id
-        self.provider = provider
-        self.label = label
-        self.input_per_mtok = input_per_mtok
-        self.output_per_mtok = output_per_mtok
-        self.cached_input_per_mtok = cached_input_per_mtok
-        self.cache_min_tokens = cache_min_tokens
-        self.supports_effort = supports_effort
-        self.supports_thinking = supports_thinking
-        self.note = note
+    model_id: str
+    provider: str
+    label: str
+    input_per_mtok: float
+    output_per_mtok: float
+    cached_input_per_mtok: float
+    _: KW_ONLY
+    supports_effort: bool = False
+    supports_thinking: bool = False
+    note: str = ""
 
     def cost_micros(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> int:
-        """Estimated cost of one call, in USD millionths.
-
-        Cached tokens bill at the reduced read rate and count separately from
-        ``input_tokens``, matching how both providers report usage.
-        """
-        fresh = max(0, input_tokens)
-        dollars = (
-            fresh * self.input_per_mtok
+        """Estimated USD millionths. A per-million rate times tokens is already in
+        micros. Cached tokens are reported apart from ``input_tokens`` by both
+        providers and bill at the read rate."""
+        return round(
+            max(0, input_tokens) * self.input_per_mtok
             + max(0, cached_tokens) * self.cached_input_per_mtok
             + max(0, output_tokens) * self.output_per_mtok
-        ) / 1_000_000.0
-        return int(round(dollars * 1_000_000))
+        )
 
     def public(self) -> Dict:
         """Shape sent to the dashboard's model dropdown."""
@@ -95,22 +71,20 @@ _ANTHROPIC_MODELS = [
     ChatModel(
         "claude-sonnet-5", ANTHROPIC, "Claude Sonnet 5",
         3.00, 15.00, 0.30,
-        cache_min_tokens=1024, supports_effort=True, supports_thinking=True,
+        supports_effort=True, supports_thinking=True,
         note="Recommended. Best balance of persona fidelity and tool accuracy.",
     ),
     ChatModel(
         "claude-opus-5", ANTHROPIC, "Claude Opus 5",
         5.00, 25.00, 0.50,
-        cache_min_tokens=512, supports_effort=True, supports_thinking=True,
+        supports_effort=True, supports_thinking=True,
         note="Strongest reasoning. Noticeably pricier for little gain in chat.",
     ),
     ChatModel(
         "claude-haiku-4-5", ANTHROPIC, "Claude Haiku 4.5",
         1.00, 5.00, 0.10,
-        # Lumi's prefix does not reach this minimum, so prompt caching never
-        # engages here, making Haiku less of a saving than its sticker price
-        # implies. Hence the note.
-        cache_min_tokens=4096, supports_effort=False, supports_thinking=False,
+        # Haiku's 4096-token cache minimum is above Lumi's ~1.8k prefix, so prompt
+        # caching never engages and it saves less than its sticker price implies.
         note="Cheapest. Prompt caching does not engage at Lumi's prompt size.",
     ),
 ]

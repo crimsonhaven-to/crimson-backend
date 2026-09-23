@@ -54,32 +54,52 @@ async def search_anime_by_name(
 
 
 @router.get("/trending")
-async def get_trending_anime(limit: int = Query(10, ge=1, le=50, description="Number of results to return")):
-    results = await _upstream(lambda c: fetch_trending_anime(c, limit), "Failed to fetch trending anime")
+async def get_trending_anime(
+    limit: int = Query(10, ge=1, le=50, description="Number of results to return"),
+):
+    results = await _upstream(
+        lambda c: fetch_trending_anime(c, limit), "Failed to fetch trending anime"
+    )
     return {"success": True, "count": len(results), "animes": results}
 
 
 @router.get("/search/shows", dependencies=[Depends(_require_tmdb)])
-async def search_shows_by_name(query_name: str = Query(..., min_length=1, description="TV show name to search")):
-    results = await _upstream(lambda c: fetch_tmdb_show_search_results(c, query_name), "Search failed")
+async def search_shows_by_name(
+    query_name: str = Query(..., min_length=1, description="TV show name to search"),
+):
+    results = await _upstream(
+        lambda c: fetch_tmdb_show_search_results(c, query_name), "Search failed"
+    )
     return {"success": True, "query": query_name, "count": len(results), "suggestions": results}
 
 
 @router.get("/trending/shows")
-async def get_trending_shows(limit: int = Query(10, ge=1, le=50, description="Number of results to return")):
-    results = await _upstream(lambda c: fetch_trending_shows(c, limit), "Failed to fetch trending shows")
+async def get_trending_shows(
+    limit: int = Query(10, ge=1, le=50, description="Number of results to return"),
+):
+    results = await _upstream(
+        lambda c: fetch_trending_shows(c, limit), "Failed to fetch trending shows"
+    )
     return {"success": True, "count": len(results), "shows": results}
 
 
 @router.get("/search/movies", dependencies=[Depends(_require_tmdb)])
-async def search_movies_by_name(query_name: str = Query(..., min_length=1, description="Movie name to search")):
-    results = await _upstream(lambda c: fetch_tmdb_movie_search_results(c, query_name), "Search failed")
+async def search_movies_by_name(
+    query_name: str = Query(..., min_length=1, description="Movie name to search"),
+):
+    results = await _upstream(
+        lambda c: fetch_tmdb_movie_search_results(c, query_name), "Search failed"
+    )
     return {"success": True, "query": query_name, "count": len(results), "suggestions": results}
 
 
 @router.get("/trending/movies")
-async def get_trending_movies(limit: int = Query(10, ge=1, le=50, description="Number of results to return")):
-    results = await _upstream(lambda c: fetch_trending_movies(c, limit), "Failed to fetch trending movies")
+async def get_trending_movies(
+    limit: int = Query(10, ge=1, le=50, description="Number of results to return"),
+):
+    results = await _upstream(
+        lambda c: fetch_trending_movies(c, limit), "Failed to fetch trending movies"
+    )
     return {"success": True, "count": len(results), "movies": results}
 
 
@@ -92,8 +112,12 @@ def _gzipped(request: Request, result):
 @router.get("/catalogue")
 async def get_catalogue(
     request: Request,
-    category: Optional[str] = Query(None, description="Optional format filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL"),
-    genre: Optional[str] = Query(None, description="Optional genre filter, e.g. Action, Romance, Comedy"),
+    category: Optional[str] = Query(
+        None, description="Optional format filter, e.g. TV, MOVIE, OVA, ONA, SPECIAL"
+    ),
+    genre: Optional[str] = Query(
+        None, description="Optional genre filter, e.g. Action, Romance, Comedy"
+    ),
 ):
     """The full mapped anime archive from the local database, gzipped."""
     return _gzipped(request, await browse.anime_catalogue(category, genre))
@@ -101,8 +125,12 @@ async def get_catalogue(
 
 @router.get("/catalogue/anime")
 async def get_anime_catalogue(
-    genre: Optional[str] = Query(None, description="Optional AniList genre filter, e.g. Action, Romance"),
-    sort: str = Query(CATALOGUE_DEFAULT_SORT, description="trending | popular | score | newest | title"),
+    genre: Optional[str] = Query(
+        None, description="Optional AniList genre filter, e.g. Action, Romance"
+    ),
+    sort: str = Query(
+        CATALOGUE_DEFAULT_SORT, description="trending | popular | score | newest | title"
+    ),
     page: int = Query(1, ge=1, le=200, description="1-based page for the browse hub"),
 ):
     """One page of AniList anime, the hub's fast default view. When AniList is
@@ -142,7 +170,9 @@ async def get_anime_catalogue(
 @router.get("/catalogue/shows")
 async def get_shows_catalogue(
     request: Request,
-    genre: Optional[str] = Query(None, description="Optional genre filter, e.g. Drama, Comedy, Crime"),
+    genre: Optional[str] = Query(
+        None, description="Optional genre filter, e.g. Drama, Comedy, Crime"
+    ),
 ):
     """Non-anime TV from the local tables, popular first."""
     return _gzipped(request, await browse.shows_catalogue(genre))
@@ -151,7 +181,9 @@ async def get_shows_catalogue(
 @router.get("/catalogue/movies")
 async def get_movies_catalogue(
     request: Request,
-    genre: Optional[str] = Query(None, description="Optional genre filter, e.g. Action, Drama, Horror"),
+    genre: Optional[str] = Query(
+        None, description="Optional genre filter, e.g. Action, Drama, Horror"
+    ),
 ):
     """Movies from the local tables, popular first, with ``vote_average``."""
     return _gzipped(request, await browse.movies_catalogue(genre))

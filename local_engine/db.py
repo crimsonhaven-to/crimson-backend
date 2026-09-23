@@ -1,16 +1,8 @@
-"""
-PostgreSQL store for the admin-managed local media sources.
+"""Postgres store for the admin-registered Local source roots (``local_media_sources``).
 
-Each row is one directory the operator has registered from the Admin Dashboard
-(a NAS share or a Docker bind-mount, e.g. ``-v /movies:/crimson/movies1`` →
-register ``/crimson/movies1``). The "Local" scraper scans every *enabled* root
-for matching files, and the ``/local_proxy`` route re-validates against the same
-enabled set on every request, so disabling/removing a source instantly stops
-playback.
-
-Mirrors account_engine.db's pooled, synchronous psycopg style: methods are plain
-psycopg calls borrowing from the shared pool (db_pool), called from api.py's async
-handlers via ``run_in_threadpool``. Volumes are tiny (a handful of rows).
+Each row is a directory, typically a Docker bind-mount, with three switches:
+``enabled`` (served at all), ``encoding`` (non-web containers are transcoded to
+HLS) and ``download_enabled`` (the downloader may write into it).
 """
 
 from __future__ import annotations
@@ -25,25 +17,15 @@ _COLS = "id, label, path, enabled, encoding, download_enabled, created_at"
 
 
 class LocalSourceStore:
-    """Thin data layer for the ``local_media_sources`` table."""
-
-    # The enabled-roots config is read on every scrape AND every /local_proxy /
-    # /local_hls request, so it's cached process-wide for a few seconds. Each cached
-    # entry is ``{"path", "encoding", "download_enabled", "label"}`` so callers can tell
-    # direct-play roots from transcode-enabled ones, tell which roots the downloader may
-    # write into (and name a file's source) without a second query.
-    # Kept at class level so the cache
-    # is shared no matter which instance (scraper/resolver/route/admin) reads it; any
-    # write invalidates it via _bump().
+    # Read on every scrape and every /local_proxy and /local_hls request, so held
+    # for a few seconds. Writes on this replica invalidate at once.
     _roots_cache: Optional[List[dict]] = None
     _roots_cache_at: float = 0.0
     _ROOTS_TTL = 5.0
 
-    # -- schema ---------------------------------------------------------------
     def init_db(self) -> None:
-        """Create the schema (idempotent)."""
         with get_connection() as conn:
-            lock_schema_init(conn)  # serialize DDL across replicas (see db_pool)
+            lock_schema_init(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS local_media_sources (
@@ -52,29 +34,12 @@ class LocalSourceStore:
                     path       TEXT NOT NULL UNIQUE,
                     enabled    BOOLEAN NOT NULL DEFAULT TRUE,
                     encoding   BOOLEAN NOT NULL DEFAULT FALSE,
+                    download_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TEXT NOT NULL
                 );
                 """
             )
-            # Per-source on-the-fly transcoding switch. OFF by default so existing
-            # rows (and a fresh deploy) keep today's direct-play-only behaviour;
-            # when ON, the Local scraper also surfaces non-web containers (mkv/avi/…)
-            # and they play via the /local_hls transcode route. Added via ALTER for
-            # DBs created before encoding support existed.
-            conn.execute(
-                "ALTER TABLE local_media_sources ADD COLUMN IF NOT EXISTS encoding BOOLEAN NOT NULL DEFAULT FALSE"
-            )
-            # Per-source "the background downloader may write into this root" switch.
-            # OFF by default so registering a source never silently makes it a write
-            # target; the operator opts a source in from the Admin Dashboard, and the
-            # downloader lands files under ``<root>/crimson-downloads/`` on the first
-            # download-enabled root with enough free space (see download_engine). Added
-            # via ALTER for DBs created before the downloader existed.
-            conn.execute(
-                "ALTER TABLE local_media_sources ADD COLUMN IF NOT EXISTS download_enabled BOOLEAN NOT NULL DEFAULT FALSE"
-            )
 
-    # -- reads ----------------------------------------------------------------
     def list_sources(self) -> List[dict]:
         with get_connection() as conn:
             return conn.execute(
@@ -88,9 +53,8 @@ class LocalSourceStore:
             ).fetchone()
 
     def enabled_roots_config(self) -> List[dict]:
-        """``{"path", "encoding"}`` for every enabled source (cached briefly; see
-        class docstring). The single source of truth the lighter ``enabled_roots``
-        derives from, so a scrape/proxy request hits the DB at most once per TTL."""
+        """``{"id", "path", "encoding", "download_enabled", "label"}`` per enabled
+        source, so one cached read answers every per-request question."""
         now = time.monotonic()
         cached = LocalSourceStore._roots_cache
         if cached is not None and (now - LocalSourceStore._roots_cache_at) < LocalSourceStore._ROOTS_TTL:
@@ -112,23 +76,19 @@ class LocalSourceStore:
                 for r in rows
             ]
         except Exception:
-            # DB hiccup: serve the last known config rather than 500 a playback.
+            # Serve the last known config rather than fail a playback on a DB hiccup.
             config = cached or []
         LocalSourceStore._roots_cache = config
         LocalSourceStore._roots_cache_at = now
         return config
 
     def enabled_roots(self) -> List[str]:
-        """Paths of all enabled sources (cached briefly; see class docstring)."""
         return [r["path"] for r in self.enabled_roots_config()]
 
     def download_roots_config(self) -> List[dict]:
-        """Enabled sources the downloader may write into (``download_enabled = TRUE``),
-        in registration order — the order the downloader tries them for free space.
-        Derived from the same cached enabled-roots config, so this adds no DB hit."""
+        """In registration order, the order the downloader tries them."""
         return [r for r in self.enabled_roots_config() if r.get("download_enabled")]
 
-    # -- writes ---------------------------------------------------------------
     def add_source(
         self, label: str, path: str, encoding: bool = False, download_enabled: bool = False
     ) -> dict:
@@ -152,7 +112,8 @@ class LocalSourceStore:
         encoding: Optional[bool] = None,
         download_enabled: Optional[bool] = None,
     ) -> Optional[dict]:
-        sets, vals = [], []
+        sets: list[str] = []
+        vals: list = []
         if label is not None:
             sets.append("label = %s")
             vals.append(label)
@@ -184,10 +145,8 @@ class LocalSourceStore:
         self._bump()
         return row is not None
 
-    # -- cache ----------------------------------------------------------------
     @staticmethod
     def _bump() -> None:
-        """Invalidate the enabled-roots cache after any write."""
         LocalSourceStore._roots_cache = None
         LocalSourceStore._roots_cache_at = 0.0
 

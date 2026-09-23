@@ -39,7 +39,9 @@ def _pick_best(streams: List[Dict], preferences: Optional[Dict]) -> Optional[Dic
 
     def _mismatches(stream: Dict) -> int:
         tag = (stream.get("language") or "").lower()
-        return (bool(pref_lang) and pref_lang not in tag) + (bool(pref_type) and pref_type not in tag)
+        return (bool(pref_lang) and pref_lang not in tag) + (
+            bool(pref_type) and pref_type not in tag
+        )
 
     return min(streams, key=_mismatches) if streams else None
 
@@ -65,8 +67,14 @@ async def _fallback_title(tmdb_id: int) -> Optional[str]:
         return None
 
 
-async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: int,
-                               episode_number: int, preferences: Optional[Dict]) -> None:
+async def _warmup_next_episode(
+    *,
+    base_url: str,
+    tmdb_id: int,
+    season_number: int,
+    episode_number: int,
+    preferences: Optional[Dict],
+) -> None:
     try:
         if not await asyncio.to_thread(cache_manager.store.get_enabled):
             return
@@ -79,19 +87,27 @@ async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: in
             return  # end of season, or not out yet
 
         anilist_id = await asyncio.to_thread(catalogue.get_anilist_id, tmdb_id, season_number)
-        media_ctx = await anilist_context(anilist_id, None if anilist_id else await _fallback_title(tmdb_id))
+        media_ctx = await anilist_context(
+            anilist_id, None if anilist_id else await _fallback_title(tmdb_id)
+        )
         if not anilist_id:
             await add_localized_titles(media_ctx, tmdb_id)
 
-        streams = [s async for s in fan_out(media_ctx, tmdb_id, season_number, next_ep, base_url, "tv")]
+        streams = [
+            s async for s in fan_out(media_ctx, tmdb_id, season_number, next_ep, base_url, "tv")
+        ]
         # Only sources the cache would accept, so the pick is never one that
         # would silently fail to cache.
         best = _pick_best([s for s in streams if await cache_manager.cacheable(s)], preferences)
         if not best:
             return
         await cache_manager.maybe_enqueue(
-            best, tmdb_id=tmdb_id, season_number=season_number, episode_number=next_ep,
-            anilist_id=anilist_id, media_type="tv",
+            best,
+            tmdb_id=tmdb_id,
+            season_number=season_number,
+            episode_number=next_ep,
+            anilist_id=anilist_id,
+            media_type="tv",
         )
         logger.info(
             f"warmup: queued tmdb={tmdb_id} s{season_number}e{next_ep} "
@@ -101,11 +117,22 @@ async def _warmup_next_episode(*, base_url: str, tmdb_id: int, season_number: in
         logger.warning(f"continue-watching warmup failed: {e}")
 
 
-def schedule_warmup(request: Request, *, tmdb_id: int, season_number: int,
-                    episode_number: int, preferences: Optional[Dict]) -> None:
+def schedule_warmup(
+    request: Request,
+    *,
+    tmdb_id: int,
+    season_number: int,
+    episode_number: int,
+    preferences: Optional[Dict],
+) -> None:
     """Fire and forget, so saving progress is never delayed. The base URL is read
     here, while the request is still at hand."""
-    spawn(_warmup_next_episode(
-        base_url=public_base_url(request), tmdb_id=int(tmdb_id), season_number=int(season_number),
-        episode_number=int(episode_number), preferences=preferences,
-    ))
+    spawn(
+        _warmup_next_episode(
+            base_url=public_base_url(request),
+            tmdb_id=int(tmdb_id),
+            season_number=int(season_number),
+            episode_number=int(episode_number),
+            preferences=preferences,
+        )
+    )

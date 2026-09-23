@@ -132,10 +132,18 @@ def mapping_stats() -> dict:
         """,
         (),
     )
-    return row or dict.fromkeys((
-        "anime_entries", "tmdb_seasons", "tmdb_extras", "tmdb_shows",
-        "tmdb_movies", "api_cache", "mapping_etag", "last_synced",
-    ))
+    return row or dict.fromkeys(
+        (
+            "anime_entries",
+            "tmdb_seasons",
+            "tmdb_extras",
+            "tmdb_shows",
+            "tmdb_movies",
+            "api_cache",
+            "mapping_etag",
+            "last_synced",
+        )
+    )
 
 
 # --- browse lists -----------------------------------------------------------------
@@ -171,34 +179,38 @@ def get_catalogue_items() -> List[Dict]:
         return []
 
     items: List[Dict] = []
-    for e in entries:
-        title = e["title_english"] or e["title_romaji"] or e["title_native"]
+    for entry in entries:
+        title = entry["title_english"] or entry["title_romaji"] or entry["title_native"]
         if not title:
             continue
-        aid = e["anilist_id"]
+        aid = entry["anilist_id"]
         tmdb_id: Optional[int] = None
         season_number: Optional[int] = None
         if aid in season_map:
             tmdb_id, season_number = season_map[aid]
         elif aid in extra_map:
             tmdb_id = extra_map[aid]
-        movie_id = e["tmdb_movie_id"]
+        movie_id = entry["tmdb_movie_id"]
         if tmdb_id is None and movie_id is None:
             continue  # nothing the client could open
-        poster_path = show_posters.get(tmdb_id) if tmdb_id is not None else movie_posters.get(movie_id)
-        items.append({
-            "anilist_id": aid,
-            "title": title,
-            "title_romaji": e["title_romaji"],
-            "title_english": e["title_english"],
-            "category": e["anime_type"] or "UNKNOWN",
-            "genres": decode_genres(e["genres"]),
-            "year": e["start_year"],
-            "tmdb_id": tmdb_id,
-            "season_number": season_number,
-            "tmdb_movie_id": movie_id,
-            "poster": tmdb_img(poster_path) if poster_path else None,
-        })
+        poster_path = (
+            show_posters.get(tmdb_id) if tmdb_id is not None else movie_posters.get(movie_id)
+        )
+        items.append(
+            {
+                "anilist_id": aid,
+                "title": title,
+                "title_romaji": entry["title_romaji"],
+                "title_english": entry["title_english"],
+                "category": entry["anime_type"] or "UNKNOWN",
+                "genres": decode_genres(entry["genres"]),
+                "year": entry["start_year"],
+                "tmdb_id": tmdb_id,
+                "season_number": season_number,
+                "tmdb_movie_id": movie_id,
+                "poster": tmdb_img(poster_path) if poster_path else None,
+            }
+        )
 
     items.sort(key=lambda x: (x["title"] or "").lower())
     return items
@@ -240,7 +252,9 @@ def _tmdb_cards(rows: List[dict], kind: str, date_column: str) -> List[Dict]:
 def get_shows_catalogue_items() -> List[Dict]:
     """Non-anime TV from the local table, popular first, so the grid leads with
     popular titles even before a full backfill."""
-    rows = _all("SELECT tmdb_id, title, poster_path, first_air_date, genres, popularity FROM tmdb_shows")
+    rows = _all(
+        "SELECT tmdb_id, title, poster_path, first_air_date, genres, popularity FROM tmdb_shows"
+    )
     return _tmdb_cards(rows, "show", "first_air_date")
 
 
@@ -344,14 +358,16 @@ def search_anime_entries(query: str, limit: int = 10) -> List[Dict]:
             continue
         tmdb_id = r["season_tmdb_id"] or r["extra_tmdb_id"]
         poster_path = r["show_poster"] if tmdb_id else r["movie_poster"]
-        items.append({
-            "title": title,
-            "tmdb_id": tmdb_id,
-            "anilist_id": r["anilist_id"],
-            "poster": tmdb_img(poster_path) if poster_path else None,
-            "year": str(r["start_year"]) if r["start_year"] else None,
-            # TMDB results carry a score and local rows do not; the client reads
-            # it only when sorting a hub, never on a suggestion.
-            "vote_average": None,
-        })
+        items.append(
+            {
+                "title": title,
+                "tmdb_id": tmdb_id,
+                "anilist_id": r["anilist_id"],
+                "poster": tmdb_img(poster_path) if poster_path else None,
+                "year": str(r["start_year"]) if r["start_year"] else None,
+                # TMDB results carry a score and local rows do not; the client reads
+                # it only when sorting a hub, never on a suggestion.
+                "vote_average": None,
+            }
+        )
     return items

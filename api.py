@@ -31,9 +31,17 @@ from core.rate_limit import limiter
 from core.version import VERSION
 from download_engine import admin_routes as download_admin
 from iptv_engine import routes as iptv_routes
-from local_engine import admin_routes as local_admin, media_routes as local_media, routes as local_routes
+from local_engine import (
+    admin_routes as local_admin,
+    media_routes as local_media,
+    routes as local_routes,
+)
 from manga_engine import routes as manga_routes
-from metadata_engine import admin_routes as metadata_admin, discovery_routes, routes as metadata_routes
+from metadata_engine import (
+    admin_routes as metadata_admin,
+    discovery_routes,
+    routes as metadata_routes,
+)
 from notify_engine import routes as airing_routes
 from playback_engine import (
     admin_routes as playback_admin,
@@ -74,14 +82,42 @@ app.add_exception_handler(HTTPException, errors.http_exception_handler)
 app.add_exception_handler(Exception, errors.unhandled_exception_handler)
 
 for module in (
-    auth_routes, profile_routes, library_routes, security_routes, wrapped_routes,
-    supporters_routes, changelog_routes, recommend_routes, chat_routes, subtitles_routes,
-    skiptimes_routes, manga_routes, iptv_routes, airing_routes,
-    system_routes, discovery_routes, watch_routes, grant_routes, movieweb_routes,
-    metadata_routes, proxy_routes, cache_routes, telemetry_routes, local_routes, local_media,
+    auth_routes,
+    profile_routes,
+    library_routes,
+    security_routes,
+    wrapped_routes,
+    supporters_routes,
+    changelog_routes,
+    recommend_routes,
+    chat_routes,
+    subtitles_routes,
+    skiptimes_routes,
+    manga_routes,
+    iptv_routes,
+    airing_routes,
+    system_routes,
+    discovery_routes,
+    watch_routes,
+    grant_routes,
+    movieweb_routes,
+    metadata_routes,
+    proxy_routes,
+    cache_routes,
+    telemetry_routes,
+    local_routes,
+    local_media,
     metrics_routes,
-    account_admin, apikey_admin, metadata_admin, local_admin, cache_admin, download_admin,
-    chat_admin, telemetry_admin, playback_admin, system_admin,
+    account_admin,
+    apikey_admin,
+    metadata_admin,
+    local_admin,
+    cache_admin,
+    download_admin,
+    chat_admin,
+    telemetry_admin,
+    playback_admin,
+    system_admin,
 ):
     app.include_router(module.router)
 

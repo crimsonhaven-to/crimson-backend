@@ -1,19 +1,15 @@
 """The process-wide PostgreSQL connection pool (psycopg 3).
 
-Connection settings come from ``DATABASE_URL``, or else the ``POSTGRES_*``
-parts. ``DB_PREPARE_THRESHOLD`` stays disabled by default: prepared statements do
-not survive PgBouncer's transaction pooling, where a later EXECUTE can land on a
-different backend than the PREPARE, and these queries gain little from plan
-caching. Set an integer to re-enable it on a direct connection.
+``DB_PREPARE_THRESHOLD`` is disabled by default: under PgBouncer's transaction
+pooling an EXECUTE can land on a different backend than its PREPARE, and these
+queries gain little from plan caching.
 """
 
 from __future__ import annotations
 
 import threading
-from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Optional
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -24,17 +20,14 @@ from core.config import Settings, get_settings
 _pool: Optional[ConnectionPool] = None
 _lock = threading.Lock()
 
-# Shared by every init_db() that creates schema. `CREATE TABLE IF NOT EXISTS` is
-# not safe under catalog contention: replicas booting together race and one dies
-# with "tuple concurrently updated". Taking this lock first serializes them, and
-# the loser then runs the DDL as a harmless no-op. Transaction-scoped, so it
-# releases when init_db commits.
+# `CREATE TABLE IF NOT EXISTS` is not safe under catalog contention: replicas
+# booting together race and one dies with "tuple concurrently updated". Every
+# init_db() takes this transaction-scoped lock first, so the loser's DDL is a
+# no-op.
 SCHEMA_INIT_LOCK = 0x6372736E  # "crsn"
 
 
 def lock_schema_init(conn) -> None:
-    """Take the schema-init advisory lock on ``conn``'s transaction. Call it first
-    inside an init_db() block so concurrent replica startups don't race on DDL."""
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_INIT_LOCK,))
 
 
@@ -48,10 +41,6 @@ def _dsn(s: Settings) -> str:
 
 
 def get_pool() -> ConnectionPool:
-    """The shared pool, opened on first call.
-
-    ``dict_row`` is set pool-wide so every borrowed connection yields dict rows.
-    """
     global _pool
     if _pool is None:
         with _lock:
@@ -77,43 +66,28 @@ def get_pool() -> ConnectionPool:
 
 
 def get_connection():
-    """Borrow a pooled connection as a context manager.
-
-    A clean exit commits the transaction and an exception rolls it back; either
-    way the connection returns to the pool.
-    """
+    """Borrow a pooled connection as a context manager: a clean exit commits,
+    an exception rolls back."""
     return get_pool().connection()
 
 
-@contextmanager
-def connection() -> Iterator[psycopg.Connection]:
-    """:func:`get_connection` as a generator context manager, where the explicit
-    ``with connection() as conn`` reads better."""
-    with get_pool().connection() as conn:
-        yield conn
-
-
 def pool_stats() -> dict:
-    """Live pool utilisation and configured bounds, for the admin dashboard.
-
-    Merges psycopg_pool's own counters with the configured min/max so the
-    dashboard can show headroom. Reports ``available: False`` if the pool is not
-    open yet."""
+    """Pool counters plus the configured bounds, for the admin dashboard."""
     if _pool is None:
         return {"available": False}
     try:
         raw = _pool.get_stats()
     except Exception:
         raw = {}
-    size = raw.get("pool_size", 0)
-    in_use = raw.get("pool_size") - raw.get("pool_available", 0) if raw.get("pool_size") is not None else None
+    # psycopg_pool reports both counters or, if get_stats failed, neither.
+    idle = raw.get("pool_available")
     return {
         "available": True,
-        "min_size": getattr(_pool, "min_size", None),
-        "max_size": getattr(_pool, "max_size", None),
-        "size": size,
-        "idle": raw.get("pool_available"),
-        "in_use": in_use,
+        "min_size": _pool.min_size,
+        "max_size": _pool.max_size,
+        "size": raw.get("pool_size", 0),
+        "idle": idle,
+        "in_use": raw["pool_size"] - idle if idle is not None else None,
         "waiting": raw.get("requests_waiting"),
         "requests_total": raw.get("requests_num"),
         "requests_errors": raw.get("requests_errors"),
@@ -122,7 +96,6 @@ def pool_stats() -> dict:
 
 
 def close_pool() -> None:
-    """Close the pool; called on application shutdown."""
     global _pool
     if _pool is not None:
         _pool.close()

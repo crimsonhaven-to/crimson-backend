@@ -65,15 +65,23 @@ async def season_list(tmdb_id: int, show: Optional[Dict]) -> List[Dict]:
     if not show:
         return [
             _season_entry(
-                tmdb_id, s["season_number"], s, name=f"Season {s['season_number']}",
-                poster=None, summary=None, air_date=None, episode_count=None,
+                tmdb_id,
+                s["season_number"],
+                s,
+                name=f"Season {s['season_number']}",
+                poster=None,
+                summary=None,
+                air_date=None,
+                episode_count=None,
             )
             for s in stored
         ]
     by_number = {s["season_number"]: s for s in stored}
     return [
         _season_entry(
-            tmdb_id, s["season_number"], by_number.get(s["season_number"], {}),
+            tmdb_id,
+            s["season_number"],
+            by_number.get(s["season_number"], {}),
             name=s["name"],
             poster=s["poster"] or show.get("poster"),
             summary=s.get("overview") or show.get("overview"),
@@ -104,7 +112,8 @@ async def show_details(tmdb_id: int) -> Dict:
     stored = await asyncio.to_thread(catalogue.get_show_info, tmdb_id)
     return {
         "success": True,
-        "show": stored or {
+        "show": stored
+        or {
             "tmdb_id": tmdb_id,
             "title": show.get("title"),
             "overview": show.get("overview"),
@@ -125,7 +134,9 @@ async def season_details(tmdb_id: int, season_number: int) -> Dict:
             fetch_anilist_metadata(client, anilist_id) if anilist_id else empty(),
         )
     if not tmdb_meta and not anilist_meta:
-        raise HTTPException(status_code=404, detail=f"No data for TMDB ID {tmdb_id} season {season_number}")
+        raise HTTPException(
+            status_code=404, detail=f"No data for TMDB ID {tmdb_id} season {season_number}"
+        )
     return {
         "success": True,
         "tmdb_id": tmdb_id,
@@ -140,7 +151,12 @@ async def anilist_mapping(anilist_id: int) -> Dict:
     mapping = await asyncio.to_thread(catalogue.get_tmdb_season, anilist_id)
     if not mapping:
         raise _not_mapped()
-    return {"success": True, "anilist_id": anilist_id, "tmdb_id": mapping[0], "season_number": mapping[1]}
+    return {
+        "success": True,
+        "anilist_id": anilist_id,
+        "tmdb_id": mapping[0],
+        "season_number": mapping[1],
+    }
 
 
 async def anime_info(tmdb_id: int, season: int) -> Dict:
@@ -155,7 +171,9 @@ async def anime_info(tmdb_id: int, season: int) -> Dict:
             fetch_anilist_metadata(client, anilist_id) if anilist_id else empty(),
         )
     if not show and not tmdb_data and not anilist_data:
-        raise HTTPException(status_code=404, detail=f"No data for TMDB ID {tmdb_id} season {season}")
+        raise HTTPException(
+            status_code=404, detail=f"No data for TMDB ID {tmdb_id} season {season}"
+        )
 
     available = [s["season_number"] for s in show.get("seasons", [])]
     if not available:
@@ -174,7 +192,9 @@ async def anime_info(tmdb_id: int, season: int) -> Dict:
         "anilist_id": anilist_id,
         "current_season": season,
         "available_seasons": available,
-        "description": anilist_data.get("description") or tmdb_data.get("summary") or show.get("overview"),
+        "description": anilist_data.get("description")
+        or tmdb_data.get("summary")
+        or show.get("overview"),
         "summary": tmdb_data.get("summary") or show.get("overview"),
         "episodes_list": episodes,
         "title": anilist_data.get("title") or show.get("title"),
@@ -276,7 +296,12 @@ async def show_overview(tmdb_id: int) -> Dict:
         stored = await asyncio.to_thread(catalogue.get_show_info, tmdb_id)
         if not stored:
             raise HTTPException(status_code=404, detail="Show not found on TMDB")
-        show = _from_stored(stored, "first_air_date", genres=catalogue.decode_genres(stored.get("genres")), seasons=[])
+        show = _from_stored(
+            stored,
+            "first_air_date",
+            genres=catalogue.decode_genres(stored.get("genres")),
+            seasons=[],
+        )
     seasons = await season_list(tmdb_id, None if degraded else show)
     return _title_page(
         kind="show",
@@ -306,7 +331,11 @@ async def movie_overview(tmdb_id: int) -> Dict:
         if not stored:
             raise HTTPException(status_code=404, detail="Movie not found on TMDB")
         movie = _from_stored(
-            stored, "release_date", runtime=None, vote_average=None, status=None,
+            stored,
+            "release_date",
+            runtime=None,
+            vote_average=None,
+            status=None,
             genres=catalogue.decode_genres(stored.get("genres")),
         )
     return _title_page(
@@ -389,8 +418,11 @@ async def scrape_meta(tmdb_id: int, season_number: int) -> Dict:
     except Exception as e:
         logger.warning(f"scrape-meta enrichment failed for {tmdb_id}: {e}")
     return _bundle(
-        title=title, title_english=title, synonyms=synonyms,
-        release_year=release_year, imdb_id=imdb_id,
+        title=title,
+        title_english=title,
+        synonyms=synonyms,
+        release_year=release_year,
+        imdb_id=imdb_id,
     )
 
 

@@ -23,7 +23,10 @@ def _settings_payload() -> dict:
     return {
         "settings": store.get_settings(),
         "models": catalogue(),
-        "keys": {"anthropic": bool(provider_key("anthropic")), "gemini": bool(provider_key("gemini"))},
+        "keys": {
+            "anthropic": bool(provider_key("anthropic")),
+            "gemini": bool(provider_key("gemini")),
+        },
         "sdk": {"anthropic": ANTHROPIC_SDK_AVAILABLE},
     }
 
@@ -34,14 +37,19 @@ async def chat_settings():
 
 
 @router.patch("/settings")
-async def update_chat_settings(request: Request, body: ChatSettingsUpdate, user: dict = Depends(require_admin)):
+async def update_chat_settings(
+    request: Request, body: ChatSettingsUpdate, user: dict = Depends(require_admin)
+):
     """Switching on without a key for the provider is refused, or the first
     viewer to open the drawer would meet the failure as a 503."""
     patch = body.model_dump(exclude_none=True)
     current = await asyncio.to_thread(store.get_settings)
     provider = patch.get("provider", current["provider"])
     if patch.get("enabled") and not provider_key(provider):
-        raise HTTPException(status_code=400, detail=f"No API key configured for {provider}. Set it in the environment first.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"No API key configured for {provider}. Set it in the environment first.",
+        )
     if "model" in patch:
         model = get_model(patch["model"])
         if model is None:

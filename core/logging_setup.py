@@ -1,16 +1,8 @@
-"""Log formatting, with a per-request correlation id.
+"""Log formatting with the per-request correlation id from core.request_id.
 
-Two formats, chosen by ``LOG_FORMAT``:
-
-* ``plain`` (default) appends ``[req=<id>]`` only on lines emitted while handling
-  a request, so startup, scheduler and worker lines are untouched.
-* ``json`` emits one object per line for a pipeline that can query fields.
-
-Plain is the default because changing how a running deployment logs quietly
-breaks somebody's grep, so switching costs an explicit env var.
-
-The id is minted by ``RequestContextMiddleware`` and read from the ContextVar in
-core.request_id.
+``LOG_FORMAT=plain`` (the default) appends ``[req=<id>]`` to lines emitted while
+handling a request and leaves every other line alone, so existing greps keep
+working. ``LOG_FORMAT=json`` emits one object per line.
 """
 
 from __future__ import annotations
@@ -22,7 +14,6 @@ import orjson
 from core import request_id
 from core.config import get_settings
 
-# Verbatim from the basicConfig this replaced, so default output is unchanged.
 PLAIN_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # Anything not in here came from a caller's `extra=` and is worth promoting into
@@ -39,10 +30,8 @@ _STANDARD_ATTRS = frozenset(
 
 
 class RequestIdFilter(logging.Filter):
-    """Stamp the active request id onto every record.
-
-    A filter rather than a custom Logger, so it also covers records from httpx,
-    apscheduler and psycopg without them knowing anything about it."""
+    """A handler filter rather than a custom Logger, so records from httpx,
+    apscheduler and psycopg get the request id too."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "request_id"):
@@ -51,10 +40,6 @@ class RequestIdFilter(logging.Filter):
 
 
 class PlainFormatter(logging.Formatter):
-    """The previous format, with ``[req=<id>]`` appended when one is bound.
-
-    Appended rather than interpolated, so lines emitted outside a request stay
-    exactly as they were."""
 
     def __init__(self) -> None:
         super().__init__(PLAIN_FORMAT)
@@ -66,10 +51,8 @@ class PlainFormatter(logging.Formatter):
 
 
 class JsonFormatter(logging.Formatter):
-    """One JSON object per line, opt-in via ``LOG_FORMAT=json``.
-
-    Falls back to the plain format if a record carries an unserializable
-    ``extra``, so a bad log call can't take out logging itself."""
+    """Falls back to the plain format if a record's ``extra`` cannot be
+    serialized, so a bad log call cannot take out logging itself."""
 
     def __init__(self) -> None:
         super().__init__(PLAIN_FORMAT)
@@ -102,11 +85,8 @@ def _formatter() -> logging.Formatter:
 
 
 def configure(level: int = logging.INFO) -> None:
-    """Install the root handler.
-
-    ``force=True`` mirrors basicConfig owning the root handler set. uvicorn's own
-    loggers carry their own handlers with ``propagate=False`` and are left alone:
-    reformatting the access log is a separate decision from formatting ours."""
+    """Install the root handler. uvicorn's loggers keep their own handlers
+    (``propagate=False``), so the access log format is untouched."""
     handler = logging.StreamHandler()
     handler.setFormatter(_formatter())
     handler.addFilter(RequestIdFilter())

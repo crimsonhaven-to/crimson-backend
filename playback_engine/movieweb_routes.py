@@ -33,13 +33,15 @@ def _captions(subtitles: Optional[List[Dict]]) -> List[Dict]:
         if not url:
             continue
         label = s.get("label") or s.get("lang") or "Unknown"
-        out.append({
-            "id": f"{_slug(label)}-{i}",
-            "type": "srt" if ".srt" in url.lower() else "vtt",
-            "url": url,
-            "language": s.get("lang") or label,
-            "hasCorsRestrictions": False,
-        })
+        out.append(
+            {
+                "id": f"{_slug(label)}-{i}",
+                "type": "srt" if ".srt" in url.lower() else "vtt",
+                "url": url,
+                "language": s.get("lang") or label,
+                "hasCorsRestrictions": False,
+            }
+        )
     return out
 
 
@@ -85,9 +87,17 @@ async def _collect(events) -> Tuple[Dict, List[Dict]]:
 async def mw_watch_movie(request: Request, tmdb_id: int):
     """Declared before the TV route, whose {tmdb_id} would otherwise take "movie"."""
     title = await movie_title(tmdb_id)
-    meta, streams = await _collect(watch_events(
-        tmdb_id, None, None, None, title, base_url=public_base_url(request), media_type="movie",
-    ))
+    meta, streams = await _collect(
+        watch_events(
+            tmdb_id,
+            None,
+            None,
+            None,
+            title,
+            base_url=public_base_url(request),
+            media_type="movie",
+        )
+    )
     return {
         "success": True,
         "media": "movie",
@@ -101,9 +111,16 @@ async def mw_watch_movie(request: Request, tmdb_id: int):
 @limiter.limit("30/minute")
 async def mw_watch_tv(request: Request, tmdb_id: int, season_number: int, episode_number: int):
     anilist_id, title = await tv_start(tmdb_id, season_number)
-    meta, streams = await _collect(watch_events(
-        tmdb_id, season_number, episode_number, anilist_id, title, base_url=public_base_url(request),
-    ))
+    meta, streams = await _collect(
+        watch_events(
+            tmdb_id,
+            season_number,
+            episode_number,
+            anilist_id,
+            title,
+            base_url=public_base_url(request),
+        )
+    )
     payload = {
         "success": True,
         "media": "tv",

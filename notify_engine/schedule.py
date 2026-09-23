@@ -1,18 +1,10 @@
-"""
-The windowed AniList airing-schedule fetch.
+"""The windowed AniList airing-schedule fetch.
 
-Deliberately *not* ``fetch_anilist_metadata``: that is one title per request and
-writes the shared response cache, so driving it from the poller would be one
-round trip per subscription and would churn the cache every refresh. AniList's
-``Page.airingSchedules`` answers the whole window at once, so the cost is a
-handful of requests regardless of how many people follow how many shows.
-
-It goes through ``anilist_post``, so it inherits the existing 429 ladder and
-Retry-After handling rather than growing its own.
-
-The window is not restricted to subscribed ids. Fetching everything that airs in
-it costs the same handful of requests, and it is what lets the calendar show what
-is airing this week rather than only the caller's own shows.
+Not ``fetch_anilist_metadata``: that is one title per request and writes the
+shared response cache, while ``Page.airingSchedules`` answers the whole window in
+a handful of requests however many titles are followed. The window is not
+restricted to followed ids either: that costs nothing extra and is what lets the
+calendar show everything airing this week.
 """
 
 from __future__ import annotations
@@ -23,12 +15,12 @@ from typing import List, Optional, Tuple
 
 import httpx
 
+from core.clock import utc_now
 from metadata_engine.anilist import anilist_post
 
 logger = logging.getLogger("crimson.airing")
 
-# AniList's ceiling for this connection.
-_PER_PAGE = 50
+_PER_PAGE = 50  # AniList's ceiling
 
 # A guard, not a target. A week of anime is a few hundred schedules, so hitting
 # this means the window or the upstream is not what we think, and the poller
@@ -51,11 +43,9 @@ query ($page: Int, $perPage: Int, $from: Int, $to: Int) {
 
 
 def _title(entry: dict) -> Optional[str]:
-    """The show's name as AniList gives it, English first.
-
-    Worth carrying because the calendar's other source, anime_entries, is filled
-    by the Fribb mapping resync and lags behind a new season: without this, the
-    shows most worth following are the ones that render as a bare id."""
+    """AniList's name for the show, English first. Carried because the other
+    source, anime_entries, lags a new season behind the Fribb resync, so the
+    shows most worth following would otherwise render as a bare id."""
     titles = ((entry.get("media") or {}).get("title") or {})
     name = titles.get("english") or titles.get("romaji")
     return name.strip()[:500] if isinstance(name, str) and name.strip() else None
@@ -64,14 +54,14 @@ def _title(entry: dict) -> Optional[str]:
 async def fetch_window(
     client: httpx.AsyncClient, lookback_hours: int, horizon_days: int
 ) -> List[Tuple[int, int, datetime, Optional[str]]]:
-    """Every anime airing between ``now - lookback`` and ``now + horizon``.
+    """``(anilist_id, episode, airing_at, title)`` for every anime airing between
+    ``now - lookback`` and ``now + horizon``.
 
-    Returns ``(anilist_id, episode, airing_at, title)`` tuples ready for
-    ``AiringStore.upsert_schedule``. Degrades to whatever it managed to collect:
-    a partial window keeps the calendar mostly right and the next refresh fills
-    the rest, where raising would leave it empty.
+    Returns whatever it managed to collect on a failure: a partial window keeps
+    the calendar mostly right until the next refresh, where raising would leave
+    it empty.
     """
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     start = int((now - timedelta(hours=lookback_hours)).timestamp())
     end = int((now + timedelta(days=horizon_days)).timestamp())
 

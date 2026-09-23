@@ -34,23 +34,30 @@ def _context_block(user: Dict) -> Optional[str]:
         ]
     except Exception:
         recent = []
-    return persona.build_context_block(username=user.get("username"), recent=recent, top_genres=[])
+    return persona.build_context_block(username=user.get("username"), recent=recent)
 
 
 async def _conversation(user: Dict, conversation_id: int, message: str, history_turns: int) -> List:
     rows = await asyncio.to_thread(store.history, conversation_id, user["user_id"], history_turns)
     convo = [
-        providers.user_msg(r["content"]) if r["role"] == "user" else providers.assistant_msg(r["content"])
+        providers.user_msg(r["content"])
+        if r["role"] == "user"
+        else providers.assistant_msg(r["content"])
         for r in rows
     ]
     context = await asyncio.to_thread(_context_block, user)
     if context:
-        convo += [providers.user_msg(context), providers.assistant_msg("Noted. I shall keep it in mind.")]
+        convo += [
+            providers.user_msg(context),
+            providers.assistant_msg("Noted. I shall keep it in mind."),
+        ]
     convo.append(providers.user_msg(message))
     return convo
 
 
-async def reply(user: Dict, settings: Dict, conversation_id: int, message: str) -> AsyncIterator[Dict]:
+async def reply(
+    user: Dict, settings: Dict, conversation_id: int, message: str
+) -> AsyncIterator[Dict]:
     """``start``, then ``delta`` text and ``action`` affordances as they come,
     then ``done`` with every action, or ``error`` with a message for the viewer."""
     user_id = user["user_id"]
@@ -65,8 +72,12 @@ async def reply(user: Dict, settings: Dict, conversation_id: int, message: str) 
         for _ in range(max(1, int(settings["max_tool_iterations"]))):
             turn = None
             async for event in providers.stream_turn(
-                provider=provider, api_key=provider_key(provider), model=model,
-                system=persona.SYSTEM_PROMPT, messages=convo, tools=tools.TOOL_SCHEMAS,
+                provider=provider,
+                api_key=provider_key(provider),
+                model=model,
+                system=persona.SYSTEM_PROMPT,
+                messages=convo,
+                tools=tools.TOOL_SCHEMAS,
             ):
                 if event["type"] == "text":
                     collected.append(event["text"])
@@ -74,12 +85,19 @@ async def reply(user: Dict, settings: Dict, conversation_id: int, message: str) 
                 elif event["type"] == "turn":
                     turn = event["turn"]
             if turn is None:
-                raise providers.ProviderError("My oracle went silent mid-sentence. Try again shortly.")
+                raise providers.ProviderError(
+                    "My oracle went silent mid-sentence. Try again shortly."
+                )
 
             usage = turn.usage
             await asyncio.to_thread(
-                store.record_usage, user_id, provider, model.model_id,
-                usage.input_tokens, usage.output_tokens, usage.cached_tokens,
+                store.record_usage,
+                user_id,
+                provider,
+                model.model_id,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_tokens,
                 model.cost_micros(usage.input_tokens, usage.output_tokens, usage.cached_tokens),
             )
             if not turn.tool_calls:
@@ -101,7 +119,9 @@ async def reply(user: Dict, settings: Dict, conversation_id: int, message: str) 
 
         answer = "".join(collected).strip()
         if answer:
-            await asyncio.to_thread(_save_exchange, conversation_id, user_id, message, answer, actions)
+            await asyncio.to_thread(
+                _save_exchange, conversation_id, user_id, message, answer, actions
+            )
         yield {"type": "done", "actions": actions}
     except providers.ProviderError as exc:
         yield {"type": "error", "message": str(exc)}
@@ -110,7 +130,9 @@ async def reply(user: Dict, settings: Dict, conversation_id: int, message: str) 
         yield {"type": "error", "message": "Something in the crypt has broken. Try again shortly."}
 
 
-def _save_exchange(conversation_id: int, user_id: int, message: str, answer: str, actions: List[Dict]) -> None:
+def _save_exchange(
+    conversation_id: int, user_id: int, message: str, answer: str, actions: List[Dict]
+) -> None:
     store.add_message(conversation_id, user_id, "user", message, None)
     store.add_message(conversation_id, user_id, "assistant", answer, actions or None)
     store.set_title(conversation_id, user_id, message)

@@ -1,37 +1,25 @@
-"""
-Canonical wire contracts shared with the frontend and crimson-sources.
+"""The /watch NDJSON protocol shared with crimson-client and crimson-sources.
 
-The single source of truth for the /watch NDJSON protocol that
-``stream_watch_response()`` produces and crimson-client consumes. It used to be a
-prose comment duplicated across three repos, where silent drift broke playback
-for everyone, so it lives here as:
+Silent drift here breaks playback in every client, so the shape lives in one
+place: the builders the producer calls, and a JSON Schema the tests validate
+them against, exported to ``contracts/watch_ndjson.schema.json`` for the
+frontend to vendor. Regenerate it after any change with ``python -m core.contracts``.
 
-  * builder functions the producer calls, so the shape exists in exactly one
-    place in the backend, and
-  * a JSON Schema the test suite validates those builders against, exported to
-    ``contracts/watch_ndjson.schema.json`` for the frontend to vendor.
-
-Regenerate the exported schema after changing anything here::
-
-    python -m core.contracts
-
-The protocol is a discriminated union on ``type``. The producer emits one
-``meta`` line, then either an ``unaired`` line or zero or more ``stream`` lines,
-and always a final ``done`` line.
+A stream is one ``meta`` line, then either one ``unaired`` line or zero or more
+``stream`` lines, then a final ``done`` line.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 # Bump when the protocol changes in a way the client must know about. Mirrored in
 # the schema's ``$id`` so a vendored copy can assert which version it targets.
 WATCH_PROTOCOL_VERSION = 1
 
 
-# --- builders (the producer's single source of truth) ----------------------
 def build_meta_line(
     *,
     tmdb_id: int,
@@ -40,8 +28,8 @@ def build_meta_line(
     anilist_id: Optional[int],
     title: Optional[str],
 ) -> Dict[str, Any]:
-    """First line of every /watch stream. Flushed immediately so the player can
-    render its header before any source lands."""
+    """Flushed immediately so the player can render its header before any
+    source lands."""
     return {
         "type": "meta",
         "success": True,
@@ -60,8 +48,7 @@ def build_unaired_line(
     season_number: Optional[int],
     episode_number: Optional[int],
 ) -> Dict[str, Any]:
-    """Replaces every ``stream`` line when the episode is dated in the future, so
-    the client can render a "not yet aired" state."""
+    """Sent instead of any ``stream`` line when the episode airs in the future."""
     return {
         "type": "unaired",
         "air_date": air_date,
@@ -72,9 +59,8 @@ def build_unaired_line(
 
 
 def build_stream_line(stream: Dict[str, Any]) -> Dict[str, Any]:
-    """One resolved playable source, projecting the internal resolver dict onto
-    the wire shape. Note ``type`` becomes ``streamType``, and ``cacheTicket``
-    appears only on cacheable streams while server-side caching is on."""
+    """Project a resolver stream dict onto the wire. ``type`` becomes
+    ``streamType``; ``cacheTicket`` appears only while server-side caching is on."""
     line: Dict[str, Any] = {
         "type": "stream",
         "source": stream["source"],
@@ -89,11 +75,10 @@ def build_stream_line(stream: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_done_line(count: int) -> Dict[str, Any]:
-    """Final line of every /watch stream: how many ``stream`` lines preceded it."""
+    """``count`` is the number of ``stream`` lines sent."""
     return {"type": "done", "count": count}
 
 
-# --- JSON Schema (validated against the builders in tests) ------------------
 _SUBTITLE_SCHEMA = {
     "type": "object",
     "required": ["url", "lang"],
@@ -171,7 +156,6 @@ WATCH_NDJSON_SCHEMA: Dict[str, Any] = {
 
 
 def export_path() -> str:
-    """Absolute path of the committed, generated schema file."""
     return os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "contracts",
@@ -180,7 +164,6 @@ def export_path() -> str:
 
 
 def schema_json() -> str:
-    """The schema serialized exactly as written to disk, so diffs stay stable."""
     return json.dumps(WATCH_NDJSON_SCHEMA, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -190,11 +173,6 @@ def _write_schema() -> None:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(schema_json())
     print(f"wrote {path}")
-
-
-# For callers that build a whole stream's worth of lines (tests, docs).
-def all_event_types() -> List[str]:
-    return ["meta", "unaired", "stream", "done"]
 
 
 if __name__ == "__main__":

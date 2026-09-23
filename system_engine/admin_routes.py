@@ -19,7 +19,9 @@ router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(requir
 
 def _require_prometheus() -> None:
     if not prom_query.available():
-        raise HTTPException(status_code=503, detail="No Prometheus is configured (set PROMETHEUS_URL)")
+        raise HTTPException(
+            status_code=503, detail="No Prometheus is configured (set PROMETHEUS_URL)"
+        )
 
 
 @router.get("/system")
@@ -58,7 +60,9 @@ async def metrics_series(
     request: Request,
     panel: str = Query(..., description="Panel id from /admin/metrics/panels"),
     # Aliased so the parameter does not shadow the builtin.
-    range_id: str = Query(prom_query.DEFAULT_RANGE, alias="range", description="Range id from /admin/metrics/panels"),
+    range_id: str = Query(
+        prom_query.DEFAULT_RANGE, alias="range", description="Range id from /admin/metrics/panels"
+    ),
 ):
     if panel not in prom_query.PANELS:
         raise HTTPException(status_code=404, detail=f"Unknown panel '{panel[:40]}'")

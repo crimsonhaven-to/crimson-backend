@@ -46,6 +46,8 @@ async def prometheus_metrics(
     the service VIP, or consecutive scrapes hit different replicas and every
     counter sawtooths."""
     if not await _authorized(request, bearer, settings.metrics_token):
-        raise HTTPException(status_code=401, detail="Metrics access requires a token or an admin session")
+        raise HTTPException(
+            status_code=401, detail="Metrics access requires a token or an admin session"
+        )
     payload, content_type = await asyncio.to_thread(metrics.render)
     return Response(content=payload, media_type=content_type)

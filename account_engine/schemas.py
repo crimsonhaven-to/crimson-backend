@@ -78,6 +78,7 @@ class UsernameIn(BaseModel):
 class DeleteAccountRequest(BaseModel):
     """Proof that the caller is the account holder and not a stolen token: the
     password for an email account, a signed challenge for a mnemonic one."""
+
     password: Optional[str] = Field(None, max_length=passwords.MAX_PASSWORD_LENGTH)
     challenge: Optional[str] = None
     signature: Optional[str] = None

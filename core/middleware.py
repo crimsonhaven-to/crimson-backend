@@ -46,7 +46,10 @@ class RequestContextMiddleware:
                 # The router has set the route by now; a 404 has none and lands
                 # in one bucket.
                 metrics.record_http_request(
-                    method, metrics.route_label(scope), message.get("status", 0), time.monotonic() - started,
+                    method,
+                    metrics.route_label(scope),
+                    message.get("status", 0),
+                    time.monotonic() - started,
                 )
             await send(message)
 
@@ -56,7 +59,9 @@ class RequestContextMiddleware:
             if not recorded:
                 # Nothing started: the client hung up or the app raised first.
                 # 499 is nginx's client-closed-request.
-                metrics.record_http_request(method, metrics.route_label(scope), 499, time.monotonic() - started)
+                metrics.record_http_request(
+                    method, metrics.route_label(scope), 499, time.monotonic() - started
+                )
             metrics.track_in_progress(method, -1)
             request_id.unbind(token)
 

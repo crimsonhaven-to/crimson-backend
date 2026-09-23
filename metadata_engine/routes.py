@@ -43,7 +43,9 @@ async def get_anilist_mapping(anilist_id: int):
 
 
 @router.get("/info/{tmdb_id}")
-async def get_anime_info(tmdb_id: int, season: int = Query(1, ge=1, description="TMDB season number")):
+async def get_anime_info(
+    tmdb_id: int, season: int = Query(1, ge=1, description="TMDB season number")
+):
     return await overview.anime_info(tmdb_id, season)
 
 

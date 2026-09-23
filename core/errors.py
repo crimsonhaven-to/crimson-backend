@@ -18,8 +18,12 @@ def _body(status: int, error, **extra) -> dict:
     return {"success": False, "error": error, "message": lumi.voiced_error(status), **extra}
 
 
-async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content=_body(exc.status_code, exc.detail, status_code=exc.status_code))
+async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, HTTPException)  # registered for HTTPException only
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_body(exc.status_code, exc.detail, status_code=exc.status_code),
+    )
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:

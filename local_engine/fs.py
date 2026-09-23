@@ -1,81 +1,53 @@
-"""
-Filesystem helpers for the admin-managed "Local" media source.
+"""Disk access for the admin-managed Local source, and its one security model.
 
-Everything that touches the disk lives here so the scraper, the resolver, the
-``/local_proxy`` route and the admin dashboard all share one implementation and,
-crucially, one security model:
-
-  * the embed marker + proxy prefix the layers agree on,
-  * which extensions are direct-playable in a ``<video>`` tag — MVP scope is
-    direct play only (no transcoding), so the list is intentionally small,
-  * opaque token <-> absolute-path encoding for the ``/local_proxy/{token}`` URL,
-  * ``safe_resolve`` — the choke point that maps a token back to a real file ONLY
-    when it currently lives inside an *enabled* source root (path traversal and
-    symlink escapes are rejected; re-checked per request),
-  * ``inspect_path`` / ``discover_mountpoints`` — read-only helpers the Admin
-    Dashboard uses to validate a path and to surface Docker/NAS mounts as
-    one-click suggestions.
+Every path a client hands back arrives as a token, and each ``safe_resolve*``
+maps it to a file only while that file sits inside a currently enabled source
+root, re-checked per request. Disabling a root (or its encoding switch) therefore
+cuts off its streams at once, and a crafted token or symlink cannot escape.
 """
 
 from __future__ import annotations
 
-import base64
-import logging
 import os
+from functools import cache
 from typing import List, Optional
 
-from .db import store
-from functools import cache
 from core import signing
+from core.media_paths import (
+    WEB_EXTENSIONS,
+    decode_token,
+    encode_token,
+    extension,
+    is_web_playable_path,
+    is_within,
+    matching_extensions,
+    media_type_for as media_type_for,
+)
 
-logger = logging.getLogger("local_engine.fs")
+from .db import store
 
-# The scraper emits ``crimson-local:{token}``; the resolver matches on this
-# keyword and serves it via one of two routes depending on the file + the source's
-# per-root ``encoding`` flag:
-#   * ``/local_proxy``  — direct play (Range-served bytes) for browser-native files.
-#   * ``/local_hls``    — on-the-fly HLS transcode for everything else, but ONLY
-#                         when the file's source has encoding enabled.
+# The scraper emits ``crimson-local:{token}``. The resolver serves a web-native
+# file from /local_proxy and anything else from /local_hls, the latter only when
+# the file's root has encoding on.
 EMBED_MARKER = "crimson-local"
 PROXY_PREFIX = "/local_proxy"
 HLS_PREFIX = "/local_hls"
-# Subdirectory (under a download-enabled source root) the background downloader
-# lands finished media into: ``<root>/crimson-downloads/<title>/…``. The library
-# scanner treats it like any other container (its children are titles), so a
-# downloaded show surfaces automatically. In-progress downloads live under the
-# dot-prefixed staging dir below, which the scanner skips.
+# Public, because an <img> cannot carry the login-wall bearer, so every URL is
+# HMAC-signed instead.
+ART_PREFIX = "/local_art"
+
+# The downloader publishes into ``<root>/crimson-downloads/<title>`` and stages in
+# progress work under the dot-prefixed dir, which the library scanner skips.
 DOWNLOADS_SUBDIR = "crimson-downloads"
 STAGING_SUBDIR = ".incoming"
 
-# Poster / cover art discovered next to a title (Kodi/Jellyfin convention) is
-# served from here. Unlike the video proxies this route is PUBLIC (an <img> can't
-# carry the login-wall bearer), so each URL is HMAC-signed — see art_proxy_url /
-# verify_art_sig, mirroring the subtitles_proxy signing model.
-ART_PREFIX = "/local_art"
-
-# A browser ``<video>`` element can play these as-is, so the backend just
-# range-serves the bytes (the ``/local_proxy`` direct-play path).
-WEB_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
-
-# Containers a browser can't play directly but ffmpeg can read — surfaced only
-# when the source has ``encoding`` enabled, and streamed through the ``/local_hls``
-# transcode route (remuxed/re-encoded to HLS on the fly). Note ``.mp4``/``.m4v``/
-# ``.mov``/``.webm`` are deliberately NOT here: a web-native container always takes
-# the cheaper direct-play path even on an encoding-enabled source.
+# Containers ffmpeg can read but a browser cannot. A web-native container is
+# deliberately absent: it always takes the cheaper direct-play path.
 TRANSCODE_EXTENSIONS = {
     ".mkv", ".avi", ".ts", ".m2ts", ".mts", ".wmv", ".flv",
     ".mpg", ".mpeg", ".m2v", ".vob", ".ogv", ".ogm", ".3gp", ".divx", ".mxf", ".rmvb",
 }
 
-_MEDIA_TYPES = {
-    ".mp4": "video/mp4",
-    ".m4v": "video/x-m4v",
-    ".mov": "video/quicktime",
-    ".webm": "video/webm",
-}
-
-# Poster / cover / fanart images the library scanner surfaces from disk (served,
-# signed, via /local_art). Kept separate from the video extension sets above.
 ART_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 _ART_MEDIA_TYPES = {
     ".jpg": "image/jpeg",
@@ -87,256 +59,122 @@ _ART_MEDIA_TYPES = {
 }
 
 
-
-
-# --- config -----------------------------------------------------------------
 def is_configured() -> bool:
-    """True when at least one local source is enabled (gates scraper/resolver)."""
     return bool(store.enabled_roots())
 
 
-# --- token <-> path ---------------------------------------------------------
-def encode_token(path: str) -> str:
-    """URL-safe, padding-free base64 of an absolute file path."""
-    return base64.urlsafe_b64encode(path.encode("utf-8")).decode("ascii").rstrip("=")
-
-
-def decode_token(token: str) -> Optional[str]:
-    try:
-        pad = "=" * (-len(token) % 4)
-        return base64.urlsafe_b64decode(token + pad).decode("utf-8")
-    except Exception:
-        return None
-
-
-def is_web_playable_path(path: str) -> bool:
-    return os.path.splitext(path)[1].lower() in WEB_EXTENSIONS
-
-
 def is_transcodable_path(path: str) -> bool:
-    return os.path.splitext(path)[1].lower() in TRANSCODE_EXTENSIONS
-
-
-def media_type_for(path: str) -> str:
-    return _MEDIA_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+    return extension(path) in TRANSCODE_EXTENSIONS
 
 
 def is_art_path(path: str) -> bool:
-    return os.path.splitext(path)[1].lower() in ART_EXTENSIONS
+    return extension(path) in ART_EXTENSIONS
 
 
 def art_media_type_for(path: str) -> str:
-    return _ART_MEDIA_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+    return _ART_MEDIA_TYPES.get(extension(path), "application/octet-stream")
 
 
-def download_roots_config() -> List[dict]:
-    """Enabled source roots the downloader may write into (``download_enabled``), in
-    the order it should try them for free space. Thin pass-through to the store so the
-    download engine doesn't import the DB layer directly (mirrors ``enabled_roots``)."""
-    return store.download_roots_config()
-
-
-def is_within_enabled_root(real_path: str) -> Optional[str]:
-    """The enabled source root that contains ``real_path`` (already fully resolved),
-    or None. Public wrapper over the private ``_within`` traversal check so the
-    download engine can verify a computed destination stays inside a registered root
-    before writing to it — the same containment guarantee playback relies on."""
-    for root in store.enabled_roots():
-        if _within(real_path, root):
+def _enabled_root_for(real_path: str) -> Optional[dict]:
+    for root in store.enabled_roots_config():
+        if is_within(real_path, root["path"]):
             return root
     return None
+
+
+def is_within_enabled_root(real_path: str) -> bool:
+    return _enabled_root_for(real_path) is not None
 
 
 def source_label_for(real_path: str) -> Optional[str]:
-    """Human label of the enabled source root that contains ``real_path`` (already
-    resolved), or None. Lets the library surface which registered source a title
-    came from without a second DB read."""
-    for root in store.enabled_roots_config():
-        if _within(real_path, root["path"]):
-            return root.get("label")
-    return None
-
-
-def _encoding_root_for(real_path: str) -> Optional[dict]:
-    """The enabled source root that contains ``real_path`` (already fully resolved),
-    or None. Returns the whole config entry so callers can read its ``encoding`` flag
-    without a second lookup."""
-    for root in store.enabled_roots_config():
-        if _within(real_path, root["path"]):
-            return root
-    return None
+    root = _enabled_root_for(real_path)
+    return root.get("label") if root else None
 
 
 def encoding_enabled_for(real_path: str) -> bool:
-    """True when ``real_path`` lives in an enabled source root that has encoding on."""
-    root = _encoding_root_for(real_path)
+    root = _enabled_root_for(real_path)
     return bool(root and root["encoding"])
 
 
 def is_playable_path(path: str) -> bool:
-    """Whether the Local source should surface ``path`` at all: a web-native file
-    (always), or a transcodable container whose source has encoding enabled. Used by
-    the scraper so a disabled-encoding root never lists files it can't actually play."""
+    """Web-native files always; transcodable ones only under a root with encoding
+    on, so a root without it never lists files it cannot play."""
     if is_web_playable_path(path):
         return True
     return is_transcodable_path(path) and encoding_enabled_for(os.path.realpath(path))
 
 
-# --- the security choke point -----------------------------------------------
-def _within(real_path: str, root: str) -> bool:
-    """True if ``real_path`` is inside ``root`` (both fully resolved)."""
-    try:
-        real_root = os.path.realpath(root)
-        return os.path.commonpath([real_path, real_root]) == real_root
-    except ValueError:
-        # Different drives (Windows) / un-relatable paths.
-        return False
+def _real_path(token: str) -> Optional[str]:
+    raw = decode_token(token)
+    return os.path.realpath(raw) if raw else None
 
 
 def safe_resolve(token: str) -> Optional[str]:
-    """Map a ``/local_proxy`` token back to a real file, or None.
-
-    Returns a path ONLY when, after fully resolving symlinks, it is a regular,
-    web-playable file living inside a *currently enabled* source root. This is
-    what makes the proxy safe: an attacker-crafted token (``../../etc/passwd``,
-    a symlink out of the library, a path under a since-disabled source) resolves
-    to None and 404s.
-    """
-    raw = decode_token(token)
-    if not raw:
-        return None
-    real = os.path.realpath(raw)
-    if not os.path.isfile(real) or not is_web_playable_path(real):
-        return None
-    for root in store.enabled_roots():
-        if _within(real, root):
-            return real
+    real = _real_path(token)
+    if real and os.path.isfile(real) and is_web_playable_path(real) and is_within_enabled_root(real):
+        return real
     return None
 
 
 def safe_resolve_transcode(token: str) -> Optional[str]:
-    """The ``/local_hls`` counterpart of :func:`safe_resolve`.
-
-    Maps a token back to a real file ONLY when, after resolving symlinks, it is a
-    regular *transcodable* file living inside a *currently enabled* source root that
-    has **encoding turned on**. So flipping a source's encoding off (or disabling the
-    source) instantly 404s its transcode streams, re-checked on every segment
-    request — the same per-request safety model as the direct-play path."""
-    raw = decode_token(token)
-    if not raw:
-        return None
-    real = os.path.realpath(raw)
-    if not os.path.isfile(real) or not is_transcodable_path(real):
-        return None
-    return real if encoding_enabled_for(real) else None
-
-
-def safe_resolve_dir(token: str) -> Optional[str]:
-    """Map a library title token back to a real *directory* inside a currently
-    enabled source root, or None. The browsable-library counterpart of
-    :func:`safe_resolve`: the same per-request enabled-root + traversal/symlink
-    check, but for a folder (so ``/local-overview`` can list a title's episodes)."""
-    raw = decode_token(token)
-    if not raw:
-        return None
-    real = os.path.realpath(raw)
-    if not os.path.isdir(real):
-        return None
-    for root in store.enabled_roots():
-        if _within(real, root):
-            return real
+    real = _real_path(token)
+    if real and os.path.isfile(real) and is_transcodable_path(real) and encoding_enabled_for(real):
+        return real
     return None
 
 
-# --- signed local artwork (/local_art) --------------------------------------
+def safe_resolve_dir(token: str) -> Optional[str]:
+    real = _real_path(token)
+    if real and os.path.isdir(real) and is_within_enabled_root(real):
+        return real
+    return None
+
+
 @cache
 def _art_secret() -> bytes:
     return signing.resolve_secret("LOCAL_PROXY_SECRET")
 
 
-def sign_art_token(token: str) -> str:
-    """HMAC signature (hex) for an art path token."""
-    return signing.sign(_art_secret(), token)
-
-
-def verify_art_sig(token: str, sig: str) -> bool:
-    return bool(token) and signing.verify(_art_secret(), token, sig)
-
-
 def art_proxy_url(path: str) -> str:
-    """Signed same-origin ``/local_art`` URL for a local artwork file. The returned
-    path is relative (``/local_art?f=..&s=..``); callers absolutize it against the
-    backend base like the other proxy paths."""
+    """Relative ``/local_art`` URL; callers absolutise it like the other proxy paths."""
     token = encode_token(path)
-    return f"{ART_PREFIX}?f={token}&s={sign_art_token(token)}"
+    return f"{ART_PREFIX}?f={token}&s={signing.sign(_art_secret(), token)}"
 
 
 def safe_resolve_art(token: str, sig: str) -> Optional[str]:
-    """Map a signed ``/local_art`` token back to a real image file inside a currently
-    enabled source root, or None. Public route, so the HMAC ``sig`` is what gates it
-    (an <img> can't send the login-wall bearer); the enabled-root + traversal checks
-    still apply, re-validated per request."""
-    if not verify_art_sig(token, sig):
+    if not token or not signing.verify(_art_secret(), token, sig):
         return None
-    raw = decode_token(token)
-    if not raw:
-        return None
-    real = os.path.realpath(raw)
-    if not os.path.isfile(real) or not is_art_path(real):
-        return None
-    for root in store.enabled_roots():
-        if _within(real, root):
-            return real
+    real = _real_path(token)
+    if real and os.path.isfile(real) and is_art_path(real) and is_within_enabled_root(real):
+        return real
     return None
 
 
-# --- admin dashboard helpers (read-only) ------------------------------------
 def inspect_path(path: str, *, count_cap: int = 2000) -> dict:
-    """Quick, bounded health probe of a path for the Add-Source form.
-
-    Reports existence / dir / readability and a (capped) count of direct-playable
-    video files beneath it, so the admin gets immediate feedback that the path is
-    valid and actually holds media. Capped so registering a huge NAS doesn't hang.
-    """
+    """Existence, readability and a capped count of playable files, so the admin
+    sees at once whether a path holds media."""
     info = {
         "exists": False,
         "is_dir": False,
         "readable": False,
-        "video_count": 0,            # direct-playable (web-native) files
-        "transcodable_count": 0,     # files that need encoding on to play
+        "video_count": 0,
+        "transcodable_count": 0,
         "video_count_capped": False,
     }
-    try:
-        if not os.path.exists(path):
-            return info
-        info["exists"] = True
-        info["is_dir"] = os.path.isdir(path)
-        info["readable"] = os.access(path, os.R_OK)
-        if info["is_dir"] and info["readable"]:
-            n = 0          # web-native
-            t = 0          # transcodable
-            capped = False
-            for _root, _dirs, files in os.walk(path):
-                for f in files:
-                    ext = os.path.splitext(f)[1].lower()
-                    if ext in WEB_EXTENSIONS:
-                        n += 1
-                    elif ext in TRANSCODE_EXTENSIONS:
-                        t += 1
-                    if (n + t) >= count_cap:
-                        capped = True
-                        break
-                if capped:
-                    break
-            info["video_count"] = n
-            info["transcodable_count"] = t
-            info["video_count_capped"] = capped
-    except Exception:
-        pass
+    if not os.path.exists(path):
+        return info
+    info["exists"] = True
+    info["is_dir"] = os.path.isdir(path)
+    info["readable"] = os.access(path, os.R_OK)
+    if info["is_dir"] and info["readable"]:
+        found, capped = matching_extensions(path, WEB_EXTENSIONS | TRANSCODE_EXTENSIONS, count_cap)
+        web = sum(1 for ext in found if ext in WEB_EXTENSIONS)
+        info["video_count"] = web
+        info["transcodable_count"] = len(found) - web
+        info["video_count_capped"] = capped
     return info
 
 
-# Pseudo / virtual filesystems and system mount points we never want to suggest.
 _PSEUDO_FS = {
     "proc", "sysfs", "tmpfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "mqueue",
     "overlay", "shm", "securityfs", "pstore", "bpf", "tracefs", "debugfs",
@@ -346,31 +184,24 @@ _SYSTEM_PREFIXES = (
     "/proc", "/sys", "/dev", "/run", "/etc", "/boot", "/var/lib", "/var/run",
     "/usr", "/tmp", "/snap", "/lib", "/lib64", "/sbin", "/bin",
 )
-# Common bases a media bind-mount tends to land under (covers simple setups and
-# local dev where /proc/mounts isn't informative).
+# Where media bind-mounts usually land. Covers local dev, where /proc/mounts
+# says nothing useful.
 _COMMON_BASES = ("/media", "/mnt", "/crimson", "/movies", "/data", "/library", "/storage")
 
 
 def discover_mountpoints() -> List[dict]:
-    """Best-effort list of candidate media directories for the dashboard.
-
-    Surfaces Docker bind-mounts (``-v /movies:/crimson/movies1`` shows up as the
-    in-container mount point ``/crimson/movies1``) by reading ``/proc/mounts``,
-    plus the immediate children of a few conventional media bases. Pseudo and
-    system mounts are filtered out. Each entry carries an ``inspect_path`` probe
-    so the admin can tell which one holds the library. Purely advisory — the admin
-    can always type a path by hand.
-    """
+    """Candidate media directories for the dashboard, each with an ``inspect_path``
+    probe. A Docker bind-mount shows up in /proc/mounts under its in-container
+    path, which is exactly what the admin has to register."""
     found: dict = {}
-
-    # 1) /proc/mounts (Linux / inside Docker) — the reliable source for binds.
+    # Advisory only: a missing or odd /proc/mounts just means fewer suggestions.
     try:
         with open("/proc/mounts", "r", encoding="utf-8") as fh:
             for line in fh:
                 parts = line.split()
                 if len(parts) < 3:
                     continue
-                # mount points escape spaces etc. as octal (\040); unescape them.
+                # /proc/mounts escapes spaces and the like as octal (\040).
                 mnt = parts[1].encode("ascii", "ignore").decode("unicode_escape")
                 fstype = parts[2]
                 if fstype in _PSEUDO_FS or mnt == "/":
@@ -378,12 +209,9 @@ def discover_mountpoints() -> List[dict]:
                 if any(mnt == p or mnt.startswith(p + "/") for p in _SYSTEM_PREFIXES):
                     continue
                 found.setdefault(mnt, fstype)
-    except FileNotFoundError:
-        pass  # not Linux (e.g. local Windows dev) — fall back to the bases below
     except Exception:
         pass
 
-    # 2) immediate subdirectories of conventional media bases.
     for base in _COMMON_BASES:
         try:
             if os.path.isdir(base):
@@ -391,10 +219,10 @@ def discover_mountpoints() -> List[dict]:
                     p = os.path.join(base, name)
                     if os.path.isdir(p):
                         found.setdefault(p, "dir")
-        except Exception:
+        except OSError:
             continue
 
-    out = []
-    for path, fstype in sorted(found.items()):
-        out.append({"path": path, "fstype": fstype, **inspect_path(path, count_cap=200)})
-    return out
+    return [
+        {"path": path, "fstype": fstype, **inspect_path(path, count_cap=200)}
+        for path, fstype in sorted(found.items())
+    ]

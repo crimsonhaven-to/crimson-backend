@@ -33,7 +33,12 @@ async def root():
 @router.get("/lumi")
 async def lumi_blessing():
     """The shrine behind the client's Konami-code page."""
-    return {"empress": lumi.EMPRESS, "title": lumi.TITLE, "blessing": lumi.blessing(), "sigil": "🦇"}
+    return {
+        "empress": lumi.EMPRESS,
+        "title": lumi.TITLE,
+        "blessing": lumi.blessing(),
+        "sigil": "🦇",
+    }
 
 
 @router.get("/config")

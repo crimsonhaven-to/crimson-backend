@@ -1,24 +1,14 @@
-"""
-The airing calendar and per-title subscriptions.
+"""The airing calendar and per-title follows.
 
-  * ``GET    /calendar``               what airs in a window, the caller's follows flagged
-  * ``GET    /account/subscriptions``  what the caller follows, with each next episode
-  * ``POST   /account/subscriptions``  follow a title
-  * ``DELETE /account/subscriptions/{anilist_id}``
-
-All four sit behind the site-wide login wall and resolve the caller with
-``require_user``, the same dependency the rest of the account surface uses.
-
-Subscribing works for every account, including a mnemonic one with no email
-address. The calendar is worth having on its own, and refusing the follow would
-be a strange way to say "we cannot mail you". The response reports
-``email_notifications`` so the client can say so plainly instead.
+Following works for every account, including a mnemonic one with no email
+address: the calendar is worth having on its own. ``email_notifications`` in the
+responses lets the client explain why such a follow will never mail.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -26,6 +16,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from account_engine.deps import require_user
+from core.clock import utc_now
 
 from .db import store
 
@@ -56,13 +47,9 @@ async def get_calendar(
     back: int = Query(1, ge=0, le=_MAX_DAYS, description="Days of already-aired episodes to include"),
     user: dict = Depends(require_user),
 ):
-    """What airs in the window, with the caller's own follows flagged.
-
-    Both halves in one response: the client draws the whole schedule and
-    highlights what the caller follows, so splitting it would mean two requests
-    to render one view.
-    """
-    now = datetime.now(timezone.utc)
+    """What airs in the window, with the caller's own follows flagged, so one
+    request draws the whole view."""
+    now = utc_now()
     start = (now - timedelta(days=back)).replace(hour=0, minute=0, second=0, microsecond=0)
     end = (now + timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -82,8 +69,6 @@ async def list_subscriptions(user: dict = Depends(require_user)):
     return {
         "success": True,
         "count": len(items),
-        # So the client can explain why a follow will not mail, rather than
-        # leaving the user to wonder why nothing ever arrives.
         "email_notifications": _can_be_emailed(user),
         "subscriptions": items,
     }

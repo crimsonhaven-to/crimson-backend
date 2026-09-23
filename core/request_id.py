@@ -36,5 +36,5 @@ def unbind(token: Token) -> None:
 
 
 def current() -> str:
-    """"" outside a request, such as at startup or in a scheduler job."""
+    """ "" outside a request, such as at startup or in a scheduler job."""
     return _request_id.get()

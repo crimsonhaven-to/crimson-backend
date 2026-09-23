@@ -3,6 +3,7 @@ gets the warm pool and one MVCC-safe transaction, with state the dashboard polls
 The command-line twin is ``python -m metadata_engine.resync``."""
 
 import asyncio
+from typing import Any, Dict
 
 from core.background import spawn
 from core.clock import utc_now_iso
@@ -10,7 +11,7 @@ from core.clock import utc_now_iso
 from .mapping_sync import engine
 
 # Returned by reference to the status endpoint, so it is only ever updated.
-state = {
+state: Dict[str, Any] = {
     "running": False,
     "started_at": None,
     "finished_at": None,
@@ -24,8 +25,14 @@ _lock = asyncio.Lock()
 
 async def _run(triggered_by: str) -> None:
     async with _lock:
-        state.update(running=True, started_at=utc_now_iso(), finished_at=None,
-                     ok=None, error=None, triggered_by=triggered_by)
+        state.update(
+            running=True,
+            started_at=utc_now_iso(),
+            finished_at=None,
+            ok=None,
+            error=None,
+            triggered_by=triggered_by,
+        )
         try:
             outcome = await engine.sync_database_async(force=True)
             state.update(ok=outcome == "synced", error=None if outcome == "synced" else outcome)

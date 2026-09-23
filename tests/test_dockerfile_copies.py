@@ -1,17 +1,8 @@
-"""Guard: every top-level module the app imports must be COPY'd into the image.
+"""Every top-level module the app imports must have a COPY line in the Dockerfile.
 
-The Dockerfile builds the runtime image with one ``COPY <pkg> ./<pkg>`` line per
-local top-level package (``core``, ``resolvers``, ``metadata_engine``, …) plus
-``COPY api.py .``. That list is maintained by hand, so it's easy to add a new
-top-level package (e.g. ``web/``) and forget the matching COPY — the image then
-builds fine but crashes at startup with ``ModuleNotFoundError`` the moment
-``uvicorn api:app`` imports it.
-
-This test makes that mistake a red CI gate instead of a failed deploy. It derives
-the set of top-level modules the app *actually* imports from a clean ``import api``
-(run in a subprocess so pytest's own modules don't pollute the graph), then asserts
-each one has a COPY line in the Dockerfile. Add a package and import it, and this
-test starts requiring its COPY automatically — no denylist to maintain.
+The COPY list is maintained by hand, and a missing line builds fine but crashes
+at startup with ``ModuleNotFoundError``. The required set comes from a clean
+``import api`` in a subprocess, so pytest's own modules do not pollute it.
 """
 
 import json
@@ -22,9 +13,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 
-# Snippet run in a fresh interpreter: import the app exactly as the container does,
-# then report the top-level modules that resolved to files inside the repo (i.e.
-# the ones that must be shipped in the image — stdlib and pip deps live elsewhere).
+# Imports the app as the container does and reports the top-level modules that
+# resolved to files inside the repo; stdlib and pip packages live elsewhere.
 _PROBE = r"""
 import api, sys, os, json
 root = os.path.dirname(os.path.abspath(api.__file__))
@@ -33,8 +23,6 @@ skip_top = {".venv", ".venv-test", "venv", "env", "__pycache__", ".git", ".githu
 required = set()
 
 def consider(path):
-    # Record the top-level repo dir/file a loaded module lives in, if any. Uses
-    # abspath so both "web/routes/x.py" -> "web" and the entrypoint "api.py" work.
     if not path:
         return
     p = os.path.abspath(path)
@@ -43,9 +31,8 @@ def consider(path):
         if top not in skip_top:
             required.add(top)
 
-# Walk EVERY loaded module (submodules included) and consult both __file__ and
-# __path__ — a namespace package (no __init__.py, e.g. metadata_engine) has
-# __file__ == None, so its dir is only discoverable via __path__ / its submodules.
+# A namespace package (no __init__.py) has __file__ == None, so __path__ is
+# consulted too.
 for mod in list(sys.modules.values()):
     consider(getattr(mod, "__file__", None))
     for entry in list(getattr(mod, "__path__", []) or []):
@@ -100,7 +87,7 @@ def _required_modules() -> list:
         text=True,
     )
     assert proc.returncode == 0, (
-        "Importing `api` in a clean subprocess failed — the module graph could not "
+        "Importing `api` in a clean subprocess failed, so the module graph could not "
         f"be probed.\n--- stderr ---\n{proc.stderr}"
     )
     for line in proc.stdout.splitlines():
@@ -113,20 +100,17 @@ def _required_modules() -> list:
 
 
 def test_every_imported_toplevel_module_is_copied_into_the_image():
-    """Fail loudly (before build/deploy) if the app imports a top-level module the
-    Dockerfile never copies — the classic "forgot the COPY line" deploy breaker."""
     required = _required_modules()
     copied = _dockerfile_copy_sources(DOCKERFILE.read_text(encoding="utf-8"))
 
     missing = sorted(m for m in required if m not in copied)
 
     def _copy_line(name: str) -> str:
-        # A top-level module file (api.py) is copied as a file; a package as a dir.
         return f"COPY {name} ." if name.endswith(".py") else f"COPY {name} ./{name}"
 
     assert not missing, (
         "These top-level modules are imported by the app but are NOT copied into "
-        "the Docker image — it would build, then crash at startup with "
+        "the Docker image: it would build, then crash at startup with "
         "ModuleNotFoundError. Add to the Dockerfile:\n"
         + "\n".join(f"    {_copy_line(m)}" for m in missing)
     )

@@ -13,7 +13,7 @@ from account_engine.db import store as account_store
 from metadata_engine.tmdb import tmdb_img
 
 from .db import get_catalogue_index
-from .recommender import build_genre_weights, score_candidates, top_genres
+from .recommender import build_genre_weights, rank_key, score_candidates, top_genres
 
 # A saved title is the strongest explicit signal, a finished one a strong
 # implicit one, something in progress a weak hint. A title seen through several
@@ -63,7 +63,11 @@ def _collect_seeds(user_id: int) -> Dict:
             return
         seed = seeds[surface].get(key)
         if seed is None:
-            seeds[surface][key] = {"anilist_id": row.get("anilist_id"), "tmdb_id": row.get("tmdb_id"), "weight": weight}
+            seeds[surface][key] = {
+                "anilist_id": row.get("anilist_id"),
+                "tmdb_id": row.get("tmdb_id"),
+                "weight": weight,
+            }
             counts[counter] += 1
             return
         seed["weight"] = max(seed["weight"], weight)
@@ -73,7 +77,11 @@ def _collect_seeds(user_id: int) -> Dict:
     for row in account_store.list_favorites(user_id):
         _add(row, FAVORITE_WEIGHT, "favorites_used")
     for row in account_store.list_progress(user_id):
-        _add(row, COMPLETED_WEIGHT if row.get("status") == "completed" else IN_PROGRESS_WEIGHT, "history_used")
+        _add(
+            row,
+            COMPLETED_WEIGHT if row.get("status") == "completed" else IN_PROGRESS_WEIGHT,
+            "history_used",
+        )
     return {"seeds": seeds, **counts}
 
 
@@ -114,8 +122,7 @@ def recommend(user_id: int, limit: int) -> Dict:
             merged_weights[genre] += weight
         scored.extend(score_candidates(candidates, genre_weights, excluded_tmdb))
 
-    # Ties go to the newer title, then the higher id.
-    scored.sort(key=lambda c: (c["score"], c.get("year") or 0, c.get("tmdb_id") or 0), reverse=True)
+    scored.sort(key=rank_key, reverse=True)
     return {
         "recommendations": [_shape(it) for it in scored[:limit]],
         "based_on": {
@@ -134,5 +141,8 @@ def similar(anilist_id: int, limit: int) -> Optional[List[Dict]]:
     if not genres:
         return None
     genre_weights, _ = build_genre_weights([{"genres": genres, "weight": 1.0}])
-    ranked = score_candidates(index.anime_candidates, genre_weights, {index.tmdb_by_anilist.get(anilist_id)})
+    own_tmdb = index.tmdb_by_anilist.get(anilist_id)
+    ranked = score_candidates(
+        index.anime_candidates, genre_weights, {own_tmdb} if own_tmdb else set()
+    )
     return [_shape(it) for it in ranked[:limit]]

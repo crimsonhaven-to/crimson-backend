@@ -62,7 +62,9 @@ async def _fetch(client, item: Dict) -> Dict:
     tmdb_id = item.get("tmdb_id")
     is_movie = item.get("media_kind") == "movie"
     if tmdb_id:
-        data = await (fetch_tmdb_movie(client, tmdb_id) if is_movie else fetch_tmdb_show(client, tmdb_id))
+        data = await (
+            fetch_tmdb_movie(client, tmdb_id) if is_movie else fetch_tmdb_show(client, tmdb_id)
+        )
         if not data:
             return {}
         date = data.get("release_date") if is_movie else data.get("first_air_date")
@@ -117,7 +119,8 @@ async def warm_id_items(items: List[Dict]) -> None:
     """Warm the titles that carry a tmdb_id, which are exact and cheap. Title
     searches stay lazy on the overview, to avoid a search fan-out per list load."""
     need = [
-        it for it in items
+        it
+        for it in items
         if it.get("tmdb_id") and _wants_enrichment(it) and local_get(_key(it["id"])) is None
     ]
     if not need:

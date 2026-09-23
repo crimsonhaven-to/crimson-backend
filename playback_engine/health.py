@@ -11,7 +11,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from cache_engine.db import store as cache_store
 from core.config import get_settings
@@ -33,7 +33,7 @@ LIBRARY_SOURCES = {
 
 # Opening the tab must not re-hammer every upstream; "Re-probe" forces a sweep.
 _TTL = 300.0
-_cache: Dict[str, object] = {"at": 0.0, "data": None}
+_cache: Dict[str, Any] = {"at": 0.0, "data": None}
 _lock = asyncio.Lock()
 
 
@@ -64,13 +64,20 @@ async def _probe_scrape_source(scraper_class, anilist_data: Dict, target: Dict) 
     started = time.perf_counter()
     try:
         embeds = await run_single_scraper(
-            scraper_class, target["tmdb_id"], target["season"], target["episode"], anilist_data, media_type="tv",
+            scraper_class,
+            target["tmdb_id"],
+            target["season"],
+            target["episode"],
+            anilist_data,
+            media_type="tv",
         )
         entry["embeds"] = len(embeds or [])
         if entry["embeds"]:
             entry.update(status="ok", detail=f"Resolved {entry['embeds']} embed(s) for the canary")
         else:
-            entry.update(status="empty", detail="Reachable, but found no embeds for the canary title")
+            entry.update(
+                status="empty", detail="Reachable, but found no embeds for the canary title"
+            )
     except Exception as e:
         entry.update(status="error", detail=str(e)[:240] or e.__class__.__name__)
     entry["latency_ms"] = round((time.perf_counter() - started) * 1000)
@@ -79,8 +86,13 @@ async def _probe_scrape_source(scraper_class, anilist_data: Dict, target: Dict) 
 
 def _library(source_id: str, status: str, detail: str, metrics: Dict) -> Dict:
     return {
-        "id": source_id, "category": "library", **LIBRARY_SOURCES[source_id],
-        "status": status, "detail": detail, "latency_ms": None, "metrics": metrics,
+        "id": source_id,
+        "category": "library",
+        **LIBRARY_SOURCES[source_id],
+        "status": status,
+        "detail": detail,
+        "latency_ms": None,
+        "metrics": metrics,
     }
 
 
@@ -107,11 +119,17 @@ def _probe_library_sources() -> List[Dict]:
 
     jellyfin = jellyfin_is_configured()
     return [
-        _library("CacheScraper", *cache, {
-            "ready": stats.get("ready"), "pending": stats.get("pending"),
-            "downloading": stats.get("downloading"), "failed": stats.get("failed"),
-            "targets": len(targets),
-        }),
+        _library(
+            "CacheScraper",
+            *cache,
+            {
+                "ready": stats.get("ready"),
+                "pending": stats.get("pending"),
+                "downloading": stats.get("downloading"),
+                "failed": stats.get("failed"),
+                "targets": len(targets),
+            },
+        ),
         _library("LocalScraper", *local, {"total": len(sources), "enabled": len(enabled)}),
         _library(
             "JellyfinScraper",
@@ -132,10 +150,13 @@ async def _sweep() -> Dict:
         logger.warning(f"source-health canary metadata fetch failed: {e}")
     anilist_data = {**anilist_data, "title": anilist_data.get("title") or target["title"]}
 
-    scrape_results = await asyncio.gather(*(
-        _probe_scrape_source(cls, anilist_data, target)
-        for cls in ALL_SCRAPERS if cls.__name__ not in LIBRARY_SOURCES
-    ))
+    scrape_results = await asyncio.gather(
+        *(
+            _probe_scrape_source(cls, anilist_data, target)
+            for cls in ALL_SCRAPERS
+            if cls.__name__ not in LIBRARY_SOURCES
+        )
+    )
     sources = await asyncio.to_thread(_probe_library_sources) + list(scrape_results)
 
     summary: Dict = {"total": len(sources)}

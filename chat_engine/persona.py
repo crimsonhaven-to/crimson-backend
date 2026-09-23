@@ -1,20 +1,12 @@
 """
-Lumi's system prompt.
+Lumi's system prompt: the mascot from ``core.lumi``'s quips and voiced errors,
+rewritten as instructions a model can hold a conversation in.
 
-The voice already exists in ``core.lumi`` as the quips and voiced errors that
-surface across the API. This is that same character rewritten as instructions a
-model can hold a conversation in, so the chatbot sounds like the established
-mascot rather than a second assistant wearing her name.
-
-``SYSTEM_PROMPT`` is a frozen constant. It interpolates no timestamp or user id,
-because it is the cached prefix: anything volatile would change the prompt bytes
-every call and silently disable caching for the whole conversation. Per-user
-context goes in a separate uncached block after the history instead.
-
-The house style rules are load-bearing rather than decorative. The em dash ban is
-an explicit product requirement, so it is both stated here and asserted in the
-tests, since a model drifts back toward its default punctuation over a long
-conversation.
+``SYSTEM_PROMPT`` is the cached prefix, so it interpolates nothing: a timestamp
+or user id would change the bytes every call and silently disable caching.
+Per-viewer context goes in a separate block after the history. The dash ban is a
+product requirement, stated here and asserted in the tests, because a model
+drifts back to its default punctuation over a long conversation.
 """
 
 from __future__ import annotations
@@ -93,17 +85,10 @@ def build_context_block(
     *,
     username: Optional[str],
     recent: List[Dict],
-    top_genres: List[str],
 ) -> Optional[str]:
-    """A per-request block of grounding facts about this viewer.
-
-    Kept out of ``SYSTEM_PROMPT`` because it changes per session, and folding it
-    into the cached prefix would invalidate the cache every request. Sent as its
-    own message after the history instead.
-
-    Deliberately thin: it exists so Lumi can open with something personal without
-    spending a tool call, not so she can answer history questions from it.
-    """
+    """Grounding facts about this viewer, sent as its own message after the
+    history. Deliberately thin: enough for a personal opener without a tool
+    call, not enough to answer history questions from."""
     lines: List[str] = []
     if username:
         lines.append(f"The viewer's display name is {username}.")
@@ -111,8 +96,6 @@ def build_context_block(
         titles = ", ".join(r.get("title", "?") for r in recent[:5] if r.get("title"))
         if titles:
             lines.append(f"Recently watched, newest first: {titles}.")
-    if top_genres:
-        lines.append(f"Their strongest genre affinities: {', '.join(top_genres[:5])}.")
 
     if not lines:
         return None

@@ -66,6 +66,8 @@ def set_username(request: Request, body: UsernameIn, user: dict = Depends(requir
     """A cosmetic, non-unique greeting name. An empty value clears it."""
     name = (body.username or "").strip()
     if len(name) > MAX_USERNAME_LENGTH:
-        raise HTTPException(status_code=400, detail=f"Name must be at most {MAX_USERNAME_LENGTH} characters")
+        raise HTTPException(
+            status_code=400, detail=f"Name must be at most {MAX_USERNAME_LENGTH} characters"
+        )
     store.set_username(user["user_id"], name or None)
     return {"success": True, "username": name or None}

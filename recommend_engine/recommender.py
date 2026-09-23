@@ -1,15 +1,16 @@
-"""
-Pure recommendation scoring.
-
-Deterministic functions over in-memory data (no I/O), so the weights and the
-ranking maths live in one easily-reasoned-about place. The routes layer feeds
-these per-surface (anime / shows / movies) seeds and candidate lists — each
-scored within its own genre vocabulary — then merges the results by score.
+"""Recommendation scoring: pure functions, no I/O. Each surface (anime, shows,
+movies) is scored within its own genre vocabulary and the service merges the
+results with ``rank_key``.
 """
 
 import math
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
+
+
+def rank_key(candidate: Dict) -> Tuple[float, int, int]:
+    """Best first with ``reverse=True``; ties go to the newer title, then the higher id."""
+    return (candidate["score"], candidate.get("year") or 0, candidate.get("tmdb_id") or 0)
 
 
 def build_genre_weights(seeds: List[Dict]) -> Tuple[Dict[str, float], int]:
@@ -40,10 +41,9 @@ def score_candidates(
 
     A candidate's score is the summed weight of its genres the viewer likes,
     dampened by ``sqrt(genre_count)`` so a kitchen-sink entry tagged with many
-    genres can't dominate purely by surface area — focused overlap is rewarded.
-    Returns every matching candidate (a copy, annotated with ``score`` +
-    ``matched_genres``), sorted best-first; the caller merges/slices across
-    surfaces. ``excluded_tmdb`` drops titles the viewer already has.
+    genres cannot win on surface area alone. Returns every matching candidate
+    (a copy with ``score`` and ``matched_genres``), best first. ``excluded_tmdb``
+    drops titles the viewer already has.
     """
     if not genre_weights:
         return []
@@ -63,10 +63,7 @@ def score_candidates(
         item["matched_genres"] = matched
         scored.append(item)
 
-    scored.sort(
-        key=lambda c: (c["score"], c.get("year") or 0, c.get("tmdb_id") or 0),
-        reverse=True,
-    )
+    scored.sort(key=rank_key, reverse=True)
     return scored
 
 

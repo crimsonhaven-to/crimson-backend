@@ -1,20 +1,17 @@
-"""
-Backend-hosted video player page, served at GET /player.
+"""The backend-hosted video player page served at GET /player.
 
 The frontend plays iframe sources well but only links raw hls/mp4, so a resolver
 can wrap its stream in ``/player?type=hls&src=/jellyfin_proxy/...`` and hand the
-frontend a normal iframe instead.
-
-Player and stream share the backend origin, so hls.js fetches segments
-same-origin and needs no CORS. ``src`` is restricted to same-origin relative
-paths so this can't be used to embed arbitrary external content.
+frontend an iframe instead. Player and stream share the backend origin, so
+hls.js needs no CORS, and ``src`` is restricted to same-origin paths so the page
+cannot embed external content.
 """
 
 import json
 from html import escape
 from string import Template
 
-PLAYER_COLOR_DEFAULT = "C20000"  # Crimson red, matching the other sources.
+PLAYER_COLOR = "C20000"
 
 
 def is_safe_src(src: str) -> bool:
@@ -77,16 +74,19 @@ _TEMPLATE = Template(
 )
 
 
-def render_player(src: str, stream_type: str = "", title: str = "", poster: str = "",
-                  color: str = PLAYER_COLOR_DEFAULT) -> str:
-    """Render the player HTML for a same-origin stream URL."""
+def render_player(src: str, stream_type: str = "", title: str = "") -> str:
     if not stream_type:
         stream_type = "hls" if ".m3u8" in src.lower() else "mp4"
-    safe_color = "".join(c for c in (color or "") if c in "0123456789abcdefABCDEF") or PLAYER_COLOR_DEFAULT
-    # json.dumps escapes src/type safely for the JS context.
-    cfg = json.dumps({"src": src, "type": stream_type})
+    # json.dumps alone does not stop "</script>" in src from closing the script
+    # element, so the HTML-significant characters are escaped as JS unicode escapes.
+    cfg = (
+        json.dumps({"src": src, "type": stream_type})
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
     return _TEMPLATE.safe_substitute(
         title=escape(title or "Crimson Player"),
-        color=safe_color,
+        color=PLAYER_COLOR,
         cfg=cfg,
     )

@@ -1,35 +1,25 @@
-"""
-Named-panel Prometheus queries for the dashboard's Metrics tab.
+"""Named-panel Prometheus queries for the dashboard's Metrics tab.
 
-``web/routes/metrics.py`` reads /metrics off whichever replica answered: current
-values, no history, counters that reset each deploy. This module adds the time
-axis by talking to a private Prometheus that scrapes every Swarm task, so the
-dashboard can draw fleet-wide rates over days instead of one process's totals.
+/metrics on one replica has no history and resets each deploy; a private
+Prometheus scraping every Swarm task gives fleet-wide rates over days.
 
-The browser never sends PromQL. It sends a panel id and a range id, both
-dictionary keys here, and anything else is a 404. Prometheus has no
-authentication and no read-only query mode, so a passthrough would let any admin
-session run arbitrary expressions against the whole TSDB. A closed vocabulary the
-server owns removes the question entirely, matching how the signed proxies and
-/mw key scoping treat client input.
+The browser sends a panel id and a range id, never PromQL. Prometheus has no
+authentication and no read-only mode, so a passthrough would let any admin
+session run arbitrary expressions against the whole TSDB.
 
-Two things a naive dashboard gets wrong, which the panels are written around:
+Most crimson_* metrics are per replica and summed. ``crimson_download_jobs`` and
+``crimson_source_success_ratio`` come from the shared database, so every replica
+reports the same value and they use ``max()``, never ``sum()``.
+``crimson_schema_version`` shows ``max()`` and ``min()`` side by side: the lines
+separating is a rolling deploy in progress.
 
-* Most crimson_* metrics are per replica, so the fleet number is their sum.
-* Three are cluster-wide and must never be summed. ``crimson_download_jobs`` and
-  ``crimson_source_success_ratio`` are read from the shared database, so every
-  replica reports the same value and ``sum()`` would multiply it by the replica
-  count; they use ``max()``. ``crimson_schema_version`` is per replica, but
-  comparing replicas is its whole point, so it uses ``max()`` and ``min()`` side
-  by side and the lines separating is a rolling deploy caught in the act.
-
-Everything degrades quietly. Without ``PROMETHEUS_URL`` the endpoints report
-``available: false``; if it is set but unreachable, panels return an error string
-rather than raising, since a monitoring outage must not take the dashboard down.
+A monitoring outage must not take the dashboard down, so failures come back as
+an error string in the payload rather than an exception.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
@@ -39,26 +29,24 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from core.http_client import get_http_client
 from core.config import get_settings
+from core.http_client import http_client
 
 logger = logging.getLogger("crimson.metrics.query")
 
-# The scrape job name in deploy/prometheus/prometheus.yml. Every panel filters on
-# it, so a Prometheus shared with other projects cannot blend foreign timeseries
-# into these charts.
+# The scrape job in deploy/prometheus/prometheus.yml. Every panel filters on it
+# so a Prometheus shared with other projects cannot blend in foreign series.
 JOB = "crimson-api"
 
-# A `by (route)` panel can fan out wider than a chart can legibly draw. The widest
-# are already topk() in the query; this is the backstop for the rest. Series are
-# kept by peak value, so the cap drops the quiet ones.
+# Backstop for `by (label)` panels wider than a chart can draw; the quietest
+# series (by peak) are dropped.
 MAX_SERIES = 8
 
 _TIMEOUT = 12.0
 
 
 def base_url() -> str:
-    """The private Prometheus base URL, or "" when the feature is not deployed."""
+    """The Prometheus base URL, or "" when the feature is not deployed."""
     raw = get_settings().prometheus_url.rstrip("/")
     if not raw:
         return ""
@@ -72,13 +60,9 @@ def available() -> bool:
     return bool(base_url())
 
 
-# --- ranges -----------------------------------------------------------------
-# step lands every range at roughly 240-360 points: enough to look like a line,
-# few enough to keep the JSON small and the SVG cheap. window is the rate()
-# lookback, always several scrape intervals wide so a missed scrape leaves a dip
-# rather than a hole.
-
-
+# step gives every range roughly 240-360 points: enough for a line, few enough
+# to keep the JSON small. window is the rate() lookback, several scrape intervals
+# wide so a missed scrape leaves a dip rather than a hole.
 @dataclass(frozen=True)
 class Range:
     id: str
@@ -105,9 +89,6 @@ RANGES: Dict[str, Range] = {
 DEFAULT_RANGE = "6h"
 
 
-# --- panels -----------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class Panel:
     id: str
@@ -116,8 +97,8 @@ class Panel:
     # How the client formats the y axis: rps | seconds | ratio | count | bytes.
     unit: str
     description: str
-    # (legend, PromQL) templates. $JOB and $WINDOW are substituted here; $label
-    # tokens in the legend come from each result series' own labels.
+    # (legend, PromQL) pairs. $JOB and $WINDOW are expanded in the query; $label
+    # tokens in the legend are filled from each result series' labels.
     series: Tuple[Tuple[str, str], ...]
     stacked: bool = False
 
@@ -133,7 +114,6 @@ class Panel:
 
 
 _PANEL_LIST: Tuple[Panel, ...] = (
-    # --- Traffic -------------------------------------------------------------
     Panel(
         "http_rate", "Requests per second", "Traffic", "rps",
         "Everything the fleet served, split by status code.",
@@ -170,7 +150,6 @@ _PANEL_LIST: Tuple[Panel, ...] = (
         "request rate is flat means responses are getting slower.",
         (("in flight", 'sum(crimson_http_requests_in_progress{job="$JOB"})'),),
     ),
-    # --- Playback ------------------------------------------------------------
     Panel(
         "watch_rate", "Watch fan-outs per second", "Playback", "rps",
         "One per /watch request, by how it ended.",
@@ -194,7 +173,6 @@ _PANEL_LIST: Tuple[Panel, ...] = (
             ("streams each", 'sum(rate(crimson_watch_streams_total{job="$JOB"}[$WINDOW])) / sum(rate(crimson_watch_requests_total{job="$JOB"}[$WINDOW]))'),
         ),
     ),
-    # --- Sources -------------------------------------------------------------
     Panel(
         "resolve_success", "Resolver success rate", "Sources", "ratio",
         "Share of embed resolves that produced a stream, per source. A line "
@@ -234,7 +212,6 @@ _PANEL_LIST: Tuple[Panel, ...] = (
         "rather than summed across replicas.",
         (("$source", 'max by (source) (crimson_source_success_ratio{job="$JOB"})'),),
     ),
-    # --- Fleet ---------------------------------------------------------------
     Panel(
         "replicas", "Replicas being scraped", "Fleet", "count",
         "Straight off Prometheus' own up series, so this counts what the scraper "
@@ -278,11 +255,10 @@ _PANEL_LIST: Tuple[Panel, ...] = (
     ),
     Panel(
         "workers", "Background worker backlog", "Fleet", "count",
-        "Cache remuxes queued on the cache worker, and admin download jobs by "
+        "Cache remuxes running on the cache worker, and admin download jobs by "
         "status. The download queue is a database table shared by every replica, "
         "so it is read with max() and not summed.",
         (
-            ("remuxes queued", 'sum(crimson_cache_worker_queue_depth{job="$JOB"})'),
             ("remuxes running", 'sum(crimson_cache_worker_inflight{job="$JOB"})'),
             ("downloads $status", 'max by (status) (crimson_download_jobs{job="$JOB"})'),
         ),
@@ -303,26 +279,18 @@ PANELS: Dict[str, Panel] = {p.id: p for p in _PANEL_LIST}
 
 
 def panel_catalogue() -> List[Dict[str, Any]]:
-    """Every panel in declaration order; the client groups by `group`."""
     return [p.as_dict() for p in _PANEL_LIST]
 
 
 def range_catalogue() -> List[Dict[str, Any]]:
-    return [RANGES[key].as_dict() for key in ("1h", "6h", "24h", "7d", "30d")]
-
-
-# --- legends ----------------------------------------------------------------
+    return [r.as_dict() for r in RANGES.values()]
 
 _LEGEND_TOKEN = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def render_legend(template: str, metric: Dict[str, str]) -> str:
-    """Fill a legend template from one result series' labels.
-
-    ``"$source"`` against ``{"source": "Jellyfin"}`` gives ``"Jellyfin"``; a
-    template with no token is a fixed name. If the label asked for is missing,
-    fall back to whatever the series does carry, since an unlabelled line in a
-    chart is useless."""
+    """Fill a legend template from one series' labels. If a label is missing, fall
+    back to whatever labels the series does carry: an unnamed line is useless."""
     if "$" not in template:
         return template
 
@@ -346,9 +314,6 @@ def render_legend(template: str, metric: Dict[str, str]) -> str:
     return rendered or template
 
 
-# --- query execution --------------------------------------------------------
-
-
 def _expand(promql: str, window: str) -> str:
     return promql.replace("$JOB", JOB).replace("$WINDOW", window)
 
@@ -356,11 +321,9 @@ def _expand(promql: str, window: str) -> str:
 def _finite(raw: Any) -> Optional[float]:
     """A JSON-safe float, or None for a gap.
 
-    Prometheus sends sample values as strings, and "NaN" / "+Inf" are legal ones.
-    Every ratio panel returns NaN whenever the denominator was zero, meaning no
-    traffic in that step. Passing it through would put a bare NaN in the response
-    body, which is not valid JSON and makes res.json() throw, blanking the tab
-    over a quiet minute at 4am. Null instead draws as a gap."""
+    Ratio panels return "NaN" whenever a step had no traffic. A bare NaN in the
+    body is invalid JSON and makes the browser's res.json() throw, blanking the
+    tab; null draws as a gap instead."""
     try:
         value = float(raw)
     except (TypeError, ValueError):
@@ -379,10 +342,9 @@ def _peak(points: List[List[Any]]) -> float:
 
 
 async def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """One Prometheus API call. Raises only httpx errors, which every caller here
-    turns into a reported error string."""
-    client = get_http_client()
-    response = await client.get(f"{base_url()}{path}", params=params, timeout=_TIMEOUT)
+    """One Prometheus API call. Raises httpx.HTTPError or ValueError."""
+    async with http_client() as client:
+        response = await client.get(f"{base_url()}{path}", params=params, timeout=_TIMEOUT)
     response.raise_for_status()
     body = response.json()
     if body.get("status") != "success":
@@ -391,23 +353,23 @@ async def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
 
 
 async def query_panel(panel_id: str, range_id: str) -> Dict[str, Any]:
-    """Run one named panel over one named range.
+    """Run one named panel over one named range. Failures come back as
+    ``ok: False`` with an error string, so one hiccup greys out a single card
+    rather than breaking a page of a dozen."""
+    panel = PANELS.get(panel_id)
+    window = RANGES.get(range_id)
+    if panel is None or window is None:
+        return {"ok": False, "error": "unknown panel or range", "series": []}
 
-    Returns a rendered payload even on failure, with ``ok: False`` and an error
-    string, because the dashboard shows a dozen panels at once and one hiccup
-    should grey out a card rather than break the page."""
-    panel = PANELS[panel_id]
-    window = RANGES[range_id]
-
-    # Aligned to the step so repeated loads ask the identical question, which its
-    # query cache can answer, and so panels line up on the same x positions.
+    # Aligned to the step so repeated loads ask the identical question, which
+    # Prometheus can answer from cache, and panels share x positions.
     end = math.floor(time.time() / window.step) * window.step
     start = end - window.seconds
 
     series: List[Dict[str, Any]] = []
     try:
-        for legend, promql in panel.series:
-            data = await _get(
+        responses = await asyncio.gather(*(
+            _get(
                 "/api/v1/query_range",
                 {
                     "query": _expand(promql, window.window),
@@ -416,15 +378,18 @@ async def query_panel(panel_id: str, range_id: str) -> Dict[str, Any]:
                     "step": window.step,
                 },
             )
+            for _, promql in panel.series
+        ))
+        for (legend, _), data in zip(panel.series, responses):
             for result in data.get("result") or []:
                 metric = result.get("metric") or {}
                 points = [
                     [int(float(ts)), _finite(value)]
                     for ts, value in (result.get("values") or [])
                 ]
+                # Known to Prometheus but empty in this window: drawing it would
+                # add a legend entry pointing at nothing.
                 if not any(value is not None for _, value in points):
-                    # A series Prometheus knows but has no data for in this
-                    # window. Drawing it adds a legend entry pointing at nothing.
                     continue
                 series.append({"label": render_legend(legend, metric), "points": points})
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
@@ -456,10 +421,9 @@ async def query_panel(panel_id: str, range_id: str) -> Dict[str, Any]:
 
 
 async def scrape_targets() -> Dict[str, Any]:
-    """Which replicas Prometheus is scraping, and which it cannot reach.
-
-    Surfaced on its own because an empty chart from no traffic and an empty chart
-    from a scraper that lost the fleet look identical."""
+    """Which replicas Prometheus is scraping and which it cannot reach. An empty
+    chart from no traffic and one from a scraper that lost the fleet look
+    identical, so this is shown separately."""
     try:
         data = await _get("/api/v1/targets", {"state": "any"})
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
@@ -486,15 +450,13 @@ async def scrape_targets() -> Dict[str, Any]:
     }
 
 
-# Retention is a process flag, so it only changes on redeploy. Cached for an hour
-# so opening the tab does not re-ask; the UI uses it to warn when a chosen range
-# is longer than the server keeps.
+# Retention is a Prometheus process flag that only changes on redeploy. The UI
+# uses it to warn when a range is longer than the server keeps.
 _RETENTION: Tuple[float, Optional[str]] = (0.0, None)
 _RETENTION_TTL = 3600.0
 
 
 async def retention_hint() -> Optional[str]:
-    """How long this Prometheus keeps data, as its own flag reports it."""
     global _RETENTION
     cached_at, value = _RETENTION
     if value is not None and time.monotonic() - cached_at < _RETENTION_TTL:

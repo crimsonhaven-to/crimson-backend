@@ -19,8 +19,15 @@ from core.config import get_settings
 from .db import store
 
 PUBLIC_EXACT = {
-    "/", "/lumi", "/health", "/config", "/metrics",
-    "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc",
+    "/",
+    "/lumi",
+    "/health",
+    "/config",
+    "/metrics",
+    "/openapi.json",
+    "/docs",
+    "/docs/oauth2-redirect",
+    "/redoc",
 }
 # /metrics is listed only so a scrape carrying METRICS_TOKEN reaches its handler,
 # which does its own token-or-admin check. The media relays below are loaded by
@@ -77,7 +84,11 @@ apikey_is_valid = _ValidTokenCache(apikey_store.validate_and_touch, max_entries=
 
 
 def _is_public(path: str, extra_prefixes: tuple) -> bool:
-    return path in PUBLIC_EXACT or path.startswith(PUBLIC_PREFIXES) or bool(extra_prefixes and path.startswith(extra_prefixes))
+    return (
+        path in PUBLIC_EXACT
+        or path.startswith(PUBLIC_PREFIXES)
+        or bool(extra_prefixes and path.startswith(extra_prefixes))
+    )
 
 
 class LoginWallMiddleware:
@@ -108,11 +119,19 @@ class LoginWallMiddleware:
             return await self.app(scope, receive, send)
         # A key unlocks the movie-web bridge and nothing else, so handing one to
         # the fork does not make it a skeleton key for the whole backend.
-        if (path == "/mw" or path.startswith("/mw/")) and api_key and await apikey_is_valid(api_key):
+        if (
+            (path == "/mw" or path.startswith("/mw/"))
+            and api_key
+            and await apikey_is_valid(api_key)
+        ):
             return await self.app(scope, receive, send)
 
         response = JSONResponse(
-            {"detail": "Authentication required", "message": lumi.voiced_error(401), "success": False},
+            {
+                "detail": "Authentication required",
+                "message": lumi.voiced_error(401),
+                "success": False,
+            },
             status_code=401,
         )
         await response(scope, receive, send)

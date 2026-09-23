@@ -1,20 +1,11 @@
-"""
-Request coalescing for cache misses.
+"""Request coalescing for cache misses: one upstream call per key at a time.
 
-The two-tier cache in :mod:`core.response_cache` is only consulted by the
-caller; the check-then-fetch lives at each call site. So on a cold or
-just-expired key every concurrent request misses L1, misses L2 and calls the
-upstream at the same moment. AniList is the worst case: its entries carry
-``nextAiringEpisode``, so a popular title's cache expires precisely while that
-title is at peak traffic, and the 429 ladder in ``metadata_engine.anilist`` then
-turns one stampede into a multi-second stall for every request caught in it.
+On a cold or just-expired key every concurrent request would otherwise miss both
+cache tiers and hit the upstream at once. AniList is the worst case: its entries
+expire on ``nextAiringEpisode``, so a popular title's cache lapses at peak
+traffic, and the 429 backoff then stalls every request caught in the stampede.
 
-:func:`run` collapses that to one upstream call per key. The first caller runs
-the fetch, everyone else awaits the same task.
-
-Per process, not per cluster: with three replicas a stampede collapses to three
-upstream calls rather than one. Closing that last gap needs the shared Redis
-that ``core.rate_limit`` is also waiting on.
+Per process, not per cluster: three replicas still make three upstream calls.
 """
 
 from __future__ import annotations
@@ -42,12 +33,9 @@ def _release(key: str, task: asyncio.Task) -> None:
 
 
 async def run(key: str, factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
-    """Await ``factory()``, sharing one in-flight call per ``key``.
-
-    ``factory`` is invoked only for the first caller. A failure propagates to
-    everyone waiting on it and leaves the key clean, so the next request retries
-    rather than inheriting a cached rejection.
-    """
+    """Await ``factory()``, sharing one in-flight call per ``key``. A failure
+    reaches every waiter and leaves the key clean, so the next request retries
+    rather than inheriting a cached rejection."""
     task = _inflight.get(key)
     if task is None:
         # The task inherits the leader's context, so request-scoped state such as
@@ -58,8 +46,6 @@ async def run(key: str, factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
     else:
         logger.debug("joined in-flight fetch for %s", key)
 
-    # Shielded: awaiting a task propagates the awaiter's cancellation into it, so
-    # one client disconnecting would otherwise abort the fetch every other waiter
-    # is relying on. The task runs to completion and still populates the cache
-    # even if every caller walks away.
+    # Without the shield one client disconnecting would cancel the fetch every
+    # other waiter relies on. The task still fills the cache if everyone leaves.
     return await asyncio.shield(task)

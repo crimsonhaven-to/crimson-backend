@@ -1,18 +1,12 @@
-"""
-Security event log: who tried to get in, what was denied, what an admin changed.
+"""Security event log: who tried to get in, what was denied, what an admin changed.
 
-One append-only table fed from the auth choke points in .routes, the admin
-actions in .admin_routes, and the slowapi 429 handler in api.py. Deliberately
-not fed by the site-wide login wall, which every internet bot hits and would
-drown the table in noise; the auth endpoints and rate-limit hits carry the
-actual signal. Reads power the dashboard's Security tab.
+An append-only table fed from the auth flows, admin actions and the 429
+handler. Not fed by the site-wide login wall, which every internet bot hits and
+would drown the signal. Writes never raise, so a failing log can degrade the
+ledger but never a login.
 
-Writes are fire-and-forget: :func:`log_event` swallows everything, so a full
-disk can degrade the log but never a login.
-
-Privacy: raw client IPs and the attempted identity are stored, but never a full
-public key, password or token. Rows past ``SECURITY_EVENTS_RETENTION_DAYS``
-(default 90) are pruned by the scheduler.
+Raw client IPs and the attempted identity are stored, never a full public key,
+password or token. Rows past SECURITY_EVENTS_RETENTION_DAYS are pruned.
 """
 
 from __future__ import annotations
@@ -29,14 +23,12 @@ from core.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
-
-# Caps so a hostile client can't bloat rows with crafted inputs.
+# Caps so a hostile client cannot bloat rows with crafted inputs.
 MAX_IDENTITY_LEN = 200
 MAX_USER_AGENT_LEN = 300
 MAX_DETAIL_LEN = 2000
 
-# Kept in one place so the dashboard and any alerting agree on spelling.
-# log_event accepts unknown types too, for forward compatibility.
+# The dashboard's filter list. log_event accepts unknown types too.
 EVENT_TYPES = (
     "login_success",            # a session was issued (email or mnemonic)
     "login_failed",             # bad credentials / bad signature / unknown key
@@ -52,6 +44,9 @@ EVENT_TYPES = (
     "password_reset_failed",    # invalid/expired reset token
     "rate_limited",             # slowapi tripped a 429 on an auth-adjacent path
     "admin_action",             # an admin changed users / invites / bridge keys
+    "session_revoked",          # the owner signed a session out
+    "account_delete_failed",    # account deletion refused (bad confirmation)
+    "account_deleted",          # the owner deleted their account
 )
 
 # 'failure' marks every denial, which is the attack signal; 'info' is for
@@ -77,11 +72,9 @@ def key_prefix(public_key: Optional[str]) -> Optional[str]:
 
 
 def init_db() -> None:
-    """Create the schema (idempotent, safe on every replica).
-
-    ``user_id`` has no foreign key on purpose: the trail must survive the account
-    it describes being deleted. ``ts`` is TIMESTAMPTZ rather than the ISO-TEXT
-    used by the account tables because the charts need ``date_trunc``."""
+    """``user_id`` has no foreign key so the trail survives the account being
+    deleted. ``ts`` is TIMESTAMPTZ, unlike the account tables, because the
+    charts need ``date_trunc``."""
     with get_connection() as conn:
         lock_schema_init(conn)
         conn.execute(
@@ -133,20 +126,12 @@ def log_event(
     identity: Optional[str] = None,
     detail: Optional[dict] = None,
 ) -> None:
-    """Record one security event. Never raises: a failed write is a warning in
-    the app log and nothing else.
-
-    Synchronous by design (one small INSERT). Callers keep it off the event loop
-    with a plain ``def`` handler or ``run_in_threadpool``."""
+    """Record one security event. Never raises. Synchronous (one INSERT), so
+    async callers run it in a thread."""
     try:
         if outcome not in OUTCOMES:
             outcome = "info"
-        user_agent = None
-        if request is not None:
-            try:
-                user_agent = request.headers.get("user-agent")
-            except Exception:
-                user_agent = None
+        user_agent = request.headers.get("user-agent") if request is not None else None
         with get_connection() as conn:
             conn.execute(
                 """
@@ -167,7 +152,6 @@ def log_event(
         logger.warning(f"security event log failed ({event_type}): {e}")
 
 
-# ---------------------------------------------------------------- dashboard reads
 def _parse_detail(raw: Optional[str]):
     if not raw:
         return None
@@ -268,16 +252,25 @@ def fold_top_ips(rows: List[dict], limit: int = 10) -> List[dict]:
         slot["count"] += n
         slot["types"][r["event_type"]] = slot["types"].get(r["event_type"], 0) + n
         last = r.get("last_seen")
-        last_iso = last.isoformat() if hasattr(last, "isoformat") else last
+        last_iso = last.isoformat() if last is not None else None
         if last_iso and (slot["last_seen"] is None or last_iso > slot["last_seen"]):
             slot["last_seen"] = last_iso
     ranked = sorted(by_ip.values(), key=lambda s: s["count"], reverse=True)
     return ranked[:limit]
 
 
+def fold_type_totals(rows: List[dict]) -> List[dict]:
+    """Per (event_type, outcome) totals over the per-day rows, largest first."""
+    totals: Dict[tuple, int] = {}
+    for r in rows:
+        key = (r["event_type"], r["outcome"])
+        totals[key] = totals.get(key, 0) + int(r["n"] or 0)
+    ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+    return [{"event_type": t, "outcome": o, "count": n} for (t, o), n in ranked]
+
+
 def stats(days: int = 14) -> dict:
-    """Everything the Security tab needs in one payload: 24h tiles, a per-day
-    series, per-type totals, top offending IPs and most-targeted identities."""
+    """Everything the Security tab needs in one payload."""
     days = max(1, min(days, 90))
     now = utc_now()
     since = now - timedelta(days=days - 1)
@@ -285,34 +278,25 @@ def stats(days: int = 14) -> dict:
     last_24h = now - timedelta(hours=24)
 
     with get_connection() as conn:
-        def tile(sql: str, params) -> int:
-            return int(conn.execute(sql, params).fetchone()["n"] or 0)
-
-        tiles = {
-            "failed_logins_24h": tile(
-                "SELECT COUNT(*) AS n FROM security_events WHERE ts >= %s AND event_type IN ('login_failed', 'login_unverified')",
-                (last_24h,),
-            ),
-            "invite_rejections_24h": tile(
-                "SELECT COUNT(*) AS n FROM security_events WHERE ts >= %s AND event_type = 'invite_invalid'",
-                (last_24h,),
-            ),
-            "rate_limited_24h": tile(
-                "SELECT COUNT(*) AS n FROM security_events WHERE ts >= %s AND event_type = 'rate_limited'",
-                (last_24h,),
-            ),
-            "offending_ips_24h": tile(
-                "SELECT COUNT(DISTINCT ip) AS n FROM security_events WHERE ts >= %s AND outcome = 'failure' AND ip IS NOT NULL",
-                (last_24h,),
-            ),
-            "signups_window": tile(
-                "SELECT COUNT(*) AS n FROM security_events WHERE ts >= %s AND event_type = 'register_success'",
-                (day_start,),
-            ),
-            "events_window": tile(
-                "SELECT COUNT(*) AS n FROM security_events WHERE ts >= %s", (day_start,)
-            ),
-        }
+        tiles = dict(conn.execute(
+            """
+            SELECT COUNT(*) FILTER (WHERE event_type IN ('login_failed', 'login_unverified'))
+                       AS failed_logins_24h,
+                   COUNT(*) FILTER (WHERE event_type = 'invite_invalid') AS invite_rejections_24h,
+                   COUNT(*) FILTER (WHERE event_type = 'rate_limited')   AS rate_limited_24h,
+                   COUNT(DISTINCT ip) FILTER (WHERE outcome = 'failure') AS offending_ips_24h
+            FROM security_events WHERE ts >= %s
+            """,
+            (last_24h,),
+        ).fetchone())
+        tiles.update(conn.execute(
+            """
+            SELECT COUNT(*) FILTER (WHERE event_type = 'register_success') AS signups_window,
+                   COUNT(*) AS events_window
+            FROM security_events WHERE ts >= %s
+            """,
+            (day_start,),
+        ).fetchone())
 
         series_rows = conn.execute(
             """
@@ -320,17 +304,6 @@ def stats(days: int = 14) -> dict:
             FROM security_events
             WHERE ts >= %s
             GROUP BY 1, 2, 3
-            """,
-            (day_start,),
-        ).fetchall()
-
-        type_rows = conn.execute(
-            """
-            SELECT event_type, outcome, COUNT(*) AS n
-            FROM security_events
-            WHERE ts >= %s
-            GROUP BY 1, 2
-            ORDER BY COUNT(*) DESC
             """,
             (day_start,),
         ).fetchall()
@@ -362,10 +335,7 @@ def stats(days: int = 14) -> dict:
         "retention_days": get_settings().security_events_retention_days,
         "tiles": tiles,
         "series": zero_filled_series(series_rows, days, now.date()),
-        "by_type": [
-            {"event_type": r["event_type"], "outcome": r["outcome"], "count": int(r["n"])}
-            for r in type_rows
-        ],
+        "by_type": fold_type_totals(series_rows),
         "top_ips": fold_top_ips(ip_rows),
         "top_identities": [
             {
@@ -401,12 +371,9 @@ def purge_old() -> int:
         return cur.rowcount or 0
 
 
-# ------------------------------------------------------- the account's own view
-# What an account holder may see of their own ledger. A whitelist, not a
-# blacklist: every event type here was read and judged safe to show its owner,
-# and a type added to the ledger later stays invisible until someone does the
-# same for it. admin_action in particular must never appear, since it describes
-# what an operator did and often to whom.
+# What an account holder may see of their own ledger. A whitelist, so a type
+# added later stays hidden until someone judges it safe. admin_action must never
+# appear: it describes what an operator did, often to someone else.
 USER_VISIBLE_EVENTS = (
     "login_success",
     "login_failed",
@@ -425,13 +392,8 @@ USER_VISIBLE_EVENTS = (
 
 
 def _row_for_owner(row: dict) -> dict:
-    """One event as its own account holder may see it.
-
-    ``detail`` and ``identity`` are absent on purpose. detail is an internal blob
-    written by admin actions and auth choke points and can carry operator
-    context; identity is the address or key prefix an attempt was made against,
-    which is not the account holder's to read. What is left answers the only
-    question this endpoint exists for: what happened, when, from where."""
+    """``detail`` can carry operator context and ``identity`` is whatever an
+    attempt was made against; neither is the account holder's to read."""
     return {
         "ts": row["ts"].isoformat() if row.get("ts") else None,
         "event_type": row.get("event_type"),
@@ -442,14 +404,10 @@ def _row_for_owner(row: dict) -> dict:
 
 
 def list_events_for_user(user_id: int, limit: int = 50) -> List[dict]:
-    """Newest-first whitelisted events belonging to this account.
+    """Newest-first whitelisted events of this account.
 
-    Filtered on user_id alone. Matching on identity as well would show "someone
-    tried to sign in as you" for a failed attempt against an unknown address,
-    which reads as a feature and is an account enumeration oracle: any registered
-    user could then ask the server whether an address exists. A failed login
-    against an address that has no account has no user_id, and stays invisible
-    here."""
+    Filtered on user_id alone: matching on identity too would let any user ask
+    whether an address has an account, an enumeration oracle."""
     with get_connection() as conn:
         rows = conn.execute(
             """

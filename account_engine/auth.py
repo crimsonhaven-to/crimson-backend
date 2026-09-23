@@ -30,8 +30,12 @@ _DUMMY_HASH = "pbkdf2_sha256$1$AAAA$AAAA"
 
 
 # --- invites --------------------------------------------------------------------
-def check_invite_code(code: str, request: Optional[Request] = None,
-                      identity: Optional[str] = None, flow: Optional[str] = None) -> bool:
+def check_invite_code(
+    code: str,
+    request: Optional[Request] = None,
+    identity: Optional[str] = None,
+    flow: Optional[str] = None,
+) -> bool:
     """Accept a reusable SIGNUP_INVITE_CODE (returns True) or an available
     single-use token from the Discord bot (returns False), else 403.
 
@@ -44,21 +48,32 @@ def check_invite_code(code: str, request: Optional[Request] = None,
     is_static = code in get_settings().signup_invite_code
     if not is_static and not store.invite_token_is_available(code):
         audit.log_event(
-            "invite_invalid", outcome="failure", request=request, identity=identity,
+            "invite_invalid",
+            outcome="failure",
+            request=request,
+            identity=identity,
             detail={"flow": flow, "reason": "unknown_code"},
         )
         raise HTTPException(status_code=403, detail="Invalid invite code")
     return is_static
 
 
-def consume_invite_code(code: str, is_static: bool, used_by: str,
-                        request: Optional[Request] = None, flow: Optional[str] = None) -> None:
+def consume_invite_code(
+    code: str,
+    is_static: bool,
+    used_by: str,
+    request: Optional[Request] = None,
+    flow: Optional[str] = None,
+) -> None:
     """Burn a single-use token. A concurrent signup that took it first gets 403."""
     if is_static:
         return
     if not store.consume_invite_token((code or "").strip(), used_by=used_by):
         audit.log_event(
-            "invite_invalid", outcome="failure", request=request, identity=used_by,
+            "invite_invalid",
+            outcome="failure",
+            request=request,
+            identity=used_by,
             detail={"flow": flow, "reason": "already_used"},
         )
         raise HTTPException(status_code=403, detail="This invite code has already been used")
@@ -99,35 +114,56 @@ def normalize_public_key(public_key: str) -> str:
     return pk
 
 
-def verify_signed_challenge(public_key: str, challenge: str, signature: str,
-                            request: Optional[Request] = None, flow: Optional[str] = None) -> None:
+def verify_signed_challenge(
+    public_key: str,
+    challenge: str,
+    signature: str,
+    request: Optional[Request] = None,
+    flow: Optional[str] = None,
+) -> None:
     """Consume the one-time challenge and verify the signature over it, or 401."""
     if not _HEX64.match(public_key or ""):
-        raise HTTPException(status_code=400, detail="public_key must be 64 hex chars (32-byte Ed25519 key)")
+        raise HTTPException(
+            status_code=400, detail="public_key must be 64 hex chars (32-byte Ed25519 key)"
+        )
     if not _HEX128.match(signature or ""):
-        raise HTTPException(status_code=400, detail="signature must be 128 hex chars (64-byte Ed25519 signature)")
+        raise HTTPException(
+            status_code=400, detail="signature must be 128 hex chars (64-byte Ed25519 signature)"
+        )
 
     public_key = public_key.lower()
     # Consumed before verifying, so a failed attempt cannot be replayed.
     if not store.consume_challenge(challenge, public_key, CHALLENGE_PURPOSE):
         audit.log_event(
-            "login_failed", outcome="failure", request=request,
+            "login_failed",
+            outcome="failure",
+            request=request,
             identity=audit.key_prefix(public_key),
             detail={"method": "mnemonic", "flow": flow, "reason": "bad_challenge"},
         )
         raise HTTPException(status_code=401, detail="Invalid or expired challenge")
 
-    if not ed25519.verify(bytes.fromhex(public_key), challenge.encode("utf-8"), bytes.fromhex(signature)):
+    if not ed25519.verify(
+        bytes.fromhex(public_key), challenge.encode("utf-8"), bytes.fromhex(signature)
+    ):
         audit.log_event(
-            "login_failed", outcome="failure", request=request,
+            "login_failed",
+            outcome="failure",
+            request=request,
             identity=audit.key_prefix(public_key),
             detail={"method": "mnemonic", "flow": flow, "reason": "bad_signature"},
         )
         raise HTTPException(status_code=401, detail="Signature verification failed")
 
 
-def register_mnemonic(pk: str, challenge: str, signature: str, invite_code: str,
-                      label: Optional[str], request: Request) -> dict:
+def register_mnemonic(
+    pk: str,
+    challenge: str,
+    signature: str,
+    invite_code: str,
+    label: Optional[str],
+    request: Request,
+) -> dict:
     """Create the account for a public key and open a session.
 
     The 409 and the invite check both run before the challenge is consumed: a
@@ -137,17 +173,26 @@ def register_mnemonic(pk: str, challenge: str, signature: str, invite_code: str,
         raise HTTPException(status_code=409, detail="Account already exists; use /auth/login")
     is_static = check_invite_code(invite_code, request, audit.key_prefix(pk), "mnemonic_register")
     verify_signed_challenge(pk, challenge, signature, request, "register")
-    consume_invite_code(invite_code, is_static, used_by=f"mnemonic:{pk}",
-                        request=request, flow="mnemonic_register")
+    consume_invite_code(
+        invite_code, is_static, used_by=f"mnemonic:{pk}", request=request, flow="mnemonic_register"
+    )
     account = store.create_account(pk, label)
     token, expires_at = open_session(account, request)
     audit.log_event(
-        "register_success", outcome="success", request=request,
-        user_id=account["user_id"], identity=audit.key_prefix(pk),
+        "register_success",
+        outcome="success",
+        request=request,
+        user_id=account["user_id"],
+        identity=audit.key_prefix(pk),
         detail={"method": "mnemonic"},
     )
-    return {"public_key": pk, "label": account.get("label"), "session_token": token,
-            "expires_at": expires_at, "created": True}
+    return {
+        "public_key": pk,
+        "label": account.get("label"),
+        "session_token": token,
+        "expires_at": expires_at,
+        "created": True,
+    }
 
 
 def login_mnemonic(pk: str, challenge: str, signature: str, request: Request) -> dict:
@@ -160,12 +205,20 @@ def login_mnemonic(pk: str, challenge: str, signature: str, request: Request) ->
     verify_signed_challenge(pk, challenge, signature, request, "login")
     token, expires_at = open_session(account, request)
     audit.log_event(
-        "login_success", outcome="success", request=request,
-        user_id=account["user_id"], identity=audit.key_prefix(pk),
+        "login_success",
+        outcome="success",
+        request=request,
+        user_id=account["user_id"],
+        identity=audit.key_prefix(pk),
         detail={"method": "mnemonic"},
     )
-    return {"public_key": pk, "label": account.get("label"), "session_token": token,
-            "expires_at": expires_at, "created": False}
+    return {
+        "public_key": pk,
+        "label": account.get("label"),
+        "session_token": token,
+        "expires_at": expires_at,
+        "created": False,
+    }
 
 
 # --- email ------------------------------------------------------------------------
@@ -187,7 +240,7 @@ def validate_password(password: str) -> None:
         raise HTTPException(
             status_code=400,
             detail=f"Password must be {passwords.MIN_PASSWORD_LENGTH} to "
-                   f"{passwords.MAX_PASSWORD_LENGTH} characters",
+            f"{passwords.MAX_PASSWORD_LENGTH} characters",
         )
 
 
@@ -200,22 +253,29 @@ def register_email(body: EmailRegisterRequest, request: Request) -> dict:
 
     if store.get_account_by_email(email):
         audit.log_event(
-            "register_blocked", outcome="failure", request=request, identity=email,
+            "register_blocked",
+            outcome="failure",
+            request=request,
+            identity=email,
             detail={"method": "email", "reason": "email_taken"},
         )
         raise HTTPException(status_code=409, detail="An account with this email already exists")
 
-    consume_invite_code(body.invite_code, is_static, used_by=email,
-                        request=request, flow="email_register")
+    consume_invite_code(
+        body.invite_code, is_static, used_by=email, request=request, flow="email_register"
+    )
     account = store.create_email_account(email, passwords.hash_password(body.password), body.label)
     audit.log_event(
-        "register_success", outcome="success", request=request,
-        user_id=account["user_id"], identity=email, detail={"method": "email"},
+        "register_success",
+        outcome="success",
+        request=request,
+        user_id=account["user_id"],
+        identity=email,
+        detail={"method": "email"},
     )
 
     if get_settings().demo_mode:
         store.set_email_verified(account["user_id"], True)
-        account = store.get_account(account["user_id"])
         return {**_email_session(account, True, request), "requires_verification": False}
 
     mailer.send_verification_email(
@@ -238,7 +298,10 @@ def login_email(email: str, password: str, request: Request) -> dict:
     ok = passwords.verify_password(password, stored_hash or _DUMMY_HASH)
     if not account or not stored_hash or not ok:
         audit.log_event(
-            "login_failed", outcome="failure", request=request, identity=email,
+            "login_failed",
+            outcome="failure",
+            request=request,
+            identity=email,
             user_id=account["user_id"] if account else None,
             detail={"method": "email", "reason": "bad_credentials"},
         )
@@ -246,8 +309,12 @@ def login_email(email: str, password: str, request: Request) -> dict:
 
     if not account.get("email_verified"):
         audit.log_event(
-            "login_unverified", outcome="failure", request=request, identity=email,
-            user_id=account["user_id"], detail={"method": "email"},
+            "login_unverified",
+            outcome="failure",
+            request=request,
+            identity=email,
+            user_id=account["user_id"],
+            detail={"method": "email"},
         )
         raise HTTPException(
             status_code=403,
@@ -258,8 +325,12 @@ def login_email(email: str, password: str, request: Request) -> dict:
         store.set_password(account["user_id"], passwords.hash_password(password))
 
     audit.log_event(
-        "login_success", outcome="success", request=request, identity=email,
-        user_id=account["user_id"], detail={"method": "email"},
+        "login_success",
+        outcome="success",
+        request=request,
+        identity=email,
+        user_id=account["user_id"],
+        detail={"method": "email"},
     )
     return _email_session(account, False, request)
 
@@ -269,12 +340,19 @@ def verify_email(token: str, request: Request) -> dict:
     user_id = store.consume_email_token(token, "verify")
     if user_id is None:
         audit.log_event("verify_failed", outcome="failure", request=request)
-        raise HTTPException(status_code=400, detail="This verification link is invalid or has expired")
+        raise HTTPException(
+            status_code=400, detail="This verification link is invalid or has expired"
+        )
     store.set_email_verified(user_id, True)
     account = store.get_account(user_id)
+    if account is None:
+        raise HTTPException(status_code=400, detail="This account no longer exists")
     audit.log_event(
-        "email_verified", outcome="success", request=request,
-        user_id=user_id, identity=account.get("email"),
+        "email_verified",
+        outcome="success",
+        request=request,
+        user_id=user_id,
+        identity=account.get("email"),
     )
     return _email_session(account, True, request)
 
@@ -284,23 +362,29 @@ def resend_verification(email: str, request: Request) -> None:
     resends for unknown addresses is exactly the probing the ledger is for."""
     email = normalize_email(email)
     account = store.get_account_by_email(email)
-    sent = bool(account and account.get("email") and not account.get("email_verified"))
-    if sent:
+    sent = False
+    if account and account.get("email") and not account.get("email_verified"):
         mailer.send_verification_email(
             email, store.create_email_token(account["user_id"], "verify", VERIFY_TOKEN_TTL)
         )
-    audit.log_event("verify_resend_requested", request=request, identity=email, detail={"sent": sent})
+        sent = True
+    audit.log_event(
+        "verify_resend_requested", request=request, identity=email, detail={"sent": sent}
+    )
 
 
 def request_password_reset(email: str, request: Request) -> None:
     email = normalize_email(email)
     account = store.get_account_by_email(email)
-    sent = bool(account and account.get("password_hash"))
-    if sent:
+    sent = False
+    if account and account.get("password_hash"):
         mailer.send_reset_email(
             email, store.create_email_token(account["user_id"], "reset", RESET_TOKEN_TTL)
         )
-    audit.log_event("password_reset_requested", request=request, identity=email, detail={"sent": sent})
+        sent = True
+    audit.log_event(
+        "password_reset_requested", request=request, identity=email, detail={"sent": sent}
+    )
 
 
 def reset_password(token: str, password: str, request: Request) -> None:
@@ -326,8 +410,11 @@ def confirm_owner(user: dict, body: DeleteAccountRequest, request: Request) -> N
     if stored_hash:
         if not body.password or not passwords.verify_password(body.password, stored_hash):
             audit.log_event(
-                "account_delete_failed", outcome="failure", request=request,
-                user_id=user["user_id"], detail={"reason": "bad_password"},
+                "account_delete_failed",
+                outcome="failure",
+                request=request,
+                user_id=user["user_id"],
+                detail={"reason": "bad_password"},
             )
             raise HTTPException(status_code=401, detail="Password is incorrect")
         return

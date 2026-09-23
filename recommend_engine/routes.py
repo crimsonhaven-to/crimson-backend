@@ -54,4 +54,9 @@ async def get_similar(
         raise HTTPException(status_code=500, detail="Could not build recommendations")
     if items is None:
         raise HTTPException(status_code=404, detail="No genre data for that title")
-    return {"success": True, "anilist_id": anilist_id, "count": len(items), "recommendations": items}
+    return {
+        "success": True,
+        "anilist_id": anilist_id,
+        "count": len(items),
+        "recommendations": items,
+    }

@@ -11,7 +11,9 @@ router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(requir
 
 
 @router.get("/source-stats")
-async def admin_source_stats(days: int = Query(14, ge=1, le=365, description="Window to aggregate over")):
+async def admin_source_stats(
+    days: int = Query(14, ge=1, le=365, description="Window to aggregate over"),
+):
     """What actually resolved for viewers, from their anonymous beacons, where
     /admin/source-health probes from the backend."""
     rows = await asyncio.to_thread(store.top_stats, days)

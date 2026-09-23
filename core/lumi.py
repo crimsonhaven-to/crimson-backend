@@ -1,14 +1,4 @@
-""" 
-Lumi, the voice of Luminas Crimsonveil, empress of the Crimson Archives.
-
-One dependency-free home for the mascot's personality, so her voice stays
-consistent across the ``X-Lumi`` header, the voiced errors, ``/lumi`` and the
-root easter egg.
-
-Header quips must be ASCII: they ride in an HTTP header value, which is latin-1
-at best, so an emoji would raise on encode. Blessings and error lines ride in
-JSON bodies and may carry unicode.
-"""
+"""Lumi, the mascot's voice for the ``X-Lumi`` header, voiced errors and ``/lumi``."""
 
 from __future__ import annotations
 
@@ -17,7 +7,8 @@ import random
 EMPRESS = "Luminas Crimsonveil"
 TITLE = "Eternal Empress of the Crimson Archives"
 
-# ASCII only: these go into the X-Lumi header on every request.
+# ASCII only: an HTTP header value is latin-1 at best, so an emoji would raise
+# on encode.
 _HEADER_QUIPS = (
     "Snooping in the headers again, mortal? How quaint.",
     "Every byte here bends the knee to me.",
@@ -31,7 +22,6 @@ _HEADER_QUIPS = (
     "Curiosity is a delightful little sin.",
 )
 
-# JSON-body lines, so unicode is welcome.
 _BLESSINGS = (
     "I bless your bandwidth, mortal. Buffer not. ✨",
     "May your streams run swift and your subtitles never lie.",
@@ -61,7 +51,6 @@ _ERROR_LINES = {
     504: "I waited. It did not answer. How terribly rude of it.",
 }
 
-# Fallback for a status with no bespoke line, grouped by class.
 _ERROR_FALLBACK = {
     4: "You have erred, mortal. Try again, and try better.",
     5: "The crypt convulses. Lumi is displeased, but not at you. This time.",
@@ -69,17 +58,14 @@ _ERROR_FALLBACK = {
 
 
 def header_quip() -> str:
-    """A short, ASCII-only quip for the ``X-Lumi`` header."""
     return random.choice(_HEADER_QUIPS)
 
 
 def blessing() -> str:
-    """A random royal blessing for ``/lumi`` and the root easter egg."""
     return random.choice(_BLESSINGS)
 
 
 def voiced_error(status_code: int) -> str:
-    """Lumi's line for an error status, falling back by status class. Never raises."""
     line = _ERROR_LINES.get(status_code)
     if line:
         return line

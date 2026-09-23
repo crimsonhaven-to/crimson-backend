@@ -16,8 +16,14 @@ from .library import favorite_item_key
 # Internal keys (user_id, item_key) stay out; list_name leads so a spreadsheet
 # sorted on it groups by list.
 EXPORT_FIELDS = (
-    "list_name", "title", "media_type", "tmdb_id", "anilist_id",
-    "season_number", "poster", "added_at",
+    "list_name",
+    "title",
+    "media_type",
+    "tmdb_id",
+    "anilist_id",
+    "season_number",
+    "poster",
+    "added_at",
 )
 
 
@@ -95,16 +101,18 @@ def favorites_from_rows(rows: List[dict]) -> Tuple[List[tuple], int]:
             skipped_no_id += 1
             continue
         media_type = _clean_str(r.get("media_type"))
-        favs.append((
-            (_clean_str(r.get("list_name")) or "favorites")[:100],
-            {
-                "item_key": favorite_item_key(tmdb_id, anilist_id, media_type),
-                "tmdb_id": tmdb_id,
-                "anilist_id": anilist_id,
-                "season_number": _coerce_int(r.get("season_number")),
-                "media_type": media_type,
-                "title": _clean_str(r.get("title")),
-                "poster": _clean_str(r.get("poster")),
-            },
-        ))
+        favs.append(
+            (
+                (_clean_str(r.get("list_name")) or "favorites")[:100],
+                {
+                    "item_key": favorite_item_key(tmdb_id, anilist_id, media_type),
+                    "tmdb_id": tmdb_id,
+                    "anilist_id": anilist_id,
+                    "season_number": _coerce_int(r.get("season_number")),
+                    "media_type": media_type,
+                    "title": _clean_str(r.get("title")),
+                    "poster": _clean_str(r.get("poster")),
+                },
+            )
+        )
     return favs, skipped_no_id

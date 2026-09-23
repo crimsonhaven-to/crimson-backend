@@ -1,30 +1,15 @@
-"""
-PostgreSQL store for the admin download queue.
+"""Postgres store for the admin download queue: one ``download_jobs`` row per
+submitted URL or magnet, which is also the job queue the download-worker drains.
 
-The Admin Dashboard hands the backend a URL (plain http/https) or a ``magnet:``
-link; the file is fetched in the background by an **aria2c** sidecar and landed
-under ``<root>/crimson-downloads/`` on the first *download-enabled* local source
-with enough free space (see ``download_engine.fs`` / ``download_engine.manager``).
-Once on disk the existing ``local_engine`` library scanner surfaces it like any
-other on-disk title — no separate playback path.
+| status   | meaning                                                   |
+|----------|-----------------------------------------------------------|
+| pending  | written by a route, waiting for the worker                |
+| active   | handed to aria2 (``gid`` set), progress updated per poll  |
+| paused   | paused by the admin                                       |
+| complete | moved out of staging into ``crimson-downloads``           |
+| failed   | aria2 or move error, reason in ``error``                  |
 
-One table, ``download_jobs`` — one row per submitted download, carrying the whole
-lifecycle:
-
-    pending  -> the row a route wrote; awaiting the download-worker.
-    active   -> handed to aria2 (``gid`` set); bytes/speed updated as it runs.
-    paused   -> admin-paused (aria2 paused if it had started).
-    complete -> finished and moved out of staging into crimson-downloads.
-    failed   -> aria2 error / move error (``error`` carries the reason).
-
-Mirrors cache_engine.db / local_engine.db: plain pooled psycopg calls borrowing
-from the shared pool (db_pool), driven from api.py's async handlers via
-``run_in_threadpool``. Volumes are tiny (a handful of rows).
-
-The DB row is the queue (like the video cache): a route on any replica writes a
-``pending`` row, and only the dedicated download-worker (RUN_DOWNLOAD_WORKER)
-submits it to aria2 and polls it, so a download survives an api redeploy. Run
-exactly one download-worker: nothing stops two of them submitting the same row.
+Finished files are surfaced by the Local library scanner like any other title.
 """
 
 from __future__ import annotations
@@ -40,26 +25,20 @@ _COLS = (
     "final_path, error, created_by, created_at, updated_at"
 )
 
-# Lifecycle states for a download_jobs row.
 STATUS_PENDING = "pending"
 STATUS_ACTIVE = "active"
 STATUS_PAUSED = "paused"
 STATUS_COMPLETE = "complete"
 STATUS_FAILED = "failed"
 
-# Download kinds.
 KIND_HTTP = "http"
 KIND_TORRENT = "torrent"
 
 
 class DownloadStore:
-    """Data layer for the ``download_jobs`` table."""
-
-    # ----------------------------------------------------------------- schema
     def init_db(self) -> None:
-        """Create the schema (idempotent)."""
         with get_connection() as conn:
-            lock_schema_init(conn)  # serialize DDL across replicas (see db_pool)
+            lock_schema_init(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS download_jobs (
@@ -89,11 +68,11 @@ class DownloadStore:
                 "ON download_jobs (status, created_at, id)"
             )
 
-    # ------------------------------------------------------------------ reads
     def list_jobs(
         self, status: Optional[str] = None, limit: int = 100, offset: int = 0
     ) -> List[dict]:
-        where, params = "", []
+        where = ""
+        params: list = []
         if status:
             where = "WHERE status = %s"
             params.append(status)
@@ -129,7 +108,6 @@ class DownloadStore:
             ).fetchone()
 
     def fetch_pending(self, limit: int = 8) -> List[dict]:
-        """Oldest ``pending`` rows for the worker to submit to aria2."""
         with get_connection() as conn:
             return conn.execute(
                 f"SELECT {_COLS} FROM download_jobs WHERE status = %s "
@@ -138,7 +116,6 @@ class DownloadStore:
             ).fetchall()
 
     def fetch_active(self) -> List[dict]:
-        """All ``active`` rows (already handed to aria2) for the worker to poll."""
         with get_connection() as conn:
             return conn.execute(
                 f"SELECT {_COLS} FROM download_jobs WHERE status = %s ORDER BY id",
@@ -153,7 +130,6 @@ class DownloadStore:
         return row["n"] if row else 0
 
     def stats(self) -> dict:
-        """Aggregate counts + total downloaded bytes, for the dashboard."""
         out = {"pending": 0, "active": 0, "paused": 0, "complete": 0, "failed": 0, "total_bytes": 0}
         try:
             with get_connection() as conn:
@@ -169,13 +145,11 @@ class DownloadStore:
             pass
         return out
 
-    # ----------------------------------------------------------------- writes
     def create_job(
         self, kind: str, source_url: str, name: Optional[str], created_by: str
     ) -> dict:
-        """Write a fresh ``pending`` job (the target root + staging dir are chosen
-        later, by the worker, so free space is checked when the download actually
-        starts)."""
+        """The target root is chosen later by the worker, so free space is checked
+        when the download actually starts."""
         now = utc_now_iso()
         with get_connection() as conn:
             return conn.execute(
@@ -197,8 +171,6 @@ class DownloadStore:
         dest_dir: str,
         staging_dir: str,
     ) -> Optional[dict]:
-        """Record the aria2 gid + the chosen destination and flip the row to
-        ``active``."""
         with get_connection() as conn:
             return conn.execute(
                 f"""
@@ -213,8 +185,6 @@ class DownloadStore:
             ).fetchone()
 
     def update_gid(self, job_id: int, gid: str) -> None:
-        """Follow aria2's metadata->data gid switch (a magnet's real download gets a
-        new gid once metadata resolves; see download_engine.manager)."""
         with get_connection() as conn:
             conn.execute(
                 "UPDATE download_jobs SET gid = %s, updated_at = %s WHERE id = %s",
@@ -248,7 +218,6 @@ class DownloadStore:
             )
 
     def set_status(self, job_id: int, status: str) -> Optional[dict]:
-        """Directly set a row's status (used by pause/resume/retry)."""
         with get_connection() as conn:
             return conn.execute(
                 f"UPDATE download_jobs SET status = %s, updated_at = %s WHERE id = %s "
@@ -257,10 +226,8 @@ class DownloadStore:
             ).fetchone()
 
     def requeue(self, job_id: int) -> Optional[dict]:
-        """Reset a row to ``pending`` and clear its aria2 gid so the worker submits it
-        afresh (used to retry a failed job and, on worker startup, to reclaim rows the
-        old worker was mid-download on — aria2 resumes from the control file left in the
-        staging dir)."""
+        """Back to ``pending`` without a gid, so the worker resubmits it. aria2
+        resumes from the control file left in the staging dir."""
         with get_connection() as conn:
             return conn.execute(
                 f"UPDATE download_jobs SET status = %s, gid = NULL, download_speed = 0, "
@@ -269,8 +236,7 @@ class DownloadStore:
             ).fetchone()
 
     def delete_job(self, job_id: int) -> Optional[dict]:
-        """Delete a row, returning it (so the caller can remove it from aria2 + clean
-        the staging dir)."""
+        """Returns the deleted row so the caller can clean up aria2 and staging."""
         with get_connection() as conn:
             return conn.execute(
                 f"DELETE FROM download_jobs WHERE id = %s RETURNING {_COLS}", (job_id,)

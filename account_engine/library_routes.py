@@ -156,8 +156,12 @@ def get_progress(
 @limiter.limit("60/minute")
 async def upsert_progress(request: Request, body: ProgressIn, user: dict = Depends(require_user)):
     item_key = progress_item_key(
-        body.tmdb_id, body.anilist_id, body.season_number, body.episode_number,
-        body.media_type, body.local_id,
+        body.tmdb_id,
+        body.anilist_id,
+        body.season_number,
+        body.episode_number,
+        body.media_type,
+        body.local_id,
     )
     payload = {**body.model_dump(), "item_key": item_key, "status": resolve_status(body)}
     try:
@@ -225,7 +229,9 @@ def remove_progress(
                 status_code=400,
                 detail="Provide item_key, or tmdb_id/anilist_id/local_id (+season/episode)",
             )
-        item_key = progress_item_key(tmdb_id, anilist_id, season_number, episode_number, media_type, local_id)
+        item_key = progress_item_key(
+            tmdb_id, anilist_id, season_number, episode_number, media_type, local_id
+        )
     if not store.remove_progress(user["user_id"], item_key):
         raise HTTPException(status_code=404, detail="Progress entry not found")
     return {"success": True, "removed": item_key}

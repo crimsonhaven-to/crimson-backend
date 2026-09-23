@@ -63,7 +63,9 @@ def _gauge(name: str, doc: str, value: float) -> GaugeMetricFamily:
 
 
 def _build_and_schema():
-    info = GaugeMetricFamily("crimson_build_info", "Always 1; the labels carry the running version.", labels=["version"])
+    info = GaugeMetricFamily(
+        "crimson_build_info", "Always 1; the labels carry the running version.", labels=["version"]
+    )
     info.add_metric([str(VERSION)], 1)
     yield info
     schema = migrations.cached_status() or {}
@@ -75,7 +77,8 @@ def _build_and_schema():
             schema["version"],
         )
     yield _gauge(
-        "crimson_schema_drift", "Migration files whose checksum no longer matches what was applied.",
+        "crimson_schema_drift",
+        "Migration files whose checksum no longer matches what was applied.",
         len(schema.get("drift") or []),
     )
 
@@ -97,8 +100,11 @@ def _pool():
 def _cache_worker():
     # Only the cache-worker replica runs one; elsewhere 0 is the correct answer.
     cache = cache_manager.worker_stats()
-    yield _gauge("crimson_cache_worker_queue_depth", "Remux jobs queued in this replica's cache worker.", cache.get("queued", 0))
-    yield _gauge("crimson_cache_worker_inflight", "Remux jobs currently running in this replica's cache worker.", cache.get("inflight", 0))
+    yield _gauge(
+        "crimson_cache_worker_inflight",
+        "Remux jobs currently running in this replica's cache worker.",
+        cache.get("inflight", 0),
+    )
 
 
 def _download_jobs():
@@ -120,7 +126,8 @@ def _source_health():
         labels=["source"],
     )
     events = CounterMetricFamily(
-        "crimson_source_resolve_events", "Client-reported resolve outcomes per source over 14 days.",
+        "crimson_source_resolve_events",
+        "Client-reported resolve outcomes per source over 14 days.",
         labels=["source", "outcome"],
     )
     for row in telemetry_rows():

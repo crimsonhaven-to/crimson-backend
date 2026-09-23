@@ -27,9 +27,12 @@ def favorite_item_key(
 
 
 def progress_item_key(
-    tmdb_id: Optional[int], anilist_id: Optional[int],
-    season_number: Optional[int], episode_number: Optional[int],
-    media_type: Optional[str] = None, local_id: Optional[str] = None,
+    tmdb_id: Optional[int],
+    anilist_id: Optional[int],
+    season_number: Optional[int],
+    episode_number: Optional[int],
+    media_type: Optional[str] = None,
+    local_id: Optional[str] = None,
 ) -> str:
     """One row per episode, or one per movie. Manga keeps one row per title: the
     chapter rides in episode_number and the page in position_seconds, so each

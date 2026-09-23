@@ -84,33 +84,43 @@ def _grant_runner(scraper_cls, resolver_cls):
     """Discovery with the scraper, then the resolver's secret-gated
     ``resolve_direct``: one raw-URL stream per quality variant, best first."""
 
-    async def _run(tmdb_id: int, season: int, episode: int, anilist_data: Dict,
-                   media_type: str, base_url: str) -> List[Dict]:
-        embeds = await run_single_scraper(scraper_cls, tmdb_id, season, episode, anilist_data, media_type)
+    async def _run(
+        tmdb_id: int, season: int, episode: int, anilist_data: Dict, media_type: str, base_url: str
+    ) -> List[Dict]:
+        embeds = await run_single_scraper(
+            scraper_cls, tmdb_id, season, episode, anilist_data, media_type
+        )
         resolver = resolver_cls()
         out: List[Dict] = []
         for embed in embeds:
             try:
                 streams = await resolver.resolve_direct(embed)
             except Exception as e:
-                logger.warning(f"[resolve] {resolver.source_name} resolve_direct failed: {type(e).__name__} - {e}")
+                logger.warning(
+                    f"[resolve] {resolver.source_name} resolve_direct failed: {type(e).__name__} - {e}"
+                )
                 continue
             for res in streams or []:
                 if not res.get("url"):
                     continue
-                out.append({
-                    # The label dedups against the client's own tile for the source.
-                    "label": res.get("label") or resolver.source_name,
-                    "streamType": res.get("streamType") or "mp4",
-                    "url": res["url"],
-                    "headers": res.get("headers") or {},
-                    "subtitles": [
-                        {**s, "url": base_url.rstrip("/") + s["url"]}
-                        if base_url and isinstance(s.get("url"), str) and s["url"].startswith("/") else s
-                        for s in res.get("subtitles") or []
-                    ],
-                    "language": res.get("language"),
-                })
+                out.append(
+                    {
+                        # The label dedups against the client's own tile for the source.
+                        "label": res.get("label") or resolver.source_name,
+                        "streamType": res.get("streamType") or "mp4",
+                        "url": res["url"],
+                        "headers": res.get("headers") or {},
+                        "subtitles": [
+                            {**s, "url": base_url.rstrip("/") + s["url"]}
+                            if base_url
+                            and isinstance(s.get("url"), str)
+                            and s["url"].startswith("/")
+                            else s
+                            for s in res.get("subtitles") or []
+                        ],
+                        "language": res.get("language"),
+                    }
+                )
         return out
 
     return _run
@@ -132,7 +142,9 @@ def _build_grants() -> Dict[str, Tuple[Callable[[], bool], Runner]]:
         try:
             runner = _grant_runner(load_ref(desc["scraper"]), load_ref(desc["resolver"]))
         except Exception as e:
-            logger.warning(f"[resolve] skipping overlay grant {desc.get('keys')}: {type(e).__name__} - {e}")
+            logger.warning(
+                f"[resolve] skipping overlay grant {desc.get('keys')}: {type(e).__name__} - {e}"
+            )
             continue
         for key in desc["keys"]:
             grants[str(key).lower()] = (desc["is_configured"], runner)
@@ -160,7 +172,7 @@ async def resolve_grant(request: Request):
         return _error("source_unconfigured", 503)
 
     try:
-        tmdb_id = int(body.get("tmdbId") or body.get("tmdb_id"))
+        tmdb_id = int(body.get("tmdbId") or body.get("tmdb_id") or "")
     except (TypeError, ValueError):
         return _error("bad_request", 400)
     media_type = "movie" if (body.get("mediaType") or "tv") == "movie" else "tv"
@@ -177,7 +189,9 @@ async def resolve_grant(request: Request):
     }
 
     try:
-        streams = await runner(tmdb_id, season, episode, anilist_data, media_type, public_base_url(request))
+        streams = await runner(
+            tmdb_id, season, episode, anilist_data, media_type, public_base_url(request)
+        )
     except Exception as e:
         logger.error(f"[resolve] grant for {source!r} failed: {type(e).__name__} - {e}")
         return _error("resolve_failed", 502)

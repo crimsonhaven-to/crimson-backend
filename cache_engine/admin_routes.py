@@ -41,13 +41,16 @@ def _with_status(row: dict) -> dict:
 def _checked_new_path(raw: str) -> str:
     path = os.path.normpath(raw.strip())
     if not os.path.isabs(path):
-        raise HTTPException(status_code=400, detail="Path must be absolute: the in-container path, e.g. /crimson/cache")
+        raise HTTPException(
+            status_code=400,
+            detail="Path must be absolute: the in-container path, e.g. /crimson/cache",
+        )
     info = inspect_target(path, 1)
     if not info["exists"]:
         raise HTTPException(
             status_code=400,
             detail="Path does not exist inside the backend container. Bind-mount your NAS "
-                   "share first (e.g. - /nas/cache:/crimson/cache).",
+            "share first (e.g. - /nas/cache:/crimson/cache).",
         )
     if not info["is_dir"]:
         raise HTTPException(status_code=400, detail="Path is not a directory")
@@ -96,6 +99,7 @@ async def list_cache_targets():
 @router.get("/cache-targets/discover")
 async def discover_cache_targets():
     """Candidate directories, probed for writability and free space."""
+
     def _discover():
         have = {os.path.normpath(r["path"]) for r in store.list_targets()}
         return [
@@ -124,6 +128,7 @@ async def add_cache_target(body: CacheTargetCreate):
 @router.patch("/cache-targets/{target_id}")
 async def update_cache_target(target_id: int, body: CacheTargetUpdate):
     """The name is what viewers see as the source. The path is immutable."""
+
     def _update():
         if not store.get_target(target_id):
             raise HTTPException(status_code=404, detail="Target not found")
@@ -158,6 +163,7 @@ async def list_cached_episodes(
 async def delete_cached_episode(entry_id: int):
     """Drops the entry and its file. Dropping a failed entry lets the episode be
     cached again on its next play."""
+
     def _delete():
         row = store.delete_episode(entry_id)
         if not row:

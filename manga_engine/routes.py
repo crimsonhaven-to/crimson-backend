@@ -74,7 +74,9 @@ async def _resolve_manga_id(provider, meta: dict) -> Optional[str]:
         return cached["mangadex_id"]
     manga_id = await provider.resolve_manga_id(_candidate_titles(meta))
     if manga_id:
-        await set_cached_response(cache_key, {"mangadex_id": manga_id}, ttl_seconds=_MAP_TTL_SECONDS)
+        await set_cached_response(
+            cache_key, {"mangadex_id": manga_id}, ttl_seconds=_MAP_TTL_SECONDS
+        )
     return manga_id
 
 
@@ -85,19 +87,25 @@ async def _get_chapters_cached(provider, manga_id: str, language: str) -> List[d
         return cached["chapters"]
     chapters = await provider.get_chapters(manga_id, language)
     if chapters:
-        await set_cached_response(cache_key, {"chapters": chapters}, ttl_seconds=_CHAPTERS_TTL_SECONDS)
+        await set_cached_response(
+            cache_key, {"chapters": chapters}, ttl_seconds=_CHAPTERS_TTL_SECONDS
+        )
     return chapters
 
 
 @router.get("/search/manga", dependencies=[Depends(require_manga_enabled)])
-async def search_manga(query_name: str = Query(..., min_length=1, description="Manga name to search")):
+async def search_manga(
+    query_name: str = Query(..., min_length=1, description="Manga name to search"),
+):
     async with http_client() as client:
         results = await search_anilist_manga(client, query_name)
     return {"success": True, "query": query_name, "count": len(results), "suggestions": results}
 
 
 @router.get("/trending/manga", dependencies=[Depends(require_manga_enabled)])
-async def trending_manga(limit: int = Query(12, ge=1, le=50, description="Number of results to return")):
+async def trending_manga(
+    limit: int = Query(12, ge=1, le=50, description="Number of results to return"),
+):
     """``stale`` is true when AniList was down and the last good row was served."""
     async with http_client() as client:
         result = await fetch_trending_manga(client, limit)
@@ -107,8 +115,12 @@ async def trending_manga(limit: int = Query(12, ge=1, le=50, description="Number
 
 @router.get("/catalogue/manga", dependencies=[Depends(require_manga_enabled)])
 async def catalogue_manga(
-    genre: Optional[str] = Query(None, description="Optional AniList genre filter, e.g. Action, Romance"),
-    sort: str = Query(CATALOGUE_DEFAULT_SORT, description="trending | popular | score | newest | title"),
+    genre: Optional[str] = Query(
+        None, description="Optional AniList genre filter, e.g. Action, Romance"
+    ),
+    sort: str = Query(
+        CATALOGUE_DEFAULT_SORT, description="trending | popular | score | newest | title"
+    ),
     page: int = Query(1, ge=1, le=200, description="1-based page for the browse hub"),
 ):
     """One live page of AniList manga. There is no local manga table, so unlike
@@ -140,7 +152,9 @@ async def catalogue_manga(
 @router.get("/manga-overview/{anilist_id}")
 async def manga_overview(
     anilist_id: int,
-    language: Optional[str] = Query(None, description="Preferred chapter language (default: server default)"),
+    language: Optional[str] = Query(
+        None, description="Preferred chapter language (default: server default)"
+    ),
     settings: Settings = Depends(require_manga_enabled),
 ):
     """AniList metadata, plus the chapter list when a provider is present. Without
@@ -219,5 +233,7 @@ async def manga_proxy(
         logger.warning(f"[manga_proxy] fetch failed: {type(e).__name__} - {e}")
         raise HTTPException(status_code=502, detail="Image unavailable")
     if isinstance(payload, (bytes, bytearray)):
-        return Response(content=payload, status_code=status, media_type=content_type, headers=headers)
+        return Response(
+            content=payload, status_code=status, media_type=content_type, headers=headers
+        )
     return StreamingResponse(payload, status_code=status, media_type=content_type, headers=headers)

@@ -7,13 +7,13 @@ read-mostly and TTL-bounded, so no cross-replica invalidation is needed.
 
 import asyncio
 import logging
-import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import orjson
 
 from core import metrics
+from core.bounded_cache import BoundedCache
 from core.db_pool import get_connection
 
 logger = logging.getLogger("crimson.cache")
@@ -24,7 +24,7 @@ _LOCAL_TTL = 300
 # Keys include per-title and per-search values, so the dict needs a ceiling.
 _LOCAL_MAX = 5000
 
-_local: Dict[str, Tuple[float, object]] = {}
+_local = BoundedCache(_LOCAL_MAX)
 
 
 def _utcnow_iso() -> str:
@@ -35,27 +35,17 @@ def _utcnow_iso() -> str:
 
 def local_get(key: str):
     # Counted without the key as a label, which would be unbounded cardinality.
-    hit = _local.get(key)
-    if hit is None or hit[0] < time.monotonic():
-        _local.pop(key, None)
-        metrics.record_cache_lookup("l1", False)
-        return None
-    metrics.record_cache_lookup("l1", True)
-    return hit[1]
+    value = _local.get(key)
+    metrics.record_cache_lookup("l1", value is not None)
+    return value
 
 
 def local_set(key: str, value: object, ttl: int = _LOCAL_TTL) -> None:
-    if len(_local) >= _LOCAL_MAX and key not in _local:
-        now = time.monotonic()
-        for stale in [k for k, (expiry, _) in _local.items() if expiry < now]:
-            del _local[stale]
-        if len(_local) >= _LOCAL_MAX:
-            _local.clear()
-    _local[key] = (time.monotonic() + ttl, value)
+    _local.set(key, value, ttl)
 
 
 def local_pop(key: str) -> None:
-    _local.pop(key, None)
+    _local.pop(key)
 
 
 def _read(cache_key: str) -> Optional[Dict]:
@@ -91,11 +81,13 @@ async def get_cached_response(cache_key: str) -> Optional[Dict]:
     return row
 
 
-async def set_cached_response(cache_key: str, data: Dict, ttl_seconds: int = CACHE_TTL) -> None:
+async def set_cached_response(cache_key: str, data: object, ttl_seconds: int = CACHE_TTL) -> None:
     """Upsert an L2 entry. A no-op on empty data."""
     if not data:
         return
-    expires_at = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl_seconds)).isoformat()
+    expires_at = (
+        datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl_seconds)
+    ).isoformat()
     try:
         await asyncio.to_thread(_write, cache_key, orjson.dumps(data).decode("utf-8"), expires_at)
     except Exception as e:
@@ -112,7 +104,9 @@ def _stale_key(cache_key: str) -> str:
     return f"stale:{cache_key}"
 
 
-async def set_cached_response_shadowed(cache_key: str, data: Dict, ttl_seconds: int = CACHE_TTL) -> None:
+async def set_cached_response_shadowed(
+    cache_key: str, data: object, ttl_seconds: int = CACHE_TTL
+) -> None:
     """Write the fresh entry and its shadow. A no-op on empty data, so a failed
     fetch never overwrites a good shadow with nothing."""
     if not data:
@@ -128,6 +122,7 @@ async def get_stale_response(cache_key: str) -> Optional[Dict]:
 def purge_expired_cache() -> int:
     """Consume-on-read never deletes rows, and every unique search writes one."""
     with get_connection() as conn:
-        return conn.execute(
-            "DELETE FROM api_cache WHERE expires_at < %s", (_utcnow_iso(),)
-        ).rowcount or 0
+        return (
+            conn.execute("DELETE FROM api_cache WHERE expires_at < %s", (_utcnow_iso(),)).rowcount
+            or 0
+        )

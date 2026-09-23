@@ -77,29 +77,49 @@ async def player(
 def _signed_stream(fetch):
     async def _route(request: Request):
         q = request.query_params
-        return proxy_response(*await _relay(
-            fetch, url=q.get("u"), sig=q.get("s"), range_header=request.headers.get("range"),
-        ))
+        return proxy_response(
+            *await _relay(
+                fetch,
+                url=q.get("u"),
+                sig=q.get("s"),
+                range_header=request.headers.get("range"),
+            )
+        )
+
     return _route
 
 
 def _signed_stream_with_headers(fetch):
     async def _route(request: Request):
         q = request.query_params
-        return proxy_response(*await _relay(
-            fetch, url=q.get("u"), origin=q.get("o"), referer=q.get("r"), sig=q.get("s"),
-            range_header=request.headers.get("range"),
-        ))
+        return proxy_response(
+            *await _relay(
+                fetch,
+                url=q.get("u"),
+                origin=q.get("o"),
+                referer=q.get("r"),
+                sig=q.get("s"),
+                range_header=request.headers.get("range"),
+            )
+        )
+
     return _route
 
 
 def _reverse_proxy(fetch):
     async def _route(request: Request, host: str, path: str):
-        return proxy_response(*await _relay(
-            fetch, host=host, path=path, query_string=request.url.query, method=request.method,
-            body=await request.body() if request.method == "POST" else None,
-            range_header=request.headers.get("range"),
-        ))
+        return proxy_response(
+            *await _relay(
+                fetch,
+                host=host,
+                path=path,
+                query_string=request.url.query,
+                method=request.method,
+                body=await request.body() if request.method == "POST" else None,
+                range_header=request.headers.get("range"),
+            )
+        )
+
     return _route
 
 
@@ -122,7 +142,11 @@ def register_overlay_proxies(app: FastAPI) -> tuple:
             continue
         name = module.__name__.rsplit(".", 1)[1]
         app.add_api_route(
-            f"/{name}_proxy{suffix}", route, methods=methods, name=f"{name}_proxy", include_in_schema=False,
+            f"/{name}_proxy{suffix}",
+            route,
+            methods=methods,
+            name=f"{name}_proxy",
+            include_in_schema=False,
         )
         prefixes.append(f"/{name}_proxy")
     if prefixes:

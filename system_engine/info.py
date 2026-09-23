@@ -45,7 +45,9 @@ def _database_state() -> Dict:
         "cache_targets": len(cache_store.enabled_targets()),
         "local_total": len(sources),
         "local_enabled": sum(1 for s in sources if s.get("enabled")),
-        "download_sources": sum(1 for s in sources if s.get("download_enabled") and s.get("enabled")),
+        "download_sources": sum(
+            1 for s in sources if s.get("download_enabled") and s.get("enabled")
+        ),
         "download_stats": download_store.stats(),
         # Live, unlike /health's boot snapshot: `pending` is a file in this image
         # not recorded here, `drift` an applied migration edited afterwards.
@@ -101,7 +103,15 @@ async def snapshot() -> Dict:
         },
         "db_pool": db["pool"],
         "schema": db["schema"],
-        "cache": {"enabled": db["cache_enabled"], "targets_enabled": db["cache_targets"], **db["cache_stats"]},
+        "cache": {
+            "enabled": db["cache_enabled"],
+            "targets_enabled": db["cache_targets"],
+            **db["cache_stats"],
+        },
         "local_sources": {"total": db["local_total"], "enabled": db["local_enabled"]},
-        "downloads": {"aria2_available": aria2_ok, "enabled_sources": db["download_sources"], **db["download_stats"]},
+        "downloads": {
+            "aria2_available": aria2_ok,
+            "enabled_sources": db["download_sources"],
+            **db["download_stats"],
+        },
     }

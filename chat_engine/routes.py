@@ -36,14 +36,21 @@ async def chat_status(user: dict = Depends(require_user)):
 
 @router.get("/conversations")
 async def list_conversations(user: dict = Depends(require_chat_user)):
-    return {"success": True, "conversations": await asyncio.to_thread(store.list_conversations, user["user_id"])}
+    return {
+        "success": True,
+        "conversations": await asyncio.to_thread(store.list_conversations, user["user_id"]),
+    }
 
 
 @router.get("/conversations/{conversation_id}")
 async def get_conversation(conversation_id: int, user: dict = Depends(require_chat_user)):
     rows = await asyncio.to_thread(store.history, conversation_id, user["user_id"], 100)
     messages = [
-        {"role": r["role"], "content": r["content"], "actions": json.loads(r["actions"]) if r.get("actions") else []}
+        {
+            "role": r["role"],
+            "content": r["content"],
+            "actions": json.loads(r["actions"]) if r.get("actions") else [],
+        }
         for r in rows
     ]
     return {"success": True, "conversation_id": conversation_id, "messages": messages}
@@ -72,13 +79,18 @@ def _open_conversation(user: dict, requested_id):
 @router.post("")
 @limiter.limit("20/minute")
 async def chat(request: Request, body: ChatRequest, user: dict = Depends(require_chat_user)):
-    settings, conversation_id = await asyncio.to_thread(_open_conversation, user, body.conversation_id)
+    settings, conversation_id = await asyncio.to_thread(
+        _open_conversation, user, body.conversation_id
+    )
 
     async def _lines():
-        async for event in conversation.reply(user, settings, conversation_id, body.message.strip()):
+        async for event in conversation.reply(
+            user, settings, conversation_id, body.message.strip()
+        ):
             yield conversation.ndjson_line(event)
 
     return StreamingResponse(
-        _lines(), media_type="application/x-ndjson",
+        _lines(),
+        media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )

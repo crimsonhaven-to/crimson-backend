@@ -44,9 +44,13 @@ async def require_chat_user(user: dict = Depends(require_user)) -> dict:
     if not state["settings"]["enabled"]:
         raise HTTPException(status_code=403, detail="Lumi is not currently awake.")
     if not state["key_present"]:
-        raise HTTPException(status_code=503, detail="Lumi has no oracle configured. Tell the operator.")
+        raise HTTPException(
+            status_code=503, detail="Lumi has no oracle configured. Tell the operator."
+        )
     if not state["granted"]:
-        raise HTTPException(status_code=403, detail="You have not been granted an audience with Lumi.")
+        raise HTTPException(
+            status_code=403, detail="You have not been granted an audience with Lumi."
+        )
     return user
 
 

@@ -1,46 +1,32 @@
 """
 Anthropic and Gemini behind one streaming, tool-calling interface.
 
-The rest of the engine speaks one neutral message format and never learns which
-vendor answered. That is what makes the provider an operator dropdown rather than
-a redeploy.
+The rest of the engine speaks one neutral message format, which is what makes
+the provider an operator dropdown rather than a redeploy. Anthropic goes through
+its SDK; Gemini through plain httpx, since one POST with an SSE body does not
+justify a second heavy SDK in a pinned image.
 
-Anthropic goes through the official SDK, which handles retries, streaming state
-and typed errors. Gemini goes through plain httpx against the REST endpoint,
-because the surface needed here is one POST with an SSE body and the alternative
-is a second heavy SDK in a deliberately pinned image.
+Both paths are async generators, because a callback cannot yield out of the
+caller's frame and would buffer the whole reply. Text arrives as ``text`` events;
+tool calls arrive whole on the terminal ``turn`` event.
 
-Both paths are async generators rather than callback-driven: a callback cannot
-yield out of the caller's frame, so it would buffer the whole reply and hand it
-over at the end, which is precisely the streaming this feature exists to provide.
-Text arrives as ``text`` events; tool calls are collected and delivered whole on
-the terminal ``turn`` event, since a half-decoded argument object helps nobody.
-
-Thought signatures
-------------------
-Gemini 3 stamps an opaque ``thoughtSignature`` on the part its reasoning produced
-and rejects the next request with a 400 if that part returns without it. Tool use
-is where this bites: the first call succeeds, then the second leg of the loop
-replays the turn as history and fails, so the feature looks broken only once a
-tool is involved. The value therefore rides the neutral format and is echoed back
-verbatim. It is provider bookkeeping; nothing else may read it.
-
-Signatures live only as long as the request that minted them, so history reloaded
-from the database has none. That is fine: the requirement applies to a turn
-replayed inside one tool loop, and Anthropic has no equivalent concept.
+Gemini 3 stamps an opaque ``thoughtSignature`` on parts and answers 400 when a
+replayed part comes back without it, which breaks the second leg of every tool
+loop. It rides the neutral format and is echoed verbatim; nothing else may read
+it. History reloaded from the database has none, which is fine: the requirement
+only covers a turn replayed inside one tool loop.
 
 Prompt caching is requested on the Anthropic path by marking the last system
-block. The persona plus tool schemas come to roughly 1.8k tokens, clearing the
-minimum on every model but Haiku 4.5, where the marker is accepted and silently
-does nothing. Gemini's implicit caching needs no flag. This is why
-``SYSTEM_PROMPT`` is frozen: a timestamp there would turn every cache read into a
-cache write.
+block; Gemini caches implicitly. This is why ``SYSTEM_PROMPT`` is frozen: a
+timestamp there would turn every cache read into a cache write.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -52,9 +38,6 @@ from .models import ANTHROPIC, GEMINI, ChatModel
 try:
     import anthropic
 except ImportError:  # pragma: no cover - only on a stripped build
-    # Rebinding a module name to None is the pattern an optional import needs and
-    # the one thing mypy cannot express, so it is silenced rather than worked
-    # around with a second sentinel name.
     anthropic = None  # type: ignore[assignment]
 
 logger = logging.getLogger("crimson.chat.providers")
@@ -67,79 +50,44 @@ MAX_OUTPUT_TOKENS = 2048
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 
-# Events yielded by the streaming generators:
-#   {"type": "text", "text": str}   incremental reply text
-#   {"type": "turn", "turn": Turn}  terminal, once, with tool calls and usage
-Event = Dict
-
 
 class ProviderError(RuntimeError):
     """A provider call failed in a way the viewer should be told about."""
 
 
+@dataclass(slots=True)
 class ToolCall:
-    """One requested tool invocation.
+    """One requested tool invocation. ``signature`` is Gemini's thought signature
+    (see the module docstring); Anthropic leaves it None."""
 
-    ``signature`` is opaque provider bookkeeping, echoed back verbatim when this
-    call is replayed as history. Gemini 3 hard-errors with a 400 if the follow-up
-    request has dropped it, which fails every tool-using conversation on the
-    second leg of the loop. Anthropic leaves it None, and nothing outside the
-    provider that minted it may interpret the value.
-    """
-
-    __slots__ = ("call_id", "name", "args", "signature")
-
-    def __init__(
-        self, call_id: str, name: str, args: Dict, signature: Optional[str] = None
-    ):
-        self.call_id = call_id
-        self.name = name
-        self.args = args or {}
-        self.signature = signature
+    call_id: str
+    name: str
+    args: Dict
+    signature: Optional[str] = None
 
 
+@dataclass(slots=True)
 class Usage:
-    __slots__ = ("input_tokens", "output_tokens", "cached_tokens")
-
-    def __init__(self, input_tokens: int = 0, output_tokens: int = 0, cached_tokens: int = 0):
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-        self.cached_tokens = cached_tokens
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
 
 
+@dataclass(slots=True)
 class Turn:
-    """One round trip: what it said, what it wants to call, what it cost."""
+    """One round trip. ``signature`` is the one Gemini put on the reply text."""
 
-    __slots__ = ("text", "tool_calls", "usage", "signature")
-
-    def __init__(
-        self,
-        text: str,
-        tool_calls: List[ToolCall],
-        usage: Usage,
-        signature: Optional[str] = None,
-    ):
-        self.text = text
-        self.tool_calls = tool_calls
-        self.usage = usage
-        # Arrived on a text part rather than a functionCall one. Same contract as
-        # ToolCall.signature.
-        self.signature = signature
-
-    @property
-    def wants_tools(self) -> bool:
-        return bool(self.tool_calls)
+    text: str
+    tool_calls: List[ToolCall] = field(default_factory=list)
+    usage: Usage = field(default_factory=Usage)
+    signature: Optional[str] = None
 
 
-# --- neutral message format -------------------------------------------------
 # A conversation is a list of these dicts:
 #   {"role": "user",      "text": str}
-#   {"role": "assistant", "text": str, "tool_calls": [ToolCall]}
+#   {"role": "assistant", "text": str, "tool_calls": [ToolCall], "signature": str | None}
 #   {"role": "tool",      "call_id": str, "name": str, "result": dict}
-Msg = Dict
-
-
-def user_msg(text: str) -> Msg:
+def user_msg(text: str) -> Dict:
     return {"role": "user", "text": text}
 
 
@@ -147,7 +95,7 @@ def assistant_msg(
     text: str,
     tool_calls: Optional[List[ToolCall]] = None,
     signature: Optional[str] = None,
-) -> Msg:
+) -> Dict:
     return {
         "role": "assistant",
         "text": text,
@@ -156,12 +104,11 @@ def assistant_msg(
     }
 
 
-def tool_msg(call: ToolCall, result: Dict) -> Msg:
+def tool_msg(call: ToolCall, result: Dict) -> Dict:
     return {"role": "tool", "call_id": call.call_id, "name": call.name, "result": result}
 
 
-# --- Anthropic --------------------------------------------------------------
-def _anthropic_messages(messages: List[Msg]) -> List[Dict]:
+def _anthropic_messages(messages: List[Dict]) -> List[Dict]:
     """Neutral history to Anthropic content blocks.
 
     Tool results must be batched: several blocks from one assistant turn have to
@@ -211,20 +158,26 @@ def _anthropic_messages(messages: List[Msg]) -> List[Dict]:
     return out
 
 
+@lru_cache(maxsize=2)
+def _anthropic_client(api_key: str):
+    # One client per key keeps its connection pool warm across turns.
+    return anthropic.AsyncAnthropic(api_key=api_key)
+
+
 async def _anthropic_stream(
     *,
     api_key: str,
     model: ChatModel,
     system: str,
-    messages: List[Msg],
+    messages: List[Dict],
     tools: List[Dict],
-) -> AsyncIterator[Event]:
+) -> AsyncIterator[Dict]:
     if anthropic is None:
         raise ProviderError(
             "This build has no Anthropic client installed. Switch provider to "
             "Gemini, or install the anthropic package."
         )
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    client = _anthropic_client(api_key)
 
     request: Dict = {
         "model": model.model_id,
@@ -268,7 +221,7 @@ async def _anthropic_stream(
         raise ProviderError("I could not reach my oracle. Try again shortly.") from exc
 
     calls = [
-        ToolCall(block.id, block.name, block.input)
+        ToolCall(block.id, block.name, block.input or {})
         for block in final.content
         if block.type == "tool_use"
     ]
@@ -293,7 +246,6 @@ def _friendly_error(status: int) -> str:
     return "That request displeased the oracle. Try phrasing it differently."
 
 
-# --- Gemini -----------------------------------------------------------------
 # Function declarations take an OpenAPI schema whose `type` is a proto enum, so
 # those values must be upper case. The rest of the subset carries over unchanged.
 def _gemini_schema(node):
@@ -310,7 +262,7 @@ def _gemini_schema(node):
     return node
 
 
-def _gemini_contents(messages: List[Msg]) -> List[Dict]:
+def _gemini_contents(messages: List[Dict]) -> List[Dict]:
     """Neutral history to Gemini ``contents``.
 
     Gemini calls the assistant role "model" and carries tool results as a
@@ -368,9 +320,9 @@ async def _gemini_stream(
     api_key: str,
     model: ChatModel,
     system: str,
-    messages: List[Msg],
+    messages: List[Dict],
     tools: List[Dict],
-) -> AsyncIterator[Event]:
+) -> AsyncIterator[Dict]:
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": _gemini_contents(messages),
@@ -465,7 +417,6 @@ async def _gemini_stream(
     }
 
 
-# --- entry point ------------------------------------------------------------
 async def stream_turn(
     *,
     provider: str,
@@ -474,9 +425,9 @@ async def stream_turn(
     api_key: Optional[str],
     model: ChatModel,
     system: str,
-    messages: List[Msg],
+    messages: List[Dict],
     tools: List[Dict],
-) -> AsyncIterator[Event]:
+) -> AsyncIterator[Dict]:
     """One round trip to whichever provider the operator selected.
 
     Yields ``text`` events as they arrive and exactly one terminal ``turn``.

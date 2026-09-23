@@ -13,7 +13,13 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 
 from . import transcode
-from .fs import art_media_type_for, media_type_for, safe_resolve, safe_resolve_art, safe_resolve_transcode
+from .fs import (
+    art_media_type_for,
+    media_type_for,
+    safe_resolve,
+    safe_resolve_art,
+    safe_resolve_transcode,
+)
 
 logger = logging.getLogger("crimson.local.media")
 
@@ -43,7 +49,10 @@ async def local_hls(token: str, resource: str):
         raise HTTPException(status_code=422, detail="Could not probe media")
 
     if resource in _PLAYLISTS:
-        return Response(content=transcode.build_media_playlist(duration), media_type="application/vnd.apple.mpegurl")
+        return Response(
+            content=transcode.build_media_playlist(duration),
+            media_type="application/vnd.apple.mpegurl",
+        )
 
     if not (resource.startswith("seg") and resource.endswith(".ts")):
         raise HTTPException(status_code=404, detail="Not found")

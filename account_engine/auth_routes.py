@@ -42,9 +42,11 @@ def auth_challenge(request: Request, body: ChallengeRequest):
 def auth_register(request: Request, body: RegisterRequest):
     """Create the account for a public key. 409 if it exists, 403 on a bad invite."""
     pk = auth.normalize_public_key(body.public_key)
-    return AuthResponse(**auth.register_mnemonic(
-        pk, body.challenge, body.signature, body.invite_code, body.label, request
-    ))
+    return AuthResponse(
+        **auth.register_mnemonic(
+            pk, body.challenge, body.signature, body.invite_code, body.label, request
+        )
+    )
 
 
 @router.post("/auth/login", response_model=AuthResponse)
@@ -86,7 +88,10 @@ async def email_verify(request: Request, body: EmailTokenRequest):
 async def email_resend(request: Request, body: EmailOnlyRequest):
     """Always reports success, so it is no account-existence oracle."""
     await run_in_threadpool(auth.resend_verification, body.email, request)
-    return {"success": True, "message": "If that account exists and is unverified, a new link is on its way."}
+    return {
+        "success": True,
+        "message": "If that account exists and is unverified, a new link is on its way.",
+    }
 
 
 @router.post("/auth/email/forgot")

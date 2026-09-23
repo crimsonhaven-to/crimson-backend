@@ -24,8 +24,14 @@ from scrapers import ALL_SCRAPERS
 logger = logging.getLogger("crimson.pipeline")
 
 
-async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episode_num: int,
-                             anilist_data: Dict, media_type: str = "tv") -> List:
+async def run_single_scraper(
+    scraper_class,
+    tmdb_id: int,
+    season_num: int,
+    episode_num: int,
+    anilist_data: Dict,
+    media_type: str = "tv",
+) -> List:
     """One scraper's embeds for an episode. Episode-only sources are skipped for
     a movie, so they never build a bogus season 1 episode 1 URL for a film."""
     if media_type == "movie" and not getattr(scraper_class, "SUPPORTS_MOVIES", False):
@@ -36,7 +42,12 @@ async def run_single_scraper(scraper_class, tmdb_id: int, season_num: int, episo
     started = time.monotonic()
     outcome = "error"
     try:
-        media_ctx = {"tmdb_id": tmdb_id, "tmdb_season": season_num, "media_type": media_type, **anilist_data}
+        media_ctx = {
+            "tmdb_id": tmdb_id,
+            "tmdb_season": season_num,
+            "media_type": media_type,
+            **anilist_data,
+        }
         slug = await scraper.search_anime(media_ctx)
         if not slug:
             outcome = "empty"
@@ -67,7 +78,11 @@ def _stream(item: Dict, default_source: str, base_url: str) -> Dict:
         kind = "iframe"
     else:
         kind = item.get("type") or ("hls" if "m3u8" in url.lower() else "mp4")
-    stream = {"source": item.get("source") or default_source, "type": kind, "url": _absolute(url, base_url)}
+    stream = {
+        "source": item.get("source") or default_source,
+        "type": kind,
+        "url": _absolute(url, base_url),
+    }
     subtitles = [
         {**s, "url": _absolute(s["url"], base_url)} if isinstance(s.get("url"), str) else s
         for s in item.get("subtitles") or []
@@ -90,7 +105,9 @@ def _as_items(resolved) -> List[Dict]:
     return [{"url": resolved}] if resolved else []
 
 
-async def resolve_streams(embed_urls: List[str], base_url: str = "", language: Optional[str] = None) -> List[Dict]:
+async def resolve_streams(
+    embed_urls: List[str], base_url: str = "", language: Optional[str] = None
+) -> List[Dict]:
     """Resolve embeds to streams. ``language`` is the dub or sub label a scraper
     knew for these embeds, stamped on every stream they produce."""
     resolvers = [cls() for cls in ALL_RESOLVERS]
@@ -110,14 +127,22 @@ async def resolve_streams(embed_urls: List[str], base_url: str = "", language: O
             metrics.record_resolve(resolver.source_name, "error", time.monotonic() - started)
             logger.error(f"Resolver error for {resolver.source_name}: {e}")
             continue
-        metrics.record_resolve(resolver.source_name, "ok" if resolved else "empty", time.monotonic() - started)
+        metrics.record_resolve(
+            resolver.source_name, "ok" if resolved else "empty", time.monotonic() - started
+        )
 
         items = _as_items(resolved)
         if not items and not isinstance(resolved, list):
             # For marker-based sources the embed is a routing token, not a page,
             # and iframing it would show an empty frame.
             if embed_url.lower().startswith(("http://", "https://")):
-                streams.append({"source": f"{resolver.source_name} (Embed)", "type": "iframe", "url": embed_url})
+                streams.append(
+                    {
+                        "source": f"{resolver.source_name} (Embed)",
+                        "type": "iframe",
+                        "url": embed_url,
+                    }
+                )
             continue
         streams.extend(_stream(item, resolver.source_name, base_url) for item in items)
 
@@ -149,8 +174,9 @@ async def add_localized_titles(media_ctx: Dict, tmdb_id: int) -> None:
     media_ctx["synonyms"] = existing + [t for t in german or [] if t not in existing]
 
 
-async def fan_out(media_ctx: Dict, tmdb_id: int, season_number, episode_number,
-                  base_url: str, media_type: str) -> AsyncIterator[Dict]:
+async def fan_out(
+    media_ctx: Dict, tmdb_id: int, season_number, episode_number, base_url: str, media_type: str
+) -> AsyncIterator[Dict]:
     """Yield each distinct stream the moment its scraper and resolver finish, so
     a slow source never holds back a fast one. Closing the iterator cancels the
     remaining scrapers."""
@@ -161,15 +187,26 @@ async def fan_out(media_ctx: Dict, tmdb_id: int, season_number, episode_number,
     async def _work(scraper_class):
         try:
             embeds = await run_single_scraper(
-                scraper_class, tmdb_id, season_number, episode_number, media_ctx, media_type=media_type,
+                scraper_class,
+                tmdb_id,
+                season_number,
+                episode_number,
+                media_ctx,
+                media_type=media_type,
             )
             for embed in embeds:
                 # A bare URL, or a dict when the scraper knows the dub or sub.
-                embed_url, language = (embed.get("url"), embed.get("language")) if isinstance(embed, dict) else (embed, None)
+                embed_url, language = (
+                    (embed.get("url"), embed.get("language"))
+                    if isinstance(embed, dict)
+                    else (embed, None)
+                )
                 if not embed_url or embed_url in seen_embeds:
                     continue
                 seen_embeds.add(embed_url)
-                for stream in await resolve_streams([embed_url], base_url=base_url, language=language):
+                for stream in await resolve_streams(
+                    [embed_url], base_url=base_url, language=language
+                ):
                     if stream["url"] not in seen_urls:
                         seen_urls.add(stream["url"])
                         await queue.put(stream)
@@ -192,9 +229,15 @@ async def fan_out(media_ctx: Dict, tmdb_id: int, season_number, episode_number,
             worker.cancel()
 
 
-async def watch_events(tmdb_id: int, season_number, episode_number, anilist_id: Optional[int],
-                       fallback_title: Optional[str] = None, base_url: str = "",
-                       media_type: str = "tv") -> AsyncIterator[Dict]:
+async def watch_events(
+    tmdb_id: int,
+    season_number,
+    episode_number,
+    anilist_id: Optional[int],
+    fallback_title: Optional[str] = None,
+    base_url: str = "",
+    media_type: str = "tv",
+) -> AsyncIterator[Dict]:
     """The /watch contract as dicts: ``meta`` at once, ``unaired`` for an episode
     not out yet, one ``stream`` per source as it lands, then ``done``.
 
@@ -204,18 +247,25 @@ async def watch_events(tmdb_id: int, season_number, episode_number, anilist_id: 
     started = time.monotonic()
     media_ctx = await anilist_context(anilist_id, fallback_title)
     yield build_meta_line(
-        tmdb_id=tmdb_id, season_number=season_number, episode_number=episode_number,
-        anilist_id=anilist_id, title=media_ctx["title"],
+        tmdb_id=tmdb_id,
+        season_number=season_number,
+        episode_number=episode_number,
+        anilist_id=anilist_id,
+        title=media_ctx["title"],
     )
 
     if media_type != "movie":
         # Extras are not in the numbered-season list, so they carry no air date.
-        air_date = ((await season_episode_info(tmdb_id, season_number)).get("air_dates") or {}).get(episode_number)
+        air_date = ((await season_episode_info(tmdb_id, season_number)).get("air_dates") or {}).get(
+            episode_number
+        )
         if is_future_air_date(air_date):
             metrics.record_watch(media_type, "unaired", 0, time.monotonic() - started)
             yield build_unaired_line(
-                air_date=air_date, title=media_ctx["title"],
-                season_number=season_number, episode_number=episode_number,
+                air_date=air_date,
+                title=media_ctx["title"],
+                season_number=season_number,
+                episode_number=episode_number,
             )
             yield build_done_line(0)
             return
@@ -226,7 +276,9 @@ async def watch_events(tmdb_id: int, season_number, episode_number, anilist_id: 
     first_stream: Optional[float] = None
     finished = False
     try:
-        async for stream in fan_out(media_ctx, tmdb_id, season_number, episode_number, base_url, media_type):
+        async for stream in fan_out(
+            media_ctx, tmdb_id, season_number, episode_number, base_url, media_type
+        ):
             # Caching on resolve would cache whichever source was fastest, so the
             # stream carries a signed ticket the player redeems after about ten
             # seconds of playback instead.
@@ -244,10 +296,18 @@ async def watch_events(tmdb_id: int, season_number, episode_number, anilist_id: 
             yield build_stream_line(stream)
         # Recorded before the done line, so a consumer that leaves at the very end
         # still leaves an accurate sample.
-        metrics.record_watch(media_type, "streams" if count else "empty", count, time.monotonic() - started, first_stream)
+        metrics.record_watch(
+            media_type,
+            "streams" if count else "empty",
+            count,
+            time.monotonic() - started,
+            first_stream,
+        )
         finished = True
         yield build_done_line(count)
     finally:
         if not finished:
             # Left before the fan-out finished: abandonment, never failure.
-            metrics.record_watch(media_type, "abandoned", count, time.monotonic() - started, first_stream)
+            metrics.record_watch(
+                media_type, "abandoned", count, time.monotonic() - started, first_stream
+            )

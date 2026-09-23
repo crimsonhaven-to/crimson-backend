@@ -17,7 +17,9 @@ router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(requir
 
 
 class ApiKeyCreate(BaseModel):
-    label: Optional[str] = Field(None, max_length=100, description="A note to identify this key, e.g. 'movie-web prod'")
+    label: Optional[str] = Field(
+        None, max_length=100, description="A note to identify this key, e.g. 'movie-web prod'"
+    )
 
 
 @router.get("/api-keys")

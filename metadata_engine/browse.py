@@ -86,7 +86,13 @@ async def _catalogue(
         bodies = local_get(body_key)
         if bodies is None:
             bodies = json_response.encode(
-                {"success": True, "count": len(items), "total": len(items), **derived, list_key: items}
+                {
+                    "success": True,
+                    "count": len(items),
+                    "total": len(items),
+                    **derived,
+                    list_key: items,
+                }
             )
             local_set(body_key, bodies)
         return bodies
@@ -104,22 +110,31 @@ async def anime_catalogue(category: Optional[str], genre: Optional[str]):
     """The full mapped anime archive. The facets describe the whole catalogue so
     every tab and chip renders; ``animes`` honours the filters."""
     return await _catalogue(
-        ANIME_CACHE_KEY, catalogue.get_catalogue_items, "animes", genre, category, with_categories=True
+        ANIME_CACHE_KEY,
+        catalogue.get_catalogue_items,
+        "animes",
+        genre,
+        category,
+        with_categories=True,
     )
 
 
 async def shows_catalogue(genre: Optional[str]):
-    return await _catalogue("catalogue:shows:v1", catalogue.get_shows_catalogue_items, "shows", genre)
+    return await _catalogue(
+        "catalogue:shows:v1", catalogue.get_shows_catalogue_items, "shows", genre
+    )
 
 
 async def movies_catalogue(genre: Optional[str]):
-    return await _catalogue("catalogue:movies:v1", catalogue.get_movies_catalogue_items, "movies", genre)
+    return await _catalogue(
+        "catalogue:movies:v1", catalogue.get_movies_catalogue_items, "movies", genre
+    )
 
 
 # --- local fallback for the anime hub ---------------------------------------------
 def _year(item: Dict) -> int:
-    year = item.get("year")
-    return int(year) if str(year or "").isdigit() else 0
+    year = str(item.get("year") or "")
+    return int(year) if year.isdigit() else 0
 
 
 def order_local_anime(items: List[Dict], sort: str) -> List[Dict]:
@@ -129,7 +144,10 @@ def order_local_anime(items: List[Dict], sort: str) -> List[Dict]:
         return sorted(items, key=lambda it: (it.get("title") or "").lower())
     if sort == "newest":
         return sorted(items, key=lambda it: (-_year(it), (it.get("title") or "").lower()))
-    return sorted(items, key=lambda it: (0 if it.get("poster") else 1, -_year(it), (it.get("title") or "").lower()))
+    return sorted(
+        items,
+        key=lambda it: (0 if it.get("poster") else 1, -_year(it), (it.get("title") or "").lower()),
+    )
 
 
 async def local_anime_fallback(client, *, genre, sort, page, per_page=LOCAL_ANIME_PER_PAGE) -> Dict:
@@ -161,15 +179,21 @@ async def local_anime_fallback(client, *, genre, sort, page, per_page=LOCAL_ANIM
             if local:
                 head.append({**local, "poster": local.get("poster") or t.get("poster")})
             else:
-                head.append({
-                    "anilist_id": aid, "kind": "anime", "title": t.get("title"),
-                    "poster": t.get("poster"), "year": t.get("year"), "genres": [],
-                })
+                head.append(
+                    {
+                        "anilist_id": aid,
+                        "kind": "anime",
+                        "title": t.get("title"),
+                        "poster": t.get("poster"),
+                        "year": t.get("year"),
+                        "genres": [],
+                    }
+                )
         ordered = head + [it for it in ordered if it["anilist_id"] not in seen]
 
     start = (page - 1) * per_page
     return {
-        "items": ordered[start:start + per_page],
+        "items": ordered[start : start + per_page],
         "total": len(ordered),
         "page": page,
         "has_next": start + per_page < len(ordered),

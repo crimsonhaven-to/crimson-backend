@@ -36,7 +36,11 @@ async def trigger_resync(user: dict = Depends(require_admin)):
     """The same wholesale rebuild as ``metadata_engine.resync``, in the
     background. Poll /admin/resync/status."""
     if not forced_resync.start(admin_identity(user)):
-        return {"success": False, "message": "A resync is already running", "resync": forced_resync.state}
+        return {
+            "success": False,
+            "message": "A resync is already running",
+            "resync": forced_resync.state,
+        }
     return {"success": True, "message": "Resync started", "resync": forced_resync.state}
 
 
@@ -51,12 +55,24 @@ async def backfill_status():
 
 
 @router.post("/backfill")
-async def trigger_backfill(body: Optional[BackfillTrigger] = None, user: dict = Depends(require_admin)):
+async def trigger_backfill(
+    body: Optional[BackfillTrigger] = None, user: dict = Depends(require_admin)
+):
     """Queued in the database and claimed within about a minute by api-sync.
     A no-op while one is already queued or running."""
     pages = (body and body.pages) or get_settings().metadata_backfill_pages
-    row, created = await asyncio.to_thread(maintenance.request_backfill, pages, admin_identity(user))
+    row, created = await asyncio.to_thread(
+        maintenance.request_backfill, pages, admin_identity(user)
+    )
     payload = maintenance.job_status_payload(row)
     if not created:
-        return {"success": False, "message": "A backfill is already queued or running", "backfill": payload}
-    return {"success": True, "message": "Backfill queued; api-sync will start it shortly", "backfill": payload}
+        return {
+            "success": False,
+            "message": "A backfill is already queued or running",
+            "backfill": payload,
+        }
+    return {
+        "success": True,
+        "message": "Backfill queued; api-sync will start it shortly",
+        "backfill": payload,
+    }

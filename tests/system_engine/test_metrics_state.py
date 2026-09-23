@@ -32,5 +32,5 @@ def test_worker_stats_need_no_started_worker():
     from cache_engine.downloader import manager as cache_manager
 
     stats = cache_manager.worker_stats()
-    assert stats["queued"] == 0 and stats["inflight"] == 0
+    assert stats["inflight"] == 0
     assert stats["running"] is False

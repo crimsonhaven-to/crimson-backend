@@ -120,7 +120,6 @@ class Settings(BaseSettings):
     cache_internal_base: str = "http://127.0.0.1:8000"
     cache_max_concurrent: int = Field(1, ge=1)
     cache_download_timeout: int = 3600
-    cache_queue_max: int = 200
     cache_poll_interval: int = Field(10, ge=2)
     cache_min_free_bytes: int = 2 * 1024**3
 
@@ -163,8 +162,12 @@ class Settings(BaseSettings):
         return value.strip() if isinstance(value, str) else value
 
     @field_validator(
-        "allowed_origins", "admin_emails", "signup_invite_code", "crimson_proxy_base",
-        "manga_languages", "manga_content_rating",
+        "allowed_origins",
+        "admin_emails",
+        "signup_invite_code",
+        "crimson_proxy_base",
+        "manga_languages",
+        "manga_content_rating",
         mode="before",
     )
     @classmethod

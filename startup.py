@@ -16,7 +16,7 @@ path, so an unreachable upstream never delays startup.
 
 import asyncio
 import logging
-from typing import Awaitable, Callable
+from typing import Any, Callable, Coroutine
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -80,8 +80,17 @@ async def shutdown(app: FastAPI, logger: logging.Logger) -> None:
 def _init_schema(logger: logging.Logger) -> None:
     """The init_db()s own the baseline schema, so they run before the numbered
     migrations. All take the same advisory lock, so concurrent boots serialize."""
-    for store in (mapping, account_store, audit, apikey_store, supporters_store,
-                  local_store, cache_store, download_store, telemetry_store):
+    for store in (
+        mapping,
+        account_store,
+        audit,
+        apikey_store,
+        supporters_store,
+        local_store,
+        cache_store,
+        download_store,
+        telemetry_store,
+    ):
         store.init_db()
     # Loud in the log and on /health, but a bookkeeping failure must not become a
     # boot loop across every replica.
@@ -123,6 +132,7 @@ async def _start_workers(logger: logging.Logger) -> None:
 def _logged(logger: logging.Logger, label: str, job: Callable[[], object]) -> Callable[[], None]:
     """A job that logs its failure instead of killing the scheduler thread, and
     logs its result when there is one worth reporting."""
+
     def _run():
         try:
             result = job()
@@ -130,14 +140,15 @@ def _logged(logger: logging.Logger, label: str, job: Callable[[], object]) -> Ca
                 logger.info(f"{label}: {result}")
         except Exception as e:
             logger.error(f"{label} failed: {e}")
+
     return _run
 
 
-def _on_own_loop(coro_fn: Callable[[], Awaitable]) -> Callable[[], object]:
+def _on_own_loop(coro_fn: Callable[[], Coroutine[Any, Any, Any]]) -> Callable[[], object]:
     return lambda: asyncio.run(coro_fn())
 
 
-def _warm(logger: logging.Logger, label: str, coro_fn: Callable[[], Awaitable]) -> None:
+def _warm(logger: logging.Logger, label: str, coro_fn: Callable[[], Coroutine[Any, Any, Any]]) -> None:
     async def _run():
         try:
             result = await coro_fn()
@@ -145,6 +156,7 @@ def _warm(logger: logging.Logger, label: str, coro_fn: Callable[[], Awaitable]) 
             logger.info(f"{label} warmed{detail}")
         except Exception as e:
             logger.error(f"{label} warm-up failed (will retry on schedule): {e}")
+
     spawn(_run())
 
 
@@ -153,10 +165,20 @@ def _start_scheduler(logger: logging.Logger) -> BackgroundScheduler:
     scheduler = BackgroundScheduler()
 
     def every(job_id: str, label: str, job, **interval) -> None:
-        scheduler.add_job(_logged(logger, label, job), IntervalTrigger(**interval), id=job_id, replace_existing=True)
+        scheduler.add_job(
+            _logged(logger, label, job),
+            IntervalTrigger(**interval),
+            id=job_id,
+            replace_existing=True,
+        )
 
     def nightly(job_id: str, label: str, job, hour: int) -> None:
-        scheduler.add_job(_logged(logger, label, job), CronTrigger(hour=hour, minute=0), id=job_id, replace_existing=True)
+        scheduler.add_job(
+            _logged(logger, label, job),
+            CronTrigger(hour=hour, minute=0),
+            id=job_id,
+            replace_existing=True,
+        )
 
     _every_replica(every)
     _cached_services(logger, every)
@@ -203,7 +225,12 @@ def _cached_services(logger, every) -> None:
     # Lets proxy_url route only to hosts that are up: failover between deploys.
     if _crimson_proxy.is_enabled():
         _warm(logger, "Proxy health", _crimson_proxy.refresh_health)
-        every("proxy_health_job", "Proxy health refresh", _on_own_loop(_crimson_proxy.refresh_health), minutes=2)
+        every(
+            "proxy_health_job",
+            "Proxy health refresh",
+            _on_own_loop(_crimson_proxy.refresh_health),
+            minutes=2,
+        )
     else:
         logger.info("CRIMSON_PROXY_BASE not set, external CORS proxy disabled, /sign returns 503")
 
@@ -247,30 +274,55 @@ def _sync_replica(logger, every, nightly) -> None:
 
     if settings.demo_mode:
         # Signup is open, so all non-admin data is wiped nightly to bound growth.
-        nightly("demo_reset_job", "DEMO_MODE nightly reset", account_store.wipe_demo_data, settings.demo_reset_hour)
+        nightly(
+            "demo_reset_job",
+            "DEMO_MODE nightly reset",
+            account_store.wipe_demo_data,
+            settings.demo_reset_hour,
+        )
 
     spawn(_initial_sync(logger))
-    every("db_sync_job", "Scheduled mapping sync", _on_own_loop(mapping.sync_database_async), hours=24)
+    every(
+        "db_sync_job", "Scheduled mapping sync", _on_own_loop(mapping.sync_database_async), hours=24
+    )
     # Nothing upstream reports a TMDB change, so the tables are swept oldest-first.
-    nightly("metadata_nightly_refresh_job", "Nightly metadata refresh",
-            _on_own_loop(maintenance.refresh_daily_slice), settings.metadata_refresh_hour)
+    nightly(
+        "metadata_nightly_refresh_job",
+        "Nightly metadata refresh",
+        _on_own_loop(maintenance.refresh_daily_slice),
+        settings.metadata_refresh_hour,
+    )
     # A dashboard backfill arrives through a table, because a serving replica
     # cannot reach this portless container. APScheduler's default max_instances=1
     # keeps a long run from stacking ticks.
-    every("metadata_backfill_drain_job", "Backfill drain", _on_own_loop(maintenance.run_pending_backfill), minutes=1)
+    every(
+        "metadata_backfill_drain_job",
+        "Backfill drain",
+        _on_own_loop(maintenance.run_pending_backfill),
+        minutes=1,
+    )
     if settings.run_metadata_backfill:
         _warm(logger, "Startup metadata backfill", maintenance.backfill_catalogue)
 
     # A fresh deploy would otherwise show an empty calendar until the first tick.
     # Six-hourly: a slipped broadcast is the only thing that changes.
     _warm(logger, "Airing schedule", airing.refresh_schedule)
-    every("airing_refresh_job", "Airing schedule refresh", _on_own_loop(airing.refresh_schedule), hours=6)
+    every(
+        "airing_refresh_job",
+        "Airing schedule refresh",
+        _on_own_loop(airing.refresh_schedule),
+        hours=6,
+    )
 
     if not settings.airing_notify_enabled:
-        logger.info("AIRING_NOTIFY_ENABLED is off, the calendar and follows work but nobody is mailed")
+        logger.info(
+            "AIRING_NOTIFY_ENABLED is off, the calendar and follows work but nobody is mailed"
+        )
         return
     if settings.airing_notify_dry_run:
-        logger.warning("AIRING_NOTIFY_DRY_RUN is ON: notifications are claimed and logged, but nobody is mailed")
+        logger.warning(
+            "AIRING_NOTIFY_DRY_RUN is ON: notifications are claimed and logged, but nobody is mailed"
+        )
 
     def _notify():
         result = airing.send_due_notifications()
