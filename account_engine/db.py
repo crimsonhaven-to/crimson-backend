@@ -1,49 +1,41 @@
-"""
-Account storage (PostgreSQL): accounts, sessions, login challenges, favorites
-and watch progress. Shares the mapping tables' database (see db_pool), but a
-Fribb resync only touches the mapping tables, so user data survives it.
+"""Account storage: accounts, sessions, login challenges, email and invite
+tokens, favorites (watchlists) and watch progress.
 
-Identity model (see account_engine.ed25519): an account *is* an Ed25519 public
-key. Only the public key is stored, never the mnemonic or private key, and
-possession is proven per-login by signing a one-time challenge. Session tokens
-are stored as SHA-256 hashes so a DB leak can't be replayed.
+An account is either an Ed25519 public key (see ed25519.py) or an email with a
+password hash. Session and email tokens are stored as SHA-256 hashes so a
+database leak cannot be replayed. Timestamps are ISO-8601 TEXT in UTC, so the
+``expires_at`` comparisons in SQL are plain string comparisons.
 """
 
 import hashlib
 import json
+import logging
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Dict, List, Optional, Tuple
 
+from core.clock import utc_now, utc_now_iso
 from core.db_pool import get_connection, lock_schema_init
 
-# Lifetimes.
+logger = logging.getLogger(__name__)
+
 SESSION_TTL = timedelta(days=30)
 CHALLENGE_TTL = timedelta(minutes=5)
-VERIFY_TOKEN_TTL = timedelta(hours=24)   # email verification link
-RESET_TOKEN_TTL = timedelta(hours=1)     # password reset link
+VERIFY_TOKEN_TTL = timedelta(hours=24)
+RESET_TOKEN_TTL = timedelta(hours=1)
 
-# Soft per-account row caps: an account could otherwise insert unbounded
-# distinct item_keys. Updates to existing keys pass; only growth is capped.
+# Soft caps: without them an account could insert unbounded distinct item_keys.
+# Updates to existing keys always pass; only growth is capped.
 MAX_FAVORITES_PER_USER = 2000
 MAX_PROGRESS_PER_USER = 5000
 
-# How long a watch event is kept. Three years, so Wrapped can look back two full
-# years and still have the current one, and so the one table here designed to be
-# read years later is not also the one that grows forever.
+# Three years, so Wrapped can look back two full years plus the current one
+# without the table growing forever.
 WATCH_EVENTS_RETENTION_DAYS = 3 * 365
 
 
 class QuotaExceeded(Exception):
-    """Raised when a per-account row cap would be exceeded (surfaced as HTTP 409)."""
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    return dt.isoformat()
+    """A per-account row cap would be exceeded (surfaced as HTTP 409)."""
 
 
 def _hash_token(raw: str) -> str:
@@ -53,45 +45,66 @@ def _hash_token(raw: str) -> str:
 def _public_session_id(token_hash: str) -> str:
     """A stable handle for one session that is safe to put in a response.
 
-    ``token_hash`` is the primary key and the obvious identifier, and it is the
-    one value that must never be published: it is the SHA-256 of a live bearer
-    token, so handing it out hands out the lookup key for the session table.
-    Hashing it again with a distinct prefix gives a stable id that identifies the
-    row for revocation without being reversible to the key."""
+    ``token_hash`` is the lookup key for a live bearer token and must never be
+    published; a second, prefixed hash identifies the row without revealing it."""
     return hashlib.sha256(f"crimson-session:{token_hash}".encode("utf-8")).hexdigest()[:32]
 
 
+def _account_search(search: Optional[str]) -> Tuple[str, list]:
+    """WHERE clause over ``accounts a``, shared by the admin page and its total so
+    the two can never disagree."""
+    term = (search or "").strip()
+    if not term:
+        return "", []
+    like = f"%{term}%"
+    return (
+        "WHERE a.email ILIKE %s OR a.label ILIKE %s OR a.username ILIKE %s"
+        " OR CAST(a.user_id AS TEXT) = %s",
+        [like, like, like, term],
+    )
+
+
+_FAVORITE_UPSERT = """
+    INSERT INTO favorites
+        (user_id, item_key, list_name, tmdb_id, anilist_id, season_number,
+         media_type, title, poster, added_at)
+    VALUES (%(user_id)s, %(item_key)s, %(list_name)s, %(tmdb_id)s, %(anilist_id)s,
+            %(season_number)s, %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
+    ON CONFLICT(user_id, item_key, list_name) DO UPDATE SET
+        tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
+        season_number=excluded.season_number, media_type=excluded.media_type,
+        title=excluded.title, poster=excluded.poster
+"""
+
+
 class AccountStore:
-    """Thin PostgreSQL data layer for the account system.
-
-    Methods are synchronous psycopg calls off the shared pool; callers run them in
-    a thread pool. Timestamps are ISO-8601 ``TEXT`` so the lexicographic
-    ``expires_at`` comparisons gating sessions and challenges stay correct.
-    """
-
-    def __init__(self, db_path: Optional[str] = None):
-        # Ignored; kept for call-site compatibility. Storage is the shared pool.
-        self._explicit_path = db_path
-
-    # -- connection / schema --------------------------------------------
-    def _connect(self):
-        # Pooled connection: dict rows, commits on exit.
-        return get_connection()
+    """Synchronous psycopg calls off the shared pool; callers run them in a thread."""
 
     def init_db(self) -> None:
-        """Create the schema (idempotent)."""
-        with self._connect() as conn:
-            # Serialize DDL across replicas (see db_pool.lock_schema_init).
+        with get_connection() as conn:
             lock_schema_init(conn)
             conn.execute(
                 """
+                -- An account has a public_key OR an email, so both are nullable.
                 CREATE TABLE IF NOT EXISTS accounts (
-                    user_id       BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                    public_key    TEXT UNIQUE NOT NULL,
-                    label         TEXT,
-                    created_at    TEXT NOT NULL,
-                    last_login_at TEXT
+                    user_id        BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    public_key     TEXT UNIQUE,
+                    label          TEXT,
+                    created_at     TEXT NOT NULL,
+                    last_login_at  TEXT,
+                    email          TEXT,
+                    password_hash  TEXT,
+                    email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                    -- Seeded from ADMIN_EMAILS at startup (see bootstrap_admins).
+                    is_admin       BOOLEAN NOT NULL DEFAULT FALSE,
+                    -- JSON, so a new preference key is a frontend-only change.
+                    preferences    TEXT,
+                    -- Display name only: never used for auth, so not unique.
+                    username       TEXT
                 );
+                -- NULL emails (mnemonic accounts) coexist.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email
+                    ON accounts (LOWER(email)) WHERE email IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY,
@@ -101,28 +114,6 @@ class AccountStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
-                -- Email+password identity alongside the Ed25519 one: an account
-                -- has a public_key OR an email, so public_key is nullable. The
-                -- ALTERs upgrade already-deployed databases in place.
-                ALTER TABLE accounts ALTER COLUMN public_key DROP NOT NULL;
-                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email          TEXT;
-                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS password_hash  TEXT;
-                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
-                -- Gates the /admin dashboard. The first admin is seeded from
-                -- ADMIN_EMAILS at startup (see bootstrap_admins).
-                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_admin       BOOLEAN NOT NULL DEFAULT FALSE;
-                -- Client preferences as JSON in TEXT, so a new preference key is a
-                -- frontend-only change. NULL => the client uses its local default.
-                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS preferences    TEXT;
-                -- Cosmetic display name. Never used for auth, and non-unique on
-                -- purpose: it is a display name, not an identity.
-                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS username       TEXT;
-                -- Case-insensitive email uniqueness; NULLs (crypto accounts) coexist.
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email
-                    ON accounts (LOWER(email)) WHERE email IS NOT NULL;
-
-                -- Single-use tokens emailed for verification / reset. Only the
-                -- SHA-256 hash is stored, so a DB leak exposes no usable token.
                 CREATE TABLE IF NOT EXISTS email_tokens (
                     token_hash TEXT PRIMARY KEY,
                     user_id    BIGINT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
@@ -139,22 +130,20 @@ class AccountStore:
                     expires_at TEXT NOT NULL
                 );
 
-                -- Single-use invite tokens minted by the Discord bot. Unlike the
-                -- reusable SIGNUP_INVITE_CODE each registers exactly one account.
-                -- Used rows are kept as a ledger of who consumed which invite.
+                -- Single-use codes minted by the Discord bot. Used rows are kept
+                -- as a ledger of who consumed which invite.
                 CREATE TABLE IF NOT EXISTS invite_tokens (
                     code        TEXT PRIMARY KEY,
-                    created_by  TEXT,          -- discord user id that minted it
+                    created_by  TEXT,          -- discord user id
                     created_at  TEXT NOT NULL,
                     expires_at  TEXT,          -- NULL = never expires
-                    used_at     TEXT,          -- NULL = still unused
+                    used_at     TEXT,          -- NULL = unused
                     used_by     TEXT           -- email that consumed it
                 );
                 CREATE INDEX IF NOT EXISTS idx_invite_tokens_unused ON invite_tokens(used_at);
 
-                -- Doubles as the watchlists table: each row belongs to a named list,
-                -- defaulting to 'favorites' so legacy clients keep working. A show may
-                -- sit in several lists, hence list_name in the primary key.
+                -- Also the watchlists table: 'favorites' is the default list and a
+                -- show may sit in several lists, hence list_name in the key.
                 CREATE TABLE IF NOT EXISTS favorites (
                     user_id       BIGINT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
                     item_key      TEXT NOT NULL,
@@ -168,22 +157,6 @@ class AccountStore:
                     added_at      TEXT NOT NULL,
                     PRIMARY KEY (user_id, item_key, list_name)
                 );
-                -- In-place upgrade for pre-watchlist databases: add the column,
-                -- then widen the primary key to include it (once).
-                ALTER TABLE favorites ADD COLUMN IF NOT EXISTS list_name TEXT NOT NULL DEFAULT 'favorites';
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM information_schema.key_column_usage
-                        WHERE table_name = 'favorites'
-                          AND constraint_name = 'favorites_pkey'
-                          AND column_name = 'list_name'
-                    ) THEN
-                        ALTER TABLE favorites DROP CONSTRAINT IF EXISTS favorites_pkey;
-                        ALTER TABLE favorites
-                            ADD CONSTRAINT favorites_pkey PRIMARY KEY (user_id, item_key, list_name);
-                    END IF;
-                END $$;
                 CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, added_at);
                 CREATE INDEX IF NOT EXISTS idx_favorites_list ON favorites(user_id, list_name, added_at);
 
@@ -199,35 +172,30 @@ class AccountStore:
                     status           TEXT NOT NULL DEFAULT 'in_progress',
                     title            TEXT,
                     poster           TEXT,
+                    -- 'movie' routes history back to /watch-movie.
                     media_type       TEXT,
+                    -- Local media has no tmdb/anilist id, so its path token rides
+                    -- here for /local/{local_id} and per-show dedup.
                     local_id         TEXT,
                     updated_at       TEXT NOT NULL,
                     PRIMARY KEY (user_id, item_key)
                 );
-                -- Pre-movies upgrade: lets a row carry 'movie' so history can route
-                -- back to /watch-movie.
-                ALTER TABLE watch_progress ADD COLUMN IF NOT EXISTS media_type TEXT;
-                -- Local media has no tmdb/anilist id, so the on-disk path token rides
-                -- here: history routes to /local/{local_id} and the title's episodes
-                -- dedup as one show.
-                ALTER TABLE watch_progress ADD COLUMN IF NOT EXISTS local_id TEXT;
                 CREATE INDEX IF NOT EXISTS idx_progress_user ON watch_progress(user_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_progress_status ON watch_progress(user_id, status);
                 """
             )
         self.purge_expired()
-        print("[AccountStore] Schema ready (PostgreSQL).")
+        logger.info("Account schema ready")
 
-    # -- accounts -------------------------------------------------------
     def get_account_by_public_key(self, public_key: str) -> Optional[Dict]:
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
                 "SELECT * FROM accounts WHERE public_key = %s", (public_key,)
             ).fetchone()
             return dict(row) if row else None
 
     def get_account(self, user_id: int) -> Optional[Dict]:
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
                 "SELECT * FROM accounts WHERE user_id = %s", (user_id,)
             ).fetchone()
@@ -236,25 +204,23 @@ class AccountStore:
     def create_account(self, public_key: str, label: Optional[str]) -> Dict:
         """Create an account for a public key. Raises psycopg.errors.UniqueViolation
         if the key already exists."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
-                "INSERT INTO accounts (public_key, label, created_at) VALUES (%s, %s, %s) RETURNING user_id",
-                (public_key, label, _iso(_now())),
+                "INSERT INTO accounts (public_key, label, created_at) VALUES (%s, %s, %s) RETURNING *",
+                (public_key, label, utc_now_iso()),
             ).fetchone()
-            user_id = row["user_id"]
-        return self.get_account(user_id)
+        return dict(row)
 
     def touch_login(self, user_id: int) -> None:
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute(
                 "UPDATE accounts SET last_login_at = %s WHERE user_id = %s",
-                (_iso(_now()), user_id),
+                (utc_now_iso(), user_id),
             )
 
-    # -- preferences ----------------------------------------------------
     def get_preferences(self, user_id: int) -> Dict:
         """Stored client preferences as a dict; ``{}`` when unset or unparseable."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
                 "SELECT preferences FROM accounts WHERE user_id = %s", (user_id,)
             ).fetchone()
@@ -269,25 +235,23 @@ class AccountStore:
     def set_preferences(self, user_id: int, preferences: Dict) -> Dict:
         """Overwrite the account's preferences. Returns the stored dict."""
         blob = json.dumps(preferences, ensure_ascii=False)
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute(
                 "UPDATE accounts SET preferences = %s WHERE user_id = %s",
                 (blob, user_id),
             )
         return preferences
 
-    # -- display name ---------------------------------------------------
     def set_username(self, user_id: int, username: Optional[str]) -> None:
         """Set (or clear, with None) the account's cosmetic display name."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute(
                 "UPDATE accounts SET username = %s WHERE user_id = %s",
                 (username, user_id),
             )
 
-    # -- admin ----------------------------------------------------------
     def set_admin(self, user_id: int, is_admin: bool) -> None:
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute(
                 "UPDATE accounts SET is_admin = %s WHERE user_id = %s",
                 (is_admin, user_id),
@@ -299,7 +263,7 @@ class AccountStore:
         lowered = [e.strip().lower() for e in (emails or []) if e and e.strip()]
         if not lowered:
             return 0
-        with self._connect() as conn:
+        with get_connection() as conn:
             cur = conn.execute(
                 "UPDATE accounts SET is_admin = TRUE"
                 " WHERE LOWER(email) = ANY(%s) AND is_admin = FALSE",
@@ -308,23 +272,21 @@ class AccountStore:
             return cur.rowcount
 
     def count_admins(self) -> int:
-        with self._connect() as conn:
+        with get_connection() as conn:
             return conn.execute(
                 "SELECT COUNT(*) AS n FROM accounts WHERE is_admin = TRUE"
             ).fetchone()["n"]
 
     def delete_account(self, user_id: int) -> bool:
         """Delete an account; ON DELETE CASCADE clears its rows. False if unknown."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             cur = conn.execute("DELETE FROM accounts WHERE user_id = %s", (user_id,))
             return cur.rowcount > 0
 
     def wipe_demo_data(self) -> Dict[str, int]:
-        """DEMO_MODE nightly reset: delete every non-admin account (cascading its
-        rows), plus all challenges and invite tokens. Admins are preserved because
-        is_admin is only re-seeded at startup, so wiping them would lock the
-        operator out until a restart. Returns row counts for logging."""
-        with self._connect() as conn:
+        """DEMO_MODE nightly reset. Admins survive because is_admin is only
+        re-seeded at startup, so wiping them would lock the operator out."""
+        with get_connection() as conn:
             accounts = conn.execute(
                 "DELETE FROM accounts WHERE is_admin = FALSE"
             ).rowcount
@@ -339,22 +301,11 @@ class AccountStore:
     def list_accounts(
         self, search: Optional[str] = None, limit: int = 50, offset: int = 0
     ) -> List[Dict]:
-        """Accounts (newest first) with favorite / progress / session counts for the
-        admin table. Never returns password_hash. Search is case-insensitive over
-        email, label, display name and numeric id."""
-        params: list = []
-        where = ""
-        if search and search.strip():
-            term = search.strip()
-            like = f"%{term}%"
-            where = (
-                "WHERE a.email ILIKE %s OR a.label ILIKE %s OR a.username ILIKE %s"
-                " OR CAST(a.user_id AS TEXT) = %s"
-            )
-            params += [like, like, like, term]
-        now = _iso(_now())
+        """The admin accounts table, newest first. Never returns password_hash."""
+        where, params = _account_search(search)
+        now = utc_now_iso()
         params += [now, limit, offset]
-        with self._connect() as conn:
+        with get_connection() as conn:
             rows = conn.execute(
                 f"""
                 SELECT a.user_id, a.email, a.label, a.username, a.email_verified, a.is_admin,
@@ -374,64 +325,80 @@ class AccountStore:
             return [dict(r) for r in rows]
 
     def count_accounts(self, search: Optional[str] = None) -> int:
-        params: list = []
-        where = ""
-        if search and search.strip():
-            term = search.strip()
-            like = f"%{term}%"
-            where = (
-                "WHERE email ILIKE %s OR label ILIKE %s OR CAST(user_id AS TEXT) = %s"
-            )
-            params += [like, like, term]
-        with self._connect() as conn:
+        where, params = _account_search(search)
+        with get_connection() as conn:
             return conn.execute(
-                f"SELECT COUNT(*) AS n FROM accounts {where}", tuple(params)
+                f"SELECT COUNT(*) AS n FROM accounts a {where}", tuple(params)
             ).fetchone()["n"]
 
     def email_recipients(self, verified_only: bool = True) -> List[Dict]:
-        """Everyone an admin broadcast can reach; mnemonic-only accounts have no
-        address and are skipped. ``verified_only`` also drops unverified addresses,
-        which may not belong to the account holder."""
+        """Everyone an admin broadcast can reach. An unverified address may not
+        belong to the account holder, hence ``verified_only``."""
         where = "email IS NOT NULL"
         if verified_only:
             where += " AND email_verified = TRUE"
-        with self._connect() as conn:
+        with get_connection() as conn:
             rows = conn.execute(
                 f"SELECT user_id, email, username FROM accounts WHERE {where} ORDER BY user_id"
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def email_recipient_counts(self) -> Dict[str, int]:
+        with get_connection() as conn:
+            return dict(conn.execute(
+                """
+                SELECT COUNT(*) FILTER (WHERE email_verified = TRUE) AS verified,
+                       COUNT(*) AS "all"
+                FROM accounts WHERE email IS NOT NULL
+                """
+            ).fetchone())
+
     def admin_overview(self) -> Dict:
-        """Aggregate account-system stats for the admin health dashboard."""
-        with self._connect() as conn:
-            def scalar(sql: str, p: tuple = ()) -> int:
-                return conn.execute(sql, p).fetchone()["n"]
+        """Account-system stats for the admin health dashboard."""
+        now = utc_now()
+        stats: Dict = {}
+        with get_connection() as conn:
+            stats.update(conn.execute(
+                """
+                SELECT COUNT(*)                                        AS users_total,
+                       COUNT(*) FILTER (WHERE email_verified = TRUE)   AS users_verified,
+                       COUNT(*) FILTER (WHERE is_admin = TRUE)         AS users_admin,
+                       COUNT(*) FILTER (WHERE email IS NOT NULL)       AS users_email,
+                       COUNT(*) FILTER (WHERE public_key IS NOT NULL)  AS users_mnemonic,
+                       COUNT(*) FILTER (WHERE created_at >= %s)        AS users_new_24h,
+                       COUNT(*) FILTER (WHERE created_at >= %s)        AS users_new_7d
+                FROM accounts
+                """,
+                ((now - timedelta(days=1)).isoformat(), (now - timedelta(days=7)).isoformat()),
+            ).fetchone())
+            stats.update(conn.execute(
+                "SELECT COUNT(*) AS sessions_active FROM sessions WHERE expires_at > %s",
+                (now.isoformat(),),
+            ).fetchone())
+            stats.update(conn.execute(
+                """
+                SELECT COUNT(*)                                    AS invites_total,
+                       COUNT(*) FILTER (WHERE used_at IS NULL)     AS invites_unused,
+                       COUNT(*) FILTER (WHERE used_at IS NOT NULL) AS invites_used
+                FROM invite_tokens
+                """
+            ).fetchone())
+            stats.update(conn.execute(
+                "SELECT COUNT(*) AS favorites_total FROM favorites"
+            ).fetchone())
+            stats.update(conn.execute(
+                """
+                SELECT COUNT(*)                                          AS progress_total,
+                       COUNT(*) FILTER (WHERE status = 'completed')      AS progress_completed,
+                       COUNT(*) FILTER (WHERE status = 'in_progress')    AS progress_in_progress
+                FROM watch_progress
+                """
+            ).fetchone())
+        return stats
 
-            now = _iso(_now())
-            day_ago = _iso(_now() - timedelta(days=1))
-            week_ago = _iso(_now() - timedelta(days=7))
-            return {
-                "users_total": scalar("SELECT COUNT(*) AS n FROM accounts"),
-                "users_verified": scalar("SELECT COUNT(*) AS n FROM accounts WHERE email_verified = TRUE"),
-                "users_admin": scalar("SELECT COUNT(*) AS n FROM accounts WHERE is_admin = TRUE"),
-                "users_email": scalar("SELECT COUNT(*) AS n FROM accounts WHERE email IS NOT NULL"),
-                "users_mnemonic": scalar("SELECT COUNT(*) AS n FROM accounts WHERE public_key IS NOT NULL"),
-                "users_new_24h": scalar("SELECT COUNT(*) AS n FROM accounts WHERE created_at >= %s", (day_ago,)),
-                "users_new_7d": scalar("SELECT COUNT(*) AS n FROM accounts WHERE created_at >= %s", (week_ago,)),
-                "sessions_active": scalar("SELECT COUNT(*) AS n FROM sessions WHERE expires_at > %s", (now,)),
-                "invites_total": scalar("SELECT COUNT(*) AS n FROM invite_tokens"),
-                "invites_unused": scalar("SELECT COUNT(*) AS n FROM invite_tokens WHERE used_at IS NULL"),
-                "invites_used": scalar("SELECT COUNT(*) AS n FROM invite_tokens WHERE used_at IS NOT NULL"),
-                "favorites_total": scalar("SELECT COUNT(*) AS n FROM favorites"),
-                "progress_total": scalar("SELECT COUNT(*) AS n FROM watch_progress"),
-                "progress_completed": scalar("SELECT COUNT(*) AS n FROM watch_progress WHERE status = 'completed'"),
-                "progress_in_progress": scalar("SELECT COUNT(*) AS n FROM watch_progress WHERE status = 'in_progress'"),
-            }
-
-    # -- email + password accounts --------------------------------------
     def get_account_by_email(self, email: str) -> Optional[Dict]:
         """Case-insensitive lookup by email."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
                 "SELECT * FROM accounts WHERE LOWER(email) = LOWER(%s)", (email,)
             ).fetchone()
@@ -442,39 +409,36 @@ class AccountStore:
     ) -> Dict:
         """Create an email+password account (unverified). Raises
         psycopg.errors.UniqueViolation if the email is already taken."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
                 """
                 INSERT INTO accounts (email, password_hash, label, email_verified, created_at)
-                VALUES (%s, %s, %s, FALSE, %s) RETURNING user_id
+                VALUES (%s, %s, %s, FALSE, %s) RETURNING *
                 """,
-                (email, password_hash, label, _iso(_now())),
+                (email, password_hash, label, utc_now_iso()),
             ).fetchone()
-            user_id = row["user_id"]
-        return self.get_account(user_id)
+        return dict(row)
 
     def set_password(self, user_id: int, password_hash: str) -> None:
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute(
                 "UPDATE accounts SET password_hash = %s WHERE user_id = %s",
                 (password_hash, user_id),
             )
 
     def set_email_verified(self, user_id: int, verified: bool = True) -> None:
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute(
                 "UPDATE accounts SET email_verified = %s WHERE user_id = %s",
                 (verified, user_id),
             )
 
-    # -- email tokens (verification / password reset) -------------------
     def create_email_token(self, user_id: int, purpose: str, ttl: timedelta) -> str:
-        """Issue a single-use token for ``purpose`` ('verify' | 'reset') and return
-        it raw. Earlier tokens of the same purpose are dropped so only the newest
-        link works."""
+        """Issue a raw single-use token. Earlier tokens of the same purpose are
+        dropped so only the newest link works."""
         raw = secrets.token_urlsafe(32)
-        expires = _now() + ttl
-        with self._connect() as conn:
+        expires = utc_now() + ttl
+        with get_connection() as conn:
             conn.execute(
                 "DELETE FROM email_tokens WHERE user_id = %s AND purpose = %s",
                 (user_id, purpose),
@@ -482,83 +446,67 @@ class AccountStore:
             conn.execute(
                 "INSERT INTO email_tokens (token_hash, user_id, purpose, created_at, expires_at)"
                 " VALUES (%s, %s, %s, %s, %s)",
-                (_hash_token(raw), user_id, purpose, _iso(_now()), _iso(expires)),
+                (_hash_token(raw), user_id, purpose, utc_now_iso(), expires.isoformat()),
             )
         return raw
 
     def consume_email_token(self, raw_token: str, purpose: str) -> Optional[int]:
-        """Atomically validate and delete a token; user_id on success, else None.
-        The DELETE rowcount gates consumption, so a link can't be replayed."""
+        """Burn a token and return its user_id if it was for ``purpose`` and fresh.
+
+        Any presented token is deleted, even a wrong or stale one, and only the
+        request whose DELETE returned the row may use it, so a link cannot be
+        replayed concurrently."""
         if not raw_token:
             return None
-        token_hash = _hash_token(raw_token)
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
-                "SELECT user_id, purpose, expires_at FROM email_tokens WHERE token_hash = %s",
-                (token_hash,),
+                "DELETE FROM email_tokens WHERE token_hash = %s"
+                " RETURNING user_id, purpose, expires_at",
+                (_hash_token(raw_token),),
             ).fetchone()
-            if row is None:
-                return None
-            cur = conn.execute(
-                "DELETE FROM email_tokens WHERE token_hash = %s", (token_hash,)
-            )
-            if cur.rowcount == 0 or row["purpose"] != purpose:
-                return None
-            try:
-                if datetime.fromisoformat(row["expires_at"]) <= _now():
-                    return None
-            except ValueError:
-                return None
-            return row["user_id"]
+        if row is None or row["purpose"] != purpose or row["expires_at"] <= utc_now_iso():
+            return None
+        return row["user_id"]
 
     def revoke_user_sessions(self, user_id: int) -> None:
         """Drop every session, so a leaked one can't outlive a password reset."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
 
-    # -- single-use invite tokens (minted by the Discord bot) -----------
-    def create_invite_token(
-        self, created_by: Optional[str] = None, ttl: Optional[timedelta] = None
-    ) -> str:
-        """Mint a single-use invite code. ``created_by`` is the Discord user id that
-        requested it; a ``ttl`` of None never expires (still single-use)."""
-        code = secrets.token_hex(8)  # unguessable but easy to paste
-        expires = _iso(_now() + ttl) if ttl else None
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO invite_tokens (code, created_by, created_at, expires_at)"
-                " VALUES (%s, %s, %s, %s)",
-                (code, created_by, _iso(_now()), expires),
+    def create_invite_tokens(
+        self, count: int, created_by: Optional[str] = None, ttl: Optional[timedelta] = None
+    ) -> List[str]:
+        """Unguessable but short enough to paste. A ``ttl`` of None never expires."""
+        codes = [secrets.token_hex(8) for _ in range(count)]
+        now = utc_now()
+        expires = (now + ttl).isoformat() if ttl else None
+        with get_connection() as conn:
+            conn.cursor().executemany(
+                "INSERT INTO invite_tokens (code, created_by, created_at, expires_at) VALUES (%s, %s, %s, %s)",
+                [(code, created_by, now.isoformat(), expires) for code in codes],
             )
-        return code
+        return codes
 
     def invite_token_is_available(self, code: str) -> bool:
-        """Read-only pre-check for a clean error message. Consumption is gated
-        authoritatively and race-safely by consume_invite_token."""
+        """Pre-check for a clean error message; consume_invite_token is the
+        race-safe gate."""
         if not code:
             return False
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
                 "SELECT expires_at, used_at FROM invite_tokens WHERE code = %s", (code,)
             ).fetchone()
         if row is None or row["used_at"] is not None:
             return False
-        if row["expires_at"]:
-            try:
-                if datetime.fromisoformat(row["expires_at"]) <= _now():
-                    return False
-            except ValueError:
-                return False
-        return True
+        return not row["expires_at"] or row["expires_at"] > utc_now_iso()
 
     def consume_invite_token(self, code: str, used_by: Optional[str] = None) -> bool:
-        """Burn a single-use invite token; True only if it existed, was unused and
-        had not expired. The ``used_at IS NULL`` guard makes it race-safe: two
-        concurrent signups contend on the row and only one UPDATE matches."""
+        """True only if the token existed, was unused and fresh. The ``used_at IS
+        NULL`` guard makes it race-safe: only one concurrent UPDATE can match."""
         if not code:
             return False
-        now = _iso(_now())
-        with self._connect() as conn:
+        now = utc_now_iso()
+        with get_connection() as conn:
             cur = conn.execute(
                 """
                 UPDATE invite_tokens
@@ -573,7 +521,7 @@ class AccountStore:
 
     def list_invite_tokens(self, include_used: bool = False, limit: int = 50) -> List[Dict]:
         """Newest invite tokens; unused only unless ``include_used``."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             if include_used:
                 rows = conn.execute(
                     "SELECT * FROM invite_tokens ORDER BY created_at DESC LIMIT %s",
@@ -588,116 +536,94 @@ class AccountStore:
             return [dict(r) for r in rows]
 
     def revoke_invite_token(self, code: str) -> bool:
-        """Delete an unused invite token. False if unknown or already used, since
-        used rows stay as a ledger."""
+        """Delete an unused token. Used rows stay as the ledger."""
         if not code:
             return False
-        with self._connect() as conn:
+        with get_connection() as conn:
             cur = conn.execute(
                 "DELETE FROM invite_tokens WHERE code = %s AND used_at IS NULL", (code,)
             )
             return cur.rowcount > 0
 
-    # -- challenges (one-time login nonces) -----------------------------
     def create_challenge(self, public_key: str, purpose: str) -> Tuple[str, str]:
         challenge = secrets.token_urlsafe(32)
-        expires = _now() + CHALLENGE_TTL
-        with self._connect() as conn:
+        expires = utc_now() + CHALLENGE_TTL
+        with get_connection() as conn:
             conn.execute(
                 "INSERT INTO challenges (challenge, public_key, purpose, expires_at) VALUES (%s, %s, %s, %s)",
-                (challenge, public_key, purpose, _iso(expires)),
+                (challenge, public_key, purpose, expires.isoformat()),
             )
-        return challenge, _iso(expires)
+        return challenge, expires.isoformat()
 
     def consume_challenge(self, challenge: str, public_key: str, purpose: str) -> bool:
-        """Validate and delete a challenge; true only if it matched and was fresh."""
-        with self._connect() as conn:
+        """Burn a challenge; True only if it matched and was fresh.
+
+        Deleted unconditionally and gated on the returned row, so of two
+        concurrent requests only one can consume it and a captured signature
+        cannot be replayed in parallel."""
+        with get_connection() as conn:
             row = conn.execute(
-                "SELECT public_key, purpose, expires_at FROM challenges WHERE challenge = %s",
+                "DELETE FROM challenges WHERE challenge = %s"
+                " RETURNING public_key, purpose, expires_at",
                 (challenge,),
             ).fetchone()
-            if row is None:
-                return False
-            # Delete unconditionally and gate on rowcount: two concurrent requests
-            # can both SELECT the row, but only the one whose DELETE removes it may
-            # consume it, so a captured signature can't be replayed in parallel.
-            cur = conn.execute("DELETE FROM challenges WHERE challenge = %s", (challenge,))
-            if cur.rowcount == 0:
-                return False
-            if row["public_key"] != public_key or row["purpose"] != purpose:
-                return False
-            try:
-                expires = datetime.fromisoformat(row["expires_at"])
-            except ValueError:
-                return False
-            return expires > _now()
+        return (
+            row is not None
+            and row["public_key"] == public_key
+            and row["purpose"] == purpose
+            and row["expires_at"] > utc_now_iso()
+        )
 
-    # -- sessions -------------------------------------------------------
     def create_session(
         self, user_id: int,
         user_agent: Optional[str] = None, ip: Optional[str] = None,
     ) -> Tuple[str, str]:
-        """Issue a session as (raw_token, expires_at_iso). Only the hash is stored.
-
-        The device columns are what let their owner recognise a session later;
-        they are optional so the callers that have no request context still work.
-        """
+        """Returns (raw_token, expires_at). The device columns let the owner
+        recognise the session later."""
         raw = secrets.token_urlsafe(32)
-        now = _now()
+        now = utc_now()
         expires = now + SESSION_TTL
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO sessions (token_hash, user_id, created_at, expires_at,
                                       user_agent, ip, last_seen_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
-                (_hash_token(raw), user_id, _iso(now), _iso(expires),
-                 (user_agent or None), (ip or None), _iso(now)),
+                (_hash_token(raw), user_id, now.isoformat(), expires.isoformat(),
+                 (user_agent or None), (ip or None), now.isoformat()),
             )
-        return raw, _iso(expires)
+        return raw, expires.isoformat()
 
     def get_user_by_session(self, raw_token: str) -> Optional[Dict]:
         if not raw_token:
             return None
-        with self._connect() as conn:
+        with get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT a.* , s.expires_at AS session_expires_at
+                SELECT a.*, s.expires_at AS session_expires_at
                 FROM sessions s JOIN accounts a ON a.user_id = s.user_id
-                WHERE s.token_hash = %s
+                WHERE s.token_hash = %s AND s.expires_at > %s
                 """,
-                (_hash_token(raw_token),),
+                (_hash_token(raw_token), utc_now_iso()),
             ).fetchone()
-            if row is None:
-                return None
-            try:
-                if datetime.fromisoformat(row["session_expires_at"]) <= _now():
-                    conn.execute(
-                        "DELETE FROM sessions WHERE token_hash = %s", (_hash_token(raw_token),)
-                    )
-                    return None
-            except ValueError:
-                return None
-            return dict(row)
+        return dict(row) if row else None
 
     def delete_session(self, raw_token: str) -> None:
-        with self._connect() as conn:
+        with get_connection() as conn:
             conn.execute(
                 "DELETE FROM sessions WHERE token_hash = %s", (_hash_token(raw_token),)
             )
 
     def validate_and_touch_session(self, raw_token: str) -> bool:
-        """True iff the token names a live session. On success, stamp last_seen_at.
+        """True iff the token names a live session, stamping last_seen_at.
 
-        Mirrors ApiKeyStore.validate_and_touch: called only on a cache miss in the
-        login wall, so the write happens at most once per session per cache-TTL
-        rather than once per request. One statement, so recording the use costs
-        nothing beyond the check that was happening anyway."""
+        Called only on a login-wall cache miss, so this writes at most once per
+        session per cache TTL, and doing it in the check costs no extra round trip."""
         if not raw_token:
             return False
-        now = _iso(_now())
-        with self._connect() as conn:
+        now = utc_now_iso()
+        with get_connection() as conn:
             cur = conn.execute(
                 "UPDATE sessions SET last_seen_at = %s"
                 " WHERE token_hash = %s AND expires_at > %s",
@@ -706,13 +632,10 @@ class AccountStore:
             return cur.rowcount > 0
 
     def list_sessions(self, user_id: int, current_token: Optional[str] = None) -> List[Dict]:
-        """The account's live sessions, newest first, with the caller's flagged.
-
-        Deliberately does not return ``token_hash`` under any name: the public id
-        is derived here so a route handler cannot leak the hash by forwarding a
-        row it did not inspect."""
+        """Live sessions, newest first, with the caller's flagged. The public id is
+        derived here so a handler cannot leak ``token_hash`` by forwarding a row."""
         current_hash = _hash_token(current_token) if current_token else None
-        with self._connect() as conn:
+        with get_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT token_hash, created_at, expires_at, user_agent, ip, last_seen_at
@@ -720,7 +643,7 @@ class AccountStore:
                 WHERE user_id = %s AND expires_at > %s
                 ORDER BY created_at DESC
                 """,
-                (user_id, _iso(_now())),
+                (user_id, utc_now_iso()),
             ).fetchall()
         return [
             {
@@ -736,13 +659,10 @@ class AccountStore:
         ]
 
     def revoke_session(self, user_id: int, session_id: str) -> bool:
-        """Revoke one session of this account by its public id.
-
-        The public id is a one-way derivation of the primary key, so it cannot be
-        turned back into a WHERE clause. Matching in Python over the account's own
-        handful of rows is the honest way to do it, and it keeps the scan bound to
-        one user_id so the id is never an oracle for another account's session."""
-        with self._connect() as conn:
+        """The public id is one-way, so it cannot become a WHERE clause: match it
+        over this account's own rows, which also keeps it from being an oracle for
+        another account's sessions."""
+        with get_connection() as conn:
             rows = conn.execute(
                 "SELECT token_hash FROM sessions WHERE user_id = %s", (user_id,)
             ).fetchall()
@@ -756,7 +676,7 @@ class AccountStore:
 
     def revoke_other_sessions(self, user_id: int, current_token: Optional[str]) -> int:
         """Sign out everywhere except the caller. Returns how many were dropped."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             if current_token:
                 cur = conn.execute(
                     "DELETE FROM sessions WHERE user_id = %s AND token_hash <> %s",
@@ -766,13 +686,9 @@ class AccountStore:
                 cur = conn.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
             return cur.rowcount
 
-    # -- favorites / watchlists -----------------------------------------
-    # A favorite is a row in a named list. 'favorites' is the default; any other
-    # name is a custom watchlist. The same show may live in several lists.
     def upsert_favorite(self, user_id: int, fav: Dict, list_name: str = "favorites") -> Dict:
-        with self._connect() as conn:
-            # Soft cap on new keys only; updates always pass. Same transaction as
-            # the insert, so a small concurrent overshoot is possible and harmless.
+        with get_connection() as conn:
+            # A small concurrent overshoot of the cap is possible and harmless.
             exists = conn.execute(
                 "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
                 (user_id, fav["item_key"], list_name),
@@ -784,18 +700,8 @@ class AccountStore:
                 if count >= MAX_FAVORITES_PER_USER:
                     raise QuotaExceeded(f"favorites limit ({MAX_FAVORITES_PER_USER}) reached")
             conn.execute(
-                """
-                INSERT INTO favorites
-                    (user_id, item_key, list_name, tmdb_id, anilist_id, season_number,
-                     media_type, title, poster, added_at)
-                VALUES (%(user_id)s, %(item_key)s, %(list_name)s, %(tmdb_id)s, %(anilist_id)s,
-                        %(season_number)s, %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
-                ON CONFLICT(user_id, item_key, list_name) DO UPDATE SET
-                    tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
-                    season_number=excluded.season_number, media_type=excluded.media_type,
-                    title=excluded.title, poster=excluded.poster
-                """,
-                {"user_id": user_id, "list_name": list_name, "added_at": _iso(_now()), **fav},
+                _FAVORITE_UPSERT,
+                {"user_id": user_id, "list_name": list_name, "added_at": utc_now_iso(), **fav},
             )
             row = conn.execute(
                 "SELECT * FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
@@ -805,7 +711,7 @@ class AccountStore:
 
     def list_favorites(self, user_id: int, list_name: Optional[str] = None) -> List[Dict]:
         """Rows in one list, or every list (newest first) when ``list_name`` is None."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             if list_name is None:
                 rows = conn.execute(
                     "SELECT * FROM favorites WHERE user_id = %s ORDER BY added_at DESC",
@@ -819,9 +725,19 @@ class AccountStore:
                 ).fetchall()
             return [dict(r) for r in rows]
 
+    def library_counts(self, user_id: int) -> Dict[str, int]:
+        with get_connection() as conn:
+            return dict(conn.execute(
+                """
+                SELECT (SELECT COUNT(*) FROM favorites WHERE user_id = %s)      AS favorites,
+                       (SELECT COUNT(*) FROM watch_progress WHERE user_id = %s) AS progress
+                """,
+                (user_id, user_id),
+            ).fetchone())
+
     def list_watchlists(self, user_id: int) -> List[Dict]:
         """Distinct list names with each list's item count."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             rows = conn.execute(
                 "SELECT list_name, COUNT(*) AS count FROM favorites WHERE user_id = %s "
                 "GROUP BY list_name ORDER BY list_name",
@@ -830,17 +746,17 @@ class AccountStore:
             return [dict(r) for r in rows]
 
     def bulk_upsert_favorites(
-        self, user_id: int, items: List[Tuple[str, Dict]]
+        self, user_id: int, items: List[Tuple[str, Dict]], replace: bool = False
     ) -> Dict:
-        """Insert/update many favorites in one transaction, for import.
-
-        ``items`` is a list of ``(list_name, fav)`` pairs. New keys are inserted
-        only while the per-account cap has room; existing keys always update.
-        Returns ``{"imported", "skipped_quota"}``."""
+        """Import ``(list_name, fav)`` pairs in one transaction. New keys stop at
+        the cap; existing keys always update. ``replace`` clears every list first in
+        the same transaction, so a failed import never leaves the account empty."""
         imported = 0
         skipped_quota = 0
-        now = _iso(_now())
-        with self._connect() as conn:
+        now = utc_now_iso()
+        with get_connection() as conn:
+            if replace:
+                conn.execute("DELETE FROM favorites WHERE user_id = %s", (user_id,))
             count = conn.execute(
                 "SELECT COUNT(*) AS n FROM favorites WHERE user_id = %s", (user_id,)
             ).fetchone()["n"]
@@ -855,33 +771,17 @@ class AccountStore:
                         continue
                     count += 1
                 conn.execute(
-                    """
-                    INSERT INTO favorites
-                        (user_id, item_key, list_name, tmdb_id, anilist_id, season_number,
-                         media_type, title, poster, added_at)
-                    VALUES (%(user_id)s, %(item_key)s, %(list_name)s, %(tmdb_id)s, %(anilist_id)s,
-                            %(season_number)s, %(media_type)s, %(title)s, %(poster)s, %(added_at)s)
-                    ON CONFLICT(user_id, item_key, list_name) DO UPDATE SET
-                        tmdb_id=excluded.tmdb_id, anilist_id=excluded.anilist_id,
-                        season_number=excluded.season_number, media_type=excluded.media_type,
-                        title=excluded.title, poster=excluded.poster
-                    """,
+                    _FAVORITE_UPSERT,
                     {"user_id": user_id, "list_name": list_name, "added_at": now, **fav},
                 )
                 imported += 1
         return {"imported": imported, "skipped_quota": skipped_quota}
 
-    def clear_favorites(self, user_id: int) -> int:
-        """Delete every favorite in every list. Returns how many rows were removed."""
-        with self._connect() as conn:
-            cur = conn.execute("DELETE FROM favorites WHERE user_id = %s", (user_id,))
-            return cur.rowcount
-
     def remove_favorite(
         self, user_id: int, item_key: str, list_name: Optional[str] = None
     ) -> bool:
         """Remove a show from one list, or from every list when ``list_name`` is None."""
-        with self._connect() as conn:
+        with get_connection() as conn:
             if list_name is None:
                 cur = conn.execute(
                     "DELETE FROM favorites WHERE user_id = %s AND item_key = %s",
@@ -894,26 +794,8 @@ class AccountStore:
                 )
             return cur.rowcount > 0
 
-    def is_favorite(
-        self, user_id: int, item_key: str, list_name: Optional[str] = None
-    ) -> bool:
-        with self._connect() as conn:
-            if list_name is None:
-                row = conn.execute(
-                    "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s",
-                    (user_id, item_key),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT 1 FROM favorites WHERE user_id = %s AND item_key = %s AND list_name = %s",
-                    (user_id, item_key, list_name),
-                ).fetchone()
-            return row is not None
-
-    # -- watch progress -------------------------------------------------
     def upsert_progress(self, user_id: int, prog: Dict) -> Dict:
-        with self._connect() as conn:
-            # Soft cap on new keys only, so progress saves keep working at the cap.
+        with get_connection() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM watch_progress WHERE user_id = %s AND item_key = %s",
                 (user_id, prog["item_key"]),
@@ -940,15 +822,12 @@ class AccountStore:
                     status=excluded.status, title=excluded.title, poster=excluded.poster,
                     media_type=excluded.media_type, local_id=excluded.local_id, updated_at=excluded.updated_at
                 """,
-                {"user_id": user_id, "updated_at": _iso(_now()),
+                {"user_id": user_id, "updated_at": utc_now_iso(),
                  "media_type": None, "local_id": None, **prog},
             )
-            # The history half of the same save. watch_progress is keyed
-            # (user_id, item_key) and overwritten on a timer, so it cannot say
-            # when anything was watched; this row can. Same connection and same
-            # threadpool call as the upsert above on purpose: POST
-            # /account/progress fires every 30s for every viewer in every
-            # playback session, and a second round trip there is not free.
+            # watch_progress is overwritten on a timer, so it cannot say when
+            # anything was watched; watch_events can. Same connection on purpose:
+            # this save fires every 30s per viewer, so an extra round trip is not free.
             conn.execute(
                 """
                 INSERT INTO watch_events
@@ -956,9 +835,7 @@ class AccountStore:
                 VALUES (%(user_id)s, %(item_key)s, (now() AT TIME ZONE 'utc')::date,
                         %(anilist_id)s, %(tmdb_id)s, %(media_type)s, %(title)s, %(position_seconds)s)
                 ON CONFLICT (user_id, item_key, watched_on) DO UPDATE SET
-                    -- The furthest point reached that day. A rewatch restarts at
-                    -- zero and climbs again, so taking the max is the only answer
-                    -- that does not shrink as you keep watching.
+                    -- A rewatch restarts at zero, so only the max never shrinks.
                     seconds = GREATEST(COALESCE(watch_events.seconds, 0),
                                        COALESCE(excluded.seconds, 0)),
                     title = COALESCE(excluded.title, watch_events.title)
@@ -976,7 +853,7 @@ class AccountStore:
             return dict(row)
 
     def list_progress(self, user_id: int, status: Optional[str] = None) -> List[Dict]:
-        with self._connect() as conn:
+        with get_connection() as conn:
             if status:
                 rows = conn.execute(
                     "SELECT * FROM watch_progress WHERE user_id = %s AND status = %s ORDER BY updated_at DESC",
@@ -990,27 +867,28 @@ class AccountStore:
             return [dict(r) for r in rows]
 
     def remove_progress(self, user_id: int, item_key: str) -> bool:
-        with self._connect() as conn:
+        with get_connection() as conn:
             cur = conn.execute(
                 "DELETE FROM watch_progress WHERE user_id = %s AND item_key = %s",
                 (user_id, item_key),
             )
             return cur.rowcount > 0
 
-    # -- maintenance ----------------------------------------------------
     def purge_expired(self) -> None:
         """Drop expired sessions, challenges, email tokens and old watch events."""
-        now = _iso(_now())
-        with self._connect() as conn:
+        now = utc_now_iso()
+        with get_connection() as conn:
             conn.execute("DELETE FROM sessions WHERE expires_at <= %s", (now,))
             conn.execute("DELETE FROM challenges WHERE expires_at <= %s", (now,))
             conn.execute("DELETE FROM email_tokens WHERE expires_at <= %s", (now,))
-            # init_db() calls this, and init_db() runs before the migration
-            # runner by design, so on the first boot after 006 the table does not
-            # exist yet. Nothing to prune then, and asking first is cheaper than
-            # aborting the transaction this method shares.
+            # init_db() runs before the migration runner, so on a fresh install
+            # watch_events (migration 006) does not exist yet, and a failed DELETE
+            # would abort this shared transaction.
             if conn.execute("SELECT to_regclass('public.watch_events') AS t").fetchone()["t"]:
                 conn.execute(
                     "DELETE FROM watch_events WHERE watched_on < %s",
-                    ((_now() - timedelta(days=WATCH_EVENTS_RETENTION_DAYS)).date(),),
+                    ((utc_now() - timedelta(days=WATCH_EVENTS_RETENTION_DAYS)).date(),),
                 )
+
+
+store = AccountStore()

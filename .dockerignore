@@ -1,15 +1,15 @@
-# Keep the build context small and avoid baking secrets / local state into the image.
+# The Dockerfile copies explicit paths, so this list only keeps the build context
+# small and keeps secrets and local state out of it.
 .git
-.github
 .gitignore
+.gitlab-ci.yml
 .vscode
 .claude
 .env
 *.env
 !.env.example
 
-# Leftover local SQLite files from before the PostgreSQL migration — never bake
-# them into the image (state now lives in PostgreSQL, not in the build context).
+# State lives in PostgreSQL; a stray local SQLite file must never reach the image.
 *.db
 *.db-journal
 *.db-wal
@@ -25,18 +25,23 @@ __pycache__/
 .venv/
 venv/
 
-# Dev/CI-only: the test suite, its tooling config and the throwaway local venv
-# are never needed in the runtime image (the CI `gate` job runs them separately).
+# Dev and CI only: the CI `gate` job runs the tests outside the image.
 tests/
 .venv-test/
 requirements-dev.txt
 pyproject.toml
-# Generated API contract artifacts (used by the frontend + tests, not at runtime).
+scripts/
+graphify-out/
+
+# Generated API contract, used by the frontend and tests, not at runtime.
 openapi.json
 contracts/
 
-# Docs / misc not needed at runtime
-README.md
-metadata_engine/README.md
-New_System.md
-New_System_Progress.md
+# Deployment files are applied on the hosts, never inside the app container.
+deploy/
+docker-compose*.yml
+docker-stack.yml
+
+# Docs
+docs/
+**/*.md

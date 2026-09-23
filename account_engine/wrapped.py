@@ -1,24 +1,15 @@
-"""
-A year of watching, aggregated per account.
+"""A year of watching, aggregated per account.
 
-Where the numbers come from, and why that matters
--------------------------------------------------
-``watch_events`` (migration 006) is one row per item per day and is the honest
-source. It only exists from the day it shipped, so any year that starts before
-that has a span this table cannot describe. For that span the aggregate falls
-back to ``watch_progress.updated_at``, which is the last time a row was touched
-and not when it was watched: an episode started in January and resumed in
-December reads as December there, and a rewatch is invisible because the row was
-overwritten rather than appended.
-
-That fallback is not hidden. When any part of the requested year predates the
-events table, the payload carries ``approximate: true`` and ``events_since``,
-so a client can say so rather than presenting a guess as a measurement.
+``watch_events`` (migration 006, one row per item per day) is the honest source,
+but it only exists from the day it shipped. For any earlier span of the year the
+numbers fall back to ``watch_progress.updated_at``, which is when a row was last
+touched, not when it was watched, and which cannot see a rewatch. That fallback
+is never hidden: the payload then carries ``approximate: true`` and
+``events_since``.
 
 Everything is computed in Python from one bounded row set per source (a heavy
-viewer is a few thousand rows a year) rather than in half a dozen aggregate
-queries. The counting rules below are the part worth getting right, and they are
-much easier to read, and to argue with, as plain loops.
+viewer is a few thousand rows a year), because the counting rules are the part
+worth getting right and are far easier to read and argue with as plain loops.
 """
 
 import json
@@ -32,8 +23,8 @@ from core.db_pool import get_connection
 
 logger = logging.getLogger(__name__)
 
-# Anything outside this is not a real UTC offset, and a wide one would drag the
-# query window further than the day of padding below covers.
+# Real UTC offsets. A wider one would also move the local day further than the
+# one day of query padding in build() covers.
 MIN_OFFSET_MINUTES = -12 * 60
 MAX_OFFSET_MINUTES = 14 * 60
 
@@ -48,28 +39,22 @@ TOP_GENRES = 8
 
 
 def _surface(row: dict) -> str:
-    """Which part of the site this row was watched on.
-
-    The same precedence as _favorite_item_key: an explicit media_type wins, and
-    an AniList id otherwise means anime. Kept separate from each other because
-    they do not count the same way (see the manga note in the module below)."""
+    """Which part of the site this row was watched on: an explicit media_type
+    wins, otherwise an AniList id means anime."""
     media_type = row.get("media_type")
     if media_type in ("manga", "movie", "local"):
         return media_type
     return "anime" if row.get("anilist_id") is not None else "show"
 
 
-# _progress_item_key appends ":s{season}:e{episode}" to a show-level base, so
-# stripping that suffix gives the show back. Needed for local media, which is the
-# one surface with no AniList or TMDB id to group on.
+# Progress item keys end in ":s{season}:e{episode}"; stripping that gives the
+# show back for local media, the one surface with no AniList or TMDB id.
 _EPISODE_SUFFIX = re.compile(r"(:s-?\d+)?(:e-?\d+)$")
 
 
 def _show_key(entry: dict) -> str:
-    """The title an entry belongs to, so twelve episodes are one show.
-
-    Keyed exactly like _dedup_by_show in account_engine.routes, which is what
-    Continue Watching already collapses on."""
+    """The title an entry belongs to, so twelve episodes are one show. TMDB
+    numbers movies and shows independently, so a movie gets its own prefix."""
     if entry["surface"] == "manga":
         return entry["item_key"]
     if entry.get("anilist_id") is not None:
@@ -77,7 +62,8 @@ def _show_key(entry: dict) -> str:
     if entry["surface"] == "local":
         return _EPISODE_SUFFIX.sub("", entry["item_key"])
     if entry.get("tmdb_id") is not None:
-        return f"tmdb:{entry['tmdb_id']}"
+        prefix = "movie" if entry["surface"] == "movie" else "tmdb"
+        return f"{prefix}:{entry['tmdb_id']}"
     return entry["item_key"]
 
 
@@ -111,10 +97,8 @@ def _load_progress(conn, user_id: int) -> List[dict]:
 
 
 def _events_since(conn, user_id: int) -> Optional[datetime]:
-    """The first moment this account has an event row for, or None.
-
-    This is what makes the approximation visible: everything before it in the
-    requested year came from last-touch timestamps."""
+    """The first moment this account has an event row for, or None. Anything
+    before it came from last-touch timestamps."""
     row = conn.execute(
         "SELECT MIN(first_seen_at) AS since FROM watch_events WHERE user_id = %s",
         (user_id,),
@@ -123,7 +107,7 @@ def _events_since(conn, user_id: int) -> Optional[datetime]:
 
 
 def _parse_updated_at(value) -> Optional[datetime]:
-    """watch_progress.updated_at is ISO-8601 TEXT (see account_engine.db)."""
+    """watch_progress.updated_at is ISO-8601 TEXT; a naive value is UTC."""
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     try:
@@ -134,15 +118,11 @@ def _parse_updated_at(value) -> Optional[datetime]:
 
 
 def _genres_for(conn, items: List[dict]) -> Counter:
-    """Genre counts over distinct titles, not over episodes.
+    """Genre counts over distinct titles, so a long show does not bury the rest.
 
-    A 24-episode season is one vote for its genres, otherwise a long show buries
-    everything else. Local rows carry no AniList or TMDB id and therefore no
-    genres at all; they are left out rather than bucketed as "unknown", which
-    would let an operator's own library dominate the chart. Manga is left out
-    for a different reason: its AniList ids come from AniList's manga space, and
-    looking one up in anime_entries would silently return another title's
-    genres."""
+    Local rows have no genres and are left out rather than counted as "unknown".
+    Manga is left out because its AniList ids are from the manga id space, and
+    looking one up in anime_entries would return another title's genres."""
     anime_ids, show_ids, movie_ids = set(), set(), set()
     for item in items:
         surface = item["surface"]
@@ -189,7 +169,6 @@ def _longest_streak(days: List[date]) -> Tuple[int, Optional[str], Optional[str]
 
 def build(user_id: int, year: int, offset_minutes: int = 0) -> dict:
     """One account's year, in the viewer's own timezone."""
-    offset_minutes = max(MIN_OFFSET_MINUTES, min(MAX_OFFSET_MINUTES, int(offset_minutes)))
     first_day, last_day = date(year, 1, 1), date(year, 12, 31)
     # watched_on is a UTC date and the local day can fall either side of it, so
     # the window is widened by a day and the local date does the real filtering.
@@ -199,8 +178,8 @@ def build(user_id: int, year: int, offset_minutes: int = 0) -> dict:
         since = _events_since(conn, user_id)
         events = _load_events(conn, user_id, first_day - pad, last_day + pad)
 
-        # (item_key, local day) is the unit of "watched this, that day". Event
-        # rows are the truth; a progress row only fills a day no event covers.
+        # (item_key, local day) is the unit of "watched this, that day". A
+        # progress row only fills a day no event covers.
         by_day: Dict[Tuple[str, date], dict] = {}
         for row in events:
             day = _local_day(row["first_seen_at"], offset_minutes)
@@ -208,8 +187,7 @@ def build(user_id: int, year: int, offset_minutes: int = 0) -> dict:
                 continue
             by_day[(row["item_key"], day)] = {**row, "day": day, "exact": True}
 
-        # The span of the year the events table cannot describe. With no events
-        # at all, that is the whole year.
+        # With no events at all, the whole year is approximate.
         approximate_until = _local_day(since, offset_minutes) if since else last_day + pad
         approximate = approximate_until > first_day
 
@@ -226,13 +204,12 @@ def build(user_id: int, year: int, offset_minutes: int = 0) -> dict:
         entries = list(by_day.values())
         for entry in entries:
             entry["surface"] = _surface(entry)
+            entry["show"] = _show_key(entry)
         genres = _genres_for(conn, entries)
 
-    # One entry per item, at the furthest position ever reached. Summing the
-    # daily figures instead would double count an episode watched across two
-    # days, because each day records the furthest point reached so far. This
-    # undercounts a rewatch and never overcounts, which is the right direction
-    # for a number presented to the person who did the watching.
+    # One figure per item, at the furthest position ever reached: each day
+    # records the furthest point so far, so summing days would double count an
+    # episode watched across two. This undercounts a rewatch but never overcounts.
     furthest: Dict[str, float] = {}
     surfaces: Dict[str, str] = {}
     shows_seen: Dict[str, str] = {}
@@ -241,11 +218,10 @@ def build(user_id: int, year: int, offset_minutes: int = 0) -> dict:
         key = entry["item_key"]
         furthest[key] = max(furthest.get(key, 0.0), float(entry.get("seconds") or 0.0))
         surfaces[key] = entry["surface"]
-        shows_seen[key] = _show_key(entry)
+        shows_seen[key] = entry["show"]
         if entry.get("title"):
             titles.setdefault(shows_seen[key], entry["title"])
 
-    # Per show, not per episode: a season of twelve is one entry in the chart.
     per_show: Dict[str, float] = {}
     for key, seconds in furthest.items():
         show = shows_seen[key]
@@ -256,12 +232,11 @@ def build(user_id: int, year: int, offset_minutes: int = 0) -> dict:
     busiest_day, busiest_count = (per_day.most_common(1) or [(None, 0)])[0]
     streak_days, streak_start, streak_end = _longest_streak(days)
 
-    # Counted per surface and never summed into one headline number: a manga row
-    # is one per title (the chapter rides in episode_number), so adding it to a
-    # per-episode anime count would compare two different things.
+    # Never summed into one headline number: a manga row is one per title (the
+    # chapter rides in episode_number), not one per episode.
     by_surface = Counter(surfaces.values())
     shows = {
-        surface: len({_show_key(entry) for entry in entries if entry["surface"] == surface})
+        surface: len({entry["show"] for entry in entries if entry["surface"] == surface})
         for surface in by_surface
     }
 
@@ -269,8 +244,6 @@ def build(user_id: int, year: int, offset_minutes: int = 0) -> dict:
     return {
         "year": year,
         "offset_minutes": offset_minutes,
-        # True when any part of the year predates watch_events, in which case
-        # that span was reconstructed from last-touch timestamps.
         "approximate": approximate,
         "events_since": since.isoformat() if since else None,
         "episodes": by_surface.get("anime", 0) + by_surface.get("show", 0)
@@ -291,8 +264,8 @@ def build(user_id: int, year: int, offset_minutes: int = 0) -> dict:
         "top_genres": [
             {"genre": name, "count": count} for name, count in genres.most_common(TOP_GENRES)
         ],
-        "first_title": titles.get(_show_key(ordered[0])) if ordered else None,
-        "last_title": titles.get(_show_key(ordered[-1])) if ordered else None,
+        "first_title": titles.get(ordered[0]["show"]) if ordered else None,
+        "last_title": titles.get(ordered[-1]["show"]) if ordered else None,
         "top_titles": [
             {"title": titles[show], "minutes": round(seconds / 60.0)}
             for show, seconds in sorted(

@@ -1,41 +1,24 @@
-"""
-Signed cache tickets — defer a stream's caching until the player confirms the
-viewer actually watched it.
+"""Signed cache tickets: cache the stream the viewer chose, not the fastest one.
 
-Why this exists: ``/watch`` resolves several sources per episode, fastest-first
-(PlayIMDb usually wins the race). If we enqueued a download the instant a stream
-resolved, we'd almost always cache that fastest source — not the high-quality,
-language-tagged one (Voe / VidSrc / …) the viewer actually ends up choosing. So
-instead the watch path stamps each *cacheable* stream with an opaque ticket; the
-player calls ``POST /cache/confirm`` with that ticket once the viewer has watched
-~10s, and only then does the download get enqueued.
+``/watch`` resolves several sources per episode and the fastest usually wins the
+race, so enqueueing on resolve would nearly always cache that one. Instead each
+cacheable stream carries a ticket, and the player redeems it at
+``POST /cache/confirm`` after about ten seconds of watching.
 
-The ticket is HMAC-signed with the same shared ``PROXY_SECRET`` the proxies use,
-so a client can only ever ask us to cache a stream **we ourselves resolved and
-signed** — it can't smuggle an arbitrary URL into ffmpeg (closes the SSRF hole,
-exactly like the signed stream proxies). Tickets are self-contained and stateless
-so the ``/watch`` replica that mints one and the ``/cache/confirm`` replica that
-redeems it needn't be the same node.
+The HMAC means a client can only ask us to cache a stream we resolved ourselves,
+never smuggle an arbitrary URL into ffmpeg. Tickets are stateless, so the replica
+that mints one need not be the one that redeems it.
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
 from typing import Optional
 
-# Reuse the proxies' shared-secret resolution so a ticket minted by one replica
-# verifies on whichever replica the confirm call lands on (PROXY_SECRET first,
-# then CACHE_TICKET_SECRET, then a logged per-process random fallback).
-from resolvers._proxy_secret import resolve_secret
+from core import signing
+from core.media_paths import decode_token, encode_token
 
-_SECRET = resolve_secret("CACHE_TICKET_SECRET")
-
-
-def _sign(body: str) -> str:
-    return hmac.new(_SECRET, body.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+_SECRET = signing.resolve_secret("CACHE_TICKET_SECRET")
 
 
 def mint(
@@ -50,15 +33,8 @@ def mint(
     anilist_id: Optional[int],
     media_type: str = "tv",
 ) -> str:
-    """A compact ``<payload>.<sig>`` ticket carrying everything ``maybe_enqueue``
-    needs to reconstruct this exact stream. Short keys keep it small — it rides in
-    every NDJSON stream line.
-
-    ``media_type`` ("tv" | "movie") rides along so the downloader can refuse to
-    cache movies: the cache key is (tmdb_id, season, episode, language), and TMDB
-    movie ids share that numeric space with tv ids, so a movie would collide with
-    a same-id show until the cache is namespaced. Defaults to "tv" so older tickets
-    decode unchanged."""
+    """``<payload>.<sig>``. Short keys because the ticket rides in every NDJSON
+    stream line."""
     payload = {
         "u": url,
         "t": type,
@@ -70,22 +46,19 @@ def mint(
         "ai": int(anilist_id) if anilist_id is not None else None,
         "mt": media_type or "tv",
     }
-    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    return f"{body}.{_sign(body)}"
+    body = encode_token(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+    return f"{body}.{signing.sign(_SECRET, body)}"
 
 
 def verify(ticket: str) -> Optional[dict]:
-    """Decode a ticket minted by :func:`mint`, or None if it's absent, forged or
-    garbled. The returned dict is shaped for ``DownloadManager.maybe_enqueue``."""
+    """The minted fields, or None when the ticket is absent, forged or garbled."""
     if not ticket or "." not in ticket:
         return None
     body, _, sig = ticket.rpartition(".")
-    if not hmac.compare_digest(_sign(body), sig or ""):
+    if not signing.verify(_SECRET, body, sig):
         return None
     try:
-        pad = "=" * (-len(body) % 4)
-        p = json.loads(base64.urlsafe_b64decode(body + pad))
+        p = json.loads(decode_token(body) or "")
         return {
             "url": p["u"],
             "type": p["t"],

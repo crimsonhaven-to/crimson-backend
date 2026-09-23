@@ -1,66 +1,43 @@
-"""
-Recommendation data layer.
+"""The in-process index the recommender scores against, built from tables the
+metadata engine already maintains: genres on ``anime_entries`` (tied to shows by
+``tmdb_seasons`` and ``tmdb_extras``), ``tmdb_shows`` and ``tmdb_movies``.
 
-Builds an in-process "catalogue index" from the metadata tables the rest of the
-backend already maintains:
-
-  * anime    — genres on ``anime_entries`` mapped to shows via ``tmdb_seasons`` /
-               ``tmdb_extras`` (see metadata_engine.db_handler).
-  * shows    — genres on ``tmdb_shows`` (lazily populated by fetch_tmdb_show and
-               the trending/search discovery, see api.py).
-  * movies   — genres on ``tmdb_movies`` (same lazy population).
-
-Nothing here writes, no schema is added, and no external API is called:
-recommendations are derived purely from genres already in the database. Each of
-the three surfaces is scored within its own genre vocabulary (AniList genres and
-TMDB tv/movie genres differ), and the routes layer merges the three by score.
-
-The index only changes as titles get opened / resynced, so it's cached
-in-process for ``CACHE_TTL`` seconds — turning each request into a CPU pass over
-in-memory dicts instead of a multi-thousand-row scan + JSON parse.
+Read-only, no external calls. AniList and TMDB tv/movie genres are different
+vocabularies, so each surface is scored separately and the service merges them.
+The index only changes as titles are opened or resynced, so it is cached for
+``CACHE_TTL`` rather than rescanning and re-parsing thousands of rows per request.
 """
 
 import json
 import threading
 import time
+from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Optional
 
 from core.db_pool import get_connection
 
-CACHE_TTL = 1800  # seconds (30 min)
+CACHE_TTL = 1800
 
 _lock = threading.Lock()
 _cache: Optional["CatalogueIndex"] = None
 _cache_at: float = 0.0
 
 
+@dataclass(frozen=True)
 class CatalogueIndex:
-    """Immutable snapshot of the local catalogue used for scoring.
-
-    Genre maps (for resolving a *seed* to its genres):
-      * ``genres_by_anilist`` — anilist_id -> genres (every anime entry).
-      * ``genres_by_show``    — non-anime show tmdb_id -> genres.
-      * ``genres_by_movie``   — movie tmdb_id -> genres.
-    ``tmdb_by_anilist`` collapses an anime seed (any season) to its show tmdb_id.
-
-    Candidate lists (the things we actually recommend), each one row per title
-    with a genre set, display title, year and poster path:
-      * ``anime_candidates`` / ``show_candidates`` / ``movie_candidates``.
-    """
-
-    def __init__(self, *, genres_by_anilist, genres_by_show, genres_by_movie,
-                 tmdb_by_anilist, anime_candidates, show_candidates, movie_candidates):
-        self.genres_by_anilist: Dict[int, FrozenSet[str]] = genres_by_anilist
-        self.genres_by_show: Dict[int, FrozenSet[str]] = genres_by_show
-        self.genres_by_movie: Dict[int, FrozenSet[str]] = genres_by_movie
-        self.tmdb_by_anilist: Dict[int, int] = tmdb_by_anilist
-        self.anime_candidates: List[Dict] = anime_candidates
-        self.show_candidates: List[Dict] = show_candidates
-        self.movie_candidates: List[Dict] = movie_candidates
+    # Seed lookups: a seed resolves to its genres through these.
+    genres_by_anilist: Dict[int, FrozenSet[str]]
+    genres_by_show: Dict[int, FrozenSet[str]]
+    genres_by_movie: Dict[int, FrozenSet[str]]
+    # An anime seed from any season collapses to its show.
+    tmdb_by_anilist: Dict[int, int]
+    # What can be recommended: one postered row per title, with its genre set.
+    anime_candidates: List[Dict]
+    show_candidates: List[Dict]
+    movie_candidates: List[Dict]
 
 
 def _parse_genres(raw) -> FrozenSet[str]:
-    """Parse a JSON-encoded genres column into a set (``frozenset()`` on junk)."""
     if not raw:
         return frozenset()
     try:
@@ -73,7 +50,6 @@ def _parse_genres(raw) -> FrozenSet[str]:
 
 
 def _year(date_str) -> Optional[int]:
-    """Best-effort 4-digit year from a 'YYYY-MM-DD' TMDB date string."""
     if not date_str or len(str(date_str)) < 4:
         return None
     try:
@@ -89,7 +65,6 @@ def _build_index() -> CatalogueIndex:
     with get_connection() as conn:
         cur = conn.cursor()
 
-        # --- anime -----------------------------------------------------
         cur.execute(
             "SELECT anilist_id, title_romaji, title_english, title_native, "
             "anime_type, start_year, genres FROM anime_entries"
@@ -105,7 +80,7 @@ def _build_index() -> CatalogueIndex:
             "ORDER BY tmdb_id, season_number"
         )
         tmdb_by_anilist: Dict[int, int] = {}
-        lowest_season: Dict[int, Dict] = {}  # tmdb_id -> {anilist_id, season_number}
+        lowest_season: Dict[int, Dict] = {}
         for r in cur.fetchall():
             tmdb_by_anilist.setdefault(r["anilist_id"], r["tmdb_id"])
             lowest_season.setdefault(
@@ -117,7 +92,6 @@ def _build_index() -> CatalogueIndex:
         for r in cur.fetchall():
             tmdb_by_anilist.setdefault(r["anilist_id"], r["tmdb_id"])
 
-        # --- non-anime shows + movies ----------------------------------
         cur.execute(
             "SELECT tmdb_id, title, poster_path, first_air_date, genres FROM tmdb_shows"
         )
@@ -127,13 +101,12 @@ def _build_index() -> CatalogueIndex:
         )
         movie_rows = cur.fetchall()
 
-        # Posters for anime candidates come from tmdb_shows (sparse).
         posters = {r["tmdb_id"]: r["poster_path"] for r in show_rows}
 
-    # anime candidates: one per show (lowest season) that has genres AND a poster.
-    # The poster comes from tmdb_shows, which is sparse (only titles opened at least
-    # once), so we skip posterless candidates — exactly like /trending and /search do
-    # (a posterless tile just renders a "No Sigil" placeholder on the home rows).
+    # One anime candidate per show, its lowest season. The poster comes from
+    # tmdb_shows, which only holds titles seen at least once, and a posterless
+    # candidate is skipped as /trending and /search skip them: the tile would
+    # render as a placeholder.
     anime_candidates: List[Dict] = []
     for tmdb_id, sel in lowest_season.items():
         anilist_id = sel["anilist_id"]
@@ -161,9 +134,7 @@ def _build_index() -> CatalogueIndex:
         g = _parse_genres(r["genres"])
         if not g:
             continue
-        # A seed still needs its genres even if it has no poster, so register the
-        # genre lookup unconditionally; only the *candidate* (a tile we'd render)
-        # requires a poster.
+        # A posterless title can still be a seed; only a candidate needs a poster.
         genres_by_show[r["tmdb_id"]] = g
         if not r["poster_path"]:
             continue
@@ -207,18 +178,14 @@ def _build_index() -> CatalogueIndex:
     )
 
 
-def get_catalogue_index(force: bool = False) -> CatalogueIndex:
-    """Return the cached catalogue index, rebuilding it if stale (or forced).
-
-    Synchronous (borrows a pooled connection); call from a threadpool in async
-    handlers like the rest of this backend's DB access.
-    """
+def get_catalogue_index() -> CatalogueIndex:
+    """The cached index, rebuilt once stale. Synchronous."""
     global _cache, _cache_at
-    now = time.time()
-    if not force and _cache is not None and (now - _cache_at) < CACHE_TTL:
+    if _cache is not None and time.monotonic() - _cache_at < CACHE_TTL:
         return _cache
     with _lock:
-        if force or _cache is None or (time.time() - _cache_at) >= CACHE_TTL:
+        # Another thread may have rebuilt it while this one waited for the lock.
+        if _cache is None or time.monotonic() - _cache_at >= CACHE_TTL:
             _cache = _build_index()
-            _cache_at = time.time()
+            _cache_at = time.monotonic()
     return _cache

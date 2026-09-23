@@ -1,53 +1,33 @@
-"""
-IPTV service — a browsable catalogue of the world's free-to-air TV, courtesy of
-the iptv-org project (https://github.com/iptv-org/iptv).
+"""Live TV: a read-only catalogue of free-to-air channels from the iptv-org index
+(https://iptv-org.github.io/api/).
 
-Nothing here is hosted, stored, or shipped by us: iptv-org curates a public,
-daily-updated index of publicly available broadcast streams, and this service
-fetches that index (the JSON API at https://iptv-org.github.io/api/), joins it
-into a compact in-process catalogue, and serves it read-only. We honour the
-project's own blocklist (channels removed on request of the rights holder) and
-exclude NSFW-flagged channels by default.
+Nothing is hosted here. Each refresh fetches the index, drops blocklisted,
+closed and (by default) NSFW channels plus any without a stream, and keeps the
+joined result in process. A refresh is about 25 MB, so it runs in a background
+thread, per replica.
 
-Data joined per refresh (all fetched from IPTV_API_BASE):
-  * ``channels.json``  — channel identity (id, name, country, categories, …)
-  * ``streams.json``   — the playable HLS URLs (joined on channel id)
-  * ``logos.json``     — channel logos (best one picked per channel)
-  * ``categories.json``/``countries.json`` — the browse facets
-  * ``blocklist.json`` — channels we must not surface
-
-Playback goes through the signed same-origin ``/iptv_proxy`` (see routes):
-roughly a fifth of the indexed streams are plain ``http://`` (mixed content —
-an https page can't touch them), most serve no usable CORS, and some gate on a
-Referer/User-Agent the viewer's browser can't send. The proxy solves all three
-the same way the other operator proxies do.
-
-Configuration (all optional):
-  * ``IPTV_ENABLED``        — master switch (default true).
-  * ``IPTV_REFRESH_HOURS``  — hours between catalogue refreshes (default 12;
-                              upstream publishes daily).
-  * ``IPTV_INCLUDE_NSFW``   — include NSFW-flagged channels (default false).
-
-The catalogue lives per replica (no cross-replica coordination), exactly like
-the changelog cache; a refresh is ~25 MB of JSON twice a day.
+Playback prefers the broadcaster's CDN and falls back to the signed
+``/iptv_proxy``: about a fifth of the streams are plain http (mixed content on an
+https page), many send no CORS, and some need a Referer or User-Agent a browser
+cannot set.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import logging
-import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from urllib.parse import quote, urljoin
 
 import httpx
 
-from resolvers._proxy_secret import resolve_secret
+from functools import cache
+
+from core import signing
+from core.clock import utc_now_iso
+from core.config import get_settings
 from resolvers._ssrf_guard import guarded_client
 
 logger = logging.getLogger("crimson.iptv")
@@ -65,51 +45,27 @@ DEFAULT_UA = (
 )
 
 
-def enabled() -> bool:
-    """Master switch — IPTV needs no secrets, so it defaults on."""
-    return (os.getenv("IPTV_ENABLED") or "true").strip().lower() not in ("0", "false", "no")
-
-
-def _include_nsfw() -> bool:
-    return (os.getenv("IPTV_INCLUDE_NSFW") or "").strip().lower() in ("1", "true", "yes")
-
-
-def _refresh_hours() -> float:
-    try:
-        return max(1.0, float(os.getenv("IPTV_REFRESH_HOURS", "12")))
-    except ValueError:
-        return 12.0
-
-
-# --- Signed proxy links ------------------------------------------------------
-# Same shape as the other operator proxies: every upstream URL the player may
-# ask /iptv_proxy to fetch is HMAC-signed, so the proxy is not an open relay.
-# The signature covers the optional Referer/User-Agent too — otherwise a caller
-# could replay a valid stream signature with attacker-chosen headers.
-
-_secret: Optional[bytes] = None
-
-
+# Every URL /iptv_proxy may fetch is signed, so it is not an open relay. The
+# signature covers the Referer and User-Agent too, or a valid signature could be
+# replayed with attacker-chosen headers.
+@cache
 def _proxy_secret() -> bytes:
-    global _secret
-    if _secret is None:
-        _secret = resolve_secret("IPTV_PROXY_SECRET")
-    return _secret
+    return signing.resolve_secret("IPTV_PROXY_SECRET")
+
+
+def _stream_payload(url: str, referrer: str, user_agent: str) -> str:
+    return "\n".join((url, referrer or "", user_agent or ""))
 
 
 def sign_stream(url: str, referrer: str = "", user_agent: str = "") -> str:
-    payload = "\n".join((url, referrer or "", user_agent or "")).encode("utf-8")
-    return hmac.new(_proxy_secret(), payload, hashlib.sha256).hexdigest()[:32]
+    return signing.sign(_proxy_secret(), _stream_payload(url, referrer, user_agent))
 
 
 def verify_stream_sig(url: str, sig: str, referrer: str = "", user_agent: str = "") -> bool:
-    if not sig:
-        return False
-    return hmac.compare_digest(sign_stream(url, referrer, user_agent), sig)
+    return signing.verify(_proxy_secret(), _stream_payload(url, referrer, user_agent), sig)
 
 
 def proxy_path(url: str, referrer: str = "", user_agent: str = "") -> str:
-    """Relative same-origin proxy path for one upstream URL (playlist or segment)."""
     parts = [
         f"{PROXY_PREFIX}?u={quote(url, safe='')}",
         f"s={sign_stream(url, referrer, user_agent)}",
@@ -121,21 +77,19 @@ def proxy_path(url: str, referrer: str = "", user_agent: str = "") -> str:
     return "&".join(parts)
 
 
-# --- HLS playlist rewriting ---------------------------------------------------
 def rewrite_playlist(text: str, base_url: str, referrer: str = "", user_agent: str = "") -> str:
-    """Rewrite an m3u8 so every sub-resource flows back through /iptv_proxy.
-
-    Handles variant/segment lines and the ``URI="..."`` attribute inside
-    EXT-X-MEDIA / EXT-X-KEY / EXT-X-MAP / EXT-X-I-FRAME-STREAM-INF tags.
-    Relative URIs are resolved against ``base_url`` (the *final* upstream URL,
-    after redirects) so the proxied link is always absolute + signed.
-    """
+    """Route every URI in an m3u8, including ``URI="..."`` tag attributes, back
+    through /iptv_proxy. ``base_url`` is the upstream URL after redirects, which
+    relative URIs resolve against."""
 
     def _route(uri: str) -> str:
         uri = uri.strip()
         if not uri or uri.startswith("data:"):
             return uri
         return proxy_path(urljoin(base_url, uri), referrer, user_agent)
+
+    def _route_attribute(match: re.Match[str]) -> str:
+        return 'URI="' + _route(match.group(1)) + '"'
 
     out = []
     for line in text.splitlines():
@@ -144,7 +98,7 @@ def rewrite_playlist(text: str, base_url: str, referrer: str = "", user_agent: s
             out.append(line)
         elif stripped.startswith("#"):
             out.append(
-                re.sub(r'URI="([^"]+)"', lambda m: 'URI="' + _route(m.group(1)) + '"', line)
+                re.sub(r'URI="([^"]+)"', _route_attribute, line)
             )
         else:
             out.append(_route(stripped))
@@ -157,7 +111,6 @@ def is_playlist(content_type: str, url: str) -> bool:
     return url.split("?", 1)[0].lower().endswith((".m3u8", ".m3u"))
 
 
-# --- Catalogue building (pure; unit-tested without network) -------------------
 def _quality_rank(quality: Optional[str]) -> int:
     try:
         return int((quality or "").lower().rstrip("pi"))
@@ -174,12 +127,8 @@ def build_catalog(
     blocklist: List[Dict],
     include_nsfw: bool = False,
 ) -> Dict:
-    """Join the raw iptv-org API payloads into the servable catalogue.
-
-    Only channels that are alive (not closed/replaced), permitted (not on the
-    project blocklist, not NSFW unless opted in) and actually *playable* (at
-    least one stream) make it in.
-    """
+    """Join the raw iptv-org payloads. Only live, permitted channels with at least
+    one stream make it in."""
     blocked = {b.get("channel") for b in blocklist if b.get("channel")}
 
     # Best logo per channel: in_use first, feed-level logos only as fallback.
@@ -240,7 +189,7 @@ def build_catalog(
             "website": ch.get("website"),
             "logo": (logo_by_channel.get(cid) or {}).get("url"),
             "streams": ch_streams,
-            # Pre-lowered haystack so search doesn't re-lower 15k names per query.
+            # Lowered once here so a search does not re-lower 15k names per query.
             "_search": " ".join(
                 [ch.get("name") or "", ch.get("network") or ""] + (ch.get("alt_names") or [])
             ).lower(),
@@ -276,34 +225,27 @@ def build_catalog(
     }
 
 
-# --- The service ---------------------------------------------------------------
 class IptvService:
-    """In-process catalogue over the iptv-org API.
-
-    Thread-safe like ChangelogService: the (large) network fetch runs outside
-    the lock; only the catalogue swap is guarded. Unlike the changelog, a
-    refresh is ~25 MB, so routes never fetch lazily inline — they kick a
-    background refresh thread and answer ``ready: false`` until it lands
-    (the frontend shows its tuning state and re-asks).
-    """
+    """The fetch runs outside the lock; only the catalogue swap is guarded. Routes
+    never fetch inline: they start a background refresh and answer
+    ``ready: false`` until it lands."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._catalog: Optional[Dict] = None
-        self._fetched_at: float = 0.0      # time.monotonic() of last success
-        self._refreshed_at: Optional[str] = None  # ISO wall time, for display
+        self._fetched_at: float = 0.0
+        self._refreshed_at: Optional[str] = None
         self._last_error: Optional[str] = None
         self._refreshing = False
 
-    # -- fetching --
     def _fetch_json(self, client: httpx.Client, name: str):
         resp = client.get(f"{IPTV_API_BASE}/{name}.json")
         resp.raise_for_status()
         return resp.json()
 
     def refresh(self) -> None:
-        """Blocking fetch + join + swap. Fail-open: on error the previous
-        catalogue keeps serving and the error is recorded + re-raised."""
+        """Blocking. On error the previous catalogue keeps serving and the error is
+        recorded, then re-raised."""
         try:
             with httpx.Client(timeout=httpx.Timeout(30.0, read=120.0), follow_redirects=True) as client:
                 channels = self._fetch_json(client, "channels")
@@ -314,12 +256,12 @@ class IptvService:
                 blocklist = self._fetch_json(client, "blocklist")
             catalog = build_catalog(
                 channels, streams, categories, countries, logos, blocklist,
-                include_nsfw=_include_nsfw(),
+                include_nsfw=get_settings().iptv_include_nsfw,
             )
             with self._lock:
                 self._catalog = catalog
                 self._fetched_at = time.monotonic()
-                self._refreshed_at = datetime.now(timezone.utc).isoformat()
+                self._refreshed_at = utc_now_iso()
                 self._last_error = None
             logger.info(
                 "IPTV catalogue refreshed: %d channels, %d categories, %d countries",
@@ -331,12 +273,10 @@ class IptvService:
             raise
 
     def ensure_refresh_started(self) -> None:
-        """Kick a background refresh if the catalogue is missing/stale and no
-        refresh is already in flight. Never blocks the caller."""
         with self._lock:
             fresh = (
                 self._catalog is not None
-                and (time.monotonic() - self._fetched_at) < _refresh_hours() * 3600
+                and (time.monotonic() - self._fetched_at) < get_settings().iptv_refresh_hours * 3600
             )
             if fresh or self._refreshing:
                 return
@@ -353,7 +293,6 @@ class IptvService:
 
         threading.Thread(target=_run, name="iptv-refresh", daemon=True).start()
 
-    # -- reading --
     def _snapshot(self) -> Optional[Dict]:
         with self._lock:
             return self._catalog
@@ -383,7 +322,6 @@ class IptvService:
 
     @staticmethod
     def _shape_card(rec: Dict) -> Dict:
-        """One channel → the browse-card shape (no streams, no private fields)."""
         return {
             "id": rec["id"],
             "name": rec["name"],
@@ -431,15 +369,9 @@ class IptvService:
         }
 
     def get_channel(self, channel_id: str) -> Optional[Dict]:
-        """Full detail for the watch page.
-
-        Playback is direct-first: the client plays ``direct_url`` straight off
-        the broadcaster's CDN whenever ``direct_ok`` (https + no header
-        requirements — measured ~55-60% of the live catalogue also serves CORS)
-        and falls back to the signed ``proxy_path`` only when the browser
-        can't: plain-http streams (mixed content), Referer/UA-gated feeds, or a
-        CDN that serves no CORS (surfaces as a fatal hls.js network error).
-        """
+        """The client plays ``direct_url`` when ``direct_ok`` and falls back to
+        ``proxy_path`` when that fails. CORS cannot be known server-side (about
+        55 to 60% of the catalogue sends it), so the client finds out by trying."""
         cat = self._snapshot()
         if not cat:
             return None
@@ -459,10 +391,8 @@ class IptvService:
                     "quality": s["quality"],
                     "label": s["label"],
                     "direct_url": s["url"],
-                    # Direct-eligible: an https page can only load https media,
-                    # and the browser can't send a custom Referer/User-Agent.
-                    # (CORS can't be known server-side — the client discovers it
-                    # by trying, then falls back to the proxy.)
+                    # An https page loads only https media, and a browser cannot
+                    # set a custom Referer or User-Agent.
                     "direct_ok": s["url"].startswith("https://")
                     and not s["referrer"]
                     and not s["user_agent"],
@@ -473,17 +403,14 @@ class IptvService:
         }
 
 
-# --- Proxy fetch (used by the /iptv_proxy route) --------------------------------
 async def proxy_fetch(url: str, referrer: str = "", user_agent: str = "",
                       range_header: Optional[str] = None):
-    """Fetch one signed upstream URL and return
-    ``(status, content_type, forward_headers, body)`` — rewritten bytes for an
-    HLS playlist, an async byte-iterator for a media segment.
+    """``(status, content_type, forward_headers, body)``: rewritten bytes for a
+    playlist, an async byte iterator for a segment.
 
-    Uses the SSRF-guarded client: iptv-org indexes arbitrary third-party hosts
-    and playlists/redirects could otherwise steer the backend at internal
-    addresses. Raises ``ValueError`` (incl. SSRFError) for the route's 403.
-    """
+    The index lists arbitrary hosts, and a playlist or redirect could otherwise
+    steer the backend at internal addresses, hence the SSRF-guarded client. Raises
+    ``ValueError`` (SSRFError included) for the route's 403."""
     headers = {"User-Agent": user_agent or DEFAULT_UA}
     if referrer:
         headers["Referer"] = referrer
@@ -495,8 +422,11 @@ async def proxy_fetch(url: str, referrer: str = "", user_agent: str = "",
         timeout=httpx.Timeout(15.0, read=30.0),
         headers=headers,
     )
-    req = client.build_request("GET", url)
-    resp = await client.send(req, stream=True)
+    try:
+        resp = await client.send(client.build_request("GET", url), stream=True)
+    except BaseException:
+        await client.aclose()
+        raise
 
     content_type = resp.headers.get("content-type", "application/octet-stream")
     final_url = str(resp.url)
@@ -527,3 +457,6 @@ async def proxy_fetch(url: str, referrer: str = "", user_agent: str = "",
             await client.aclose()
 
     return resp.status_code, content_type, forward, body_iter()
+
+
+service = IptvService()

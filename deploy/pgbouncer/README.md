@@ -1,350 +1,220 @@
-# Crimsonhaven — PgBouncer connection pooling (co-located with Patroni)
+# PgBouncer connection pooling (co-located with Patroni)
 
-This adds a **connection pooler** in front of your PostgreSQL so you can scale the
-API far past today's ~8-replica ceiling. It runs **one PgBouncer on each of your
-three database hosts**, right next to Patroni.
+One PgBouncer runs on each of the three database hosts, next to Patroni, so the API
+can scale past the ~8 replica ceiling set by Postgres' connection limit.
 
-**Read this first — why you can relax:** this change is **additive and fully
-reversible**, and it **never touches your data, your schema, or your PostgreSQL
-configuration**. You stand PgBouncer up *next to* Postgres, prove it works with a
-throwaway `psql` test, and only *then* point the app at it. If anything looks
-wrong at any point, you change one URL back and you're exactly where you started.
-Nothing here can hurt the database. Follow the steps top to bottom and you're done.
+The change is additive and reversible: it does not touch data, schema or PostgreSQL
+config. You stand the bouncers up, test them with `psql`, then switch the app's
+`DATABASE_URL` port. Rollback is switching the port back.
 
----
+## Why
 
-## 1. The problem this solves, in plain terms
-
-Every API container opens its own little batch of PostgreSQL connections (up to
-`DB_POOL_MAX`, default 10). All of them land on the **one** Patroni leader. Postgres
-allows ~100 connections total, so once you run more than ~8 API replicas, new ones
-start getting *"sorry, too many clients already"*. Connections are the bottleneck.
-
-**PgBouncer fixes this by sharing a small set of real connections among many
-clients.** It keeps, say, 25 real connections to Postgres and lets *hundreds* of
-API clients take turns using them — each only for the split-second of a single
-query. The API tier can then grow as large as your CPUs allow; Postgres still only
-ever sees ~25–30 connections.
+Each API replica opens up to `DB_POOL_MAX` (default 10) connections, all to the
+Patroni leader. Postgres allows ~100, so past ~8 replicas new connections fail with
+`too many clients already`. PgBouncer in transaction mode lends ~25 real backends to
+hundreds of clients, one transaction at a time, so Postgres sees ~25 to 30
+connections regardless of replica count.
 
 ```
-        your stateless API Swarm  (DATABASE_URL -> all three DB hosts, :6432)
-                          │   "give me the read-write node"
+        API Swarm  (DATABASE_URL -> all three DB hosts, :6432)
+                          │   target_session_attrs=read-write
         ┌─────────────────┼──────────────────────────────┐
-        │                 │                               │
    ┌────┴─────┐      ┌─────┴────┐                    ┌─────┴────┐
    │  pg-1     │     │  pg-2    │                     │  pg-3    │
-   │ PgBouncer │     │ PgBouncer│                     │ PgBouncer│  :6432 (new)
-   │   :6432   │     │   :6432  │                     │   :6432  │
+   │ PgBouncer │     │ PgBouncer│                     │ PgBouncer│  :6432
    │    │      │     │    │     │                     │    │     │
    │ Postgres  │     │ Postgres │                     │ Postgres │  :5432
-   │ PRIMARY ◀─┼─────┼─ standby │                     │ standby  │
+   │ PRIMARY   │     │ standby  │                     │ standby  │
    └──────────┘      └──────────┘                     └──────────┘
-        ▲
-        └── only the LEADER's bouncer carries traffic; the app finds it
-            automatically via target_session_attrs=read-write, and follows
-            it on failover — no VIP, no load balancer, same as today.
 ```
 
-Each bouncer only ever talks to **its own** node's Postgres (`127.0.0.1:5432`). Your
-app keeps the exact same multi-host URL trick it uses now — it just points at port
-**6432** (the bouncers) instead of **5432** (Postgres direct). libpq still asks for
-"the read-write node", so it lands on whichever bouncer fronts the current primary,
-and re-finds it after a failover. **Why this is safe for *your* app specifically:**
-in transaction mode PgBouncer reuses a backend between transactions, which only
-breaks apps that keep *session* state (temp tables, `LISTEN`, `SET SESSION`,
-session advisory locks). This backend keeps none of those — its one advisory lock
-is transaction-scoped — so it's a clean fit.
+Each bouncer talks only to its own node's Postgres (`127.0.0.1:5432`). The app keeps
+its multi-host URL with `target_session_attrs=read-write`, only the port changes, so
+libpq still finds the leader's bouncer and follows it on failover. No VIP.
 
----
+Transaction pooling breaks apps that keep session state (temp tables, `LISTEN`,
+`SET SESSION`, session advisory locks). This backend keeps none; its one advisory
+lock is transaction-scoped.
 
-## 2. Files in this directory
+## Files
 
-| File | What it is |
+| File | Purpose |
 |---|---|
-| `docker-compose.yml` | the PgBouncer service — run one copy per DB host |
-| `Dockerfile.pgbouncer` | builds the tiny PgBouncer image (Alpine package) |
-| `pgbouncer.ini` | the pooler config (transaction mode, sizing) — identical on all hosts |
-| `userlist.txt.example` | template for the auth file → copy to `userlist.txt` and fill in |
-| `README.md` | this guide |
+| `docker-compose.yml` | the PgBouncer service, one copy per DB host |
+| `Dockerfile.pgbouncer` | PgBouncer image from the Alpine package |
+| `pgbouncer.ini` | pooler config (transaction mode, sizing) |
+| `userlist.txt.example` | template for the auth file `userlist.txt` |
 
-Unlike the Patroni setup, **nothing here is per-host** — the three files are
-byte-for-byte identical on pg-1/pg-2/pg-3. There's no `.env` to edit.
+All files are identical on pg-1, pg-2 and pg-3. There is no `.env`.
 
----
+## Prerequisites
 
-## 3. Before you start
+- Patroni is healthy: `pctl list` shows one Leader and two Replicas, all `running`.
+  If not, finish `../postgres-ha/README.md` first.
+- The repo is cloned on each DB host (e.g. `/srv/crimson/deploy/pgbouncer`).
 
-- Your Patroni cluster is **already up and healthy** (`pctl list` shows one Leader,
-  two Replicas, all `running`). If not, finish `../postgres-ha/README.md` first.
-- You can run `docker compose` on each DB host (you already do, for Patroni).
-- Decide nothing else — the defaults here are production-sane.
+## Setup
 
----
+1. **Create `userlist.txt`** on one host:
 
-## 4. Get the files onto each host
+   ```bash
+   cd /srv/crimson/deploy/pgbouncer
+   cp userlist.txt.example userlist.txt
+   chmod 600 userlist.txt
+   ```
 
-You already have this repo on each DB host (you cloned it for Patroni). Just `cd`
-into this directory on each host:
+   Replace `REPLACE_WITH_YOUR_CRIMSON_APP_PASSWORD` with `CRIMSON_APP_PASSWORD` from
+   `../postgres-ha/.env` (the password in the app's `DATABASE_URL`). Keep the quotes:
 
-```bash
-cd /srv/crimson/deploy/pgbouncer      # adjust to wherever you cloned the repo
-```
+   ```
+   "crimson" "your-actual-crimson-password"
+   ```
 
----
+   With `auth_type = scram-sha-256`, PgBouncer uses this both to verify the app and
+   to log in to Postgres. The password already sits in `.env` on these hosts.
 
-## 5. Create the auth file (`userlist.txt`)
+   Optional, more secure: store the SCRAM verifier instead. This read-only query
+   prints the line to paste over the one in `userlist.txt`:
 
-PgBouncer needs to know the `crimson` login. Copy the template and fill it in:
+   ```bash
+   docker compose -f ../postgres-ha/docker-compose.yml exec patroni \
+     psql "postgresql://postgres:YOUR_SUPERUSER_PASSWORD@127.0.0.1:5432/crimson" -tAqc \
+     "select '\"'||rolname||'\" \"'||rolpassword||'\"' from pg_authid where rolname='crimson'"
+   ```
 
-```bash
-cp userlist.txt.example userlist.txt
-```
+   Copy the file to the other hosts:
 
-**The easy way (recommended):** open `userlist.txt` and replace
-`REPLACE_WITH_YOUR_CRIMSON_APP_PASSWORD` with your **crimson app password** — the
-`CRIMSON_APP_PASSWORD` from `../postgres-ha/.env` (the same password that's in your
-app's `DATABASE_URL`). Leave the `"crimson"` and the quotes exactly as they are:
+   ```bash
+   scp userlist.txt pg-2:/srv/crimson/deploy/pgbouncer/userlist.txt
+   scp userlist.txt pg-3:/srv/crimson/deploy/pgbouncer/userlist.txt
+   ```
 
-```
-"crimson" "your-actual-crimson-password"
-```
+2. **Build and start** on each host (no ordering between hosts):
 
-That's it. (auth_type is `scram-sha-256`, so PgBouncer turns this password into a
-secure SCRAM handshake for both verifying the app and logging in to Postgres. This
-password already sits in `.env` on these same hosts, so the file adds no new
-exposure.) Lock the file down:
+   ```bash
+   docker compose build
+   docker compose up -d
+   docker compose ps                 # "running (healthy)" after ~15s
+   docker compose logs --tail=20     # "process up: PgBouncer ... listening on 0.0.0.0:6432"
+   ```
 
-```bash
-chmod 600 userlist.txt
-```
+3. **Open the firewall** for the Swarm subnet only (same as the Patroni guide's
+   5432 rule). Never expose 6432 publicly.
 
-> **More secure (optional):** instead of the plaintext password, store the one-way
-> SCRAM *verifier*. This **read-only** command prints the exact line to paste (run
-> it on any DB host that's up; swap in your superuser password from `.env`):
->
-> ```bash
-> docker compose -f ../postgres-ha/docker-compose.yml exec patroni \
->   psql "postgresql://postgres:YOUR_SUPERUSER_PASSWORD@127.0.0.1:5432/crimson" -tAqc \
->   "select '\"'||rolname||'\" \"'||rolpassword||'\"' from pg_authid where rolname='crimson'"
-> ```
->
-> It only *reads* a catalog (it cannot change anything). Paste its single line of
-> output over the line in `userlist.txt`.
+   ```bash
+   sudo ufw allow from 10.0.1.0/24 to any port 6432 proto tcp
+   ```
 
-Now copy your finished `userlist.txt` to the **same path on all three hosts** (it's
-identical everywhere):
+4. **Test before touching the app.** From any machine with `psql`:
 
-```bash
-# example: from pg-1, push it to pg-2 and pg-3
-scp userlist.txt pg-2:/srv/crimson/deploy/pgbouncer/userlist.txt
-scp userlist.txt pg-3:/srv/crimson/deploy/pgbouncer/userlist.txt
-```
+   ```bash
+   psql "postgresql://crimson:YOUR_CRIMSON_PASSWORD@10.0.0.11,10.0.0.12,10.0.0.13:6432/crimson?target_session_attrs=read-write" \
+     -c "select pg_is_in_recovery() as on_a_standby, current_user, inet_server_port() as backend_port"
+   ```
 
----
+   Expected:
 
-## 6. Build and start the bouncer on each host
+   ```
+    on_a_standby | current_user | backend_port
+   --------------+--------------+--------------
+    f            | crimson      |         5432
+   ```
 
-On **each** of the three hosts, in this directory:
+   `f` means you reached the primary through a bouncer; `crimson` means auth works.
+   Then check the pool on a DB host:
 
-```bash
-docker compose build      # first time only (tiny, ~seconds)
-docker compose up -d
-```
+   ```bash
+   docker compose exec -e PGPASSWORD='YOUR_CRIMSON_PASSWORD' pgbouncer \
+     psql "host=127.0.0.1 port=6432 user=crimson dbname=pgbouncer" -c "SHOW POOLS"
+   ```
 
-Check it came up:
+   You should see a `crimson` pool with a few `sv_idle` connections.
 
-```bash
-docker compose ps                 # State should be "running (healthy)" after ~15s
-docker compose logs --tail=20     # expect a line like "process up: PgBouncer ... listening on 0.0.0.0:6432"
-```
+   > **Warning:** never add `target_session_attrs=read-write` (or any value but
+   > `any`) to an admin console (`dbname=pgbouncer`) connection. libpq then sends
+   > `SHOW transaction_read_only`, which the admin console rejects as
+   > `invalid command`, so the command fails or hangs. The admin console is local to
+   > each bouncer and needs no routing. The `crimson` database is the opposite: it
+   > requires `read-write`.
 
-Do this on all three hosts. They don't depend on each other or on boot order.
+5. **Switch the app** by changing only the port in `DATABASE_URL`:
 
----
+   ```
+   # before
+   DATABASE_URL=postgresql://crimson:PASS@10.0.0.11,10.0.0.12,10.0.0.13:5432/crimson?target_session_attrs=read-write&connect_timeout=5
+   # after
+   DATABASE_URL=postgresql://crimson:PASS@10.0.0.11,10.0.0.12,10.0.0.13:6432/crimson?target_session_attrs=read-write&connect_timeout=5
+   ```
 
-## 7. Open the firewall for :6432
+   Prepared statements must be off behind a transaction pooler. `core/db_pool.py`
+   already defaults `DB_PREPARE_THRESHOLD` to disabled; do not set it.
 
-Same idea as Postgres' `5432` — the Swarm app nodes need to reach `6432`, nothing
-public. Add it alongside your existing rule (matches §7 of the Patroni guide; use
-your real Swarm subnet):
+   Redeploy as usual (e.g. `~/crimson-deploy/deploy.sh` or
+   `docker stack deploy -c docker-stack.yml crimson`). Keep `RUN_DB_SYNC=true`
+   on the single `api-sync` replica; its resync runs as one transaction, which
+   transaction pooling handles.
 
-```bash
-# from the Swarm nodes: the new pooler port
-sudo ufw allow from 10.0.1.0/24 to any port 6432 proto tcp
-```
+6. **Verify.**
+   - `GET /health` is green; search, sign-in, favorites and watch progress work.
+   - On the leader host, `SHOW POOLS` (command above): `cl_active` rises with
+     traffic while `sv_active`/`sv_idle` stay at or below `default_pool_size`.
+   - Real backends on the leader stay low and flat:
 
-Never expose `6432` to the internet.
+     ```bash
+     psql "postgresql://crimson:PASS@127.0.0.1:5432/crimson" \
+       -c "select count(*) from pg_stat_activity where usename='crimson'"
+     ```
 
----
+   The `api` service `replicas:` in the stack file can now go well past 8.
 
-## 8. Prove it works — BEFORE touching the app (the safety gate)
+## Rollback
 
-This is the important step. We test the bouncers with a throwaway `psql`, exactly
-the way the app will use them, **while the app is still happily on `5432`**. If this
-test passes, the cutover in §9 is trivial; if it doesn't, you've changed nothing and
-can fix it calmly.
+Set `DATABASE_URL` back to `:5432` and redeploy. The bouncers can stay running idle.
 
-From a machine that has `psql` (any Swarm host, or your laptop), run — note the
-**`:6432`** and the same `target_session_attrs=read-write` your app already uses:
+## Operations
 
-```bash
-psql "postgresql://crimson:YOUR_CRIMSON_PASSWORD@10.0.0.11,10.0.0.12,10.0.0.13:6432/crimson?target_session_attrs=read-write" \
-  -c "select pg_is_in_recovery() as on_a_standby, current_user, inet_server_port() as backend_port"
-```
-
-You want exactly this shape:
-
-```
- on_a_standby | current_user | backend_port
---------------+--------------+--------------
- f            | crimson      |         5432
-```
-
-- `on_a_standby = f` → you reached the **primary** through a bouncer. 🎉 The
-  read-write routing works and follows the leader.
-- `current_user = crimson` → auth works.
-
-Also peek at the pool itself. The cleanest way is **on a DB host**, inside the
-bouncer container (it already has `psql` and is on the host network), which avoids
-SSH tunnels and shell-quoting headaches:
-
-```bash
-docker compose exec -e PGPASSWORD='YOUR_CRIMSON_PASSWORD' pgbouncer \
-  psql "host=127.0.0.1 port=6432 user=crimson dbname=pgbouncer" -c "SHOW POOLS"
-```
-
-> ⚠️ For the admin console (`dbname=pgbouncer`) do **not** add
-> `target_session_attrs=read-write` (or any value but `any`). libpq then sends
-> `SHOW transaction_read_only` on connect, which the admin console rejects
-> (`invalid command`), so the command fails or hangs. The admin console is local
-> to each bouncer and has no leader/standby notion — it needs no routing hint. The
-> real `crimson` database (§8, §9) is the opposite: it *wants* `read-write`.
-
-You'll see a `crimson` pool with a few `sv_idle` server connections. **If §8 looks
-right, you're 95% done and nothing has changed for production yet.**
-
-> Troubleshooting this step? Jump to §12 — the usual culprits are the firewall or a
-> typo in `userlist.txt`.
-
----
-
-## 9. Flip the app over to the pooler
-
-Now the only real change: point the app's `DATABASE_URL` at **`:6432`** instead of
-**`:5432`**. Everything else stays the same — the host list, the `target_session_
-attrs=read-write`, the password.
-
-**Before** (direct to Postgres):
-```
-DATABASE_URL=postgresql://crimson:PASS@10.0.0.11,10.0.0.12,10.0.0.13:5432/crimson?target_session_attrs=read-write&connect_timeout=5
-```
-**After** (through the bouncers — just the port):
-```
-DATABASE_URL=postgresql://crimson:PASS@10.0.0.11,10.0.0.12,10.0.0.13:6432/crimson?target_session_attrs=read-write&connect_timeout=5
-```
-
-The app needs prepared statements off behind a transaction pooler. **You don't have
-to do anything** — `db_pool.py` already defaults `DB_PREPARE_THRESHOLD` to disabled.
-(It's listed in `.env.example` only so you know the knob exists.)
-
-Redeploy the Swarm stack with the new `DATABASE_URL` the same way you normally
-deploy (e.g. your `~/crimson-deploy/deploy.sh`, or `docker stack deploy -c
-docker-stack.yml crimson-api`). A rolling update swaps replicas one at a time.
-
-> Keep `RUN_DB_SYNC=true` on the one `api-sync` replica, as before — it goes through
-> the bouncer too, and its wholesale resync runs as a single transaction, which
-> transaction pooling handles fine.
-
----
-
-## 10. Verify production is healthy
-
-- `GET /health` on the API is green.
-- The site loads, search works, sign-in / favorites / watch-progress work (those
-  are the DB-backed paths).
-- Watch the pool fill in under real traffic (run on the **leader** host):
-
-  ```bash
-  docker compose exec -e PGPASSWORD='PASS' pgbouncer \
-    psql "host=127.0.0.1 port=6432 user=crimson dbname=pgbouncer" -c "SHOW POOLS"
-  ```
-  `cl_active` rises with traffic; `sv_active`/`sv_idle` stay small (≤ `default_pool_
-  size`). That small, flat server number is the whole win.
-
-- Optional proof of the ceiling lifting — count real backends on the leader; it
-  should now stay low and flat no matter how many api replicas you run:
-
-  ```bash
-  psql "postgresql://crimson:PASS@127.0.0.1:5432/crimson" \
-    -c "select count(*) from pg_stat_activity where usename='crimson'"
-  ```
-
-You can now raise `replicas:` for the `api` service in `docker-stack.yml` well past
-8 without approaching Postgres' connection limit.
-
----
-
-## 11. If anything's off — instant rollback
-
-Because nothing about the database changed, rolling back is just the reverse of §9:
-set `DATABASE_URL` back to **`:5432`** and redeploy. The app goes straight back to
-talking to Postgres directly, exactly as before. You can leave the (idle) bouncers
-running while you investigate — they cost nothing.
-
----
-
-## 12. Day-2 & troubleshooting
-
-**Useful commands** — run on a DB host, via the bouncer container (read-only admin
-console). Note: `dbname=pgbouncer` and **no** `target_session_attrs` (see the
-warning in §8):
+Admin console commands, run on a DB host (`dbname=pgbouncer`, no
+`target_session_attrs`):
 
 ```bash
 cd /srv/crimson/deploy/pgbouncer
 A() { docker compose exec -e PGPASSWORD='PASS' pgbouncer \
         psql "host=127.0.0.1 port=6432 user=crimson dbname=pgbouncer" -c "$1"; }
-A "SHOW POOLS"     # per-pool client/server counts (cl_active, sv_idle, cl_waiting)
+A "SHOW POOLS"     # cl_active, sv_idle, cl_waiting per pool
 A "SHOW STATS"     # request rates, query times
-A "SHOW CLIENTS"   # who's connected
-A "SHOW SERVERS"   # the real Postgres backends
+A "SHOW CLIENTS"
+A "SHOW SERVERS"
 ```
 
-**Tuning:** the one number you might change is `default_pool_size` in
-`pgbouncer.ini` (currently 25). Only raise it if `SHOW POOLS` shows `cl_waiting > 0`
-under peak load (clients queueing for a backend). After editing, `docker compose up
--d` on each host to restart the bouncers (a brief reconnect, not a data event).
+**Tuning:** raise `default_pool_size` in `pgbouncer.ini` (currently 25) only if
+`SHOW POOLS` shows `cl_waiting > 0` at peak. Keep it well under Postgres' 100. Apply
+with `docker compose up -d` on each host (a brief reconnect).
 
-| Symptom | Likely cause / fix |
+| Symptom | Cause / fix |
 |---|---|
-| §8 `psql` hangs or "could not connect" | firewall: open `6432` from your client (§7). Confirm the bouncer is up: `docker compose ps`. |
-| §8 "password authentication failed" | `userlist.txt` doesn't match the crimson password. Re-do §5 (mind the quotes), `docker compose up -d` to reload, retry. |
-| §8 shows `on_a_standby = t` | a bouncer answered but you somehow reached a standby — make sure `target_session_attrs=read-write` is in the URL (without it, libpq accepts any node). |
-| `SHOW POOLS` / `SHOW *` hangs or `invalid command 'SHOW transaction_read_only'` | you added `target_session_attrs=read-write` (or anything but `any`) to a `dbname=pgbouncer` admin-console URL — drop it (see §8 warning). Easiest is the container form above, which omits it. The `\` line-continuation is a backtick (`` ` ``) in PowerShell, not `\` — a stray `\` becomes a junk arg; just put the command on one line. |
-| App errors after §9 mentioning **prepared statement** | something set `DB_PREPARE_THRESHOLD` to a number. Unset it (default = disabled) and redeploy. |
-| `SHOW POOLS` shows `cl_waiting` climbing | real load exceeded the pool — raise `default_pool_size` (still keep it well under Postgres' 100), restart bouncers. |
-| After a failover, brief connection errors | expected and self-healing: libpq drops, reconnects, and finds the new leader's bouncer within seconds (same as the direct setup). |
-| After a failover, **`session is read-only`** from every host, or writes failing with `cannot execute ... in a read-only transaction` | **not** self-healing within a useful time — see "Why a pooler goes stale" below. Confirm `on-role-change.sh` is installed (`postgres-ha/README.md` §6e); to clear it right now, `docker exec crimson-patroni-1 /var/lib/postgresql/data/on-role-change.sh manual leader crimson`, or restart the pooler. |
+| Test `psql` hangs or "could not connect" | Firewall (step 3), or the bouncer is down: `docker compose ps`. |
+| "password authentication failed" | `userlist.txt` does not match the crimson password. Redo step 1 (mind the quotes), `docker compose up -d`. |
+| Test shows `on_a_standby = t` | `target_session_attrs=read-write` is missing from the URL. |
+| `SHOW *` hangs or `invalid command 'SHOW transaction_read_only'` | `target_session_attrs` on an admin console URL. Drop it (see the warning in step 4). In PowerShell the line continuation is a backtick, not `\`; put the command on one line. |
+| App errors mention **prepared statement** | Something set `DB_PREPARE_THRESHOLD`. Unset it and redeploy. |
+| `cl_waiting` climbing | Load exceeds the pool. Raise `default_pool_size`, restart the bouncers. |
+| Brief connection errors right after a failover | Expected. libpq reconnects and finds the new leader's bouncer within seconds. |
+| After a failover, `session is read-only` from every host, or writes fail with `cannot execute ... in a read-only transaction` | Stale role in the pooler (below). Check `on-role-change.sh` is installed (`../postgres-ha/README.md` §6e). To clear it now: `docker exec crimson-patroni-1 /var/lib/postgresql/data/on-role-change.sh manual leader crimson`, or restart the pooler. |
 
-### Why a pooler goes stale after a failover
+### Stale role after a failover
 
-This one bites hard, because it makes *every* host look wrong at once. From
-PostgreSQL 14 on, libpq no longer asks "are you writable?" on each connection — it
-reads the startup parameters the server reports (`in_hot_standby`). PgBouncer caches
-those from the server connection it opened first and replays them to new clients, so
-after a role change the pooler on a node keeps advertising the role that node **used
-to** have:
+Since PostgreSQL 14, libpq decides writability from the `in_hot_standby` startup
+parameter instead of querying each connection. PgBouncer caches that parameter from
+its first server connection and replays it to new clients, so after a role change
+each pooler advertises its node's previous role:
 
-- on the **demoted** node it still claims to be writable, libpq picks it, and every
-  write fails with `cannot execute ... in a read-only transaction`;
-- on the **promoted** node it still claims to be read-only, libpq skips the real
-  primary, and the whole multi-host URL fails with `session is read-only`.
+- the **demoted** node still claims writable; libpq picks it and writes fail with
+  `cannot execute ... in a read-only transaction`;
+- the **promoted** node still claims read-only; libpq skips it and the multi-host
+  URL fails with `session is read-only`.
 
-That is [pgbouncer#859](https://github.com/pgbouncer/pgbouncer/issues/859), still open.
-`server_lifetime` (600s) eventually recycles the connections, but ten minutes of failed
-writes is an outage, not self-healing. The fix is the Patroni `on_role_change` callback
-in `postgres-ha/on-role-change.sh`, which issues `RECONNECT` at the moment the role
-changes — it drops no clients, and it covers unplanned failovers as well as planned
-switchovers.
-
-That's it — you've decoupled API scaling from the Postgres connection limit, kept
-your no-VIP failover, and didn't touch a single row. 🩸
+This is [pgbouncer#859](https://github.com/pgbouncer/pgbouncer/issues/859), still
+open. `server_lifetime` (600s) eventually recycles the connections, but ten minutes of
+failed writes is an outage. The fix is the Patroni `on_role_change` callback in
+`../postgres-ha/on-role-change.sh`, which issues `RECONNECT` when the role changes.
+It drops no clients and covers failovers as well as switchovers.

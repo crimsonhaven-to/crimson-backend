@@ -1,38 +1,19 @@
-"""
-Browsable index of the operator's local media library.
+"""Browsable catalogue of the Local roots: whatever is on disk becomes titles,
+even files that match no TMDB or AniList entry.
 
-The `local_scraper`/`local` resolver only answer a *targeted* request ("give me
-S2E4 of this TMDB title"). This module is the other half: it walks the enabled
-source roots and turns whatever is actually on disk into a browsable, searchable
-catalogue of **titles** — so local media surfaces in the Index (its own "Local"
-view) and in search, even for files that map to no TMDB/AniList entry at all.
+A folder is one title (show or movie) and a loose file is a single-file movie.
+Container folders (categories, ``crimson-downloads``) are descended into instead.
+Display metadata comes from the first source that yields a title:
 
-Each top-level folder under a root is one title (a show or a movie); a loose media
-file sitting directly in a root is a single-file movie title. For each title we
-resolve display metadata in a strict precedence, richest first:
+| order | source   | from                                                   |
+|-------|----------|--------------------------------------------------------|
+| 1     | nfo      | ``tvshow.nfo``, ``movie.nfo``, ``<stem>.nfo``          |
+| 2     | json     | ``<stem>.json``, ``metadata.json``, ``crimson.json``   |
+| 3     | embedded | ffprobe container tags, probe count capped per scan    |
+| 4     | tmdb-dir | the cache's ``tmdb-<id>`` and ``movie-tmdb-<id>`` names |
+| 5     | filename | the cleaned folder or file name                        |
 
-  1. **.nfo**            — Kodi/Jellyfin sidecar XML (tvshow.nfo / movie.nfo /
-                           ``<stem>.nfo``): title, year, plot, genres, and any
-                           ``uniqueid`` (tmdb/imdb/anilist).
-  2. **sidecar .json**   — a ``<stem>.json`` / ``metadata.json`` / ``crimson.json``
-                           with title/year/overview/genres/poster/tmdb_id.
-  3. **embedded tags**   — ffprobe's container ``title``/``show`` format tags
-                           (bounded + cached; only when 1+2 are absent).
-  4. **filename parse**  — the fallback: a cleaned folder/file name + a year pulled
-                           from it. This is what "index the non-metadata parts by
-                           filename" means.
-
-Artwork (poster/folder/cover/fanart images, or a ``<stem>.jpg``) is surfaced as a
-signed ``/local_art`` URL. Titles that fell all the way to (4) — and carry no
-tmdb_id — are additionally enriched *live* against TMDB at overview time (best
-effort, confident hits only) to borrow a poster/overview/genres. That enrichment
-is cached, so the list view can reuse it without fanning out one TMDB call per
-title.
-
-The identity of a title/episode is the same opaque base64url path token the rest
-of local_engine uses (see fs.encode_token): a directory token for a title, a file
-token for an episode/movie. Playback reuses the existing ``crimson-local:``
-resolver, so nothing here touches the byte path.
+Titles and episodes are identified by the same path tokens playback uses.
 """
 
 from __future__ import annotations
@@ -41,12 +22,14 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 from typing import Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
-from . import fs
+from core.bounded_cache import BoundedCache
+from core.ffmpeg import ffprobe_available
+
+from .db import store
 from .fs import (
     ART_EXTENSIONS,
     art_proxy_url,
@@ -59,31 +42,25 @@ from .fs import (
 
 logger = logging.getLogger("local_engine.library")
 
-# Reuse the fs-level store instance so a single monkeypatch of its enabled-roots
-# config (tests) — and the shared process-wide cache — covers scan + playability +
-# labels alike.
-_store = fs._store
 
-# Bounds so registering a huge NAS can never hang a scan / a single title's walk.
-_MAX_TITLES = 4000            # total titles across all roots
-_MAX_FILES_PER_TITLE = 1500   # files walked inside one title before we stop
-_EMBED_PROBE_BUDGET = 200     # max ffprobe calls for embedded tags per full scan
+# Bounds so registering a huge NAS can never hang a scan or one title's walk.
+_MAX_TITLES = 4000
+_MAX_FILES_PER_TITLE = 1500
+_EMBED_PROBE_BUDGET = 200
+# How deep the scan descends through container folders: a guard against a
+# pathological tree, not a limit on a title's own season nesting.
+_MAX_SCAN_DEPTH = 6
 
-# Sidecar metadata file names (besides ``<stem>.nfo``/``<stem>.json``) looked for
-# at a title's folder root.
 _SHOW_NFO_NAMES = ("tvshow.nfo",)
 _MOVIE_NFO_NAMES = ("movie.nfo",)
 _JSON_NAMES = ("metadata.json", "crimson.json")
-# Artwork base names (any ART_EXTENSIONS extension) looked for at a folder root.
 _ART_BASENAMES = ("poster", "folder", "cover", "default", "movie", "show", "banner", "fanart")
 
 
-# --- filename / folder-name parsing -----------------------------------------
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
-# Release-junk we strip out of a raw folder/file name to recover a display title.
 _JUNK_TOKENS = re.compile(
     r"\b(1080p|2160p|720p|480p|4k|uhd|hdr|x264|x265|h264|h265|hevc|aac|ac3|dts|"
     r"bluray|blu-ray|bdrip|brrip|webrip|web-dl|webdl|hdtv|dvdrip|remux|proper|"
@@ -94,17 +71,16 @@ _YEAR_RE = re.compile(r"(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9]|$)")
 
 
 def _clean_title(raw: str) -> str:
-    """Turn a raw folder/file base name into a human title: drop bracketed groups,
-    release junk and separators, collapse dots/underscores to spaces, Title-Case-ish
-    preserved from the source."""
+    """A display title from a release name: no extension, bracketed groups,
+    release junk or trailing ``- GROUP``."""
     name = raw or ""
-    name = re.sub(r"\.[a-z0-9]{2,4}$", "", name, flags=re.I)  # trailing extension
-    name = re.sub(r"[\[(\{].*?[\])\}]", " ", name)            # [1080p], (2021), {grp}
+    name = re.sub(r"\.[a-z0-9]{2,4}$", "", name, flags=re.I)
+    name = re.sub(r"[\[(\{].*?[\])\}]", " ", name)
     name = name.replace("_", " ").replace(".", " ")
     name = _JUNK_TOKENS.sub(" ", name)
-    # Drop a trailing release group after a dash ("Show - GROUP") and dangling seps.
-    name = re.sub(r"[-–—]\s*[A-Za-z0-9]+\s*$", " ", name)
-    name = re.sub(r"\s+", " ", name).strip(" -–—·.")
+    # Release names separate the group with a hyphen, en dash or em dash.
+    name = re.sub(r"[-\u2013\u2014]\s*[A-Za-z0-9]+\s*$", " ", name)
+    name = re.sub(r"\s+", " ", name).strip(" -\u2013\u2014\u00b7.")
     return name or (raw or "").strip()
 
 
@@ -116,26 +92,20 @@ def _parse_year(raw: str) -> Optional[int]:
     return y if 1900 <= y <= 2100 else None
 
 
-# The server-side Cache (cache_engine.fs.plan_rel_path) writes titles into folders
-# whose NAME is a TMDB id, not a human title:
-#   TV    -> ``tmdb-<id>/S<ss>E<ee>[ - <language>].<ext>``
-#   movie -> ``movie-tmdb-<id>/movie[ - <language>].<ext>``
-# Recognise those so a cached library shows real titles (resolved from that id) and a
-# correct kind — instead of every folder collapsing to "tmdb".
+# The cache names folders by TMDB id (cache_engine.fs.plan_rel_path). Recognising
+# them gives a cached library real titles and the right kind instead of "tmdb".
 _TMDB_DIR_RE = re.compile(r"^(movie-)?tmdb[-_](\d+)$", re.I)
 
 
 def _tmdb_from_dirname(name: str):
-    """``(tmdb_id, media_kind)`` if ``name`` is a TMDB-id-encoding folder (the Cache's
-    naming), else ``(None, None)``."""
     m = _TMDB_DIR_RE.match((name or "").strip())
     if not m:
         return None, None
     return int(m.group(2)), ("movie" if m.group(1) else "show")
 
 
-# Season/episode parsed from a filename (mirrors the scraper, kept local so the
-# library has no scraper import).
+# Mirrors the Local scraper's patterns, kept here so the library does not import
+# a scraper.
 _SE_PATTERNS = [
     re.compile(r"s(\d{1,2})[\s._-]*e(\d{1,3})", re.I),
     re.compile(r"(\d{1,2})x(\d{1,3})", re.I),
@@ -175,18 +145,18 @@ def _season_from_dir(name: str) -> Optional[int]:
     return None
 
 
-# --- metadata sources (nfo / json / embedded) -------------------------------
 def _first_text(root: ET.Element, tags: Tuple[str, ...]) -> Optional[str]:
     for tag in tags:
         el = root.find(tag)
-        if el is not None and (el.text or "").strip():
-            return el.text.strip()
+        text = (el.text or "").strip() if el is not None else ""
+        if text:
+            return text
     return None
 
 
 def _parse_nfo(path: str) -> Optional[Dict]:
-    """Parse a Kodi/Jellyfin .nfo into our metadata dict, or None on any trouble.
-    Handles ``movie``/``tvshow``/``episodedetails`` roots."""
+    """Metadata from a ``movie``, ``tvshow`` or ``episodedetails`` nfo, or None
+    when it does not parse."""
     try:
         tree = ET.parse(path)
         root = tree.getroot()
@@ -213,11 +183,11 @@ def _parse_nfo(path: str) -> Optional[Dict]:
     if plot:
         meta["description"] = plot
 
-    genres = [g.text.strip() for g in root.findall("genre") if (g.text or "").strip()]
+    genres = [(g.text or "").strip() for g in root.findall("genre") if (g.text or "").strip()]
     if genres:
         meta["genres"] = genres
 
-    # uniqueid: <uniqueid type="tmdb">123</uniqueid> (+ legacy <tmdbid>/<id>).
+    # Older scrapers write <tmdbid> instead of <uniqueid type="tmdb">.
     for uid in root.findall("uniqueid"):
         utype = (uid.get("type") or "").lower()
         val = (uid.text or "").strip()
@@ -234,18 +204,16 @@ def _parse_nfo(path: str) -> Optional[Dict]:
         if legacy and legacy.isdigit():
             meta["tmdb_id"] = int(legacy)
 
-    # episode nfo (for per-episode titles).
     if tag == "episodedetails":
         se = _first_text(root, ("season",))
         ep = _first_text(root, ("episode",))
         meta["season"] = int(se) if se and se.isdigit() else None
         meta["episode"] = int(ep) if ep and ep.isdigit() else None
 
-    return meta if meta.get("title") or tag == "episodedetails" else meta or None
+    return meta
 
 
 def _parse_sidecar_json(path: str) -> Optional[Dict]:
-    """Parse a flexible ``<stem>.json`` / metadata.json sidecar, or None."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -280,7 +248,7 @@ def _parse_sidecar_json(path: str) -> Optional[Dict]:
         meta["genres"] = [g.strip() for g in genres.split(",") if g.strip()]
     poster = pick("poster", "poster_url", "image")
     if isinstance(poster, str) and poster.lower().startswith(("http://", "https://")):
-        meta["poster"] = poster  # a remote poster URL is used as-is
+        meta["poster"] = poster
     tmdb = pick("tmdb_id", "tmdbId", "tmdbid")
     if isinstance(tmdb, int):
         meta["tmdb_id"] = tmdb
@@ -292,25 +260,34 @@ def _parse_sidecar_json(path: str) -> Optional[Dict]:
     return meta if meta.get("title") else None
 
 
-def _ffprobe_available() -> bool:
-    return shutil.which("ffprobe") is not None
+# Keyed by (path, mtime, size) so re-scans skip unchanged files. An empty dict
+# records "probed, no tags".
+_embedded_tags = BoundedCache(4096)
 
 
-# Bounded (path, mtime, size) -> tags cache so re-scans don't re-probe files.
-_EMBED_CACHE: Dict[tuple, Dict] = {}
-_EMBED_CACHE_MAX = 4096
+class _ProbeBudget:
+    """Caps ffprobe calls across one scan, shared down the recursion."""
+
+    def __init__(self) -> None:
+        self.left = _EMBED_PROBE_BUDGET
+
+    def take(self) -> bool:
+        if self.left <= 0:
+            return False
+        self.left -= 1
+        return True
 
 
 def _embedded_meta(path: str) -> Optional[Dict]:
-    """Container format tags (title/show/date) via ffprobe, or None. Memoised by
-    (path, mtime, size); blocking, so call off the event loop."""
+    """Title and year from the container tags, or None. Blocking."""
     try:
         st = os.stat(path)
     except OSError:
         return None
     key = (path, int(st.st_mtime), st.st_size)
-    if key in _EMBED_CACHE:
-        return _EMBED_CACHE[key] or None
+    cached = _embedded_tags.get(key)
+    if cached is not None:
+        return cached or None
     tags: Dict = {}
     try:
         out = subprocess.run(
@@ -332,20 +309,13 @@ def _embedded_meta(path: str) -> Optional[Dict]:
         y = _parse_year(str(date))
         if y:
             tags["year"] = y
-    if len(_EMBED_CACHE) >= _EMBED_CACHE_MAX:
-        _EMBED_CACHE.clear()
-    _EMBED_CACHE[key] = tags
+    _embedded_tags.set(key, tags)
     return tags or None
 
 
-# --- artwork ----------------------------------------------------------------
 def _find_artwork(dir_path: str, stem: Optional[str] = None) -> Optional[str]:
-    """Absolute path of a poster-ish image in ``dir_path``.
-
-    For a loose file (``stem`` given) only ``<stem>.<img>`` counts — a shared
-    ``poster.jpg`` sitting in a root must NOT attach to every loose file there. For
-    a folder title (``stem`` None) the conventional poster/folder/cover names apply.
-    """
+    """A poster-ish image in ``dir_path``. For a loose file only ``<stem>.<img>``
+    counts, so a ``poster.jpg`` in a root does not attach to every loose file there."""
     try:
         entries = {e.lower(): e for e in os.listdir(dir_path)}
     except OSError:
@@ -359,10 +329,7 @@ def _find_artwork(dir_path: str, stem: Optional[str] = None) -> Optional[str]:
     return None
 
 
-# --- media file discovery ---------------------------------------------------
 def _walk_playable(dir_path: str, cap: int = _MAX_FILES_PER_TITLE) -> List[str]:
-    """Every playable media file under ``dir_path`` (bounded), respecting the
-    encoding gate (mkv/avi only when the source has encoding on) via is_playable_path."""
     found: List[str] = []
     for root, _dirs, files in os.walk(dir_path):
         for f in files:
@@ -377,28 +344,19 @@ def _walk_playable(dir_path: str, cap: int = _MAX_FILES_PER_TITLE) -> List[str]:
     return found
 
 
-def _largest(paths: List[str]) -> Optional[str]:
-    best, best_size = None, -1
-    for p in paths:
-        try:
-            sz = os.path.getsize(p)
-        except OSError:
-            sz = 0
-        if sz > best_size:
-            best, best_size = p, sz
-    return best
+def _size_or_zero(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
-# --- title assembly ---------------------------------------------------------
 def _resolve_metadata(dir_path: str, media_files: List[str], stem: Optional[str],
-                      is_movie_hint: bool, embed_budget: List[int]) -> Dict:
-    """Apply the nfo -> json -> embedded -> filename precedence for one title.
-    ``embed_budget`` is a 1-element list used as a mutable counter so a full scan
-    can cap total ffprobe calls."""
+                      is_movie_hint: bool, budget: _ProbeBudget) -> Dict:
+    """The precedence in the module docstring, for one title."""
     base_name = stem if stem is not None else os.path.basename(dir_path.rstrip(os.sep))
     meta: Dict = {}
 
-    # 1) .nfo
     nfo_candidates: List[str] = []
     if stem is not None:
         nfo_candidates.append(os.path.join(dir_path, f"{stem}.nfo"))
@@ -410,7 +368,6 @@ def _resolve_metadata(dir_path: str, media_files: List[str], stem: Optional[str]
                 meta = parsed
                 break
 
-    # 2) sidecar json
     if not meta.get("title"):
         json_candidates = []
         if stem is not None:
@@ -423,21 +380,15 @@ def _resolve_metadata(dir_path: str, media_files: List[str], stem: Optional[str]
                     meta = parsed
                     break
 
-    # 3) embedded container tags (budgeted; only when 1+2 gave nothing)
-    if not meta.get("title") and embed_budget[0] > 0 and _ffprobe_available():
-        rep = _largest(media_files) if media_files else None
-        if rep:
-            embed_budget[0] -= 1
-            emb = _embedded_meta(rep)
-            if emb and emb.get("title"):
-                meta = dict(emb)
+    if not meta.get("title") and media_files and ffprobe_available() and budget.take():
+        emb = _embedded_meta(max(media_files, key=_size_or_zero))
+        if emb and emb.get("title"):
+            meta = dict(emb)
 
-    # 4) TMDB-id-encoding folder (the server-side Cache's tmdb-<id>/ dirs). Only a
-    #    folder title's name can be an id — a loose file (stem set) is never one.
+    # Only a folder can be a cache id folder, never a loose file.
     tmdb_dir_id, tmdb_dir_kind = _tmdb_from_dirname(base_name) if stem is None else (None, None)
 
-    # 5) filename / folder-name parse — the floor, but NOT for an id folder (whose
-    #    "name" is an id, not a title): leave the title to TMDB resolution.
+    # An id folder's name is not a title, so its title is left to TMDB enrichment.
     if not meta.get("title"):
         if tmdb_dir_id:
             meta = {"source": "tmdb-dir"}
@@ -445,55 +396,44 @@ def _resolve_metadata(dir_path: str, media_files: List[str], stem: Optional[str]
             meta = {"source": "filename", "title": _clean_title(base_name)}
     if tmdb_dir_id:
         meta["tmdb_id"] = meta.get("tmdb_id") or tmdb_dir_id
-        # The tmdb-/movie-tmdb- prefix is the authority on kind for a cached title.
         meta["media_kind"] = tmdb_dir_kind
     if not meta.get("year"):
         meta["year"] = _parse_year(base_name)
     if "media_kind" not in meta:
         meta["media_kind"] = "movie" if is_movie_hint else "show"
-    # An id folder is authoritative metadata (it carries a real TMDB id), so it is
-    # NOT flagged as a filename-only guess.
     meta["has_metadata"] = meta.get("source") in ("nfo", "json", "embedded", "tmdb-dir")
     return meta
 
 
-def _build_title(entry_path: str, is_dir: bool, embed_budget: List[int]) -> Optional[Dict]:
-    """Build one list item for a title (a folder, or a loose media file), or None
-    when it holds nothing playable."""
+def _build_title(entry_path: str, is_dir: bool, budget: _ProbeBudget) -> Optional[Dict]:
+    """One list item for a folder or a loose file, or None when nothing in it plays."""
     if is_dir:
         dir_path = entry_path
         stem = None
         media_files = _walk_playable(dir_path)
         if not media_files:
             return None
-        # Movie vs show: a single playable file with no season/episode markers is a
-        # movie; a movie.nfo or exactly one file also leans movie.
         parsed_eps = [se for se in (_parse_se(os.path.basename(f)) for f in media_files) if se[1] is not None]
         has_movie_nfo = any(os.path.isfile(os.path.join(dir_path, n)) for n in _MOVIE_NFO_NAMES)
         is_movie = has_movie_nfo or (len(media_files) == 1 and not parsed_eps)
-        art_dir, art_stem = dir_path, None
         rep_for_token = dir_path
     else:
-        # loose media file directly under a root -> single-file movie title
         dir_path = os.path.dirname(entry_path)
         stem = os.path.splitext(os.path.basename(entry_path))[0]
         media_files = [entry_path]
         is_movie = True
-        art_dir, art_stem = dir_path, stem
         rep_for_token = entry_path
 
-    meta = _resolve_metadata(dir_path, media_files, stem, is_movie, embed_budget)
+    meta = _resolve_metadata(dir_path, media_files, stem, is_movie, budget)
 
-    art_path = _find_artwork(art_dir, art_stem)
+    art_path = _find_artwork(dir_path, stem)
     poster = meta.get("poster") or (art_proxy_url(art_path) if art_path else None)
 
-    # Metadata resolution may have corrected the kind (e.g. a cache tmdb-<id> TV
-    # folder with a single cached episode is still a show), so trust it over the
-    # early file-count heuristic when deciding movie-vs-show shape.
+    # Metadata beats the file-count guess: a cache tmdb-<id> folder holding one
+    # episode is still a show.
     final_kind = meta.get("media_kind") or ("movie" if is_movie else "show")
     final_is_movie = final_kind == "movie"
-    # Title floor: a real title, else a per-id placeholder ("TMDB 280042") the route
-    # replaces via enrichment — never the bare "tmdb" folder name.
+    # "TMDB 280042" is a placeholder the route replaces through enrichment.
     title = meta.get("title")
     if not title:
         title = f"TMDB {meta['tmdb_id']}" if meta.get("tmdb_id") else _clean_title(os.path.basename(rep_for_token))
@@ -513,25 +453,16 @@ def _build_title(entry_path: str, is_dir: bool, embed_budget: List[int]) -> Opti
     }
 
 
-# --- identify-or-descend classification -------------------------------------
-# How deep the recursive scan will descend through *container* folders (categories,
-# crimson-downloads, nested libraries) before giving up — a guard against a
-# pathological tree, not a limit on a title's own season/episode nesting.
-_MAX_SCAN_DEPTH = 6
-
-# Classification of a directory during the recursive scan.
-_TITLE = "title"          # a single show/movie — emit one tile, walk within it
-_CONTAINER = "container"  # holds only other titles/containers — descend into it
-_EMPTY = "empty"          # nothing playable anywhere beneath — skip
+_TITLE = "title"
+_CONTAINER = "container"
+_EMPTY = "empty"
 
 
-def _dir_has_media(dir_path: str, cap: int = 1) -> bool:
-    """Whether ``dir_path`` holds at least one playable file anywhere beneath it
-    (bounded — stops at the first hit)."""
-    for _root, _dirs, files in os.walk(dir_path):
+def _dir_has_media(dir_path: str) -> bool:
+    for root, _dirs, files in os.walk(dir_path):
         for f in files:
             try:
-                if is_playable_path(os.path.join(_root, f)):
+                if is_playable_path(os.path.join(root, f)):
                     return True
             except Exception:
                 continue
@@ -539,7 +470,6 @@ def _dir_has_media(dir_path: str, cap: int = 1) -> bool:
 
 
 def _has_direct_media(dir_path: str) -> bool:
-    """Whether ``dir_path`` holds a playable file *directly* (depth 0)."""
     try:
         with os.scandir(dir_path) as it:
             for e in it:
@@ -555,7 +485,6 @@ def _has_direct_media(dir_path: str) -> bool:
 
 
 def _child_dirs(dir_path: str) -> List[str]:
-    """Immediate, non-hidden subdirectories of ``dir_path`` (absolute paths)."""
     out: List[str] = []
     try:
         with os.scandir(dir_path) as it:
@@ -568,39 +497,24 @@ def _child_dirs(dir_path: str) -> List[str]:
 
 
 def _classify_dir(dir_path: str) -> str:
-    """Decide whether ``dir_path`` is a single **title**, a **container** of other
-    titles, or **empty**.
-
-    A folder is a *title* when it holds media directly (a movie file, loose episodes)
-    or in ``Season N``/``Staffel N``/``Sxx`` subfolders (a normal multi-season show) —
-    i.e. it maps to one show/movie. A folder that holds neither, but does contain
-    subfolders that themselves hold media (a category dir like ``Movies/`` or the
-    downloader's ``crimson-downloads/``), is a *container* the scanner descends into.
-    Everything else is empty. This is what lets crimson-downloads and nested libraries
-    work without a multi-season show splitting into one tile per season."""
+    """A title holds media directly or in season folders, so a multi-season show
+    stays one tile. A container (``Movies/``, ``crimson-downloads/``) only has
+    other folders with media, and the scan descends into it."""
     if _has_direct_media(dir_path):
         return _TITLE
     subdirs = _child_dirs(dir_path)
-    if not subdirs:
-        return _EMPTY
-    # Season-named subfolders that actually hold media => this dir is one show.
-    for sub in subdirs:
-        if _season_from_dir(os.path.basename(sub)) is not None and _dir_has_media(sub):
-            return _TITLE
-    # Otherwise: a container iff at least one child holds media somewhere.
-    for sub in subdirs:
-        if _dir_has_media(sub):
-            return _CONTAINER
+    season_dirs = [sub for sub in subdirs if _season_from_dir(os.path.basename(sub)) is not None]
+    if any(_dir_has_media(sub) for sub in season_dirs):
+        return _TITLE
+    if any(_dir_has_media(sub) for sub in subdirs if sub not in season_dirs):
+        return _CONTAINER
     return _EMPTY
 
 
-# --- public API -------------------------------------------------------------
-def _scan_dir(dir_path: str, items: List[Dict], seen: set, embed_budget: List[int],
+def _scan_dir(dir_path: str, items: List[Dict], seen: set, budget: _ProbeBudget,
               depth: int) -> bool:
-    """Recursively turn one directory's children into title items (identify-or-descend).
-    A child that is a *title* becomes one item; a *container* is descended into; loose
-    playable files become single-file movie titles. Returns False once _MAX_TITLES is
-    hit so the caller stops walking."""
+    """Append the titles under ``dir_path``. False once _MAX_TITLES is hit, so the
+    caller stops walking."""
     if depth > _MAX_SCAN_DEPTH:
         return True
     try:
@@ -619,24 +533,23 @@ def _scan_dir(dir_path: str, items: List[Dict], seen: set, embed_budget: List[in
             continue
 
         if not is_dir:
-            # Loose playable file -> a single-file movie title (as before).
             try:
                 if not is_playable_path(full):
                     continue
-                item = _build_title(full, False, embed_budget)
+                item = _build_title(full, False, budget)
             except Exception as e:
                 logger.warning(f"[library] failed to build title for {full!r}: {e}")
                 item = None
         else:
             cls = _classify_dir(full)
             if cls == _CONTAINER:
-                if not _scan_dir(full, items, seen, embed_budget, depth + 1):
+                if not _scan_dir(full, items, seen, budget, depth + 1):
                     return False
                 continue
             if cls == _EMPTY:
                 continue
             try:
-                item = _build_title(full, True, embed_budget)
+                item = _build_title(full, True, budget)
             except Exception as e:
                 logger.warning(f"[library] failed to build title for {full!r}: {e}")
                 item = None
@@ -652,27 +565,20 @@ def _scan_dir(dir_path: str, items: List[Dict], seen: set, embed_budget: List[in
 
 
 def scan_library() -> List[Dict]:
-    """Scan every enabled source root into a flat list of title items (offline —
-    no external calls). Recurses through *container* folders (categories, nested
-    libraries, the downloader's ``crimson-downloads/``) so a title deep in the tree
-    still surfaces, without a multi-season show splitting into per-season tiles — see
-    :func:`_classify_dir`. Blocking disk I/O; call via run_in_threadpool. Sorted by
-    title. Bounded by _MAX_TITLES so a huge NAS can't blow up the response."""
+    """Every title under the enabled roots, sorted by title. Offline and blocking."""
     items: List[Dict] = []
-    embed_budget = [_EMBED_PROBE_BUDGET]
+    budget = _ProbeBudget()
     seen_ids: set = set()
-    for root in _store.enabled_roots():
+    for root in store.enabled_roots():
         if not os.path.isdir(root):
             continue
-        if not _scan_dir(root, items, seen_ids, embed_budget, depth=0):
+        if not _scan_dir(root, items, seen_ids, budget, depth=0):
             break
     items.sort(key=lambda x: (x["title"] or "").lower())
     return items
 
 
 def _episodes_for(dir_path: str) -> List[Dict]:
-    """Ordered episode descriptors for a show title. Each carries the file token the
-    /watch-local route plays."""
     media_files = _walk_playable(dir_path)
     eps: List[Dict] = []
     any_parsed = False
@@ -686,7 +592,6 @@ def _episodes_for(dir_path: str) -> List[Dict]:
                 s = _season_from_dir(parent)
                 if s is None:
                     s = 1
-        # per-episode title: <file>.nfo <title>, else cleaned filename
         ep_title = None
         nfo = os.path.splitext(full)[0] + ".nfo"
         if os.path.isfile(nfo):
@@ -701,7 +606,7 @@ def _episodes_for(dir_path: str) -> List[Dict]:
             "_name": fname,
         })
     if not any_parsed:
-        # No S/E markers anywhere — present the files as season 1, numbered by name.
+        # No S/E markers anywhere: season 1, numbered by file name.
         eps.sort(key=lambda x: x["_name"].lower())
         for i, ep in enumerate(eps, start=1):
             ep["season_number"] = 1
@@ -719,17 +624,17 @@ def _episodes_for(dir_path: str) -> List[Dict]:
 
 
 def get_library_item(token: str) -> Optional[Dict]:
-    """Full detail for one title (offline): metadata + episodes (show) or a single
-    play descriptor (movie). Returns None when the token doesn't resolve to a title
-    inside a currently enabled root. Blocking; call via run_in_threadpool."""
-    embed_budget = [_EMBED_PROBE_BUDGET]
+    """A title with its seasons (show) or play token (movie), or None when the
+    token is not inside an enabled root. Offline and blocking."""
+    budget = _ProbeBudget()
     real_dir = safe_resolve_dir(token)
     if real_dir:
-        item = _build_title(real_dir, True, embed_budget)
+        item = _build_title(real_dir, True, budget)
         if not item:
             return None
         if item["media_kind"] == "movie":
-            play_file = _largest(_walk_playable(real_dir))
+            files = _walk_playable(real_dir)
+            play_file = max(files, key=_size_or_zero) if files else None
             item["play"] = {"id": encode_token(play_file)} if play_file else None
             item["seasons"] = []
         else:
@@ -744,10 +649,9 @@ def get_library_item(token: str) -> Optional[Dict]:
             item["play"] = None
         return item
 
-    # A loose single-file movie title (file token).
     real_file = safe_resolve(token)
     if real_file:
-        item = _build_title(real_file, False, embed_budget)
+        item = _build_title(real_file, False, budget)
         if not item:
             return None
         item["play"] = {"id": encode_token(real_file)}
@@ -758,26 +662,21 @@ def get_library_item(token: str) -> Optional[Dict]:
 
 
 def browse_dir(token: Optional[str] = None) -> Optional[Dict]:
-    """Folder-navigation view of the library for the client's local browser: the
-    immediate children of one directory (or, with no token, the enabled source roots
-    as top-level folders). Each child is one of:
+    """The children of one directory, or the enabled roots when ``token`` is empty,
+    so media that never resolves to a title is still reachable. None when the token
+    is not inside an enabled root. Blocking.
 
-      * ``title``  — a confidently-scanned show/movie folder, carried with the same
-                     poster/metadata shape as a list item (so the browser can show a
-                     real tile and open its /local-overview),
-      * ``folder`` — a container to drill into (browse again with its ``id``),
-      * ``file``   — a loose playable file (play via /watch-local with its ``id``).
+    | type     | is                  | carries                                  |
+    |----------|---------------------|------------------------------------------|
+    | title    | a show/movie folder | the list-item shape, for /local-overview |
+    | folder   | a container         | an ``id`` to browse again                |
+    | file     | a loose file        | an ``id`` for /watch-local               |
+    """
+    budget = _ProbeBudget()
 
-    This is the "fall back to folder-navigation + filenames" surface: media that never
-    resolves to a title is still reachable by walking the tree. Returns None when the
-    token doesn't resolve inside a currently enabled root. Blocking; call via
-    run_in_threadpool."""
-    embed_budget = [_EMBED_PROBE_BUDGET]
-
-    # Root level: list each enabled source root as a folder.
     if not token:
         entries: List[Dict] = []
-        for r in _store.enabled_roots_config():
+        for r in store.enabled_roots_config():
             path = r["path"]
             if not os.path.isdir(path):
                 continue
@@ -809,7 +708,7 @@ def browse_dir(token: Optional[str] = None) -> Optional[Dict]:
             cls = _classify_dir(full)
             if cls == _TITLE:
                 try:
-                    item = _build_title(full, True, embed_budget)
+                    item = _build_title(full, True, budget)
                 except Exception:
                     item = None
                 if item:
@@ -820,7 +719,6 @@ def browse_dir(token: Optional[str] = None) -> Optional[Dict]:
                     "id": encode_token(os.path.realpath(full)),
                     "name": name,
                 })
-            # _EMPTY: skip
         elif is_playable_path(full):
             entries.append({
                 "type": "file",
@@ -829,9 +727,8 @@ def browse_dir(token: Optional[str] = None) -> Optional[Dict]:
                 "media_kind": "movie",
             })
 
-    # Parent token for "up" navigation: None when this dir is itself a source root
-    # (up goes to the synthetic root list), else the parent directory's token.
-    roots_real = {os.path.realpath(r) for r in _store.enabled_roots()}
+    # From a root, "up" goes to the synthetic list of roots.
+    roots_real = {os.path.realpath(r) for r in store.enabled_roots()}
     parent = None if os.path.realpath(real_dir) in roots_real else encode_token(
         os.path.realpath(os.path.dirname(real_dir))
     )
@@ -845,8 +742,7 @@ def browse_dir(token: Optional[str] = None) -> Optional[Dict]:
 
 
 def search_library(query: str, items: Optional[List[Dict]] = None, limit: int = 20) -> List[Dict]:
-    """Filter the scanned library by a title / filename substring. ``items`` may be
-    a pre-scanned list (the route passes its cached list to avoid re-walking disk)."""
+    """Title substring match. The route passes its cached scan as ``items``."""
     q = _norm(query)
     if not q:
         return []

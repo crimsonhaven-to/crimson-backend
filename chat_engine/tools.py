@@ -1,40 +1,31 @@
 """
-The tools Lumi can call, and their dispatch into the existing engines.
+The tools Lumi can call, each a thin adapter over code that already serves the
+REST API. A recommendation from Lumi is therefore the one ``/recommendations``
+gives, and there is no second implementation to keep in step.
 
-Design rule: nothing here implements catalogue logic. Every handler is a thin
-adapter over code that already serves the REST API, so a recommendation Lumi
-gives is by construction the same recommendation ``/recommendations`` would give.
-When the ranking changes, she changes with it and there is no second
-implementation to keep in step.
+Schemas are declared once, in the JSON Schema subset both providers accept, and
+providers.py reshapes them. The descriptions are the highest-leverage text in the
+feature: they are what the model reads to decide whether to call at all.
 
-Schemas are declared once, provider-neutral, in the JSON Schema subset both
-Anthropic and Gemini accept. providers.py reshapes them into each vendor's
-envelope. Keeping one declaration matters because tool descriptions are the
-highest-leverage text in the whole feature: they are what the model reads to
-decide whether to call at all.
-
-On ``open_title``
------------------
-It deliberately does NOT navigate anything. It resolves a title to a client
-route and returns it, and the drawer renders that as a button the viewer presses.
-The backend stays stateless and unaware of the client's router, which is the same
-division of labour the rest of the app uses (the client resolves sources; the
-backend hands it what it cannot derive).
+``open_title`` navigates nothing. It returns a client route that the drawer
+renders as a button, so the backend stays unaware of the client's router.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Callable, Dict, List, Optional
 
-from starlette.concurrency import run_in_threadpool
-
+from account_engine.db import QuotaExceeded, store
+from account_engine.library import favorite_item_key
 from core.http_client import http_client
 from metadata_engine.tmdb import (
     fetch_tmdb_movie_search_results,
     fetch_tmdb_search_results,
     fetch_tmdb_show_search_results,
 )
+from recommend_engine.service import recommend
 
 logger = logging.getLogger("crimson.chat.tools")
 
@@ -44,7 +35,6 @@ logger = logging.getLogger("crimson.chat.tools")
 MAX_ITEMS = 8
 
 
-# --- schemas ---------------------------------------------------------------
 # `description` on each tool and each property is what the model actually reads.
 # They are written prescriptively (when to call, not just what it does) because
 # recent models are conservative about reaching for tools by default.
@@ -199,7 +189,10 @@ TOOL_SCHEMAS: List[Dict] = [
 TOOL_NAMES = frozenset(t["name"] for t in TOOL_SCHEMAS)
 
 
-# --- route building --------------------------------------------------------
+def _at_least_one(value) -> int:
+    return max(1, int(value or 1))
+
+
 def build_route(
     kind: str,
     *,
@@ -214,8 +207,7 @@ def build_route(
     one piece of frontend knowledge this engine holds, which is why they are
     isolated in a single function with a test rather than formatted inline.
     """
-    s = max(1, int(season or 1))
-    e = max(1, int(episode or 1))
+    s, e = _at_least_one(season), _at_least_one(episode)
     if kind == "anime" and anilist_id:
         return f"/watch/{int(anilist_id)}/{s}/{e}"
     if kind == "show" and tmdb_id:
@@ -226,20 +218,11 @@ def build_route(
 
 
 def _item_key(kind: str, anilist_id: Optional[int], tmdb_id: Optional[int]) -> Optional[str]:
-    """Dedup key for a watchlist row.
-
-    Mirrors ``account_engine.routes._favorite_item_key``. It is reproduced rather
-    than imported because that helper is private to the routes module and
-    importing it here would couple two engines through a private name; the shapes
-    are asserted equal in the tests instead.
-    """
-    if kind == "anime" and anilist_id is not None:
-        return f"anilist:{anilist_id}"
-    if kind == "movie" and tmdb_id is not None:
-        return f"movie:{tmdb_id}"
-    if tmdb_id is not None:
-        return f"tmdb:{tmdb_id}"
-    return None
+    """The watchlist key, matching the account engine's. Only anime key by AniList id."""
+    anilist_id = anilist_id if kind == "anime" else None
+    if anilist_id is None and tmdb_id is None:
+        return None
+    return favorite_item_key(tmdb_id, anilist_id, kind)
 
 
 def _clamp(value, default: int, high: int = MAX_ITEMS) -> int:
@@ -249,20 +232,14 @@ def _clamp(value, default: int, high: int = MAX_ITEMS) -> int:
         return default
 
 
-# --- handlers --------------------------------------------------------------
-# Each returns (result_for_model, actions_for_client). The first is the JSON the
-# model reads; the second is any UI affordance the drawer should render, such as
-# a play button. Splitting them keeps presentation data out of the token budget.
+# Each handler returns (result_for_model, action_for_client): the JSON the model
+# reads, and any affordance the drawer renders, such as a play button. Splitting
+# them keeps presentation data out of the token budget.
 
 
 async def _recommend_titles(user_id: int, args: Dict):
-    # Imported lazily: recommend_engine.routes imports account_engine.routes at
-    # module scope, and a top-level import here would drag that whole chain into
-    # chat_engine's import time for a tool that may never be called.
-    from recommend_engine.routes import _recommend
-
     limit = _clamp(args.get("limit"), 5)
-    payload = await run_in_threadpool(_recommend, user_id, limit)
+    payload = await asyncio.to_thread(recommend, user_id, limit)
     items = payload.get("recommendations", [])[:limit]
 
     slim = [
@@ -351,9 +328,7 @@ async def _open_title(user_id: int, args: Dict):
     title = args.get("title") or "this title"
     label = title
     if kind in ("anime", "show"):
-        season = max(1, int(args.get("season") or 1))
-        episode = max(1, int(args.get("episode") or 1))
-        label = f"{title} S{season}E{episode}"
+        label = f"{title} S{_at_least_one(args.get('season'))}E{_at_least_one(args.get('episode'))}"
 
     return (
         {"opened": True, "label": label, "note": "A button was shown to the viewer."},
@@ -362,11 +337,9 @@ async def _open_title(user_id: int, args: Dict):
 
 
 async def _watch_progress(user_id: int, args: Dict):
-    from account_engine.routes import store
-
     status = args.get("status") or "in_progress"
     limit = _clamp(args.get("limit"), 5)
-    rows = await run_in_threadpool(
+    rows = await asyncio.to_thread(
         store.list_progress, user_id, None if status == "any" else status
     )
 
@@ -388,9 +361,6 @@ async def _watch_progress(user_id: int, args: Dict):
 
 
 async def _manage_watchlist(user_id: int, args: Dict):
-    from account_engine.db import QuotaExceeded
-    from account_engine.routes import store
-
     action = args.get("action")
     kind = args.get("kind") or "anime"
     anilist_id = args.get("anilist_id")
@@ -403,7 +373,7 @@ async def _manage_watchlist(user_id: int, args: Dict):
         )
 
     if action == "remove":
-        removed = await run_in_threadpool(store.remove_favorite, user_id, key, None)
+        removed = await asyncio.to_thread(store.remove_favorite, user_id, key, None)
         return {"removed": bool(removed)}, None
 
     fav = {
@@ -416,7 +386,7 @@ async def _manage_watchlist(user_id: int, args: Dict):
         "poster": args.get("poster"),
     }
     try:
-        await run_in_threadpool(store.upsert_favorite, user_id, fav, "favorites")
+        await asyncio.to_thread(store.upsert_favorite, user_id, fav, "favorites")
     except QuotaExceeded as exc:
         return {"error": f"Their watchlist is full: {exc}"}, None
     return {"saved": True, "title": args.get("title")}, None

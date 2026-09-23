@@ -1,92 +1,41 @@
-"""External CORS proxy (crimson-proxy) URL builder + health probe.
+"""Signed links to the external crimson-proxy edge, and its health probe.
 
-Phase 1 of moving stream-segment bandwidth off the backend: when
-``CRIMSON_PROXY_BASE`` is set, the simple *static-header HLS* sources (VOE,
-cinema.bz, PlayIMDb) hand the player a signed link to the external edge proxy
-(Netlify / Cloudflare Workers) instead of a same-origin ``/{source}_proxy``
-path. Segment bytes then flow ``CDN → edge proxy → viewer`` and never touch us.
+Powers ``/sign`` and the dashboard's proxy-health ping.
+The signature is byte-for-byte the crimson-proxy contract: HMAC-SHA256 over
+``url\nreferer\norigin\nuser-agent``, hex truncated to 32 characters, keyed with
+``PROXY_SECRET`` (the proxy's ``NITRO_PROXY_SECRET``). It covers the query and not
+the host, so one link is valid on every configured base, which is what lets
+``CRIMSON_PROXY_BASE`` list several hosts for failover.
 
-The signature contract is **byte-for-byte** the crimson-proxy one (see that
-repo's README): HMAC-SHA256 over ``url\\nreferer\\norigin\\nuser-agent``, hex
-truncated to 32 chars. The proxy holds the *same* secret (``NITRO_PROXY_SECRET``
-== our ``PROXY_SECRET``), so it can re-sign the playlist's child segments itself
-— we only ever sign the top-level stream URL.
-
-Because the signature covers the query fields and **not** the host, one signed
-link is valid on every proxy that shares the secret. So ``CRIMSON_PROXY_BASE``
-may be a comma-separated list and we pick one host per request — free
-round-robin load-balancing / failover across the free tiers.
-
-Gating: this is OFF unless BOTH ``CRIMSON_PROXY_BASE`` and ``PROXY_SECRET`` are
-set. Leave either unset and every source keeps proxying itself (same-origin
-``/{source}_proxy``), so this is a safe, flag-gated, A/B-per-source swap. A blank
-secret would mean the proxy is in open mode, which we never sign for.
+Off unless both ``CRIMSON_PROXY_BASE`` and ``PROXY_SECRET`` are set: a blank
+secret would mean the proxy runs in open mode, which is never signed for.
 """
 
-import hashlib
-import hmac
 import logging
-import os
 import random
 import time
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from core import signing
+from core.config import get_settings
 
-# Display labels of backend sources wired to prefer the external proxy when
-# enabled (shown by the admin dashboard). The backend no longer resolves any
-# third-party sources, so this is empty: source resolving + proxy offload now
-# happen client-side (the client mints its own signed links via POST /sign, and
-# the crimson-proxy helper here only powers /sign, the cache downloader, and the
-# dashboard's proxy-health ping).
-ROUTED_SOURCES: list[str] = []
+logger = logging.getLogger(__name__)
 
 
 def proxy_bases() -> list[str]:
-    """Configured proxy origins (comma-separated), trailing slashes stripped."""
-    return [
-        b.strip().rstrip("/")
-        for b in os.getenv("CRIMSON_PROXY_BASE", "").split(",")
-        if b.strip()
-    ]
+    return get_settings().crimson_proxy_base
 
 
-def _source_allowlist() -> list[str]:
-    """Optional per-source A/B allowlist (``CRIMSON_PROXY_SOURCES``). Empty/unset
-    means *all* wired sources offload; set it to a comma-separated subset (e.g.
-    ``cinema.bz,PlayIMDb``) to offload only those and keep the rest same-origin."""
-    return [s.strip() for s in os.getenv("CRIMSON_PROXY_SOURCES", "").split(",") if s.strip()]
-
-
-def _secret() -> bytes:
-    """The shared signing secret — specifically ``PROXY_SECRET`` (the value the
-    edge proxy carries as ``NITRO_PROXY_SECRET``), never a per-source secret."""
-    return (os.getenv("PROXY_SECRET") or "").encode("utf-8")
-
-
-def is_enabled(source: str | None = None) -> bool:
-    """True only when we have at least one proxy host AND a secret to sign with.
-
-    When ``source`` is given, also honour the optional ``CRIMSON_PROXY_SOURCES``
-    allowlist so individual sources can be A/B'd on/off without code changes
-    (unset allowlist = every wired source offloads). Call with no ``source`` for
-    the global "is the proxy configured at all" check (used by the dashboard)."""
-    if not (proxy_bases() and os.getenv("PROXY_SECRET")):
-        return False
-    if source is not None:
-        allow = _source_allowlist()
-        if allow and source not in allow:
-            return False
-    return True
+def is_enabled() -> bool:
+    return bool(proxy_bases() and get_settings().proxy_secret)
 
 
 def _signed_query(url: str, referer: str, origin: str, user_agent: str) -> str:
-    """The ``u=…&r=…&o=…&ua=…&s=…`` query string, signed per the crimson-proxy
-    contract (HMAC over ``url\\nreferer\\norigin\\nuser-agent``, hex[:32])."""
     payload = "\n".join([url, referer, origin, user_agent])
-    sig = hmac.new(_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    sig = signing.sign(get_settings().proxy_secret.encode("utf-8"), payload)
     return (
         f"u={quote(url, safe='')}"
         f"&r={quote(referer, safe='')}"
@@ -96,20 +45,11 @@ def _signed_query(url: str, referer: str, origin: str, user_agent: str) -> str:
     )
 
 
-# --- health-aware host selection (automatic failover) ----------------------
-# The signed query is host-independent (it covers url/referer/origin/ua, NOT the
-# host), so one signature is valid on every base that shares the secret. That lets
-# us route AWAY from a host that's down without re-signing: we keep a small health
-# cache, refreshed by the scheduler + the admin dashboard probe, and pick only from
-# the hosts last seen up. So if (say) the Netlify edge is 404ing, every link goes to
-# the Cloudflare worker automatically, and vice-versa.
-#
-# Cold/stale/all-down cache => fall back to ALL configured bases, so we're never
-# worse than the old plain random.choice. Reads/writes are dict-atomic under the
-# GIL; a slightly-stale read at worst picks a host that just went down, which then
-# fails the one fetch and is dropped on the next refresh — no lock needed.
-_health: dict[str, dict] = {}      # base -> {"healthy": bool, "ts": float}
-_HEALTH_TTL = 300.0                # a probe result older than this is ignored
+# Routing skips a host the last probe saw down. Probes run from the scheduler and
+# the dashboard; an entry older than the TTL is ignored, and with no host known
+# healthy every base is a candidate, so a cold cache is no worse than no cache.
+_health: dict[str, dict] = {}
+_HEALTH_TTL = 300.0
 
 
 def _is_known_healthy(base: str, now: float) -> bool:
@@ -118,108 +58,72 @@ def _is_known_healthy(base: str, now: float) -> bool:
 
 
 def _candidate_bases() -> list[str]:
-    """Configured bases filtered to those last probed healthy; if none are known
-    healthy (cold cache / all stale / genuinely all down) returns every base, so
-    routing degrades to "try anything" rather than giving up."""
     bases = proxy_bases()
+    now = time.time()
+    return [b for b in bases if _is_known_healthy(b, now)] or bases
+
+
+def proxy_url(url: str, *, referer: str = "", origin: str = "", user_agent: str = "") -> str | None:
+    """A signed proxy link for ``url`` carrying the headers the upstream CDN
+    wants, on a random healthy base. None when no base is configured."""
+    bases = _candidate_bases()
     if not bases:
-        return []
-    now = time.time()
-    healthy = [b for b in bases if _is_known_healthy(b, now)]
-    return healthy or bases
+        return None
+    return f"{random.choice(bases)}/?{_signed_query(url, referer, origin, user_agent)}"
 
 
-def health_snapshot() -> dict:
-    """Current cached health view (for diagnostics/admin)."""
-    now = time.time()
-    return {
-        b: {
-            "known_healthy": _is_known_healthy(b, now),
-            "raw": _health.get(b),
-        }
-        for b in proxy_bases()
-    }
-
-
-def proxy_url(url: str, *, referer: str = "", origin: str = "", user_agent: str = "") -> str:
-    """Build a signed link to the external proxy for ``url`` with the upstream
-    headers the gated CDN requires. Picks one *healthy* configured host at random
-    (all share the secret, so the link is valid on any of them); a host that the
-    last probe saw down is skipped — automatic failover to the survivors."""
-    return f"{random.choice(_candidate_bases())}/?{_signed_query(url, referer, origin, user_agent)}"
-
-
-# A harmless URL the secret-match canary points at. The proxy verifies the
-# signature BEFORE fetching, so what matters is 401 (bad secret) vs anything
-# else (secret OK) — the URL itself never needs to resolve to a real stream.
+# The proxy checks the signature before fetching, so this URL never has to exist:
+# a 401 means our secret is wrong, anything else means it matches.
 _CANARY_URL = "https://example.com/crimson-proxy-probe.m3u8"
 
 
 async def probe_bases(timeout: float = 5.0) -> list[dict]:
-    """Probe each configured proxy host for the admin dashboard. Per host:
+    """One ``{base, status, code, signed, secret_ok, detail}`` per configured host.
 
-      * ``GET /``  — liveness + whether it enforces signing (``signed`` flag).
-      * a signed **canary** request — the proxy verifies the signature before
-        fetching, so a 401 means its secret does NOT match ours (the classic
-        "all streams 401 / stuck at 00:00" cause); anything else means the
-        secret matches (or the host is in open mode).
-
-    Returns one ``{base, status, code, signed, secret_ok, detail}`` per host.
-    ``secret_ok`` is True/False, or None when it couldn't be determined."""
+    ``GET /`` gives liveness and whether the host enforces signing; a signed
+    canary then tells a matching secret from the classic mismatch that 401s every
+    stream. ``secret_ok`` is None when it could not be determined."""
     bases = proxy_bases()
     if not bases:
         return []
 
-    have_secret = bool(os.getenv("PROXY_SECRET"))
+    have_secret = bool(get_settings().proxy_secret)
     canary_q = _signed_query(_CANARY_URL, "", "", "") if have_secret else ""
 
     results: list[dict] = []
+    # Runs on the scheduler thread's own event loop, so not the shared client.
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for base in bases:
-            entry = {
-                "base": base,
-                "status": "error",
-                "code": None,
-                "signed": None,
-                "secret_ok": None,
-                "detail": "",
+            entry: dict[str, Any] = {
+                "base": base, "status": "error", "code": None, "signed": None, "secret_ok": None, "detail": "",
             }
             try:
                 resp = await client.get(f"{base}/")
-                entry["code"] = resp.status_code
-                if resp.status_code == 200:
-                    entry["status"] = "active"
-                    entry["detail"] = "up"
-                    try:
-                        entry["signed"] = bool(resp.json().get("signed"))
-                    except Exception:
-                        pass
-                else:
-                    entry["detail"] = f"HTTP {resp.status_code}"
-            except Exception as exc:  # network/DNS/timeout -> host is down
+            except Exception as exc:
                 entry["detail"] = type(exc).__name__
                 results.append(entry)
                 continue
+            entry["code"] = resp.status_code
+            if resp.status_code == 200:
+                entry["status"] = "active"
+                entry["detail"] = "up"
+                try:
+                    entry["signed"] = bool(resp.json().get("signed"))
+                except Exception:
+                    pass
+            else:
+                entry["detail"] = f"HTTP {resp.status_code}"
 
-            # Secret-match canary (only meaningful when WE have a secret to sign
-            # with and the host is enforcing signing).
             if have_secret and entry["status"] == "active":
                 try:
                     cresp = await client.get(f"{base}/?{canary_q}")
                     if cresp.status_code == 401:
-                        entry["secret_ok"] = False
-                        entry["status"] = "error"
-                        entry["detail"] = "secret mismatch (401)"
+                        entry.update(secret_ok=False, status="error", detail="secret mismatch (401)")
                     elif entry["signed"] is False:
-                        # Host accepted us but isn't enforcing signing at all —
-                        # it has no secret set (open mode). Flag it: signed links
-                        # work, but the proxy is abusable as an open relay.
-                        entry["secret_ok"] = None
-                        entry["status"] = "idle"
-                        entry["detail"] = "open mode — NITRO_PROXY_SECRET unset"
+                        # Signed links still work, but a host with no secret is an open relay.
+                        entry.update(secret_ok=None, status="idle", detail="open mode: NITRO_PROXY_SECRET unset")
                     else:
-                        entry["secret_ok"] = True
-                        entry["detail"] = "signed OK"
+                        entry.update(secret_ok=True, detail="signed OK")
                 except Exception as exc:
                     entry["detail"] = f"canary: {type(exc).__name__}"
             results.append(entry)
@@ -227,21 +131,12 @@ async def probe_bases(timeout: float = 5.0) -> list[dict]:
 
 
 async def refresh_health(timeout: float = 5.0) -> list[dict]:
-    """Probe every configured host and update the routing health cache, then return
-    the probe results (same shape as ``probe_bases``) so callers can reuse them.
+    """Probe every host, update the routing cache and return the probe results.
 
-    A host is "healthy" for routing if it's reachable AND will honour our signed
-    links — i.e. ``status`` is ``active`` (secret matches) or ``idle`` (open mode,
-    signature ignored). ``error`` (down, DNS/timeout, or a 401 secret-mismatch that
-    would reject every link) is unhealthy, so ``proxy_url`` stops routing to it.
-
-    Called at startup, on a scheduler interval, and whenever the admin dashboard
-    probes — so the cache reflects the same view the dashboard shows."""
+    ``active`` and ``idle`` (open mode, signature ignored) both honour our links;
+    ``error`` covers down hosts and a secret mismatch that would reject them all."""
     results = await probe_bases(timeout=timeout)
     now = time.time()
     for r in results:
-        base = r.get("base")
-        if not base:
-            continue
-        _health[base] = {"healthy": r.get("status") in ("active", "idle"), "ts": now}
+        _health[r["base"]] = {"healthy": r["status"] in ("active", "idle"), "ts": now}
     return results

@@ -1,40 +1,26 @@
-"""
-Versioned schema migrations.
+"""Versioned schema migrations from ``migrations/NNN_name.sql``.
 
-Why this exists: the accumulated ``ALTER TABLE ... IF NOT EXISTS`` lines in the
-``init_db()`` functions had become the schema's real version history. Nothing
-could answer whether a database matched its image, there was no down path and no
-way to backfill, and under rolling deploys a version-skewed replica stayed
-invisible until it threw at request time.
+The ``init_db()`` functions stay the idempotent baseline and run first; their DDL
+is deliberately not transcribed into ``migrations/``, so a fresh database and a
+long-lived one take the same path to the same schema. This runner owns every
+change after that.
 
-It deliberately does not take ownership of the existing schema. The ``init_db()``
-functions still run first and stay idempotent, and their DDL was not transcribed
-into ``migrations/``: doing so would make a fresh database and a long-lived one
-take different paths to the same schema, which is the divergence this is meant to
-prevent. The baseline stays put and this runner owns version 0 onward.
+``apply_pending()`` runs once at startup, after every ``init_db()``, in one
+transaction under ``SCHEMA_INIT_LOCK``: the transaction-scoped lock makes "read
+what is applied, apply the rest" atomic against other booting replicas, and a
+failure rolls the whole batch back. So nothing that cannot run in a transaction
+(``CREATE INDEX CONCURRENTLY``) belongs in a migration.
 
-``apply_pending()`` runs once per process at startup, after every ``init_db()``,
-under the same ``SCHEMA_INIT_LOCK``, so simultaneous boots serialize and the
-losers find nothing pending. It all happens in one transaction: the lock is
-transaction-scoped, which is what makes "check what is applied, then apply the
-rest" atomic against another booting replica, and a failure rolls the whole batch
-back. The consequence is that statements which cannot run inside a transaction,
-notably ``CREATE INDEX CONCURRENTLY``, do not belong in a migration file.
-
-Each applied file's SHA-256 is stored and re-checked at boot. A mismatch means an
-applied migration was edited afterwards, so some databases ran the old text. That
-is reported loudly and surfaced on ``/health``, but is not fatal: refusing to boot
-on a whitespace change would turn bookkeeping into an outage.
-
-Files order by numeric prefix rather than lexicographically, so ``010_`` sorts
-after ``009_``.
+Each applied file's SHA-256 is stored and re-checked at boot. A mismatch means
+an applied file was edited; it is logged and shown on ``/health`` but not fatal,
+because refusing to boot over a whitespace change would turn bookkeeping into an
+outage.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
@@ -43,18 +29,10 @@ from core.db_pool import get_connection, lock_schema_init
 
 logger = logging.getLogger("crimson.migrations")
 
-# Overridable so tests can point at a temp directory without touching the real set.
-DEFAULT_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 
-# NNN_name.sql: three digits so a shell listing sorts sanely too, and a restricted
-# charset so nothing odd reaches a log line.
+# A restricted charset so nothing odd reaches a log line.
 _FILENAME_RE = re.compile(r"^(\d{3,})_([A-Za-z0-9][A-Za-z0-9._-]*)\.sql$")
-
-
-def migrations_dir() -> Path:
-    """The migrations directory, overridable via ``MIGRATIONS_DIR``."""
-    override = os.getenv("MIGRATIONS_DIR")
-    return Path(override) if override else DEFAULT_MIGRATIONS_DIR
 
 
 class Migration(NamedTuple):
@@ -66,33 +44,29 @@ class Migration(NamedTuple):
 
 
 def checksum(sql: str) -> str:
-    """SHA-256 of a migration's text, newline-normalised.
-
-    CRLF matters here: the repo is developed on Windows and built in a Linux
-    container, and differing line endings must not read as drift."""
+    """SHA-256 of the text with CRLF normalised: the repo is edited on Windows
+    and built on Linux, and line endings must not read as drift."""
     return hashlib.sha256(sql.replace("\r\n", "\n").encode("utf-8")).hexdigest()
 
 
 def _is_effectively_empty(sql: str) -> bool:
-    """True when a file holds only comments. Postgres rejects an empty query
-    string, so such a file is recorded rather than executed."""
+    """Postgres rejects an empty query string, so a comment-only file is
+    recorded rather than executed."""
     body = re.sub(r"--[^\n]*", "", sql)
     body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
     return not body.strip()
 
 
 def discover(directory: Optional[Path] = None) -> List[Migration]:
-    """Every migration file on disk, ordered by numeric version.
-
-    Raises ``ValueError`` on a duplicate version: two files claiming one version
-    would apply in arbitrary order, which is never intended."""
-    directory = directory or migrations_dir()
+    """Every migration file, ordered by numeric version (so ``1000_`` follows
+    ``999_``). Raises ``ValueError`` on a duplicate version."""
+    directory = directory or MIGRATIONS_DIR
     if not directory.is_dir():
         return []
 
     found: List[Migration] = []
     seen: Dict[int, str] = {}
-    for path in sorted(directory.iterdir()):
+    for path in directory.iterdir():
         if not path.is_file() or path.suffix != ".sql":
             continue
         m = _FILENAME_RE.match(path.name)
@@ -141,18 +115,14 @@ def _applied_rows(conn) -> Dict[int, dict]:
     return {row["version"]: row for row in cur.fetchall()}
 
 
-# Lets /health report the schema version without a DB round-trip on a probe that
-# fires every 30s per replica. Migrations only run at startup, so it cannot go
-# stale in-process.
+# Lets the /health probe report the schema version without a query. Migrations
+# only run at startup, so it cannot go stale in-process.
 _last_status: Dict[str, object] = {"available": False}
 
 
 def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
-    """Apply every migration not yet recorded, in version order.
-
-    Returns a summary, also cached for :func:`cached_status`. Safe on every
-    replica: the advisory lock serializes boots and an applied migration is
-    skipped."""
+    """Apply every migration not yet recorded and return a summary, which is
+    also cached for :func:`cached_status`."""
     log = log or logger
 
     try:
@@ -168,20 +138,16 @@ def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
         log.warning(
             "No migration files found in %s. If this is a deployed container, the "
             "Dockerfile is missing its `COPY migrations ./migrations` line.",
-            migrations_dir(),
+            MIGRATIONS_DIR,
         )
 
-    applied_now: List[str] = []
+    applied_now: List[Migration] = []
     drift: List[Dict[str, object]] = []
-    applied_versions: set = set()
 
     with get_connection() as conn:
-        # Same lock the init_db()s take: DDL is not safe under catalog contention
-        # when several replicas boot at once.
         lock_schema_init(conn)
         _ensure_table(conn)
         already = _applied_rows(conn)
-        applied_versions.update(already.keys())
 
         for mig in available:
             prior = already.get(mig.version)
@@ -214,13 +180,13 @@ def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
                 "INSERT INTO schema_migrations (version, name, checksum) VALUES (%s, %s, %s)",
                 (mig.version, mig.name, mig.checksum),
             )
-            applied_now.append(mig.filename)
-            applied_versions.add(mig.version)
+            applied_now.append(mig)
 
-    current = max(applied_versions, default=None)
+    current = max([*already, *(m.version for m in applied_now)], default=None)
+    applied_names = [m.filename for m in applied_now]
 
     if applied_now:
-        log.info("Applied %d migration(s): %s", len(applied_now), ", ".join(applied_now))
+        log.info("Applied %d migration(s): %s", len(applied_now), ", ".join(applied_names))
     else:
         log.info("Schema up to date at version %s (%d migration(s) known)",
                  current, len(available))
@@ -231,7 +197,7 @@ def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
             "available": True,
             "version": current,
             "known": len(available),
-            "applied_now": applied_now,
+            "applied_now": applied_names,
             "drift": drift,
         }
     )
@@ -239,16 +205,14 @@ def apply_pending(log: Optional[logging.Logger] = None) -> Dict[str, object]:
 
 
 def cached_status() -> Dict[str, object]:
-    """The startup snapshot, with no DB access. Used by ``/health``."""
+    """The startup snapshot, with no DB access, for ``/health``."""
     return dict(_last_status)
 
 
 def status() -> Dict[str, object]:
-    """Live schema state, read from the database, for the admin dashboard.
-
-    Unlike :func:`cached_status` this costs a query, and it reports ``pending``:
-    files in the image but not recorded here, which is the signal that a replica
-    is running ahead of or behind the schema."""
+    """Live schema state for the admin dashboard. Unlike :func:`cached_status`
+    it costs a query, and reports ``pending``: files in this image the database
+    has not recorded, the sign of a replica ahead of the schema."""
     try:
         available = discover()
     except ValueError as e:
@@ -257,7 +221,6 @@ def status() -> Dict[str, object]:
     by_version = {m.version: m for m in available}
     try:
         with get_connection() as conn:
-            _ensure_table(conn)
             already = _applied_rows(conn)
     except Exception as e:
         logger.error("Schema status query failed: %s", e)
@@ -288,7 +251,6 @@ def status() -> Dict[str, object]:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    # Prints the live status without applying anything.
     import json
 
     logging.basicConfig(level=logging.INFO)

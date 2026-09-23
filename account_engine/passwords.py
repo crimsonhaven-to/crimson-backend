@@ -1,13 +1,9 @@
-"""
-Password hashing for the email+password sign-in path.
+"""Password hashing: PBKDF2-HMAC-SHA256 from stdlib.
 
-PBKDF2-HMAC-SHA256 via stdlib ``hashlib``, because the deploy image has no
-compiler toolchain for ``argon2-cffi`` / ``bcrypt`` (same reason ed25519 is
-vendored). Hashes are self-describing (``algo$iterations$salt$hash``) so the
-iteration count can be raised without invalidating existing rows, with
-``needs_rehash`` flagging older ones at next login.
-
-A hash costs roughly 0.2 to 0.4s, so callers run these in a threadpool.
+The deploy image has no compiler toolchain for argon2-cffi or bcrypt (the same
+reason ed25519 is vendored). Hashes are self-describing
+(``algo$iterations$salt$hash``), so raising the iteration count only triggers a
+rehash at next login. A hash costs 0.2 to 0.4s, so callers run it in a thread.
 """
 
 import base64
@@ -16,12 +12,11 @@ import hmac
 import secrets
 
 ALGORITHM = "pbkdf2_sha256"
-# OWASP 2023 floor. Stored hashes carry their own count, so raising this only
-# triggers a transparent rehash at next login.
+# OWASP 2023 floor.
 ITERATIONS = 600_000
 SALT_BYTES = 16
 
-# Bounded so an absurdly long password can't become a CPU-DoS vector.
+# Bounded so an absurdly long password cannot become a CPU DoS vector.
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 128
 

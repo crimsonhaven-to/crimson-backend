@@ -1,37 +1,22 @@
-"""
-PostgreSQL store for the server-side video cache.
+"""Postgres store for the server-side video cache.
 
-When caching is enabled, playing an episode kicks off a background job that
-downloads the *complete* stream to a NAS share (remuxed to mp4 — see
-``cache_engine.downloader``) and records a row here. On the next play the
-``CacheScraper`` surfaces that file as a first-class source, labelled with the
-NAS target's admin-given **name** and the original audio/subtitle language.
+| table             | holds                                                   |
+|-------------------|---------------------------------------------------------|
+| cache_targets     | NAS directories open for caching, with a display name   |
+| cache_settings    | the single-row master switch                            |
+| cached_episodes   | one row per cached file and its download lifecycle      |
 
-Three tables:
-
-  * ``cache_targets``    — the NAS directories the operator exposes for caching,
-                           each with a display *name* the cached source is shown
-                           under (a NAS share / Docker bind-mount, e.g.
-                           ``-v /nas/cache:/crimson/cache`` -> register
-                           ``/crimson/cache``). Mirrors local_engine's
-                           ``local_media_sources``.
-  * ``cache_settings``   — a single-row global master switch (caching on/off).
-  * ``cached_episodes``  — one row per cached (tmdb, season, episode, language).
-                           Carries the download lifecycle (pending -> downloading
-                           -> ready / failed) and where the file landed.
-
-Mirrors local_engine.db / account_engine.db: plain pooled psycopg calls borrowing
-from the shared pool (db_pool), driven from api.py's async handlers via
-``run_in_threadpool``. Volumes are tiny.
+The ``cached_episodes`` row is also the job queue: an api replica writes a
+``pending`` row and the cache-worker service claims and downloads it.
 """
 
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
 from typing import List, Optional
 
 from core.db_pool import get_connection, lock_schema_init
+from core.clock import utc_now_iso
 
 _TARGET_COLS = "id, name, path, enabled, created_at"
 _EP_COLS = (
@@ -39,34 +24,28 @@ _EP_COLS = (
     "language, source_origin, rel_path, container, file_size, status, error, "
     "created_at, updated_at"
 )
+_EP_COLS_CE = ", ".join("ce." + c for c in _EP_COLS.split(", "))
 
-# Lifecycle states for a cached_episodes row.
 STATUS_PENDING = "pending"
 STATUS_DOWNLOADING = "downloading"
 STATUS_READY = "ready"
 STATUS_FAILED = "failed"
-_ACTIVE_STATES = (STATUS_PENDING, STATUS_DOWNLOADING, STATUS_READY)
 
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# The switch and the target list are read on every /watch stream, scrape and
+# /cache_proxy request, so both are held for a few seconds. Writes on this
+# replica invalidate at once; other replicas converge within the TTL.
+_READ_TTL = 5.0
 
 
 class CacheStore:
-    """Data layer for the video-cache tables."""
-
-    # The enabled-targets list is read on every scrape / download-trigger / proxy
-    # request, so it's cached process-wide for a few seconds (same pattern as
-    # LocalSourceStore). Shared at class level; any write invalidates via _bump().
     _targets_cache: Optional[List[dict]] = None
     _targets_cache_at: float = 0.0
-    _TARGETS_TTL = 5.0
+    _enabled_cache: Optional[bool] = None
+    _enabled_cache_at: float = 0.0
 
-    # ----------------------------------------------------------------- schema
     def init_db(self) -> None:
-        """Create the schema (idempotent)."""
         with get_connection() as conn:
-            lock_schema_init(conn)  # serialize DDL across replicas (see db_pool)
+            lock_schema_init(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cache_targets (
@@ -94,7 +73,7 @@ class CacheStore:
                 VALUES (1, FALSE, %s)
                 ON CONFLICT (id) DO NOTHING
                 """,
-                (_now_iso(),),
+                (utc_now_iso(),),
             )
             conn.execute(
                 """
@@ -109,6 +88,7 @@ class CacheStore:
                     language       TEXT NOT NULL DEFAULT '',
                     source_origin  TEXT NOT NULL DEFAULT '',
                     rel_path       TEXT NOT NULL,
+                    media_url      TEXT,
                     container      TEXT NOT NULL DEFAULT 'mp4',
                     file_size      BIGINT,
                     status         TEXT NOT NULL DEFAULT 'pending',
@@ -118,76 +98,30 @@ class CacheStore:
                 );
                 """
             )
-            # `media_type` ("tv" | "movie") namespaces the cache key. TMDB movie ids
-            # and tv ids share one numeric space, so without it a cached movie would
-            # collide with a same-id show. It's part of the UNIQUE key (and the lookup
-            # index + claim_download's ON CONFLICT) below, and movies land under a
-            # `movie-tmdb-<id>/` dir on the NAS (see cache_engine.fs.plan_rel_path).
-            # Added via ALTER for DBs created before movie caching existed.
-            conn.execute(
-                "ALTER TABLE cached_episodes ADD COLUMN IF NOT EXISTS media_type TEXT NOT NULL DEFAULT 'tv'"
-            )
-            # The resolved, signed stream URL the cache-worker feeds ffmpeg. Stored
-            # on the row so the download can run out-of-process (in the cache-worker
-            # service) instead of in the api replica that handled /cache/confirm —
-            # the DB row IS the job queue now. Added via ALTER for DBs created before
-            # the worker split.
-            conn.execute(
-                "ALTER TABLE cached_episodes ADD COLUMN IF NOT EXISTS media_url TEXT"
-            )
-            # Drop the legacy TV-only UNIQUE (tmdb_id, season_number, episode_number,
-            # language) constraint on DBs created before movie caching — the
-            # media_type-aware unique index below replaces it. The old constraint's
-            # name was auto-generated, so find it by its exact column set rather than
-            # hardcoding a name.
-            conn.execute(
-                """
-                DO $$
-                DECLARE legacy_con TEXT;
-                BEGIN
-                    SELECT con.conname INTO legacy_con
-                    FROM pg_constraint con
-                    JOIN pg_class rel ON rel.oid = con.conrelid
-                    WHERE rel.relname = 'cached_episodes' AND con.contype = 'u'
-                      AND (
-                        SELECT array_agg(att.attname::text ORDER BY att.attname::text)
-                        FROM unnest(con.conkey) AS k
-                        JOIN pg_attribute att
-                          ON att.attrelid = con.conrelid AND att.attnum = k
-                      ) = ARRAY['episode_number', 'language', 'season_number', 'tmdb_id']
-                    LIMIT 1;
-                    IF legacy_con IS NOT NULL THEN
-                        EXECUTE 'ALTER TABLE cached_episodes DROP CONSTRAINT ' || quote_ident(legacy_con);
-                    END IF;
-                END $$;
-                """
-            )
-            # The real cache key now — keyed by media_type first so movies and shows
-            # with the same TMDB id never collide. claim_download's ON CONFLICT infers
-            # this index by its column list.
+            # claim_download's ON CONFLICT infers this index by its column list.
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS cached_episodes_uniq "
                 "ON cached_episodes (media_type, tmdb_id, season_number, episode_number, language)"
             )
-            # Lookup index for the scraper's ready_for_episode (media_type-aware).
-            # Replaces the pre-movie tmdb-only index of the same name.
-            conn.execute("DROP INDEX IF EXISTS cached_episodes_lookup")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS cached_episodes_lookup "
                 "ON cached_episodes (media_type, tmdb_id, season_number, episode_number, status)"
             )
 
-    # ----------------------------------------------------------- settings
     def get_enabled(self) -> bool:
-        """Global master switch. Defaults to False (caching off) on a fresh DB."""
+        now = time.monotonic()
+        cached = CacheStore._enabled_cache
+        if cached is not None and (now - CacheStore._enabled_cache_at) < _READ_TTL:
+            return cached
         try:
             with get_connection() as conn:
-                row = conn.execute(
-                    "SELECT enabled FROM cache_settings WHERE id = 1"
-                ).fetchone()
-            return bool(row["enabled"]) if row else False
+                row = conn.execute("SELECT enabled FROM cache_settings WHERE id = 1").fetchone()
         except Exception:
             return False
+        enabled = bool(row["enabled"]) if row else False
+        CacheStore._enabled_cache = enabled
+        CacheStore._enabled_cache_at = now
+        return enabled
 
     def set_enabled(self, enabled: bool) -> bool:
         with get_connection() as conn:
@@ -197,11 +131,11 @@ class CacheStore:
                 VALUES (1, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at
                 """,
-                (enabled, _now_iso()),
+                (enabled, utc_now_iso()),
             )
+        self._bump()
         return enabled
 
-    # --------------------------------------------------------- target reads
     def list_targets(self) -> List[dict]:
         with get_connection() as conn:
             return conn.execute(
@@ -215,11 +149,9 @@ class CacheStore:
             ).fetchone()
 
     def enabled_targets(self) -> List[dict]:
-        """All enabled targets (id/name/path), cached briefly. Used by the scraper,
-        the download trigger and the /cache_proxy route on every request."""
         now = time.monotonic()
         cached = CacheStore._targets_cache
-        if cached is not None and (now - CacheStore._targets_cache_at) < CacheStore._TARGETS_TTL:
+        if cached is not None and (now - CacheStore._targets_cache_at) < _READ_TTL:
             return cached
         try:
             with get_connection() as conn:
@@ -232,7 +164,6 @@ class CacheStore:
         CacheStore._targets_cache_at = now
         return rows
 
-    # -------------------------------------------------------- target writes
     def add_target(self, name: str, path: str) -> dict:
         with get_connection() as conn:
             row = conn.execute(
@@ -241,7 +172,7 @@ class CacheStore:
                 VALUES (%s, %s, TRUE, %s)
                 RETURNING {_TARGET_COLS}
                 """,
-                (name, path, _now_iso()),
+                (name, path, utc_now_iso()),
             ).fetchone()
         self._bump()
         return row
@@ -249,7 +180,8 @@ class CacheStore:
     def update_target(
         self, target_id: int, name: Optional[str] = None, enabled: Optional[bool] = None
     ) -> Optional[dict]:
-        sets, vals = [], []
+        sets: list[str] = []
+        vals: list = []
         if name is not None:
             sets.append("name = %s")
             vals.append(name)
@@ -275,20 +207,16 @@ class CacheStore:
         self._bump()
         return row is not None
 
-    # ----------------------------------------------------- cached-episode reads
     def ready_for_episode(
         self, tmdb_id: int, season_number: int, episode_number: int, media_type: str = "tv"
     ) -> List[dict]:
-        """Ready cached files for an episode (or a movie, ``media_type="movie"`` with
-        season/episode 0), joined to their (still-enabled) target so the scraper gets
-        the display name. Disabled/removed targets drop out automatically (the JOIN on
-        enabled targets), so toggling a target off instantly hides its cached sources.
-        ``media_type`` keeps a movie from surfacing under a same-id show and vice
-        versa."""
+        """Ready files for an episode (a movie is season 0, episode 0) with their
+        target's name. Joining on enabled targets is what hides a disabled target's
+        files immediately."""
         with get_connection() as conn:
             return conn.execute(
                 f"""
-                SELECT {', '.join('ce.' + c for c in _EP_COLS.split(', '))},
+                SELECT {_EP_COLS_CE},
                        ct.name AS target_name, ct.path AS target_path
                 FROM cached_episodes ce
                 JOIN cache_targets ct ON ct.id = ce.target_id AND ct.enabled = TRUE
@@ -299,16 +227,11 @@ class CacheStore:
                 (media_type, tmdb_id, season_number, episode_number, STATUS_READY),
             ).fetchall()
 
-    def get_episode(self, entry_id: int) -> Optional[dict]:
-        with get_connection() as conn:
-            return conn.execute(
-                f"SELECT {_EP_COLS} FROM cached_episodes WHERE id = %s", (entry_id,)
-            ).fetchone()
-
     def list_episodes(
         self, status: Optional[str] = None, limit: int = 100, offset: int = 0
     ) -> List[dict]:
-        where, params = "", []
+        where = ""
+        params: list = []
         if status:
             where = "WHERE ce.status = %s"
             params.append(status)
@@ -316,7 +239,7 @@ class CacheStore:
         with get_connection() as conn:
             return conn.execute(
                 f"""
-                SELECT {', '.join('ce.' + c for c in _EP_COLS.split(', '))},
+                SELECT {_EP_COLS_CE},
                        ct.name AS target_name
                 FROM cached_episodes ce
                 LEFT JOIN cache_targets ct ON ct.id = ce.target_id
@@ -338,7 +261,6 @@ class CacheStore:
         return row["n"] if row else 0
 
     def stats(self) -> dict:
-        """Aggregate counts + total bytes cached, for the dashboard."""
         out = {"ready": 0, "pending": 0, "downloading": 0, "failed": 0, "total_bytes": 0}
         try:
             with get_connection() as conn:
@@ -354,7 +276,6 @@ class CacheStore:
             pass
         return out
 
-    # ---------------------------------------------------- cached-episode writes
     def claim_download(
         self,
         *,
@@ -370,18 +291,10 @@ class CacheStore:
         media_url: str,
         container: str = "mp4",
     ) -> Optional[dict]:
-        """Atomically reserve a download slot for this (media_type,tmdb,season,episode,language).
-
-        Inserts a ``pending`` row (carrying ``media_url`` — the resolved, signed
-        stream the cache-worker will hand ffmpeg), or — if a row already exists but
-        previously ``failed`` — flips it back to ``pending`` for a retry. Returns the
-        row when THIS caller won the slot, or None when a ``pending``/``downloading``/
-        ``ready`` row already exists (someone else owns it, possibly another replica —
-        the shared unique constraint makes this the cross-replica dedup point).
-
-        The caller does NOT download here; the dedicated cache-worker service polls
-        for ``pending`` rows (see :meth:`fetch_pending` / :meth:`begin_download`)."""
-        now = _now_iso()
+        """Insert a ``pending`` row, or revive a ``failed`` one. Returns None when a
+        live row already exists: the unique index is the cross-replica dedup point.
+        ``media_url`` is stored so the separate cache-worker can run the download."""
+        now = utc_now_iso()
         with get_connection() as conn:
             return conn.execute(
                 f"""
@@ -412,10 +325,7 @@ class CacheStore:
             ).fetchone()
 
     def fetch_pending(self, limit: int = 8) -> List[dict]:
-        """Oldest ``pending`` download rows, joined to their still-enabled target so
-        the worker knows the NAS root to write under and the URL to pull. Rows whose
-        target was disabled/removed drop out via the JOIN (a later restart's
-        ``reset_stale_jobs`` tidies them). The cache-worker's poll loop drains this."""
+        """Oldest ``pending`` rows whose target is still enabled, with its path."""
         with get_connection() as conn:
             return conn.execute(
                 """
@@ -432,15 +342,12 @@ class CacheStore:
             ).fetchall()
 
     def begin_download(self, entry_id: int) -> bool:
-        """Atomically transition a row ``pending`` -> ``downloading``. Returns True
-        if THIS caller won it (it was still pending), False if another worker/slot
-        already claimed it. This is the cross-worker claim point now that downloads
-        run in the cache-worker service, separate from the watch/confirm path."""
+        """``pending`` to ``downloading``; False when someone else claimed it first."""
         with get_connection() as conn:
             row = conn.execute(
                 "UPDATE cached_episodes SET status = %s, updated_at = %s "
                 "WHERE id = %s AND status = %s RETURNING id",
-                (STATUS_DOWNLOADING, _now_iso(), entry_id, STATUS_PENDING),
+                (STATUS_DOWNLOADING, utc_now_iso(), entry_id, STATUS_PENDING),
             ).fetchone()
         return row is not None
 
@@ -448,36 +355,27 @@ class CacheStore:
         with get_connection() as conn:
             conn.execute(
                 "UPDATE cached_episodes SET status = %s, file_size = %s, error = NULL, updated_at = %s WHERE id = %s",
-                (STATUS_READY, file_size, _now_iso(), entry_id),
+                (STATUS_READY, file_size, utc_now_iso(), entry_id),
             )
 
     def mark_failed(self, entry_id: int, error: str) -> None:
         with get_connection() as conn:
             conn.execute(
                 "UPDATE cached_episodes SET status = %s, error = %s, updated_at = %s WHERE id = %s",
-                (STATUS_FAILED, (error or "")[:500], _now_iso(), entry_id),
+                (STATUS_FAILED, (error or "")[:500], utc_now_iso(), entry_id),
             )
 
     def delete_episode(self, entry_id: int) -> Optional[dict]:
-        """Delete a cache row, returning it (so the caller can unlink the file)."""
+        """Returns the deleted row so the caller can unlink the file."""
         with get_connection() as conn:
             return conn.execute(
                 f"DELETE FROM cached_episodes WHERE id = %s RETURNING {_EP_COLS}", (entry_id,)
             ).fetchone()
 
     def reset_stale_jobs(self) -> int:
-        """On worker startup, requeue any orphaned in-progress download by flipping
-        it ``downloading`` -> ``pending`` so this worker simply picks it up again. A
-        row stuck in ``downloading`` belongs to a previous worker that died mid-remux
-        (a deploy that outran ``stop_grace_period``, a crash); the old "interrupted by
-        restart" failure is gone — it auto-retries instead. Returns the number
-        requeued.
-
-        ``pending`` rows are deliberately left untouched: they're durable claims the
-        api's ``/cache/confirm`` wrote that no worker has started yet — the poll loop
-        will drain them. Safe to reset ``downloading`` here because the cache-worker
-        deploys stop-first (never two at once), so at startup any ``downloading`` row
-        is genuinely orphaned, not actively held by a peer."""
+        """On worker startup, put every ``downloading`` row back to ``pending``.
+        Safe only because the cache-worker deploys stop-first: at startup no peer
+        can be holding one, so each belongs to a worker that died mid-remux."""
         with get_connection() as conn:
             rows = conn.execute(
                 """
@@ -486,12 +384,14 @@ class CacheStore:
                 WHERE status = %s
                 RETURNING id
                 """,
-                (STATUS_PENDING, _now_iso(), STATUS_DOWNLOADING),
+                (STATUS_PENDING, utc_now_iso(), STATUS_DOWNLOADING),
             ).fetchall()
         return len(rows)
 
-    # ----------------------------------------------------------------- cache
     @staticmethod
     def _bump() -> None:
         CacheStore._targets_cache = None
-        CacheStore._targets_cache_at = 0.0
+        CacheStore._enabled_cache = None
+
+
+store = CacheStore()
