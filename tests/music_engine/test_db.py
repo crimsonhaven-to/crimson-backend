@@ -16,3 +16,8 @@ def test_tracks_outlive_their_playlists():
     tracks = tracks[: tracks.index(");")]
     assert "REFERENCES" not in tracks
     assert "removed_upstream" in SQL
+
+
+def test_songs_added_by_search_are_flagged_for_source_tags():
+    local = (Path(__file__).resolve().parents[2] / "migrations" / "009_music_local.sql").read_text()
+    assert re.search(r"tags_from_source\s+BOOLEAN\s+NOT NULL\s+DEFAULT FALSE", local)

@@ -1,12 +1,13 @@
 """Importing and syncing playlists into the library.
 
-Three ways in, one way to store:
+Four ways in, one way to store:
 
 | Source | Reads | Syncs | Needs |
 | --- | --- | --- | --- |
 | ``spotify`` | the Web API, private playlists and Liked Songs | yes | a connected Spotify app (Premium) |
 | ``public`` | the public embed, first 100 tracks, no album | yes | the music provider |
 | ``csv`` | an Exportify file | no | nothing |
+| ``local`` | nothing: the member adds songs found by search | no | the music provider |
 """
 
 from __future__ import annotations
@@ -32,10 +33,17 @@ logger = logging.getLogger("crimson.music.library")
 SPOTIFY = "spotify"
 PUBLIC = "public"
 CSV = "csv"
+LOCAL = "local"
 
 SYNC_INTERVAL = timedelta(hours=6)
 
 _PLAYLIST_ID = re.compile(r"(?:playlist[/:])?([A-Za-z0-9]{22})\b")
+# The noise uploaders put after a song's name. Only bracketed, so a title that
+# merely contains "live" or "audio" keeps it.
+_TITLE_NOISE = re.compile(
+    r"\s*[(\[](?:official[^)\]]*|lyrics?|lyric video|audio|visuali[sz]er|hd|hq|4k|mv)[)\]]",
+    re.IGNORECASE,
+)
 
 
 class LibraryError(Exception):
@@ -61,6 +69,27 @@ def track_key(track: ImportedTrack) -> str:
     seconds = round(track.duration_ms / 1000)
     raw = f"{track.artists[0].lower()}|{track.title.lower()}|{seconds}"
     return "meta:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def song_from_search(title: str, channel: str, duration_ms: int, cover_url: str) -> ImportedTrack:
+    """A best guess at a search result's song. YouTube Music's "Artist - Topic"
+    channels name the artist; elsewhere uploads are usually "Artist - Title".
+    The worker replaces the guess with the source's own metadata when the
+    download carries any."""
+    clean = _TITLE_NOISE.sub("", title).strip() or title.strip()
+    artist = channel.removesuffix(" - Topic").strip()
+    if not channel.endswith(" - Topic") and " - " in clean:
+        artist, clean = (part.strip() for part in clean.split(" - ", 1))
+    return ImportedTrack(
+        title=clean,
+        artists=[artist] if artist else [],
+        duration_ms=duration_ms,
+        cover_url=cover_url or None,
+    )
+
+
+def search_key(url: str) -> str:
+    return "url:" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:20]
 
 
 async def _read(source: str, user_id: int, spotify_id: str) -> ImportedPlaylist:
@@ -107,6 +136,42 @@ async def import_csv(user_id: int, name: str, text: str) -> dict:
     tracks = parse_csv(text)
     playlist = ImportedPlaylist(name=name, tracks=tracks)
     return await _store(user_id, CSV, None, playlist, sync_enabled=False)
+
+
+async def create_local(user_id: int, name: str) -> dict:
+    playlist = await asyncio.to_thread(
+        store.upsert_playlist,
+        user_id,
+        source=LOCAL,
+        spotify_id=None,
+        name=name,
+        description="",
+        cover_url=None,
+        sync_enabled=False,
+    )
+    return {"playlist": playlist}
+
+
+def _require_local(playlist: dict) -> None:
+    if playlist["source"] != LOCAL:
+        raise LibraryError("Imported playlists follow their source. Add songs to one of your own.")
+
+
+async def add_song(playlist: dict, url: str, song: ImportedTrack) -> dict:
+    _require_local(playlist)
+    result = await asyncio.to_thread(store.add_song, playlist["id"], search_key(url), song, url)
+    track = await asyncio.to_thread(store.get_track, result["track_id"])
+    if track and track["status"] == "ready":
+        await asyncio.to_thread(write_playlist_file, playlist)
+    return result
+
+
+async def remove_song(playlist: dict, track_id: int) -> bool:
+    _require_local(playlist)
+    removed = await asyncio.to_thread(store.remove_song, playlist["id"], track_id)
+    if removed:
+        await asyncio.to_thread(write_playlist_file, playlist)
+    return removed
 
 
 async def sync(playlist: dict) -> dict:

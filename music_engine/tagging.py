@@ -1,6 +1,7 @@
 """Writing the final ``.m4a``: Spotify's metadata and cover into the downloaded
-audio. Tags come from the import, never from the source's own title, which is
-the point of doing this pass at all."""
+audio. Tags come from the import, never from the source's own video title,
+which is the point of doing this pass at all. A song added by search has no
+import behind it; the worker hands in the source's music metadata instead."""
 
 from __future__ import annotations
 
@@ -40,6 +41,22 @@ def tag_args(source: str, cover: Optional[str], dest: str, track: dict, album: s
     meta("disc", track.get("disc_number"))
     meta("date", (track.get("release_date") or "")[:4])
     return args + ["-movflags", "+faststart", "-f", "mp4", dest]
+
+
+def cover_args(source: str, dest: str) -> list[str]:
+    """Whatever the image was (a search result's thumbnail is WebP, which MP4
+    cannot carry, and 16:9), the file gets a square JPEG cut from its centre,
+    which is also where YouTube puts a song's album art."""
+    return [
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", source,
+        "-vf", "crop='min(iw,ih)':'min(iw,ih)'", "-frames:v", "1", "-q:v", "2", "-f", "mjpeg",
+        dest,
+    ]
+
+
+async def square_jpeg(source: str, dest: str) -> bool:
+    rc, _out, _lines = await ffmpeg.run(cover_args(source, dest), timeout=60.0)
+    return rc == 0 and os.path.exists(dest) and os.path.getsize(dest) > 0
 
 
 async def write_tagged(

@@ -25,7 +25,7 @@ MAX_ATTEMPTS = 3
 _TRACK_COLS = (
     "id, track_key, spotify_id, isrc, title, artists, album, album_artist, track_number, "
     "disc_number, release_date, duration_ms, cover_url, status, match_url, match_manual, "
-    "rel_path, cover_path, file_size, attempts, error, created_at, updated_at"
+    "rel_path, cover_path, file_size, attempts, error, tags_from_source, created_at, updated_at"
 )
 _TRACK_COLS_T = ", ".join("t." + c for c in _TRACK_COLS.split(", "))
 _PLAYLIST_COLS = (
@@ -229,7 +229,7 @@ class MusicStore:
             return conn.execute(
                 f"""
                 SELECT {_PLAYLIST_COLS} FROM music_playlists
-                WHERE sync_enabled AND source <> 'csv'
+                WHERE sync_enabled AND spotify_id IS NOT NULL
                       AND (last_synced_at IS NULL OR last_synced_at < %s)
                 ORDER BY last_synced_at NULLS FIRST, id
                 LIMIT %s
@@ -331,6 +331,59 @@ class MusicStore:
             )
         return {"total": len(seen), "added": added, "removed": len(removed)}
 
+    def add_song(self, playlist_id: int, key: str, track: ImportedTrack, url: str) -> dict:
+        """Append a song found by search. The recording may already be in the
+        library under a Spotify import's better metadata; that row is reused.
+        Returns ``track_id`` and whether the playlist gained it."""
+        now = utc_now_iso()
+        with get_connection() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM music_tracks WHERE match_url = %s
+                ORDER BY status = 'ready' DESC, id LIMIT 1
+                """,
+                (url,),
+            ).fetchone()
+            if existing:
+                track_id = existing["id"]
+            else:
+                track_id = conn.execute(
+                    """
+                    INSERT INTO music_tracks
+                        (track_key, title, artists, duration_ms, cover_url, match_url,
+                         match_manual, tags_from_source, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE, TRUE, %s, %s)
+                    ON CONFLICT (track_key) DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    RETURNING id
+                    """,
+                    (key, track.title, Jsonb(track.artists), track.duration_ms, track.cover_url,
+                     url, now, now),
+                ).fetchone()["id"]
+            added = conn.execute(
+                """
+                INSERT INTO music_playlist_tracks (playlist_id, track_id, position, added_at)
+                SELECT %s, %s, COALESCE(MAX(position) + 1, 0), %s
+                FROM music_playlist_tracks WHERE playlist_id = %s
+                ON CONFLICT (playlist_id, track_id) DO NOTHING
+                RETURNING track_id
+                """,
+                (playlist_id, track_id, now, playlist_id),
+            ).fetchone()
+            conn.execute(
+                "UPDATE music_playlists SET updated_at = %s WHERE id = %s", (now, playlist_id)
+            )
+        return {"track_id": track_id, "added": added is not None}
+
+    def remove_song(self, playlist_id: int, track_id: int) -> bool:
+        """The playlist entry only; the song and its file stay in the library."""
+        with get_connection() as conn:
+            row = conn.execute(
+                "DELETE FROM music_playlist_tracks WHERE playlist_id = %s AND track_id = %s "
+                "RETURNING track_id",
+                (playlist_id, track_id),
+            ).fetchone()
+        return row is not None
+
     # --- tracks -----------------------------------------------------------------
     def get_track(self, track_id: int) -> Optional[dict]:
         with get_connection() as conn:
@@ -417,16 +470,22 @@ class MusicStore:
         cover_path: Optional[str],
         file_size: int,
         album: str,
+        title: str,
+        artists: list[str],
     ) -> None:
+        """``title`` and ``artists`` are what the file was tagged with, which
+        differs from the row only for a song added by search."""
         with get_connection() as conn:
             conn.execute(
                 """
                 UPDATE music_tracks
                 SET status = %s, rel_path = %s, cover_path = %s, file_size = %s, error = NULL,
-                    album = CASE WHEN album = '' THEN %s ELSE album END, updated_at = %s
+                    album = CASE WHEN album = '' THEN %s ELSE album END,
+                    title = %s, artists = %s, updated_at = %s
                 WHERE id = %s
                 """,
-                (STATUS_READY, rel_path, cover_path, file_size, album, utc_now_iso(), track_id),
+                (STATUS_READY, rel_path, cover_path, file_size, album, title, Jsonb(artists),
+                 utc_now_iso(), track_id),
             )
 
     def mark_review(self, track_id: int, candidates: list[Candidate]) -> None:

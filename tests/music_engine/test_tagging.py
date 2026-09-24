@@ -1,6 +1,6 @@
 """The ffmpeg tag pass: copy AAC, encode anything else, tags from the import."""
 
-from music_engine.tagging import tag_args
+from music_engine.tagging import cover_args, tag_args
 
 TRACK = {
     "title": "Song",
@@ -32,3 +32,10 @@ def test_other_codecs_are_encoded_and_no_cover_means_no_video_map():
     assert args[args.index("-c:a") + 1] == "aac"
     assert "1:v:0" not in args
     assert not any(m.startswith("album=") for m in _metadata(args))
+
+
+def test_a_cover_becomes_a_square_jpeg():
+    args = cover_args("thumb.webp", "cover.jpg")
+    assert args[args.index("-vf") + 1] == "crop='min(iw,ih)':'min(iw,ih)'"
+    assert args[args.index("-f") + 1] == "mjpeg"
+    assert args[-1] == "cover.jpg"

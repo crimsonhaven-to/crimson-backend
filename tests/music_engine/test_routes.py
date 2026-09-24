@@ -65,3 +65,30 @@ def test_a_ready_track_gets_signed_stream_and_art_urls():
     pending = routes._track_payload({**row, "status": "pending", "cover_path": None}, "https://api")
     assert pending["stream_url"] is None
     assert pending["cover_url"] == "https://i.scdn.co/x"
+
+
+def test_a_song_is_added_to_a_local_playlist(client, monkeypatch):
+    monkeypatch.setattr(routes.store, "get_playlist",
+                        lambda user_id, playlist_id: {"id": playlist_id, "source": "local"})
+    added = []
+
+    async def fake_add(playlist, url, song):
+        added.append((url, song.title, song.artists))
+        return {"track_id": 4, "added": True}
+
+    monkeypatch.setattr(routes.library, "add_song", fake_add)
+    body = {"url": "https://youtu.be/x", "title": "Band - Song (Official Video)",
+            "channel": "BandVEVO", "duration_ms": 1000}
+    response = client.post("/music/playlists/2/tracks", json=body)
+    assert response.status_code == 200
+    assert added == [("https://youtu.be/x", "Song", ["Band"])]
+    body["url"] = "http://youtu.be/x"
+    assert client.post("/music/playlists/2/tracks", json=body).status_code == 422
+
+
+def test_songs_cannot_be_added_to_an_imported_playlist(client, monkeypatch):
+    monkeypatch.setattr(routes.store, "get_playlist",
+                        lambda user_id, playlist_id: {"id": playlist_id, "source": "spotify"})
+    body = {"url": "https://youtu.be/x", "title": "Song"}
+    assert client.post("/music/playlists/2/tracks", json=body).status_code == 400
+    assert client.delete("/music/playlists/2/tracks/4").status_code == 400

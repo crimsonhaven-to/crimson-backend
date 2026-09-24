@@ -106,9 +106,12 @@ def publish(work_file: str, rel_path: str) -> str:
     return dest
 
 
-def place_cover(work_cover: str, rel_path: str) -> str:
-    """``cover.jpg`` beside the track, kept if the album already has one."""
-    rel_cover = os.path.join(os.path.dirname(rel_path), "cover.jpg")
+def place_cover(work_cover: str, rel_path: str, per_album: bool) -> str:
+    """``cover.jpg`` beside the track, kept if the album already has one. Songs
+    without an album share ``Singles/`` but not a cover, so each gets its own
+    ``<name>.jpg``."""
+    name = "cover.jpg" if per_album else os.path.splitext(os.path.basename(rel_path))[0] + ".jpg"
+    rel_cover = os.path.join(os.path.dirname(rel_path), name)
     dest = os.path.join(root(), rel_cover)
     if not os.path.exists(dest):
         shutil.copyfile(work_cover, dest + ".part")

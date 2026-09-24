@@ -13,7 +13,15 @@ from .access import require_music_user
 from .csv_import import CsvImportError
 from .db import store
 from .provider import ProviderError, get_provider
-from .schemas import CsvImport, MatchChoice, PlaylistImport, PlaylistUpdate, SpotifyConnect
+from .schemas import (
+    CsvImport,
+    LocalPlaylist,
+    MatchChoice,
+    PlaylistImport,
+    PlaylistUpdate,
+    SongAdd,
+    SpotifyConnect,
+)
 from .spotify import LIKED_ID, SCOPES, SpotifyAuthError, SpotifyClient, SpotifyError
 
 router = APIRouter(prefix="/music", tags=["music"])
@@ -161,6 +169,14 @@ async def import_csv(request: Request, body: CsvImport, user: dict = Depends(req
     return {"success": True, **result}
 
 
+@router.post("/playlists/local")
+@limiter.limit("20/minute")
+async def create_local_playlist(
+    request: Request, body: LocalPlaylist, user: dict = Depends(require_music_user)
+):
+    return {"success": True, **await library.create_local(user["user_id"], body.name.strip())}
+
+
 @router.get("/playlists/{playlist_id}")
 async def get_playlist(
     request: Request, playlist_id: int, user: dict = Depends(require_music_user)
@@ -202,6 +218,33 @@ async def delete_playlist(playlist_id: int, user: dict = Depends(require_music_u
     """The playlist goes; its tracks and files stay in the library."""
     if not await asyncio.to_thread(store.delete_playlist, user["user_id"], playlist_id):
         raise HTTPException(status_code=404, detail="Playlist not found")
+    return {"success": True}
+
+
+@router.post("/playlists/{playlist_id}/tracks")
+@limiter.limit("60/minute")
+async def add_song(
+    request: Request, playlist_id: int, body: SongAdd, user: dict = Depends(require_music_user)
+):
+    playlist = await _owned_playlist(user, playlist_id)
+    song = library.song_from_search(body.title, body.channel, body.duration_ms, body.thumbnail_url)
+    try:
+        result = await library.add_song(playlist, body.url, song)
+    except _USER_ERRORS as e:
+        raise _error(e)
+    return {"success": True, **result}
+
+
+@router.delete("/playlists/{playlist_id}/tracks/{track_id}")
+async def remove_song(playlist_id: int, track_id: int, user: dict = Depends(require_music_user)):
+    """The entry only: the song stays on the share."""
+    playlist = await _owned_playlist(user, playlist_id)
+    try:
+        removed = await library.remove_song(playlist, track_id)
+    except _USER_ERRORS as e:
+        raise _error(e)
+    if not removed:
+        raise HTTPException(status_code=404, detail="That song is not in this playlist")
     return {"success": True}
 
 

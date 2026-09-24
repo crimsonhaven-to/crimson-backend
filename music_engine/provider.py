@@ -78,11 +78,16 @@ class Match:
 
 @dataclass
 class Fetched:
-    """A downloaded audio file in the work directory. ``album`` is what the
-    source said, used only when the import had none."""
+    """A downloaded audio file in the work directory, with the music metadata
+    the source carried. ``album`` fills an import that had none. ``title``,
+    ``artists`` and ``cover_url`` are used only for a song added by search; the
+    first two stay empty when the source knows the upload only as a video."""
 
     path: str
     album: str = ""
+    title: str = ""
+    artists: list[str] = field(default_factory=list)
+    cover_url: str = ""
 
 
 class ProviderError(Exception):
