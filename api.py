@@ -37,7 +37,9 @@ from local_engine import (
     routes as local_routes,
 )
 from manga_engine import routes as manga_routes
-from music_engine import media_routes as music_media, routes as music_routes
+from music_engine import admin_routes as music_admin
+from music_engine import media_routes as music_media
+from music_engine import routes as music_routes
 from metadata_engine import (
     admin_routes as metadata_admin,
     discovery_routes,
@@ -118,6 +120,7 @@ for module in (
     cache_admin,
     download_admin,
     chat_admin,
+    music_admin,
     telemetry_admin,
     playback_admin,
     system_admin,

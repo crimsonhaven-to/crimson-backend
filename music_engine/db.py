@@ -582,6 +582,68 @@ class MusicStore:
                 (utc_now_iso(), track_id, rel_path),
             )
 
+    # --- the admin library view -----------------------------------------------------
+    def library_summary(self) -> dict:
+        """``queued`` counts only what the worker will take: a track no playlist
+        holds any more waits forever, on purpose."""
+        with get_connection() as conn:
+            return conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE status = 'ready') AS ready,
+                       COUNT(*) FILTER (
+                           WHERE status IN ('pending', 'working') AND EXISTS (
+                               SELECT 1 FROM music_playlist_tracks pt WHERE pt.track_id = t.id
+                           )
+                       ) AS queued,
+                       COUNT(*) FILTER (WHERE status IN ('review', 'unmatched', 'failed')) AS problems,
+                       COUNT(*) FILTER (WHERE mirrored_at IS NOT NULL) AS mirrored,
+                       COALESCE(SUM(file_size) FILTER (WHERE status = 'ready'), 0) AS bytes,
+                       COALESCE(SUM(duration_ms) FILTER (WHERE status = 'ready'), 0) AS duration_ms
+                FROM music_tracks t
+                """
+            ).fetchone()
+
+    def library_page(
+        self, *, query: str, status: Optional[str], limit: int, offset: int
+    ) -> tuple[list[dict], int]:
+        """Every track, newest first, with who holds it. ``query`` matches title,
+        album or an artist; ``status`` narrows to one state."""
+        where = ["TRUE"]
+        params: list = []
+        if query:
+            where.append("(t.title ILIKE %s OR t.album ILIKE %s OR t.artists::text ILIKE %s)")
+            params += [f"%{query}%"] * 3
+        if status:
+            where.append("t.status = %s")
+            params.append(status)
+        clause = " AND ".join(where)
+        with get_connection() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS n FROM music_tracks t WHERE {clause}", params
+            ).fetchone()["n"]
+            rows = conn.execute(
+                f"""
+                SELECT {_TRACK_COLS_T},
+                       COALESCE(
+                           ARRAY_AGG(DISTINCT COALESCE(a.username, a.label, a.email))
+                               FILTER (WHERE a.user_id IS NOT NULL),
+                           '{{}}'
+                       ) AS owners,
+                       COUNT(DISTINCT pt.playlist_id) AS playlist_count
+                FROM music_tracks t
+                LEFT JOIN music_playlist_tracks pt ON pt.track_id = t.id
+                LEFT JOIN music_playlists p ON p.id = pt.playlist_id
+                LEFT JOIN accounts a ON a.user_id = p.user_id
+                WHERE {clause}
+                GROUP BY t.id
+                ORDER BY t.created_at DESC, t.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        return rows, total
+
     def playlists_for_track(self, track_id: int) -> list[dict]:
         with get_connection() as conn:
             return conn.execute(

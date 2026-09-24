@@ -2,17 +2,17 @@
 tracks that need a person to pick a recording."""
 
 import asyncio
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from core.public_url import public_base_url
 from core.rate_limit import limiter
 
-from . import cdn, fs, library, links, spotify
+from . import cdn, fs, library, spotify
 from .access import require_music_user
 from .csv_import import CsvImportError
 from .db import store
+from .payloads import track_payload
 from .provider import ProviderError, get_provider
 from .schemas import (
     CsvImport,
@@ -39,33 +39,6 @@ def _error(e: Exception) -> HTTPException:
 
 
 _USER_ERRORS = (SpotifyError, ProviderError, library.LibraryError, CsvImportError)
-
-
-def _track_payload(row: dict, base: str) -> dict:
-    ready = row["status"] == "ready"
-    stream_url: Optional[str]
-    cover_url: Optional[str]
-    if ready and row.get("mirrored_at") and cdn.enabled():
-        stream_url = cdn.signed_url(row["rel_path"])
-        cover_url = cdn.signed_url(row["cover_path"]) if row["cover_path"] else row["cover_url"]
-    else:
-        stream_url = base + links.signed_path(links.STREAM, row["id"]) if ready else None
-        cover_url = (
-            base + links.signed_path(links.ART, row["id"]) if row["cover_path"] else row["cover_url"]
-        )
-    return {
-        "id": row["id"],
-        "spotify_id": row["spotify_id"],
-        "title": row["title"],
-        "artists": row["artists"],
-        "album": row["album"],
-        "duration_ms": row["duration_ms"],
-        "status": row["status"],
-        "error": row["error"],
-        "removed_upstream": bool(row.get("removed_upstream")),
-        "cover_url": cover_url,
-        "stream_url": stream_url,
-    }
 
 
 async def _owned_track(user: dict, track_id: int) -> dict:
@@ -197,7 +170,7 @@ async def get_playlist(
     return {
         "success": True,
         "playlist": playlist,
-        "tracks": [_track_payload(row, base) for row in rows],
+        "tracks": [track_payload(row, base) for row in rows],
     }
 
 
