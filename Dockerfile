@@ -39,6 +39,36 @@ RUN --mount=type=secret,id=sources_token --mount=type=secret,id=sources_repo \
     fi
 
 # ---------------------------------------------------------------------------
+# Optional music overlay: the source the music worker downloads from. Same
+# pattern as above, with its own repo secret and the same token. Besides the
+# modules it brings Python packages and Deno (for YouTube's player challenge).
+# The packages go to /opt/music-pylib and are appended to sys.path by a .pth
+# file, so the backend's own pinned packages always win a version clash.
+# ---------------------------------------------------------------------------
+FROM python:3.14-slim AS music-overlay
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /injected
+RUN mkdir -p music pylib bin pth
+ARG OVERLAY_REV=none
+RUN --mount=type=secret,id=sources_token --mount=type=secret,id=music_repo \
+    if [ -s /run/secrets/sources_token ] && [ -s /run/secrets/music_repo ]; then \
+        echo ">> music overlay build ${OVERLAY_REV}" && \
+        git clone --depth 1 --branch main \
+          "https://gitlab-ci-token:$(cat /run/secrets/sources_token)@$(cat /run/secrets/music_repo).git" /tmp/src && \
+        cp /tmp/src/music/*.py music/ && \
+        pip install --no-cache-dir --target pylib -r /tmp/src/requirements.txt && \
+        echo /opt/music-pylib > pth/music-overlay.pth && \
+        curl -fsSL -o /tmp/deno.zip \
+          https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip && \
+        unzip -q /tmp/deno.zip -d bin && \
+        rm -rf /tmp/src /tmp/deno.zip && \
+        echo ">> music overlay applied: $(ls music | wc -l) module(s), $(bin/deno --version | head -1)"; \
+    else \
+        echo ">> no music overlay secrets supplied, music downloads stay off"; \
+    fi
+
+# ---------------------------------------------------------------------------
 FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -89,6 +119,11 @@ COPY migrations ./migrations
 COPY --from=private-sources /injected/resolvers/ ./resolvers/
 COPY --from=private-sources /injected/scrapers/ ./scrapers/
 COPY --from=private-sources /injected/manga/ ./manga_engine/
+# Empty without the music secrets. music_engine.provider discovers MUSIC_PROVIDER.
+COPY --from=music-overlay /injected/music/ ./music_engine/
+COPY --from=music-overlay /injected/pylib/ /opt/music-pylib/
+COPY --from=music-overlay /injected/pth/ /usr/local/lib/python3.14/site-packages/
+COPY --from=music-overlay /injected/bin/ /usr/local/bin/
 
 # State lives in PostgreSQL, so the container needs no writable data volume.
 RUN useradd --create-home --uid 10001 appuser \

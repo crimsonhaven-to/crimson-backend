@@ -14,6 +14,7 @@
 # | api-sync        | 1        | Fribb resync, airing notifications    |
 # | cache-worker    | 1        | ffmpeg cache loop                     |
 # | download-worker | 1        | aria2 poll loop                       |
+# | music-worker    | 1        | music downloads and playlist sync     |
 # | aria2           | 1        | the download queue itself             |
 # | discord-bot     | 1        | invite bot (idle without a token)     |
 # | pruner          | global   | removes old release images per node   |
@@ -41,6 +42,7 @@ x-core-env: &core-env
   RUN_DB_SYNC: "false"
   RUN_CACHE_WORKER: "false"
   RUN_DOWNLOAD_WORKER: "false"
+  RUN_MUSIC_WORKER: "false"
 
 # Cached streams are pulled back through the worker's own proxies, so both api and
 # cache-worker need the source credentials.
@@ -50,6 +52,11 @@ x-source-env: &source-env
   JELLYFIN_PASSWORD: ${JELLYFIN_PASSWORD:-}
   FEBBOX_UI_TOKEN: ${FEBBOX_UI_TOKEN:-}
   FEBBOX_REGION: ${FEBBOX_REGION:-}
+
+# api serves the library and music-worker writes it, so both mount the share at
+# this path. Unset keeps the Music surface dark.
+x-music-env: &music-env
+  MUSIC_ROOT: ${MUSIC_ROOT:-}
 
 x-aria2-env: &aria2-env
   ARIA2_RPC_URL: ${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}
@@ -85,7 +92,7 @@ services:
   api:
     image: *image
     environment:
-      <<: [*core-env, *source-env, *aria2-env]
+      <<: [*core-env, *source-env, *aria2-env, *music-env]
       KOFI_VERIFICATION_TOKEN: ${KOFI_VERIFICATION_TOKEN:-}
       # Read-only PAT for /changelog; unset answers 503.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
@@ -110,10 +117,12 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       CRIMSON_PROXY_BASE: ${CRIMSON_PROXY_BASE:-}
-    # Serves /cache_proxy, so it needs the NAS mounts (see volumes at the bottom).
+    # Serves /cache_proxy and /music_stream, so it needs the NAS mounts (see
+    # volumes at the bottom).
     # volumes:
     #   - crimson_cache1:/crimson/cache1
     #   - crimson_cache2:/crimson/cache2
+    #   - crimson_music:/crimson/music
     ports:
       - target: 8000
         published: 8000
@@ -202,6 +211,28 @@ services:
       rollback_config: *singleton-rollback
       resources:
         limits: {cpus: "0.50", memory: 384M}
+        reservations: {cpus: "0.10", memory: 128M}
+    networks: [crimson_net]
+
+  # Matches, downloads and tags music, and resyncs playlists every six hours.
+  # Also calls Spotify with each account's own token, so it needs no Spotify env.
+  music-worker:
+    image: *image
+    environment:
+      <<: [*core-env, *music-env]
+      RUN_MUSIC_WORKER: "true"
+    # volumes:
+    #   - crimson_music:/crimson/music
+    healthcheck: *health
+    # Lets a download and its tag pass finish; a kill requeues the track.
+    stop_grace_period: 120s
+    deploy:
+      replicas: 1
+      restart_policy: *restart
+      update_config: *singleton-update
+      rollback_config: *singleton-rollback
+      resources:
+        limits: {cpus: "1.00", memory: 512M}
         reservations: {cpus: "0.10", memory: 128M}
     networks: [crimson_net]
 
@@ -309,6 +340,12 @@ networks:
 #     driver_opts:
 #       type: cifs
 #       device: "//${NAS_IP}/${NAS_SHARE1}"
+#       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
+#   crimson_music:
+#     driver: local
+#     driver_opts:
+#       type: cifs
+#       device: "//${NAS_IP}/crimsonmusic"
 #       o: "username=${NAS_USER},password=${NAS_PASSWORD},vers=3.0,uid=10001,gid=10001,file_mode=0664,dir_mode=0775"
 #   crimson_nfs_example:
 #     driver: local

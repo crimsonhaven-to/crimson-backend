@@ -49,9 +49,11 @@ services:
       DATABASE_URL: *database-url
       ARIA2_RPC_URL: http://aria2:6800/jsonrpc
     # Local sources and the download target: mount, then register the in-container
-    # path in Admin. aria2 must see the media library at the same path.
+    # path in Admin. aria2 must see the media library at the same path. Music: mount
+    # the share and set MUSIC_ROOT=/crimson/music in .env.
     # volumes:
     #   - /srv/media:/crimson/media
+    #   - /srv/music:/crimson/music
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
       interval: 30s
