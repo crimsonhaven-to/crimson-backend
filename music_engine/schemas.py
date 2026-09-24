@@ -30,3 +30,17 @@ class PlaylistUpdate(BaseModel):
 
 class MatchChoice(BaseModel):
     url: str = Field(..., pattern=r"^https://", max_length=500)
+
+
+class LocalPlaylist(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+
+
+class SongAdd(BaseModel):
+    """A search result, as the picker showed it."""
+
+    url: str = Field(..., pattern=r"^https://", max_length=500)
+    title: str = Field(..., min_length=1, max_length=300)
+    channel: str = Field("", max_length=200)
+    duration_ms: int = Field(0, ge=0)
+    thumbnail_url: str = Field("", pattern=r"^(https://.*)?$", max_length=1000)

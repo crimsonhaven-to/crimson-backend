@@ -137,3 +137,49 @@ async def test_a_permanent_provider_error_fails_the_track(env):
 
     await worker_module.MusicWorker()._run(Gone(Match(kind="auto", url="u")), dict(TRACK))
     assert store.names()[-1] == "mark_failed"
+
+
+class SourceTagged(FakeProvider):
+    async def fetch(self, url, work_dir):
+        fetched = await super().fetch(url, work_dir)
+        fetched.title, fetched.artists = "Real Title", ["Real Artist"]
+        return fetched
+
+
+async def test_a_song_added_by_search_takes_the_sources_tags(env):
+    _root, store = env
+    track = {**TRACK, "album_artist": "", "match_url": "https://yt/3", "tags_from_source": True}
+    await worker_module.MusicWorker()._process(SourceTagged(Match(kind="none")), track, "x")
+    ready = store.calls[0][2]
+    assert (ready["title"], ready["artists"]) == ("Real Title", ["Real Artist"])
+    assert ready["rel_path"].startswith("Real Artist")
+
+
+async def test_an_imported_song_keeps_spotifys_tags(env):
+    _root, store = env
+    track = {**TRACK, "match_url": "https://yt/3"}
+    await worker_module.MusicWorker()._process(SourceTagged(Match(kind="none")), track, "x")
+    assert store.calls[0][2]["title"] == "Song"
+
+
+async def test_a_song_added_by_search_uses_the_sources_full_size_cover(env, monkeypatch):
+    asked = []
+
+    async def fake_cover(url, work):
+        asked.append(url)
+        return None
+
+    monkeypatch.setattr(worker_module, "_download_cover", fake_cover)
+
+    class WithCover(SourceTagged):
+        async def fetch(self, url, work_dir):
+            fetched = await super().fetch(url, work_dir)
+            fetched.cover_url = "https://img/full.jpg"
+            return fetched
+
+    track = {**TRACK, "match_url": "u", "cover_url": "https://img/small.jpg"}
+    await worker_module.MusicWorker()._process(WithCover(Match(kind="none")), track, "x")
+    await worker_module.MusicWorker()._process(
+        WithCover(Match(kind="none")), {**track, "tags_from_source": True}, "x"
+    )
+    assert asked == ["https://img/small.jpg", "https://img/full.jpg"]

@@ -163,10 +163,18 @@ class MusicWorker:
 
         work = await asyncio.to_thread(fs.work_dir, track_id)
         fetched = await provider.fetch(url, work)
-        cover = await _download_cover(track.get("cover_url"), work)
+        cover_url = track.get("cover_url")
+        if track.get("tags_from_source"):
+            # The search result's thumbnail was sized for the picker, not a lock screen.
+            cover_url = fetched.cover_url or cover_url
+            if fetched.title:
+                track = {**track, "title": fetched.title,
+                         "artists": fetched.artists or track["artists"]}
+        cover = await _download_cover(cover_url, work)
         album = track["album"] or fetched.album
+        track = {**track, "album": album}
 
-        rel_path = await asyncio.to_thread(fs.unique_rel_path, fs.plan_rel_path({**track, "album": album}))
+        rel_path = await asyncio.to_thread(fs.unique_rel_path, fs.plan_rel_path(track))
         tagged = os.path.join(work, "tagged.m4a")
         error = await tagging.write_tagged(fetched.path, cover, tagged, track, album)
         if error:
@@ -176,7 +184,9 @@ class MusicWorker:
 
         size = os.path.getsize(tagged)
         await asyncio.to_thread(fs.publish, tagged, rel_path)
-        cover_path = await asyncio.to_thread(fs.place_cover, cover, rel_path) if cover else None
+        cover_path = (
+            await asyncio.to_thread(fs.place_cover, cover, rel_path, bool(album)) if cover else None
+        )
         await asyncio.to_thread(
             store.mark_ready,
             track_id,
@@ -184,6 +194,8 @@ class MusicWorker:
             cover_path=cover_path,
             file_size=size,
             album=album,
+            title=track["title"],
+            artists=track["artists"],
         )
         for playlist in await asyncio.to_thread(store.playlists_for_track, track_id):
             self._dirty.add(playlist["id"])
@@ -206,9 +218,10 @@ async def _download_cover(url: Optional[str], work: str) -> Optional[str]:
             response = await client.get(url)
         if response.status_code != 200 or not response.content:
             return None
+        original = os.path.join(work, "cover.download")
+        await asyncio.to_thread(_write_bytes, original, response.content)
         path = os.path.join(work, "cover.jpg")
-        await asyncio.to_thread(_write_bytes, path, response.content)
-        return path
+        return path if await tagging.square_jpeg(original, path) else None
     except Exception as e:
         logger.info("cover download failed for %s: %s", url, e)
         return None

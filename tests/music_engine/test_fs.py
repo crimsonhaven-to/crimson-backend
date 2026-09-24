@@ -68,10 +68,21 @@ def test_an_album_keeps_its_first_cover(root):
     open(cover, "wb").write(b"first")
     rel = os.path.join("Band", "Record", "01 - Song.m4a")
     (root / "Band" / "Record").mkdir(parents=True)
-    assert fs.place_cover(cover, rel) == os.path.join("Band", "Record", "cover.jpg")
+    assert fs.place_cover(cover, rel, True) == os.path.join("Band", "Record", "cover.jpg")
     open(cover, "wb").write(b"second")
-    fs.place_cover(cover, rel)
+    fs.place_cover(cover, rel, True)
     assert (root / "Band" / "Record" / "cover.jpg").read_bytes() == b"first"
+
+
+def test_singles_each_keep_their_own_cover(root):
+    work = fs.work_dir(2)
+    cover = os.path.join(work, "cover.jpg")
+    (root / "Band" / "Singles").mkdir(parents=True)
+    for title in ("One", "Two"):
+        open(cover, "wb").write(title.encode())
+        rel = os.path.join("Band", "Singles", f"{title}.m4a")
+        assert fs.place_cover(cover, rel, False) == os.path.join("Band", "Singles", f"{title}.jpg")
+    assert (root / "Band" / "Singles" / "One.jpg").read_bytes() == b"One"
 
 
 def test_playlist_file_lists_relative_paths(root):
