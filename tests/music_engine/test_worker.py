@@ -183,3 +183,54 @@ async def test_a_song_added_by_search_uses_the_sources_full_size_cover(env, monk
         WithCover(Match(kind="none")), {**track, "tags_from_source": True}, "x"
     )
     assert asked == ["https://img/small.jpg", "https://img/full.jpg"]
+
+
+class MirrorStore(FakeStore):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def fetch_unmirrored(self, limit):
+        return self.rows
+
+
+async def test_ready_tracks_are_copied_to_the_cdn(env, monkeypatch):
+    root, _store = env
+    (root / "Band").mkdir()
+    (root / "Band" / "a.m4a").write_bytes(b"a")
+    (root / "Band" / "cover.jpg").write_bytes(b"c")
+    rows = [
+        {"id": 1, "rel_path": "Band/a.m4a", "cover_path": "Band/cover.jpg"},
+        {"id": 2, "rel_path": "Band/gone.m4a", "cover_path": None},
+    ]
+    store = MirrorStore(rows)
+    monkeypatch.setattr(worker_module, "store", store)
+    uploaded = []
+
+    async def upload(path, rel_path, content_type):
+        uploaded.append((rel_path, content_type))
+
+    monkeypatch.setattr(worker_module.cdn, "upload", upload)
+    await worker_module.MusicWorker()._mirror_some()
+    assert uploaded == [("Band/a.m4a", "audio/mp4"), ("Band/cover.jpg", "image/jpeg")]
+    assert store.calls[0] == ("mark_mirrored", (1, "Band/a.m4a"), {})
+    assert store.calls[1][0] == "mark_failed" and store.calls[1][1][0] == 2
+
+
+async def test_a_cdn_outage_pauses_the_copy(env, monkeypatch):
+    root, _store = env
+    (root / "a.m4a").write_bytes(b"a")
+    store = MirrorStore([{"id": 1, "rel_path": "a.m4a", "cover_path": None}] * 3)
+    monkeypatch.setattr(worker_module, "store", store)
+    attempts = []
+
+    async def upload(path, rel_path, content_type):
+        attempts.append(rel_path)
+        raise worker_module.cdn.CdnError("HTTP 503")
+
+    monkeypatch.setattr(worker_module.cdn, "upload", upload)
+    worker = worker_module.MusicWorker()
+    await worker._mirror_some()
+    assert attempts == ["a.m4a"]
+    assert worker._mirror_paused_until > 0
+    assert store.calls == []

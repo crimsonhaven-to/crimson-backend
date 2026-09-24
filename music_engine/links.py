@@ -25,7 +25,7 @@ def _secret() -> bytes:
     return signing.resolve_secret("MUSIC_LINK_SECRET")
 
 
-def _expiry() -> int:
+def expiry() -> int:
     return (int(time.time()) + _LIFETIME_SECONDS) // _DAY * _DAY
 
 
@@ -34,7 +34,7 @@ def _payload(kind: str, track_id: int, expires: int) -> str:
 
 
 def signed_path(kind: str, track_id: int) -> str:
-    expires = _expiry()
+    expires = expiry()
     signature = signing.sign(_secret(), _payload(kind, track_id, expires))
     return f"/music_{kind}/{track_id}?e={expires}&s={signature}"
 

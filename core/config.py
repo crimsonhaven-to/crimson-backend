@@ -133,6 +133,11 @@ class Settings(BaseSettings):
     # --- music ------------------------------------------------------------
     # The in-container mount of the music share. Empty keeps the surface dark.
     music_root: str = ""
+    # Optional off-site copy: the music-cdn Worker in front of an R2 bucket (see
+    # deploy/music-cdn). With both set, every song and cover is uploaded there
+    # and players stream from it. The secret must match the Worker's CDN_SECRET.
+    music_cdn_url: str = ""
+    music_cdn_secret: str = ""
 
     # --- observability ----------------------------------------------------
     log_format: str = "plain"
@@ -204,7 +209,12 @@ class Settings(BaseSettings):
         return value.lower() if isinstance(value, str) else value
 
     @field_validator(
-        "frontend_base_url", "cache_internal_base", "aria2_rpc_url", "jellyfin_url", "music_root"
+        "frontend_base_url",
+        "cache_internal_base",
+        "aria2_rpc_url",
+        "jellyfin_url",
+        "music_root",
+        "music_cdn_url",
     )
     @classmethod
     def _no_trailing_slash(cls, value: str) -> str:

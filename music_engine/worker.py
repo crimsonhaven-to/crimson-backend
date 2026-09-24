@@ -23,7 +23,7 @@ from typing import Optional
 from core.config import get_settings
 from core.http_client import http_client
 
-from . import fs, library, tagging
+from . import cdn, fs, library, tagging
 from .db import STATUS_UNMATCHED, store
 from .provider import MusicProvider, ProviderError, TrackQuery, get_provider
 
@@ -34,6 +34,9 @@ POLL_SECONDS = 10
 SYNC_CHECK_SECONDS = 300
 # After the provider reports a rate limit or a network failure, for every slot.
 BACKOFF_SECONDS = 120.0
+# Tracks copied to the CDN per poll tick. The first run after switching the CDN
+# on copies the whole library, and a tick must not stall for that long.
+MIRROR_BATCH = 5
 
 
 class MusicWorker:
@@ -41,6 +44,7 @@ class MusicWorker:
         self._jobs: dict[int, asyncio.Task] = {}
         self._poller: Optional[asyncio.Task] = None
         self._paused_until = 0.0
+        self._mirror_paused_until = 0.0
         self._last_sync_check = 0.0
         # Playlists whose M3U is stale, rewritten once the queue goes quiet.
         self._dirty: set[int] = set()
@@ -91,6 +95,8 @@ class MusicWorker:
                 started = await self._start_pending(loop.time())
                 if not started and not self._jobs and self._dirty:
                     await self._write_dirty_playlists()
+                if cdn.enabled() and loop.time() >= self._mirror_paused_until:
+                    await self._mirror_some()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -201,6 +207,30 @@ class MusicWorker:
             self._dirty.add(playlist["id"])
         logger.info("[music] ready %s -> %s", label, rel_path)
 
+    async def _mirror_some(self) -> None:
+        """Copy ready tracks to the CDN. One failure pauses the pass rather than
+        walking the whole batch into the same outage."""
+        for track in await asyncio.to_thread(store.fetch_unmirrored, MIRROR_BATCH):
+            audio = await asyncio.to_thread(_on_share, track["rel_path"])
+            if not audio:
+                await asyncio.to_thread(
+                    store.mark_failed, track["id"],
+                    "The file is gone from the share. Try again to download it again.",
+                )
+                logger.warning("[music] %s is missing from the share", track["rel_path"])
+                continue
+            try:
+                await cdn.upload(audio, track["rel_path"], "audio/mp4")
+                cover = await asyncio.to_thread(_on_share, track["cover_path"])
+                if cover:
+                    await cdn.upload(cover, track["cover_path"], "image/jpeg")
+            except cdn.CdnError as e:
+                logger.warning("[music] CDN copy paused: %s", e)
+                self._mirror_paused_until = asyncio.get_running_loop().time() + BACKOFF_SECONDS
+                return
+            await asyncio.to_thread(store.mark_mirrored, track["id"], track["rel_path"])
+            logger.info("[music] copied %s to the CDN", track["rel_path"])
+
     async def _write_dirty_playlists(self) -> None:
         dirty, self._dirty = self._dirty, set()
         for playlist_id in dirty:
@@ -225,6 +255,11 @@ async def _download_cover(url: Optional[str], work: str) -> Optional[str]:
     except Exception as e:
         logger.info("cover download failed for %s: %s", url, e)
         return None
+
+
+def _on_share(rel_path: Optional[str]) -> Optional[str]:
+    path = fs.absolute(rel_path) if rel_path else None
+    return path if path and os.path.isfile(path) else None
 
 
 def _write_bytes(path: str, data: bytes) -> None:

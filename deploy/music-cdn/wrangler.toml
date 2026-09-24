@@ -1,0 +1,14 @@
+# The music CDN Worker. See README.md for the one-time setup.
+name = "crimson-music-cdn"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+workers_dev = false
+
+routes = [{ pattern = "cdn.crimsonhaven.to", custom_domain = true }]
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "crimson-music"
+
+[observability]
+enabled = true

@@ -92,3 +92,16 @@ def test_songs_cannot_be_added_to_an_imported_playlist(client, monkeypatch):
     body = {"url": "https://youtu.be/x", "title": "Song"}
     assert client.post("/music/playlists/2/tracks", json=body).status_code == 400
     assert client.delete("/music/playlists/2/tracks/4").status_code == 400
+
+
+def test_a_mirrored_track_streams_from_the_cdn(monkeypatch):
+    monkeypatch.setattr(routes.cdn, "enabled", lambda: True)
+    monkeypatch.setattr(routes.cdn, "signed_url", lambda rel: f"https://cdn/{rel}?signed")
+    row = {"id": 3, "spotify_id": None, "title": "t", "artists": ["a"], "album": "",
+           "duration_ms": 1, "status": "ready", "error": None, "cover_path": "a/cover.jpg",
+           "cover_url": None, "rel_path": "a/t.m4a", "mirrored_at": "2026-09-24"}
+    payload = routes._track_payload(row, "https://api")
+    assert payload["stream_url"] == "https://cdn/a/t.m4a?signed"
+    assert payload["cover_url"] == "https://cdn/a/cover.jpg?signed"
+    local = routes._track_payload({**row, "mirrored_at": None}, "https://api")
+    assert local["stream_url"].startswith("https://api/music_stream/3?e=")
