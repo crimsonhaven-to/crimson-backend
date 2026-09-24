@@ -3,6 +3,12 @@
 An operator build drops extra modules into ``scrapers``, ``resolvers`` and
 ``manga_engine``; the registries find them here without naming them. A base
 build finds nothing. ``PRIVATE_SOURCES_ENABLED=0`` turns discovery off.
+
+| Package | Overlay directory |
+| --- | --- |
+| ``resolvers``, ``scrapers`` | ``resolvers/``, ``scrapers/`` of the sources overlay |
+| ``manga_engine`` | ``manga/`` of the sources overlay |
+| ``music_engine`` | ``music/`` of the music overlay |
 """
 
 import importlib
@@ -84,11 +90,13 @@ def discover_resolve_grants(package):
     return _grant_cache[key]
 
 
-def discover_manga_provider(package):
+def discover_provider(package, marker: str):
+    """The first overlay module-level ``marker`` object in ``package``, e.g.
+    ``MANGA_PROVIDER`` or ``MUSIC_PROVIDER``."""
     for module in overlay_modules(package):
-        provider = getattr(module, "MANGA_PROVIDER", None)
+        provider = getattr(module, marker, None)
         if provider is not None:
-            logger.info("registered injected manga provider: %s", module.__name__)
+            logger.info("registered injected %s from %s", marker, module.__name__)
             return provider
     return None
 

@@ -31,7 +31,7 @@ PUBLIC_EXACT = {
 }
 # /metrics is listed only so a scrape carrying METRICS_TOKEN reaches its handler,
 # which does its own token-or-admin check. The media relays below are loaded by
-# <video>, <img>, <track> and hls.js, none of which can attach a bearer, so each
+# <video>, <audio>, <img>, <track> and hls.js, none of which can attach a bearer, so each
 # is signed or maps a path token to a file inside an enabled root instead. A
 # working URL for any of them only comes from an authenticated call.
 PUBLIC_PREFIXES = (
@@ -47,6 +47,8 @@ PUBLIC_PREFIXES = (
     "/subtitles_proxy",
     "/manga_proxy",
     "/iptv_proxy",
+    "/music_stream",
+    "/music_art",
 )
 
 

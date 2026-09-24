@@ -129,6 +129,7 @@ class UserUpdate(BaseModel):
     is_admin: Optional[bool] = None
     email_verified: Optional[bool] = None
     chat_enabled: Optional[bool] = None
+    music_enabled: Optional[bool] = None
     # Absent leaves the budget alone, a number sets it, and 0 freezes the user
     # without revoking access. Clearing it back to the global default needs its
     # own flag, because JSON null and an omitted field look the same here.

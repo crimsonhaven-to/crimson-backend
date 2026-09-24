@@ -7,7 +7,7 @@ Which replica runs which job:
 | Retention sweeps | every replica | idempotent DELETEs by timestamp; a second replica costs a no-op query |
 | Changelog, IPTV, proxy health | every replica | each replica caches and routes on its own copy |
 | Mapping sync, metadata refresh, backfill, airing | the ``RUN_DB_SYNC`` replica | wholesale rebuilds and bulk churn would contend on the shared database |
-| Cache and download loops | the ``RUN_CACHE_WORKER`` / ``RUN_DOWNLOAD_WORKER`` service | a long remux or transfer must survive an api redeploy |
+| Cache, download and music loops | the ``RUN_CACHE_WORKER`` / ``RUN_DOWNLOAD_WORKER`` / ``RUN_MUSIC_WORKER`` service | a long remux or transfer must survive an api redeploy |
 
 Scheduler jobs run in a worker thread with no event loop, so async jobs run on
 their own loop there. Warm-ups run once on the main loop at boot, off the boot
@@ -41,6 +41,7 @@ from download_engine.manager import manager as download_manager
 from iptv_engine.service import service as iptv_service
 from local_engine.db import store as local_store
 from metadata_engine import maintenance, sync_status
+from music_engine.worker import worker as music_worker
 from metadata_engine.mapping_sync import engine as mapping
 from notify_engine import notifier as airing
 from notify_engine.db import store as airing_store
@@ -70,6 +71,7 @@ async def shutdown(app: FastAPI, logger: logging.Logger) -> None:
     logger.info("Shutting down...")
     await cache_manager.stop()
     await download_manager.stop()
+    await music_worker.stop()
     # Waits for a running job, off the loop so the drain can still make progress.
     await asyncio.to_thread(app.state.scheduler.shutdown)
     await close_client()
@@ -115,8 +117,8 @@ def _bootstrap_admins(logger: logging.Logger) -> None:
 
 
 async def _start_workers(logger: logging.Logger) -> None:
-    """Both queues are tables, so other replicas still queue and claim rows; they
-    just do not run the loop."""
+    """Every queue is a table, so other replicas still queue rows; they just do
+    not run the loop."""
     settings = get_settings()
     if settings.run_cache_worker:
         await cache_manager.start_worker()
@@ -126,6 +128,10 @@ async def _start_workers(logger: logging.Logger) -> None:
         await download_manager.start_worker()
     else:
         logger.info("RUN_DOWNLOAD_WORKER disabled, the download-worker service runs aria2")
+    if settings.run_music_worker:
+        await music_worker.start()
+    else:
+        logger.info("RUN_MUSIC_WORKER disabled, the music-worker service downloads")
 
 
 # --- scheduling helpers ------------------------------------------------------------

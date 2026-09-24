@@ -37,6 +37,7 @@ from local_engine import (
     routes as local_routes,
 )
 from manga_engine import routes as manga_routes
+from music_engine import media_routes as music_media, routes as music_routes
 from metadata_engine import (
     admin_routes as metadata_admin,
     discovery_routes,
@@ -107,6 +108,8 @@ for module in (
     telemetry_routes,
     local_routes,
     local_media,
+    music_routes,
+    music_media,
     metrics_routes,
     account_admin,
     apikey_admin,

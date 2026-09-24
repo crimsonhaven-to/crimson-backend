@@ -77,6 +77,9 @@ FEATURES: List[Feature] = [
     Feature("Lumi chatbot key", lambda s: bool(s.anthropic_api_key or s.gemini_api_key),
             "set ANTHROPIC_API_KEY or GEMINI_API_KEY, then switch Lumi on in "
             "Admin -> Lumi and grant members access in Admin -> Users"),
+    Feature("Music library", lambda s: bool(s.music_root),
+            "set MUSIC_ROOT to the music share's mount, then grant members access "
+            "in Admin -> Users"),
     Feature("Invite-gated signup", lambda s: bool(s.signup_invite_code),
             "set SIGNUP_INVITE_CODE for a reusable invite (bot mints single-use)"),
     Feature("Admin seed", lambda s: bool(s.admin_emails),
@@ -93,6 +96,8 @@ FEATURES: List[Feature] = [
             "RUN_DB_SYNC=false on serving replicas; true on exactly one"),
     Feature("Server-side cache worker (this replica)", lambda s: s.run_cache_worker,
             "RUN_CACHE_WORKER true only on the cache-worker service"),
+    Feature("Music download worker (this replica)", lambda s: s.run_music_worker,
+            "RUN_MUSIC_WORKER true only on the music-worker service"),
 ]
 
 
