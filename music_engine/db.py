@@ -371,12 +371,15 @@ class MusicStore:
         return out
 
     def fetch_pending(self, limit: int) -> list[dict]:
-        """Fewest attempts first, so one stubborn track cannot starve the queue."""
+        """Fewest attempts first, so one stubborn track cannot starve the queue.
+        Only tracks some playlist still holds: removing a mistaken import stops
+        its downloads."""
         with get_connection() as conn:
             return conn.execute(
                 f"""
-                SELECT {_TRACK_COLS} FROM music_tracks
+                SELECT {_TRACK_COLS} FROM music_tracks t
                 WHERE status = %s
+                      AND EXISTS (SELECT 1 FROM music_playlist_tracks pt WHERE pt.track_id = t.id)
                 ORDER BY attempts, created_at, id
                 LIMIT %s
                 """,

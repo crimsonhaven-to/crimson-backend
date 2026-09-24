@@ -55,9 +55,14 @@ class MusicWorker:
             logger.warning("MUSIC_ROOT %s is missing or not writable", fs.root())
         if get_provider() is None:
             logger.warning("no music provider in this build: playlists sync, nothing downloads")
-        requeued = await asyncio.to_thread(store.reset_stale)
-        if requeued:
-            logger.info("requeued %d interrupted track(s)", requeued)
+        # A failed migration is logged rather than fatal at boot, so a missing table
+        # must not turn into a crash loop here either; the poll logs it each tick.
+        try:
+            requeued = await asyncio.to_thread(store.reset_stale)
+            if requeued:
+                logger.info("requeued %d interrupted track(s)", requeued)
+        except Exception as e:
+            logger.error("requeueing interrupted tracks failed: %s", e)
         self._poller = asyncio.create_task(self._poll())
         logger.info("music worker started (%d slots)", SLOTS)
 
