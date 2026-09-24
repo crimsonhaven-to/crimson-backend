@@ -2,7 +2,7 @@
 
 import time
 
-VERSION = "18.3.0"
+VERSION = "18.4.0"
 
 # Module-load time is close enough to boot for the dashboard's uptime.
 PROCESS_STARTED_AT = time.time()
