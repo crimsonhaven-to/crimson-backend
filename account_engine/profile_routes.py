@@ -28,6 +28,7 @@ def account_me(user: dict = Depends(require_user)):
         "email": user.get("email"),
         "email_verified": user.get("email_verified"),
         "is_admin": bool(user.get("is_admin")),
+        "music_enabled": bool(user.get("music_enabled")),
         "username": user.get("username"),
         "label": user.get("label"),
         "created_at": user.get("created_at"),

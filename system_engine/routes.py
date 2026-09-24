@@ -51,6 +51,7 @@ async def public_config(settings: Settings = Depends(get_settings)):
         "manga_enabled": settings.manga_enabled,
         "live_tv_enabled": settings.iptv_enabled,
         "local_library_enabled": local_is_configured(),
+        "music_enabled": bool(settings.music_root),
     }
 
 

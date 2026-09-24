@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     # default on so a single-container deploy works without extra config.
     run_cache_worker: bool = True
     run_download_worker: bool = True
+    run_music_worker: bool = True
 
     # --- access -----------------------------------------------------------
     require_login: bool = True
@@ -129,6 +130,10 @@ class Settings(BaseSettings):
     aria2_rpc_url: str = "http://aria2:6800/jsonrpc"
     aria2_rpc_secret: str = ""
 
+    # --- music ------------------------------------------------------------
+    # The in-container mount of the music share. Empty keeps the surface dark.
+    music_root: str = ""
+
     # --- observability ----------------------------------------------------
     log_format: str = "plain"
     metrics_token: str = ""
@@ -198,7 +203,9 @@ class Settings(BaseSettings):
     def _lowercase(cls, value):
         return value.lower() if isinstance(value, str) else value
 
-    @field_validator("frontend_base_url", "cache_internal_base", "aria2_rpc_url", "jellyfin_url")
+    @field_validator(
+        "frontend_base_url", "cache_internal_base", "aria2_rpc_url", "jellyfin_url", "music_root"
+    )
     @classmethod
     def _no_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")

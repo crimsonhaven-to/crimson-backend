@@ -25,7 +25,7 @@ _IGNORED_METHODS = {"HEAD", "OPTIONS"}
 #   * you cannot sign in without the auth endpoints,
 #   * uptime probes and the service descriptor (/, /health, /config, /lumi),
 #   * the API docs,
-#   * a signed proxy loaded cross-origin by <video>, hls.js, <img> or <track>,
+#   * a signed proxy loaded cross-origin by <video>, <audio>, hls.js, <img> or <track>,
 #     none of which can attach an Authorization header, so each is HMAC-signed
 #     and gated by the signature instead,
 #   * a caller that is not a browser: Ko-fi's webhook, Prometheus' scrape
@@ -61,6 +61,8 @@ PUBLIC_ROUTES = {
     ("GET", "/local_hls/{token}/{resource}"),
     ("GET", "/local_proxy/{token}"),
     ("GET", "/manga_proxy"),
+    ("GET", "/music_art/{track_id}"),
+    ("GET", "/music_stream/{track_id}"),
     ("GET", "/player"),
     ("GET", "/subtitles_proxy"),
 

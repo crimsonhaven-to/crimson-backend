@@ -36,9 +36,9 @@ class MangaProvider(Protocol):
 def get_provider() -> Optional[MangaProvider]:
     """The injected provider, or ``None``. The overlay is fixed at process start."""
     import manga_engine
-    from core.private_sources import discover_manga_provider
+    from core.private_sources import discover_provider
 
     try:
-        return discover_manga_provider(manga_engine)
+        return discover_provider(manga_engine, "MANGA_PROVIDER")
     except Exception:
         return None

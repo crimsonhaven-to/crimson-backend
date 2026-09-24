@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from chat_engine.db import store as chat_store
+from music_engine.db import store as music_store
 from core.background import spawn
 from core.clock import utc_now_iso
 from core.rate_limit import limiter
@@ -41,6 +42,7 @@ def _public_user(row: Optional[dict]) -> Optional[dict]:
         "email_verified": bool(row.get("email_verified")),
         # Deny by default, so a row predating the column reads False, not None.
         "chat_enabled": bool(row.get("chat_enabled")),
+        "music_enabled": bool(row.get("music_enabled")),
     }
 
 
@@ -123,8 +125,8 @@ def _apply_user_update(
     request: Request, admin: dict, user_id: int, target: dict, body: UserUpdate
 ) -> None:
     """Every change is audited. Nobody can revoke their own admin flag or demote
-    the last admin. Chat access is a spending decision, audited like the admin
-    flag rather than treated as a preference."""
+    the last admin. Chat and music access cost the operator money or disk, so
+    both are audited like the admin flag rather than treated as preferences."""
     audit_target = {"target_user_id": user_id, "target": target.get("email")}
     if body.is_admin is not None and bool(target.get("is_admin")) != body.is_admin:
         if not body.is_admin:
@@ -152,6 +154,13 @@ def _apply_user_update(
         chat_store.set_chat_access(user_id, body.chat_enabled)
         log_admin_action(
             request, admin, "chat_granted" if body.chat_enabled else "chat_revoked", **audit_target
+        )
+
+    if body.music_enabled is not None and bool(target.get("music_enabled")) != body.music_enabled:
+        music_store.set_music_access(user_id, body.music_enabled)
+        log_admin_action(
+            request, admin, "music_granted" if body.music_enabled else "music_revoked",
+            **audit_target,
         )
 
     if body.chat_budget_reset:
