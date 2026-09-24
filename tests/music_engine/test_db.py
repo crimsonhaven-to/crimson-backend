@@ -21,3 +21,11 @@ def test_tracks_outlive_their_playlists():
 def test_songs_added_by_search_are_flagged_for_source_tags():
     local = (Path(__file__).resolve().parents[2] / "migrations" / "009_music_local.sql").read_text()
     assert re.search(r"tags_from_source\s+BOOLEAN\s+NOT NULL\s+DEFAULT FALSE", local)
+
+
+def test_a_new_download_is_copied_to_the_cdn_again():
+    from music_engine import db
+
+    source = open(db.__file__).read()
+    mark_ready = source[source.index("def mark_ready"):source.index("def mark_review")]
+    assert "mirrored_at = NULL" in mark_ready

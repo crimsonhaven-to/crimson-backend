@@ -25,7 +25,8 @@ MAX_ATTEMPTS = 3
 _TRACK_COLS = (
     "id, track_key, spotify_id, isrc, title, artists, album, album_artist, track_number, "
     "disc_number, release_date, duration_ms, cover_url, status, match_url, match_manual, "
-    "rel_path, cover_path, file_size, attempts, error, tags_from_source, created_at, updated_at"
+    "rel_path, cover_path, file_size, attempts, error, tags_from_source, mirrored_at, created_at, "
+    "updated_at"
 )
 _TRACK_COLS_T = ", ".join("t." + c for c in _TRACK_COLS.split(", "))
 _PLAYLIST_COLS = (
@@ -405,13 +406,15 @@ class MusicStore:
         return row is not None
 
     def queue_counts(self, user_id: int) -> dict:
-        """Tracks in this user's playlists by status, for the library header."""
+        """Tracks in this user's playlists by status, and how many of them are in
+        the CDN copy, for the library header."""
         out = {s: 0 for s in (STATUS_PENDING, STATUS_WORKING, STATUS_READY, STATUS_REVIEW,
-                              STATUS_UNMATCHED, STATUS_FAILED)}
+                              STATUS_UNMATCHED, STATUS_FAILED, "mirrored")}
         with get_connection() as conn:
             for row in conn.execute(
                 """
-                SELECT t.status, COUNT(DISTINCT t.id) AS n
+                SELECT t.status, COUNT(DISTINCT t.id) AS n,
+                       COUNT(DISTINCT t.id) FILTER (WHERE t.mirrored_at IS NOT NULL) AS mirrored
                 FROM music_tracks t
                 JOIN music_playlist_tracks pt ON pt.track_id = t.id
                 JOIN music_playlists p ON p.id = pt.playlist_id
@@ -421,6 +424,7 @@ class MusicStore:
                 (user_id,),
             ).fetchall():
                 out[row["status"]] = row["n"]
+                out["mirrored"] += row["mirrored"]
         return out
 
     def fetch_pending(self, limit: int) -> list[dict]:
@@ -481,7 +485,7 @@ class MusicStore:
                 UPDATE music_tracks
                 SET status = %s, rel_path = %s, cover_path = %s, file_size = %s, error = NULL,
                     album = CASE WHEN album = '' THEN %s ELSE album END,
-                    title = %s, artists = %s, updated_at = %s
+                    title = %s, artists = %s, mirrored_at = NULL, updated_at = %s
                 WHERE id = %s
                 """,
                 (STATUS_READY, rel_path, cover_path, file_size, album, title, Jsonb(artists),
@@ -556,6 +560,27 @@ class MusicStore:
                 (STATUS_PENDING, utc_now_iso(), STATUS_WORKING),
             ).fetchall()
         return len(rows)
+
+    def fetch_unmirrored(self, limit: int) -> list[dict]:
+        with get_connection() as conn:
+            return conn.execute(
+                f"""
+                SELECT {_TRACK_COLS} FROM music_tracks
+                WHERE status = %s AND mirrored_at IS NULL
+                ORDER BY id
+                LIMIT %s
+                """,
+                (STATUS_READY, limit),
+            ).fetchall()
+
+    def mark_mirrored(self, track_id: int, rel_path: str) -> None:
+        """Only while the track still points at the file that was uploaded: a
+        download that finished meanwhile left a new file to copy."""
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE music_tracks SET mirrored_at = %s WHERE id = %s AND rel_path = %s",
+                (utc_now_iso(), track_id, rel_path),
+            )
 
     def playlists_for_track(self, track_id: int) -> list[dict]:
         with get_connection() as conn:

@@ -54,9 +54,12 @@ x-source-env: &source-env
   FEBBOX_REGION: ${FEBBOX_REGION:-}
 
 # api serves the library and music-worker writes it, so both mount the share at
-# this path. Unset keeps the Music surface dark.
+# this path. Unset keeps the Music surface dark. The CDN pair is optional: api
+# signs links to it, music-worker uploads to it (deploy/music-cdn).
 x-music-env: &music-env
   MUSIC_ROOT: ${MUSIC_ROOT:-}
+  MUSIC_CDN_URL: ${MUSIC_CDN_URL:-}
+  MUSIC_CDN_SECRET: ${MUSIC_CDN_SECRET:-}
 
 x-aria2-env: &aria2-env
   ARIA2_RPC_URL: ${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}

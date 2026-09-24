@@ -80,6 +80,9 @@ FEATURES: List[Feature] = [
     Feature("Music library", lambda s: bool(s.music_root),
             "set MUSIC_ROOT to the music share's mount, then grant members access "
             "in Admin -> Users"),
+    Feature("Music CDN copy", lambda s: bool(s.music_cdn_url and s.music_cdn_secret),
+            "set MUSIC_CDN_URL + MUSIC_CDN_SECRET to copy the library to the music-cdn "
+            "Worker's R2 bucket and stream from there (see deploy/music-cdn)"),
     Feature("Invite-gated signup", lambda s: bool(s.signup_invite_code),
             "set SIGNUP_INVITE_CODE for a reusable invite (bot mints single-use)"),
     Feature("Admin seed", lambda s: bool(s.admin_emails),
