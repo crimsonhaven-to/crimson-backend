@@ -40,6 +40,9 @@ The startup report shows `[  on] Music CDN copy`, and the music-worker log shows
 ## Behaviour
 
 - **Links** are signed with `MUSIC_CDN_SECRET` and expire after a week, like the api's.
+- **CORS** is open (`Access-Control-Allow-Origin: *`) on signed reads, so the player can
+  preload and download songs with `fetch()`. The signature is the access check, not the origin.
+  After updating the Worker, run `npx wrangler deploy` again or downloads of CDN songs fail.
 - **A re-download** (a new recording picked) clears `mirrored_at`, so the new file is copied too.
 - **The CDN down** pauses copying for two minutes; songs not yet copied still play from the api.
   Songs already copied play only from the CDN, so an outage there stops them.

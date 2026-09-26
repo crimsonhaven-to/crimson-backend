@@ -1,5 +1,6 @@
 """A track as the player and the admin library see it: the signed links to its
-audio and cover, from the CDN copy when there is one."""
+audio and cover, from the CDN copy when there is one, and the file's size, which
+the player needs to tell a member what a download will take on the device."""
 
 from typing import Optional
 
@@ -25,6 +26,7 @@ def track_payload(row: dict, base: str) -> dict:
         "artists": row["artists"],
         "album": row["album"],
         "duration_ms": row["duration_ms"],
+        "file_size": row["file_size"] if ready else None,
         "status": row["status"],
         "error": row["error"],
         "removed_upstream": bool(row.get("removed_upstream")),
