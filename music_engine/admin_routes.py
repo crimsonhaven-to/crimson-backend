@@ -39,7 +39,6 @@ async def library(
         "tracks": [
             {
                 **track_payload(row, base),
-                "file_size": row["file_size"],
                 "rel_path": row["rel_path"],
                 "mirrored": row["mirrored_at"] is not None,
                 "created_at": row["created_at"],

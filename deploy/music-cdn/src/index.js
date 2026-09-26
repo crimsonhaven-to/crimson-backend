@@ -42,6 +42,12 @@ function objectHeaders(object) {
   // Private: a shared cache must not keep a file a signature was needed for.
   headers.set('Cache-Control', 'private, max-age=86400');
   headers.set('X-Content-Type-Options', 'nosniff');
+  // The player downloads songs with fetch() to keep them on the device, and a
+  // cross-origin fetch needs CORS to read the body. Any origin is safe: the
+  // signature is the access check, there are no cookies to ride along, and
+  // anyone holding a link can already download it without a browser.
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, ETag');
   return headers;
 }
 
