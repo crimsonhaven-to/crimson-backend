@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -44,3 +45,16 @@ class SongAdd(BaseModel):
     channel: str = Field("", max_length=200)
     duration_ms: int = Field(0, ge=0)
     thumbnail_url: str = Field("", pattern=r"^(https://.*)?$", max_length=1000)
+
+
+class ListenReport(BaseModel):
+    track_id: int = Field(..., ge=1)
+    # When the song started, on the device's clock.
+    listened_at: datetime
+    seconds: float = Field(..., ge=0, le=86_400)
+
+
+class ListenBatch(BaseModel):
+    """What a device has heard since it last reported, oldest first."""
+
+    listens: list[ListenReport] = Field(..., max_length=200)

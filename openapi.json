@@ -3,7 +3,7 @@
   "info": {
     "title": "Anime Streaming API",
     "description": "API for streaming anime with multi-season support",
-    "version": "18.2.1"
+    "version": "18.5.0"
   },
   "paths": {
     "/auth/challenge": {
@@ -5174,6 +5174,1268 @@
         }
       }
     },
+    "/music/status": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Music Status",
+        "operationId": "music_status_music_status_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/spotify/connect": {
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Connect Spotify",
+        "operationId": "connect_spotify_music_spotify_connect_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpotifyConnect"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/spotify": {
+      "delete": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Disconnect Spotify",
+        "description": "Imported playlists stay. They stop syncing until a link exists again.",
+        "operationId": "disconnect_spotify_music_spotify_delete",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/spotify/playlists": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Spotify Playlists",
+        "operationId": "spotify_playlists_music_spotify_playlists_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/playlists": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "List Playlists",
+        "operationId": "list_playlists_music_playlists_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Import Playlist",
+        "operationId": "import_playlist_music_playlists_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlaylistImport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/playlists/csv": {
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Import Csv",
+        "operationId": "import_csv_music_playlists_csv_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CsvImport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/playlists/local": {
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Create Local Playlist",
+        "operationId": "create_local_playlist_music_playlists_local_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalPlaylist"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/playlists/{playlist_id}": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Get Playlist",
+        "operationId": "get_playlist_music_playlists__playlist_id__get",
+        "parameters": [
+          {
+            "name": "playlist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Playlist Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Update Playlist",
+        "operationId": "update_playlist_music_playlists__playlist_id__patch",
+        "parameters": [
+          {
+            "name": "playlist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Playlist Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlaylistUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Delete Playlist",
+        "description": "The playlist goes; its tracks and files stay in the library.",
+        "operationId": "delete_playlist_music_playlists__playlist_id__delete",
+        "parameters": [
+          {
+            "name": "playlist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Playlist Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/playlists/{playlist_id}/sync": {
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Sync Playlist",
+        "operationId": "sync_playlist_music_playlists__playlist_id__sync_post",
+        "parameters": [
+          {
+            "name": "playlist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Playlist Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/playlists/{playlist_id}/tracks": {
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Add Song",
+        "operationId": "add_song_music_playlists__playlist_id__tracks_post",
+        "parameters": [
+          {
+            "name": "playlist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Playlist Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SongAdd"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/playlists/{playlist_id}/tracks/{track_id}": {
+      "delete": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Remove Song",
+        "description": "The entry only: the song stays on the share.",
+        "operationId": "remove_song_music_playlists__playlist_id__tracks__track_id__delete",
+        "parameters": [
+          {
+            "name": "playlist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Playlist Id"
+            }
+          },
+          {
+            "name": "track_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Track Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/tracks/{track_id}/candidates": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Track Candidates",
+        "operationId": "track_candidates_music_tracks__track_id__candidates_get",
+        "parameters": [
+          {
+            "name": "track_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Track Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/tracks/{track_id}/match": {
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Choose Match",
+        "operationId": "choose_match_music_tracks__track_id__match_post",
+        "parameters": [
+          {
+            "name": "track_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Track Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MatchChoice"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/tracks/{track_id}/retry": {
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Retry Track",
+        "operationId": "retry_track_music_tracks__track_id__retry_post",
+        "parameters": [
+          {
+            "name": "track_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Track Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/search": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Search",
+        "operationId": "search_music_search_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Q"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music_stream/{track_id}": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Music Stream",
+        "operationId": "music_stream_music_stream__track_id__get",
+        "parameters": [
+          {
+            "name": "track_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Track Id"
+            }
+          },
+          {
+            "name": "e",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "E"
+            }
+          },
+          {
+            "name": "s",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "S"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music_art/{track_id}": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Music Art",
+        "operationId": "music_art_music_art__track_id__get",
+        "parameters": [
+          {
+            "name": "track_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Track Id"
+            }
+          },
+          {
+            "name": "e",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "E"
+            }
+          },
+          {
+            "name": "s",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "S"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/listens": {
+      "post": {
+        "tags": [
+          "music-listening"
+        ],
+        "summary": "Report Listens",
+        "operationId": "report_listens_music_listens_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListenBatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/wrapped": {
+      "get": {
+        "tags": [
+          "music-listening"
+        ],
+        "summary": "Music Wrapped",
+        "description": "This account's year of listening, counted in the viewer's timezone.",
+        "operationId": "music_wrapped_music_wrapped_get",
+        "parameters": [
+          {
+            "name": "year",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 2100,
+              "minimum": 2000,
+              "description": "Calendar year; defaults to the current one",
+              "title": "Year"
+            },
+            "description": "Calendar year; defaults to the current one"
+          },
+          {
+            "name": "offset_minutes",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 840,
+              "minimum": -720,
+              "description": "The viewer's UTC offset in minutes, as JS getTimezoneOffset() negated",
+              "default": 0,
+              "title": "Offset Minutes"
+            },
+            "description": "The viewer's UTC offset in minutes, as JS getTimezoneOffset() negated"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/admin/stats": {
       "get": {
         "tags": [
@@ -7750,6 +9012,111 @@
         }
       }
     },
+    "/admin/music/library": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Library",
+        "operationId": "library_admin_music_library_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "default": "",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "pending",
+                    "working",
+                    "ready",
+                    "review",
+                    "unmatched",
+                    "failed"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/admin/source-stats": {
       "get": {
         "tags": [
@@ -8397,6 +9764,28 @@
         "type": "object",
         "title": "ChatSettingsUpdate"
       },
+      "CsvImport": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "csv": {
+            "type": "string",
+            "maxLength": 5000000,
+            "minLength": 1,
+            "title": "Csv"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "csv"
+        ],
+        "title": "CsvImport"
+      },
       "DeleteAccountRequest": {
         "properties": {
           "password": {
@@ -8663,6 +10052,66 @@
         "type": "object",
         "title": "InviteCreate"
       },
+      "ListenBatch": {
+        "properties": {
+          "listens": {
+            "items": {
+              "$ref": "#/components/schemas/ListenReport"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Listens"
+          }
+        },
+        "type": "object",
+        "required": [
+          "listens"
+        ],
+        "title": "ListenBatch",
+        "description": "What a device has heard since it last reported, oldest first."
+      },
+      "ListenReport": {
+        "properties": {
+          "track_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Track Id"
+          },
+          "listened_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Listened At"
+          },
+          "seconds": {
+            "type": "number",
+            "maximum": 86400.0,
+            "minimum": 0.0,
+            "title": "Seconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "track_id",
+          "listened_at",
+          "seconds"
+        ],
+        "title": "ListenReport"
+      },
+      "LocalPlaylist": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "LocalPlaylist"
+      },
       "LocalSourceCreate": {
         "properties": {
           "label": {
@@ -8769,6 +10218,58 @@
           "signature"
         ],
         "title": "LoginRequest"
+      },
+      "MatchChoice": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "maxLength": 500,
+            "pattern": "^https://",
+            "title": "Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "MatchChoice"
+      },
+      "PlaylistImport": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "spotify",
+              "public"
+            ],
+            "title": "Source"
+          },
+          "playlist": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Playlist"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "playlist"
+        ],
+        "title": "PlaylistImport"
+      },
+      "PlaylistUpdate": {
+        "properties": {
+          "sync_enabled": {
+            "type": "boolean",
+            "title": "Sync Enabled"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sync_enabled"
+        ],
+        "title": "PlaylistUpdate"
       },
       "ProgressIn": {
         "properties": {
@@ -8955,6 +10456,84 @@
         ],
         "title": "ResetPasswordRequest"
       },
+      "SongAdd": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "maxLength": 500,
+            "pattern": "^https://",
+            "title": "Url"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 300,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "channel": {
+            "type": "string",
+            "maxLength": 200,
+            "title": "Channel",
+            "default": ""
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Duration Ms",
+            "default": 0
+          },
+          "thumbnail_url": {
+            "type": "string",
+            "maxLength": 1000,
+            "pattern": "^(https://.*)?$",
+            "title": "Thumbnail Url",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "url",
+          "title"
+        ],
+        "title": "SongAdd",
+        "description": "A search result, as the picker showed it."
+      },
+      "SpotifyConnect": {
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{32}$",
+            "title": "Client Id"
+          },
+          "code": {
+            "type": "string",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Code"
+          },
+          "code_verifier": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 43,
+            "title": "Code Verifier"
+          },
+          "redirect_uri": {
+            "type": "string",
+            "maxLength": 500,
+            "pattern": "^https://|^http://127\\.0\\.0\\.1[:/]",
+            "title": "Redirect Uri"
+          }
+        },
+        "type": "object",
+        "required": [
+          "client_id",
+          "code",
+          "code_verifier",
+          "redirect_uri"
+        ],
+        "title": "SpotifyConnect",
+        "description": "The browser's half of Authorization Code with PKCE: it held the verifier\nacross the redirect and now hands the code over once."
+      },
       "SubscriptionIn": {
         "properties": {
           "anilist_id": {
@@ -9032,6 +10611,17 @@
               }
             ],
             "title": "Chat Enabled"
+          },
+          "music_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Music Enabled"
           },
           "chat_monthly_token_budget": {
             "anyOf": [

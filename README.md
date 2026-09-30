@@ -63,6 +63,7 @@ imports data, and nothing imports upward.
 | `local_engine/`, `cache_engine/`, `download_engine/` | The local library (with on-the-fly HLS), the server-side cache, admin downloads through aria2 |
 | `system_engine/` | `/`, `/config`, `/health`, `/metrics`, and the admin System and Metrics tabs |
 | `chat_engine/` | Lumi, the permission-gated chatbot |
+| `music_engine/` | The music library: Spotify and CSV imports, the download worker, streaming, the CDN copy, and listens for Wrapped |
 | `notify_engine/` | The airing calendar, follows and airing emails |
 | `recommend_engine/`, `manga_engine/`, `iptv_engine/`, `subtitles_engine/`, `skiptimes_engine/` | Recommendations, manga, Live TV, OpenSubtitles tracks, AniSkip timestamps |
 | `supporters_engine/`, `changelog_engine/`, `apikey_engine/`, `telemetry_engine/` | Ko-fi supporters, the GitHub Releases changelog, movie-web bridge keys, client resolve beacons |
