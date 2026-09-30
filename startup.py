@@ -41,6 +41,7 @@ from download_engine.manager import manager as download_manager
 from iptv_engine.service import service as iptv_service
 from local_engine.db import store as local_store
 from metadata_engine import maintenance, sync_status
+from music_engine import listens_db as music_listens
 from music_engine.worker import worker as music_worker
 from metadata_engine.mapping_sync import engine as mapping
 from notify_engine import notifier as airing
@@ -205,6 +206,7 @@ def _every_replica(every) -> None:
             "security_events": audit.purge_old(),
             "airing": airing_store.purge_old(),
             "telemetry": telemetry_store.purge_old(),
+            "music_listens": music_listens.purge_old(),
         }
 
     every("purge_expired_job", "Retention sweep", _purge, hours=6)
