@@ -42,7 +42,12 @@ def valid_name(name: str) -> bool:
 
 def _client() -> httpx.AsyncClient:
     token = get_settings().app_releases_token
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    # aiter_bytes would undo a gzip encoding while the forwarded Content-Length
+    # still counts the compressed bytes, so only plain bytes are accepted.
+    headers = {"Accept-Encoding": "identity"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     return httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, headers=headers, transport=transport)
 
 
