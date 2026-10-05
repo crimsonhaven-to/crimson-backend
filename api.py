@@ -26,7 +26,7 @@ from cache_engine import admin_routes as cache_admin, routes as cache_routes
 from changelog_engine import routes as changelog_routes
 from chat_engine import admin_routes as chat_admin, routes as chat_routes
 from core import errors, logging_setup
-from core.config import get_settings
+from core.config import NATIVE_APP_ORIGIN_REGEX, get_settings
 from core.middleware import LumiHeaderMiddleware, RequestContextMiddleware
 from core.rate_limit import limiter
 from core.version import VERSION
@@ -140,6 +140,7 @@ app.add_middleware(LoginWallMiddleware, extra_public_prefixes=overlay_prefixes)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().allowed_origins,
+    allow_origin_regex=NATIVE_APP_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

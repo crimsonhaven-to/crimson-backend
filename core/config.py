@@ -19,6 +19,12 @@ load_dotenv()
 
 DEFAULT_ORIGINS = ["https://crimsonhaven.to", "https://www.crimsonhaven.to"]
 
+# The mobile apps (crimson-native, Capacitor) load the client from their own
+# origin, one subdomain per backend so each keeps its own storage, so they work
+# against any backend without each one listing them in ALLOWED_ORIGINS.
+# `.localhost` names only ever resolve to the device itself.
+NATIVE_APP_ORIGIN_REGEX = r"^(https|capacitor)://([a-z0-9-]+\.)?crimsonhaven\.localhost$"
+
 CommaList = Annotated[list[str], NoDecode]
 
 
