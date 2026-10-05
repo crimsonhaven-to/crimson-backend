@@ -3,7 +3,7 @@
   "info": {
     "title": "Anime Streaming API",
     "description": "API for streaming anime with multi-season support",
-    "version": "18.7.0"
+    "version": "18.8.0"
   },
   "paths": {
     "/auth/challenge": {
