@@ -162,6 +162,12 @@ class Settings(BaseSettings):
     changelog_cache_ttl: int = Field(1800, ge=0)
     changelog_include_prereleases: bool = True
 
+    # The desktop app's releases, proxied to members only (app_engine). A
+    # folder of files such as a GitLab generic package, without a trailing
+    # slash. Unset hides the downloads and the update feed.
+    app_releases_url: str = ""
+    app_releases_token: str = ""
+
     discord_bot_token: str = ""
     discord_owner_id: str = ""
     discord_command_prefix: str = "!"

@@ -91,6 +91,7 @@ COPY scrapers ./scrapers
 COPY resolvers ./resolvers
 COPY account_engine ./account_engine
 COPY apikey_engine ./apikey_engine
+COPY app_engine ./app_engine
 COPY cache_engine ./cache_engine
 COPY changelog_engine ./changelog_engine
 COPY chat_engine ./chat_engine

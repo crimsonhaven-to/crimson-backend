@@ -33,7 +33,8 @@ PUBLIC_EXACT = {
 # which does its own token-or-admin check. The media relays below are loaded by
 # <video>, <audio>, <img>, <track> and hls.js, none of which can attach a bearer, so each
 # is signed or maps a path token to a file inside an enabled root instead. A
-# working URL for any of them only comes from an authenticated call.
+# browser download of the desktop app (/app/download) cannot either, and is signed
+# the same way. A working URL for any of them only comes from an authenticated call.
 PUBLIC_PREFIXES = (
     "/auth/",
     "/kofi/webhook",
@@ -49,6 +50,7 @@ PUBLIC_PREFIXES = (
     "/iptv_proxy",
     "/music_stream",
     "/music_art",
+    "/app/download",
 )
 
 

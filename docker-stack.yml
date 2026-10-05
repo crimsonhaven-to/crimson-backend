@@ -100,6 +100,9 @@ services:
       # Read-only PAT for /changelog; unset answers 503.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_REPO: ${GITHUB_REPO:-crimsonhaven-to/crimson-backend}
+      # Desktop app releases for members; unset hides them.
+      APP_RELEASES_URL: ${APP_RELEASES_URL:-}
+      APP_RELEASES_TOKEN: ${APP_RELEASES_TOKEN:-}
       # Only api answers /admin. Unset shows the live snapshot without history.
       PROMETHEUS_URL: ${PROMETHEUS_URL:-}
       OPENSUBTITLES_API_KEY: ${OPENSUBTITLES_API_KEY:-}
