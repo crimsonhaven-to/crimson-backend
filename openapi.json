@@ -3,7 +3,7 @@
   "info": {
     "title": "Anime Streaming API",
     "description": "API for streaming anime with multi-season support",
-    "version": "18.5.0"
+    "version": "18.6.0"
   },
   "paths": {
     "/auth/challenge": {
@@ -6261,6 +6261,167 @@
             "schema": {
               "type": "integer",
               "title": "Track Id"
+            }
+          },
+          {
+            "name": "e",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "E"
+            }
+          },
+          {
+            "name": "s",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "S"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/app/release": {
+      "get": {
+        "tags": [
+          "desktop app"
+        ],
+        "summary": "Release",
+        "operationId": "release_app_release_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/app/updates/{name}": {
+      "get": {
+        "tags": [
+          "desktop app"
+        ],
+        "summary": "Update File",
+        "operationId": "update_file_app_updates__name__get",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/app/download/{name}": {
+      "get": {
+        "tags": [
+          "desktop app"
+        ],
+        "summary": "Download",
+        "operationId": "download_app_download__name__get",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
             }
           },
           {

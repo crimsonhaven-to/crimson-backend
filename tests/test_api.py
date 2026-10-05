@@ -65,6 +65,8 @@ PUBLIC_ROUTES = {
     ("GET", "/music_stream/{track_id}"),
     ("GET", "/player"),
     ("GET", "/subtitles_proxy"),
+    # A browser download of the desktop app, signed by the members-only /app/release.
+    ("GET", "/app/download/{name}"),
 
     ("GET", "/changelog"),
     ("GET", "/metrics"),

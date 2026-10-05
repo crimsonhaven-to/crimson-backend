@@ -67,6 +67,7 @@ imports data, and nothing imports upward.
 | `notify_engine/` | The airing calendar, follows and airing emails |
 | `recommend_engine/`, `manga_engine/`, `iptv_engine/`, `subtitles_engine/`, `skiptimes_engine/` | Recommendations, manga, Live TV, OpenSubtitles tracks, AniSkip timestamps |
 | `supporters_engine/`, `changelog_engine/`, `apikey_engine/`, `telemetry_engine/` | Ko-fi supporters, the GitHub Releases changelog, movie-web bridge keys, client resolve beacons |
+| `app_engine/` | The desktop app's installers and update feed, proxied from private release storage to members only |
 | `discord_bot/` | A separate process that mints single-use invite codes |
 | `deploy/` | Patroni HA Postgres, PgBouncer, Prometheus |
 

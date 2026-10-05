@@ -21,6 +21,7 @@ from account_engine import (
 from account_engine.audit import rate_limit_handler
 from account_engine.login_wall import LoginWallMiddleware
 from apikey_engine import admin_routes as apikey_admin
+from app_engine import routes as app_routes
 from cache_engine import admin_routes as cache_admin, routes as cache_routes
 from changelog_engine import routes as changelog_routes
 from chat_engine import admin_routes as chat_admin, routes as chat_routes
@@ -113,6 +114,7 @@ for module in (
     local_media,
     music_routes,
     music_media,
+    app_routes,
     music_listening,
     metrics_routes,
     account_admin,
