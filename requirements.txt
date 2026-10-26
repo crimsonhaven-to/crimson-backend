@@ -1,22 +1,22 @@
 # Pinned for reproducible builds on python:3.14-slim. Every package here ships a
 # wheel for it, so the image needs no compiler.
-fastapi==0.136.3
+fastapi==0.162.0
 # [standard] adds uvloop and httptools, a free throughput win for this I/O-bound app.
-uvicorn[standard]==0.48.0
+uvicorn[standard]==0.54.0
 httpx==0.28.1
-orjson==3.11.6
+orjson==3.13.0
 # Used by the scrapers and the private source overlay to pass Cloudflare's TLS fingerprint checks.
-curl_cffi==0.15.0
-python-dotenv==1.2.2
-apscheduler==3.11.2
+curl_cffi==0.17.0
+python-dotenv==1.2.4
+apscheduler==3.11.3
 # Not imported here: the private source overlay's HTML parser.
-selectolax==0.4.10
-pydantic==2.13.4
-pydantic-settings==2.15.0
-slowapi==0.1.9
-psycopg[binary,pool]==3.3.4
+selectolax==1.0.2
+pydantic==2.14.1
+pydantic-settings==2.16.1
+slowapi==0.1.10
+psycopg[binary,pool]==3.3.6
 prometheus-client==0.26.0
 # Discord invite bot gateway client.
-websockets==15.0.1
+websockets==17.3
 # Optional at runtime: without it the chatbot reports the Claude provider as unavailable.
-anthropic==0.116.0
+anthropic==2.3.0

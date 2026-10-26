@@ -3,8 +3,8 @@
 
 pytest==9.1.1
 # pytest-asyncio 1.0 caps pytest below 9.
-pytest-asyncio==1.4.0
-ruff==0.14.4
-mypy==1.18.2
+pytest-asyncio==1.4.1
+ruff==0.17.2
+mypy==2.4.0
 # Validates the /watch NDJSON builders against their JSON Schema.
-jsonschema==4.25.1
+jsonschema==4.26.0

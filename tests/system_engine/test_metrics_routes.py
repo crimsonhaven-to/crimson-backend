@@ -3,6 +3,8 @@ closed, never open."""
 
 import os
 
+from fastapi.routing import iter_route_contexts
+
 from account_engine.deps import parse_bearer
 from system_engine import metrics_routes
 
@@ -48,7 +50,7 @@ async def test_a_token_scrape_costs_no_database_lookup(monkeypatch):
 def test_the_route_is_mounted_and_hidden_from_the_schema():
     import api
 
-    routes = [r for r in api.app.routes if getattr(r, "path", None) == "/metrics"]
+    routes = [r for r in iter_route_contexts(api.app.routes) if r.path == "/metrics"]
     assert len(routes) == 1
     assert routes[0].include_in_schema is False
 

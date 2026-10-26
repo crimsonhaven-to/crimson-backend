@@ -11,6 +11,7 @@ import warnings
 from collections import Counter
 
 import pytest
+from fastapi.routing import iter_route_contexts
 
 import api
 from account_engine import login_wall
@@ -75,9 +76,12 @@ PUBLIC_ROUTES = {
 
 
 def _route_pairs(routes):
-    """(method, path) for every route, minus the framework-default methods."""
+    """(method, path) for every route, minus the framework-default methods.
+
+    Since FastAPI 0.137 an included router stays nested in `app.routes`, so the
+    routes are read through FastAPI's flattened view, with their full paths."""
     pairs = []
-    for route in routes:
+    for route in iter_route_contexts(routes):
         path = getattr(route, "path", None)
         if not path:
             continue
