@@ -85,13 +85,52 @@ def test_singles_each_keep_their_own_cover(root):
     assert (root / "Band" / "Singles" / "One.jpg").read_bytes() == b"One"
 
 
+def _song() -> list[dict]:
+    return [{"rel_path": os.path.join("Band", "Record", "01 - Song.m4a"), "title": "Song",
+             "artists": ["Band"], "duration_ms": 200_500}]
+
+
 def test_playlist_file_lists_relative_paths(root):
-    rel = fs.write_playlist_file(
-        "ray",
-        "Road Trip",
-        [{"rel_path": os.path.join("Band", "Record", "01 - Song.m4a"), "title": "Song",
-          "artists": ["Band"], "duration_ms": 200_500}],
-    )
-    assert rel == os.path.join("Playlists", "ray", "Road Trip.m3u8")
+    rel = fs.write_playlist_file("ray", 7, "Road Trip", _song())
+    assert rel == os.path.join("Playlists", "ray", "Road Trip [7].m3u8")
     lines = (root / rel).read_text().splitlines()
     assert lines == ["#EXTM3U", "#EXTINF:200,Band - Song", "../../Band/Record/01 - Song.m4a"]
+
+
+def test_playlists_of_the_same_name_keep_their_own_files(root):
+    fs.write_playlist_file("ray", 7, "Road Trip", _song())
+    fs.write_playlist_file("ray", 8, "Road Trip", [])
+    names = sorted(os.listdir(root / "Playlists" / "ray"))
+    assert names == ["Road Trip [7].m3u8", "Road Trip [8].m3u8"]
+    assert "Song" in (root / "Playlists" / "ray" / "Road Trip [7].m3u8").read_text()
+
+
+def test_a_renamed_playlist_leaves_no_old_file(root):
+    fs.write_playlist_file("ray", 7, "Road Trip", _song())
+    fs.write_playlist_file("ray", 17, "Other", _song())
+    fs.write_playlist_file("ray", 7, "Summer", _song())
+    assert sorted(os.listdir(root / "Playlists" / "ray")) == ["Other [17].m3u8", "Summer [7].m3u8"]
+
+
+def test_the_untagged_file_from_before_is_replaced(root):
+    directory = root / "Playlists" / "ray"
+    directory.mkdir(parents=True)
+    (directory / "Road Trip.m3u8").write_text("#EXTM3U\n")
+    fs.write_playlist_file("ray", 7, "Road Trip", _song())
+    assert os.listdir(directory) == ["Road Trip [7].m3u8"]
+
+
+def test_a_name_that_looks_tagged_does_not_remove_another_playlist(root):
+    fs.write_playlist_file("ray", 42, "Road Trip", _song())
+    fs.write_playlist_file("ray", 7, "Road Trip [42]", _song())
+    assert sorted(os.listdir(root / "Playlists" / "ray")) == [
+        "Road Trip [42] [7].m3u8", "Road Trip [42].m3u8"
+    ]
+
+
+def test_removing_a_playlist_file_keeps_the_others(root):
+    fs.write_playlist_file("ray", 7, "Road Trip", _song())
+    fs.write_playlist_file("ray", 8, "Road Trip", _song())
+    fs.remove_playlist_file("ray", 7)
+    fs.remove_playlist_file("nobody", 7)
+    assert os.listdir(root / "Playlists" / "ray") == ["Road Trip [8].m3u8"]

@@ -260,7 +260,7 @@ async def sync_playlist(request: Request, playlist_id: int, user: dict = Depends
 @router.delete("/playlists/{playlist_id}")
 async def delete_playlist(playlist_id: int, user: dict = Depends(require_music_user)):
     """The playlist goes; its tracks and files stay in the library."""
-    if not await asyncio.to_thread(store.delete_playlist, user["user_id"], playlist_id):
+    if not await library.delete(user["user_id"], playlist_id):
         raise HTTPException(status_code=404, detail="Playlist not found")
     return {"success": True}
 

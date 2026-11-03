@@ -207,6 +207,11 @@ class MusicStore:
                 (sync_enabled, utc_now_iso(), playlist_id, user_id),
             ).fetchone()
 
+    def all_playlist_ids(self) -> list[int]:
+        with get_connection() as conn:
+            rows = conn.execute("SELECT id FROM music_playlists").fetchall()
+        return [row["id"] for row in rows]
+
     def delete_playlist(self, user_id: int, playlist_id: int) -> bool:
         """The playlist only. Its tracks and their files stay in the library."""
         with get_connection() as conn:

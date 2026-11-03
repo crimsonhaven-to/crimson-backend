@@ -223,15 +223,35 @@ async def sync_due() -> int:
     return synced
 
 
+async def delete(user_id: int, playlist_id: int) -> bool:
+    """The playlist and its file on the share; its tracks and their files stay."""
+    if not await asyncio.to_thread(store.delete_playlist, user_id, playlist_id):
+        return False
+    await asyncio.to_thread(_remove_playlist_file, user_id, playlist_id)
+    return True
+
+
 def write_playlist_file(playlist: dict) -> None:
     """Best effort: the M3U is a convenience for other players, and a share
     hiccup must not fail an import."""
     if not fs.available():
         return
     try:
-        account = account_store.get_account(playlist["user_id"]) or {}
-        owner = account.get("username") or account.get("label") or f"user-{playlist['user_id']}"
         entries = store.ready_paths_for_playlist(playlist["id"])
-        fs.write_playlist_file(owner, playlist["name"], entries)
+        fs.write_playlist_file(_owner(playlist["user_id"]), playlist["id"], playlist["name"], entries)
     except Exception as e:
         logger.warning("could not write the playlist file for %s: %s", playlist["id"], e)
+
+
+def _remove_playlist_file(user_id: int, playlist_id: int) -> None:
+    if not fs.available():
+        return
+    try:
+        fs.remove_playlist_file(_owner(user_id), playlist_id)
+    except Exception as e:
+        logger.warning("could not remove the playlist file for %s: %s", playlist_id, e)
+
+
+def _owner(user_id: int) -> str:
+    account = account_store.get_account(user_id) or {}
+    return account.get("username") or account.get("label") or f"user-{user_id}"
