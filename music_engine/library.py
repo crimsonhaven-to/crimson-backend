@@ -8,6 +8,9 @@ Four ways in, one way to store:
 | ``public`` | the public embed, first 100 tracks, no album | yes | the music provider |
 | ``csv`` | an Exportify file | no | nothing |
 | ``local`` | nothing: the member adds songs found by search | no | the music provider |
+
+Any playlist can also be cloned into a ``local`` one, which is how an import
+becomes something the member can edit.
 """
 
 from __future__ import annotations
@@ -150,6 +153,17 @@ async def create_local(user_id: int, name: str) -> dict:
         sync_enabled=False,
     )
     return {"playlist": playlist}
+
+
+async def clone(user_id: int, playlist_id: int, name: str) -> Optional[dict]:
+    """The original keeps following its source; the copy is the member's own and
+    never syncs. None when the playlist is not theirs."""
+    row = await asyncio.to_thread(
+        store.clone_playlist, user_id, playlist_id, source=LOCAL, name=name
+    )
+    if row is not None:
+        await asyncio.to_thread(write_playlist_file, row)
+    return row
 
 
 def _require_local(playlist: dict) -> None:

@@ -30,3 +30,16 @@ def test_a_mirrored_track_streams_from_the_cdn(monkeypatch):
     assert payload["cover_url"] == "https://cdn/a/cover.jpg?signed"
     local = payloads.track_payload({**row, "mirrored_at": None}, "https://api")
     assert local["stream_url"].startswith("https://api/music_stream/3?e=")
+
+
+def test_a_custom_cover_replaces_the_imported_one_and_busts_the_cache():
+    row = {"id": 9, "name": "Mine", "cover_url": "https://i.scdn.co/x", "custom_cover_at": None}
+    plain = payloads.playlist_payload(row, "https://api")
+    assert plain["cover_url"] == "https://i.scdn.co/x"
+    assert plain["custom_cover"] is False
+
+    first = payloads.playlist_payload({**row, "custom_cover_at": "2026-11-03T10:00:00+00:00"}, "https://api")
+    second = payloads.playlist_payload({**row, "custom_cover_at": "2026-11-03T11:00:00+00:00"}, "https://api")
+    assert first["cover_url"].startswith("https://api/music_playlist_art/9?e=")
+    assert first["custom_cover"] is True
+    assert first["cover_url"] != second["cover_url"]

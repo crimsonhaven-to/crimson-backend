@@ -1,7 +1,7 @@
-"""Signed links for the audio and cover files.
+"""Signed links for the audio, cover and playlist cover files.
 
 ``<audio>`` and the lock screen's artwork fetch cannot send a bearer token, so
-``/music_stream`` and ``/music_art`` sit outside the login wall and trust a
+``/music_stream``, ``/music_art`` and ``/music_playlist_art`` sit outside the login wall and trust a
 signature instead. A link expires, so revoking someone's music access stops
 their old links within a week. The expiry is rounded to the day, so a link is
 stable for a day and caches well.
@@ -16,6 +16,7 @@ from core import signing
 
 STREAM = "stream"
 ART = "art"
+PLAYLIST_ART = "playlist_art"
 _LIFETIME_SECONDS = 7 * 86400
 _DAY = 86400
 
@@ -29,17 +30,17 @@ def expiry() -> int:
     return (int(time.time()) + _LIFETIME_SECONDS) // _DAY * _DAY
 
 
-def _payload(kind: str, track_id: int, expires: int) -> str:
-    return f"music-{kind}:{track_id}:{expires}"
+def _payload(kind: str, item_id: int, expires: int) -> str:
+    return f"music-{kind}:{item_id}:{expires}"
 
 
-def signed_path(kind: str, track_id: int) -> str:
+def signed_path(kind: str, item_id: int) -> str:
     expires = expiry()
-    signature = signing.sign(_secret(), _payload(kind, track_id, expires))
-    return f"/music_{kind}/{track_id}?e={expires}&s={signature}"
+    signature = signing.sign(_secret(), _payload(kind, item_id, expires))
+    return f"/music_{kind}/{item_id}?e={expires}&s={signature}"
 
 
-def verify(kind: str, track_id: int, expires: int, signature: str) -> bool:
+def verify(kind: str, item_id: int, expires: int, signature: str) -> bool:
     if expires < time.time():
         return False
-    return signing.verify(_secret(), _payload(kind, track_id, expires), signature)
+    return signing.verify(_secret(), _payload(kind, item_id, expires), signature)

@@ -37,6 +37,10 @@ class LocalPlaylist(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
 
 
+class PlaylistClone(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+
+
 class SongAdd(BaseModel):
     """A search result, as the picker showed it."""
 

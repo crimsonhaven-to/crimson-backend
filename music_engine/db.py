@@ -131,12 +131,14 @@ class MusicStore:
                        COUNT(pt.track_id) FILTER (WHERE t.status = 'review') AS review_count,
                        COUNT(pt.track_id) FILTER (
                            WHERE t.status IN ('unmatched', 'failed')) AS problem_count,
-                       COALESCE(SUM(t.duration_ms), 0) AS duration_ms
+                       COALESCE(SUM(t.duration_ms), 0) AS duration_ms,
+                       c.updated_at AS custom_cover_at
                 FROM music_playlists p
                 LEFT JOIN music_playlist_tracks pt ON pt.playlist_id = p.id
                 LEFT JOIN music_tracks t ON t.id = pt.track_id
+                LEFT JOIN music_playlist_covers c ON c.playlist_id = p.id
                 WHERE p.user_id = %s
-                GROUP BY p.id
+                GROUP BY p.id, c.updated_at
                 ORDER BY p.created_at, p.id
                 """,
                 (user_id,),
@@ -145,7 +147,12 @@ class MusicStore:
     def get_playlist(self, user_id: int, playlist_id: int) -> Optional[dict]:
         with get_connection() as conn:
             return conn.execute(
-                f"SELECT {_PLAYLIST_COLS} FROM music_playlists WHERE id = %s AND user_id = %s",
+                f"""
+                SELECT {_PLAYLIST_COLS_P}, c.updated_at AS custom_cover_at
+                FROM music_playlists p
+                LEFT JOIN music_playlist_covers c ON c.playlist_id = p.id
+                WHERE p.id = %s AND p.user_id = %s
+                """,
                 (playlist_id, user_id),
             ).fetchone()
 
@@ -208,6 +215,137 @@ class MusicStore:
                 (playlist_id, user_id),
             ).fetchone()
         return row is not None
+
+    def clone_playlist(
+        self, user_id: int, playlist_id: int, *, source: str, name: str
+    ) -> Optional[dict]:
+        """A new playlist of ``source`` holding the same songs in the same order,
+        its custom cover included. Songs the original lost upstream come along
+        as ordinary entries at the end. One transaction, so a half copy never
+        shows up."""
+        now = utc_now_iso()
+        with get_connection() as conn:
+            row = conn.execute(
+                f"""
+                INSERT INTO music_playlists
+                    (user_id, source, spotify_id, name, description, cover_url, sync_enabled,
+                     created_at, updated_at)
+                SELECT user_id, %s, NULL, %s, description, cover_url, FALSE, %s, %s
+                FROM music_playlists WHERE id = %s AND user_id = %s
+                RETURNING {_PLAYLIST_COLS}
+                """,
+                (source, name, now, now, playlist_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """
+                INSERT INTO music_playlist_tracks (playlist_id, track_id, position, added_at)
+                SELECT %s, track_id,
+                       ROW_NUMBER() OVER (ORDER BY removed_upstream, position) - 1, added_at
+                FROM music_playlist_tracks WHERE playlist_id = %s
+                """,
+                (row["id"], playlist_id),
+            )
+            cover = conn.execute(
+                """
+                INSERT INTO music_playlist_covers (playlist_id, content_type, data, updated_at)
+                SELECT %s, content_type, data, %s
+                FROM music_playlist_covers WHERE playlist_id = %s
+                RETURNING updated_at
+                """,
+                (row["id"], now, playlist_id),
+            ).fetchone()
+        return {**row, "custom_cover_at": cover["updated_at"] if cover else None}
+
+    def append_tracks(self, user_id: int, playlist_id: int, track_ids: list[int]) -> list[int]:
+        """Append songs already in this user's library, in the order given.
+        Ids from anyone else's library, and songs the playlist already holds,
+        are skipped. Returns the ids that were added."""
+        now = utc_now_iso()
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                INSERT INTO music_playlist_tracks (playlist_id, track_id, position, added_at)
+                SELECT %(playlist)s, ids.track_id, base.next + ids.ord - 1, %(now)s
+                FROM unnest(%(ids)s::bigint[]) WITH ORDINALITY AS ids(track_id, ord)
+                CROSS JOIN (
+                    SELECT COALESCE(MAX(position) + 1, 0) AS next
+                    FROM music_playlist_tracks WHERE playlist_id = %(playlist)s
+                ) base
+                WHERE EXISTS (
+                    SELECT 1 FROM music_playlist_tracks own
+                    JOIN music_playlists p ON p.id = own.playlist_id
+                    WHERE p.user_id = %(user)s AND own.track_id = ids.track_id
+                )
+                ON CONFLICT (playlist_id, track_id) DO NOTHING
+                RETURNING track_id
+                """,
+                {"playlist": playlist_id, "now": now, "ids": track_ids, "user": user_id},
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    "UPDATE music_playlists SET updated_at = %s WHERE id = %s", (now, playlist_id)
+                )
+        return [r["track_id"] for r in rows]
+
+    def search_library(self, user_id: int, query: str, limit: int) -> list[dict]:
+        """Songs in this user's playlists whose title, artist or album contains
+        ``query``, ready ones first, each with one playlist that holds it so it
+        can be played in context. The user's own playlists are preferred."""
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        with get_connection() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT DISTINCT ON (t.id)
+                           t.id, t.title, t.artists, t.album, t.status,
+                           p.id AS playlist_id, p.name AS playlist_name
+                    FROM music_playlist_tracks pt
+                    JOIN music_playlists p ON p.id = pt.playlist_id
+                    JOIN music_tracks t ON t.id = pt.track_id
+                    WHERE p.user_id = %s
+                          AND (t.title ILIKE %s OR t.album ILIKE %s OR t.artists::text ILIKE %s)
+                    ORDER BY t.id, p.source = 'local' DESC, p.id
+                ) hits
+                ORDER BY status = 'ready' DESC, title
+                LIMIT %s
+                """,
+                (user_id, pattern, pattern, pattern, limit),
+            ).fetchall()
+
+    # --- custom playlist covers -------------------------------------------------
+    def set_cover(self, playlist_id: int, content_type: str, data: bytes) -> str:
+        now = utc_now_iso()
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO music_playlist_covers (playlist_id, content_type, data, updated_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (playlist_id) DO UPDATE SET
+                    content_type = EXCLUDED.content_type,
+                    data = EXCLUDED.data,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (playlist_id, content_type, data, now),
+            )
+        return now
+
+    def delete_cover(self, playlist_id: int) -> bool:
+        with get_connection() as conn:
+            row = conn.execute(
+                "DELETE FROM music_playlist_covers WHERE playlist_id = %s RETURNING playlist_id",
+                (playlist_id,),
+            ).fetchone()
+        return row is not None
+
+    def get_cover(self, playlist_id: int) -> Optional[dict]:
+        with get_connection() as conn:
+            return conn.execute(
+                "SELECT content_type, data FROM music_playlist_covers WHERE playlist_id = %s",
+                (playlist_id,),
+            ).fetchone()
 
     def mark_synced(
         self, playlist_id: int, *, snapshot_id: Optional[str], error: Optional[str]

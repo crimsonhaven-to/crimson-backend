@@ -1,4 +1,4 @@
-"""The audio and cover files. Public in the login wall because ``<audio>`` and
+"""The audio, cover and playlist cover files. Public in the login wall because ``<audio>`` and
 the lock screen's artwork fetch cannot send a bearer; each link is signed and
 expires instead (see ``links``)."""
 
@@ -7,7 +7,7 @@ import os
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from . import fs, links
 from .db import STATUS_READY, store
@@ -42,3 +42,13 @@ async def music_stream(track_id: int, e: int = Query(...), s: str = Query(...)):
 async def music_art(track_id: int, e: int = Query(...), s: str = Query(...)):
     path = await _file(links.ART, track_id, e, s)
     return FileResponse(path, media_type="image/jpeg", headers=_CACHE)
+
+
+@router.get("/music_playlist_art/{playlist_id}")
+async def music_playlist_art(playlist_id: int, e: int = Query(...), s: str = Query(...)):
+    if not links.verify(links.PLAYLIST_ART, playlist_id, e, s):
+        raise HTTPException(status_code=404, detail="Not found")
+    cover = await asyncio.to_thread(store.get_cover, playlist_id)
+    if not cover:
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(bytes(cover["data"]), media_type=cover["content_type"], headers=_CACHE)

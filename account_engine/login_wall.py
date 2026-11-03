@@ -50,6 +50,7 @@ PUBLIC_PREFIXES = (
     "/iptv_proxy",
     "/music_stream",
     "/music_art",
+    "/music_playlist_art",
     "/app/download",
 )
 
