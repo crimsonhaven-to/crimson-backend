@@ -65,6 +65,9 @@ class MusicWorker:
             requeued = await asyncio.to_thread(store.reset_stale)
             if requeued:
                 logger.info("requeued %d interrupted track(s)", requeued)
+            # Rewriting every playlist file once per start moves files left under an
+            # older naming and repairs any write a share hiccup dropped.
+            self._dirty.update(await asyncio.to_thread(store.all_playlist_ids))
         except Exception as e:
             logger.error("requeueing interrupted tracks failed: %s", e)
         self._poller = asyncio.create_task(self._poll())

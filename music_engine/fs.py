@@ -6,7 +6,7 @@ stick)::
 
     <root>/Artist/Album/01 - Title.m4a
     <root>/Artist/Album/cover.jpg
-    <root>/Playlists/<owner>/<name>.m3u8
+    <root>/Playlists/<owner>/<name> [<playlist id>].m3u8
     <root>/.incoming/<track id>/          work files, moved into place when done
 
 The share is SMB on Windows, so names are cleaned to what Windows accepts.
@@ -27,6 +27,9 @@ PLAYLISTS = "Playlists"
 _MAX_SEGMENT = 100
 
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# The id keeps two playlists of the same name apart and finds a playlist's file
+# again after Spotify renames it.
+_TAGGED = re.compile(r" \[(\d+)\]\.m3u8$")
 _RESERVED = {"con", "prn", "aux", "nul"} | {f"{p}{n}" for p in ("com", "lpt") for n in range(1, 10)}
 
 
@@ -119,10 +122,11 @@ def place_cover(work_cover: str, rel_path: str, per_album: bool) -> str:
     return rel_cover
 
 
-def write_playlist_file(owner: str, name: str, entries: list[dict]) -> str:
+def write_playlist_file(owner: str, playlist_id: int, name: str, entries: list[dict]) -> str:
     """An extended M3U next to the library, paths relative to the file so the
-    share can be mounted anywhere. Written whole and renamed into place."""
-    rel_dir = os.path.join(PLAYLISTS, safe_segment(owner, "unknown"))
+    share can be mounted anywhere. Written whole and renamed into place, then
+    any older name of the same playlist is removed."""
+    rel_dir = _owner_dir(owner)
     directory = os.path.join(root(), rel_dir)
     os.makedirs(directory, exist_ok=True)
     lines = ["#EXTM3U"]
@@ -132,9 +136,33 @@ def write_playlist_file(owner: str, name: str, entries: list[dict]) -> str:
         lines.append(f"#EXTINF:{seconds},{artists} - {entry.get('title') or ''}")
         target = os.path.join(root(), entry["rel_path"])
         lines.append(os.path.relpath(target, directory).replace(os.sep, "/"))
-    rel_file = os.path.join(rel_dir, f"{safe_segment(name, 'Playlist')}.m3u8")
-    dest = os.path.join(root(), rel_file)
+    title = safe_segment(name, "Playlist")
+    file_name = f"{title} [{playlist_id}].m3u8"
+    dest = os.path.join(directory, file_name)
     with open(dest + ".part", "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
     os.replace(dest + ".part", dest)
-    return rel_file
+    _remove_playlist_files(directory, playlist_id, keep=file_name)
+    # Files written before the id was part of the name. Any playlist of that name
+    # may have left it, and each of them now writes its own tagged file.
+    untagged = f"{title}.m3u8"
+    if not _TAGGED.search(untagged) and os.path.isfile(os.path.join(directory, untagged)):
+        os.remove(os.path.join(directory, untagged))
+    return os.path.join(rel_dir, file_name)
+
+
+def remove_playlist_file(owner: str, playlist_id: int) -> None:
+    directory = os.path.join(root(), _owner_dir(owner))
+    if os.path.isdir(directory):
+        _remove_playlist_files(directory, playlist_id, keep=None)
+
+
+def _owner_dir(owner: str) -> str:
+    return os.path.join(PLAYLISTS, safe_segment(owner, "unknown"))
+
+
+def _remove_playlist_files(directory: str, playlist_id: int, keep: Optional[str]) -> None:
+    for entry in os.listdir(directory):
+        match = _TAGGED.search(entry)
+        if match and int(match.group(1)) == playlist_id and entry != keep:
+            os.remove(os.path.join(directory, entry))
