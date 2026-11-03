@@ -63,6 +63,7 @@ PUBLIC_ROUTES = {
     ("GET", "/local_proxy/{token}"),
     ("GET", "/manga_proxy"),
     ("GET", "/music_art/{track_id}"),
+    ("GET", "/music_playlist_art/{playlist_id}"),
     ("GET", "/music_stream/{track_id}"),
     ("GET", "/player"),
     ("GET", "/subtitles_proxy"),

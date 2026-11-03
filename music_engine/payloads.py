@@ -1,8 +1,10 @@
-"""A track as the player and the admin library see it: the signed links to its
-audio and cover, from the CDN copy when there is one, and the file's size, which
-the player needs to tell a member what a download will take on the device."""
+"""A track or playlist as the player and the admin library see it: the signed
+links to its audio and cover, from the CDN copy when there is one, and the file's
+size, which the player needs to tell a member what a download will take on the
+device."""
 
 from typing import Optional
+from urllib.parse import quote
 
 from . import cdn, links
 
@@ -33,3 +35,15 @@ def track_payload(row: dict, base: str) -> dict:
         "cover_url": cover_url,
         "stream_url": stream_url,
     }
+
+
+def playlist_payload(row: dict, base: str) -> dict:
+    """A playlist with its custom cover, when it has one, in place of the one
+    its import brought. The upload time rides in the link so a new cover is not
+    served from the day-long cache of the old one."""
+    custom = row.get("custom_cover_at")
+    payload = {**row, "custom_cover": bool(custom)}
+    if custom:
+        link = links.signed_path(links.PLAYLIST_ART, row["id"])
+        payload["cover_url"] = f"{base}{link}&v={quote(custom)}"
+    return payload

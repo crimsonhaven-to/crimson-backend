@@ -44,3 +44,19 @@ def test_an_art_link_cannot_stream(client):
 def test_unready_and_escaping_tracks_are_404(client):
     assert client.get(links.signed_path(links.STREAM, 2)).status_code == 404
     assert client.get(links.signed_path(links.STREAM, 3)).status_code == 404
+
+
+def test_a_playlist_cover_is_served_under_its_own_type(client, monkeypatch):
+    covers = {4: {"content_type": "image/png", "data": b"\x89PNG"}}
+    monkeypatch.setattr(media_routes.store, "get_cover", lambda playlist_id: covers.get(playlist_id))
+    response = client.get(links.signed_path(links.PLAYLIST_ART, 4))
+    assert response.status_code == 200
+    assert response.content == b"\x89PNG"
+    assert response.headers["content-type"] == "image/png"
+    assert client.get(links.signed_path(links.PLAYLIST_ART, 5)).status_code == 404
+
+
+def test_a_track_art_link_cannot_fetch_a_playlist_cover(client, monkeypatch):
+    monkeypatch.setattr(media_routes.store, "get_cover", lambda playlist_id: {"content_type": "image/png", "data": b"x"})
+    art = links.signed_path(links.ART, 4)
+    assert client.get(art.replace("music_art", "music_playlist_art")).status_code == 404

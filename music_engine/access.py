@@ -7,6 +7,10 @@ from account_engine.deps import require_user
 from core.config import get_settings
 
 
+def has_music(user: dict) -> bool:
+    return bool(get_settings().music_root) and bool(user.get("music_enabled"))
+
+
 async def require_music_user(user: dict = Depends(require_user)) -> dict:
     """503 when the server has no library, 403 when this account has no grant,
     so the page can tell a missing setup from a missing permission."""

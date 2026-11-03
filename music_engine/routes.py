@@ -8,16 +8,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from core.public_url import public_base_url
 from core.rate_limit import limiter
 
-from . import cdn, fs, library, spotify
+from . import cdn, covers, fs, library, spotify
 from .access import require_music_user
 from .csv_import import CsvImportError
 from .db import store
-from .payloads import track_payload
+from .payloads import playlist_payload, track_payload
 from .provider import ProviderError, get_provider
 from .schemas import (
     CsvImport,
     LocalPlaylist,
     MatchChoice,
+    PlaylistClone,
     PlaylistImport,
     PlaylistUpdate,
     SongAdd,
@@ -38,7 +39,13 @@ def _error(e: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(e))
 
 
-_USER_ERRORS = (SpotifyError, ProviderError, library.LibraryError, CsvImportError)
+_USER_ERRORS = (
+    SpotifyError, ProviderError, library.LibraryError, CsvImportError, covers.CoverError
+)
+
+
+def _base(request: Request) -> str:
+    return public_base_url(request).rstrip("/")
 
 
 async def _owned_track(user: dict, track_id: int) -> dict:
@@ -123,11 +130,10 @@ async def spotify_playlists(user: dict = Depends(require_music_user)):
 
 # --- playlists ------------------------------------------------------------------------
 @router.get("/playlists")
-async def list_playlists(user: dict = Depends(require_music_user)):
-    return {
-        "success": True,
-        "playlists": await asyncio.to_thread(store.list_playlists, user["user_id"]),
-    }
+async def list_playlists(request: Request, user: dict = Depends(require_music_user)):
+    rows = await asyncio.to_thread(store.list_playlists, user["user_id"])
+    base = _base(request)
+    return {"success": True, "playlists": [playlist_payload(row, base) for row in rows]}
 
 
 @router.post("/playlists")
@@ -166,23 +172,78 @@ async def get_playlist(
 ):
     playlist = await _owned_playlist(user, playlist_id)
     rows = await asyncio.to_thread(store.playlist_tracks, playlist_id)
-    base = public_base_url(request).rstrip("/")
+    base = _base(request)
     return {
         "success": True,
-        "playlist": playlist,
+        "playlist": playlist_payload(playlist, base),
         "tracks": [track_payload(row, base) for row in rows],
     }
 
 
 @router.patch("/playlists/{playlist_id}")
 async def update_playlist(
-    playlist_id: int, body: PlaylistUpdate, user: dict = Depends(require_music_user)
+    request: Request,
+    playlist_id: int,
+    body: PlaylistUpdate,
+    user: dict = Depends(require_music_user),
 ):
     await _owned_playlist(user, playlist_id)
-    playlist = await asyncio.to_thread(
+    await asyncio.to_thread(
         store.update_playlist, user["user_id"], playlist_id, sync_enabled=body.sync_enabled
     )
-    return {"success": True, "playlist": playlist}
+    playlist = await _owned_playlist(user, playlist_id)
+    return {"success": True, "playlist": playlist_payload(playlist, _base(request))}
+
+
+@router.post("/playlists/{playlist_id}/clone")
+@limiter.limit("20/minute")
+async def clone_playlist(
+    request: Request, playlist_id: int, body: PlaylistClone, user: dict = Depends(require_music_user)
+):
+    """Copies an imported playlist into one the member can edit. The songs are
+    shared, so nothing is downloaded twice."""
+    playlist = await library.clone(user["user_id"], playlist_id, body.name.strip())
+    if playlist is None:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    return {"success": True, "playlist": playlist_payload(playlist, _base(request))}
+
+
+async def _read_capped(request: Request) -> bytes:
+    """Stops reading past the cap, so an oversized upload never sits in memory whole."""
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > covers.MAX_BYTES:
+            break
+    return bytes(body)
+
+
+@router.put("/playlists/{playlist_id}/cover")
+@limiter.limit("20/minute")
+async def set_playlist_cover(
+    request: Request, playlist_id: int, user: dict = Depends(require_music_user)
+):
+    """The body is the picture itself."""
+    await _owned_playlist(user, playlist_id)
+    data = await _read_capped(request)
+    try:
+        kind = covers.content_type(data)
+    except covers.CoverError as e:
+        raise _error(e)
+    await asyncio.to_thread(store.set_cover, playlist_id, kind, data)
+    playlist = await _owned_playlist(user, playlist_id)
+    return {"success": True, "playlist": playlist_payload(playlist, _base(request))}
+
+
+@router.delete("/playlists/{playlist_id}/cover")
+async def delete_playlist_cover(
+    request: Request, playlist_id: int, user: dict = Depends(require_music_user)
+):
+    """Back to the cover the import brought, if any."""
+    await _owned_playlist(user, playlist_id)
+    await asyncio.to_thread(store.delete_cover, playlist_id)
+    playlist = await _owned_playlist(user, playlist_id)
+    return {"success": True, "playlist": playlist_payload(playlist, _base(request))}
 
 
 @router.post("/playlists/{playlist_id}/sync")

@@ -9,6 +9,11 @@ feature: they are what the model reads to decide whether to call at all.
 
 ``open_title`` navigates nothing. It returns a client route that the drawer
 renders as a button, so the backend stays unaware of the client's router.
+``play_music`` works the same way: the drawer turns it into a play button,
+because a browser only starts audio from a tap.
+
+The music tools are offered only to a viewer who has music, so a model never
+sees a tool its viewer cannot use.
 """
 
 from __future__ import annotations
@@ -25,6 +30,9 @@ from metadata_engine.tmdb import (
     fetch_tmdb_search_results,
     fetch_tmdb_show_search_results,
 )
+from music_engine import library as music_library
+from music_engine.access import has_music
+from music_engine.db import store as music_store
 from recommend_engine.service import recommend
 
 logger = logging.getLogger("crimson.chat.tools")
@@ -186,7 +194,102 @@ TOOL_SCHEMAS: List[Dict] = [
     },
 ]
 
-TOOL_NAMES = frozenset(t["name"] for t in TOOL_SCHEMAS)
+MUSIC_TOOL_SCHEMAS: List[Dict] = [
+    {
+        "name": "find_music",
+        "description": (
+            "Search this viewer's own music library: their playlists and the songs "
+            "in them. Call this whenever they mention music, a song, an artist, an "
+            "album or a playlist, and always before play_music, add_to_playlist or "
+            "create_playlist, because those need ids you can only get here. With no "
+            "query it lists every playlist they have. It only knows songs already in "
+            "their playlists."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "A song title, artist, album or playlist name, as the viewer "
+                        "said it. Leave it out to list their playlists."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "play_music",
+        "description": (
+            "Turn a playlist, or one song in it, into a button that starts playback. "
+            "Call this when the viewer asks to play, put on or listen to something. "
+            "Needs a playlist_id from find_music; pass a track_id too to start at "
+            "that song. Mention it in one short line; the button carries the rest."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "playlist_id": {"type": "integer", "description": "The playlist to play."},
+                "track_id": {
+                    "type": "integer",
+                    "description": "A song in that playlist to start at. Optional.",
+                },
+                "shuffle": {
+                    "type": "boolean",
+                    "description": "Shuffle the playlist. Default false.",
+                },
+            },
+            "required": ["playlist_id"],
+        },
+    },
+    {
+        "name": "add_to_playlist",
+        "description": (
+            "Add songs from the viewer's library to one of their own playlists. Call "
+            "this only when they clearly ask to add songs. Only playlists find_music "
+            "marks editable can change; imported ones follow Spotify."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "playlist_id": {"type": "integer", "description": "An editable playlist."},
+                "track_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Song ids from find_music, in the order to add them.",
+                },
+            },
+            "required": ["playlist_id", "track_ids"],
+        },
+    },
+    {
+        "name": "create_playlist",
+        "description": (
+            "Make a new playlist of the viewer's own, optionally filled with songs "
+            "from their library. Call this only when they ask for a new playlist. "
+            "Returns a button that opens it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The playlist's name."},
+                "track_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Song ids from find_music to start it with. Optional.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+]
+
+TOOL_NAMES = frozenset(t["name"] for t in TOOL_SCHEMAS + MUSIC_TOOL_SCHEMAS)
+
+
+def schemas_for(user: Dict) -> List[Dict]:
+    return TOOL_SCHEMAS + MUSIC_TOOL_SCHEMAS if has_music(user) else TOOL_SCHEMAS
 
 
 def _at_least_one(value) -> int:
@@ -392,25 +495,142 @@ async def _manage_watchlist(user_id: int, args: Dict):
     return {"saved": True, "title": args.get("title")}, None
 
 
+def _playlist_slim(row: Dict) -> Dict:
+    return {
+        "playlist_id": row["id"],
+        "name": row["name"],
+        "editable": row["source"] == music_library.LOCAL,
+        "songs": row.get("track_count"),
+    }
+
+
+async def _find_music(user_id: int, args: Dict):
+    query = (args.get("query") or "").strip()
+    playlists = await asyncio.to_thread(music_store.list_playlists, user_id)
+    if not query:
+        if not playlists:
+            return {"playlists": [], "note": "This viewer has no playlists yet."}, None
+        return {"playlists": [_playlist_slim(p) for p in playlists]}, None
+
+    named = [p for p in playlists if query.lower() in p["name"].lower()][:MAX_ITEMS]
+    songs = await asyncio.to_thread(music_store.search_library, user_id, query, MAX_ITEMS)
+    result: Dict = {
+        "playlists": [_playlist_slim(p) for p in named],
+        "songs": [
+            {
+                "track_id": t["id"],
+                "title": t["title"],
+                "artists": t["artists"],
+                "album": t["album"],
+                "playable": t["status"] == "ready",
+                "playlist_id": t["playlist_id"],
+                "playlist": t["playlist_name"],
+            }
+            for t in songs
+        ],
+    }
+    if not named and not songs:
+        result["note"] = f"Nothing in their library matches '{query}'."
+    return result, None
+
+
+async def _owned_playlist(user_id: int, playlist_id) -> Optional[Dict]:
+    try:
+        return await asyncio.to_thread(music_store.get_playlist, user_id, int(playlist_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def _track_ids(value) -> List[int]:
+    try:
+        return [int(v) for v in (value or [])][:100]
+    except (TypeError, ValueError):
+        return []
+
+
+async def _play_music(user_id: int, args: Dict):
+    playlist = await _owned_playlist(user_id, args.get("playlist_id"))
+    if not playlist:
+        return {"error": "No such playlist. Use find_music to get a playlist_id."}, None
+
+    tracks = await asyncio.to_thread(music_store.playlist_tracks, playlist["id"])
+    ready = [t for t in tracks if t["status"] == "ready"]
+    if not ready:
+        return {"error": "Nothing in that playlist has finished downloading yet."}, None
+
+    try:
+        track_id = int(args["track_id"]) if args.get("track_id") else None
+    except (TypeError, ValueError):
+        track_id = None
+    start = next((t for t in ready if t["id"] == track_id), None) if track_id else None
+    if track_id and start is None:
+        return {"error": "That song is not playable from this playlist."}, None
+
+    label = f"{start['title']} · {playlist['name']}" if start else playlist["name"]
+    return (
+        {"ready": True, "label": label, "note": "A play button was shown to the viewer."},
+        {
+            "type": "play_music",
+            "playlist_id": playlist["id"],
+            "track_id": start["id"] if start else None,
+            "shuffle": bool(args.get("shuffle")),
+            "label": label,
+        },
+    )
+
+
+async def _add_to_playlist(user_id: int, args: Dict):
+    playlist = await _owned_playlist(user_id, args.get("playlist_id"))
+    if not playlist:
+        return {"error": "No such playlist. Use find_music to get a playlist_id."}, None
+    if playlist["source"] != music_library.LOCAL:
+        return {"error": "That playlist is imported and follows its source. Pick an editable one."}, None
+    ids = _track_ids(args.get("track_ids"))
+    added = await asyncio.to_thread(music_store.append_tracks, user_id, playlist["id"], ids)
+    if added:
+        await asyncio.to_thread(music_library.write_playlist_file, playlist)
+    return {"added": len(added), "skipped": len(ids) - len(added)}, None
+
+
+async def _create_playlist(user_id: int, args: Dict):
+    name = (args.get("name") or "").strip()[:200]
+    if not name:
+        return {"error": "A playlist needs a name."}, None
+    playlist = (await music_library.create_local(user_id, name))["playlist"]
+    ids = _track_ids(args.get("track_ids"))
+    added = await asyncio.to_thread(music_store.append_tracks, user_id, playlist["id"], ids)
+    if added:
+        await asyncio.to_thread(music_library.write_playlist_file, playlist)
+    return (
+        {"playlist_id": playlist["id"], "added": len(added)},
+        {"type": "open", "route": f"/music/playlist/{playlist['id']}", "label": name},
+    )
+
+
 _HANDLERS: Dict[str, Callable] = {
     "recommend_titles": _recommend_titles,
     "search_catalogue": _search_catalogue,
     "open_title": _open_title,
     "watch_progress": _watch_progress,
     "manage_watchlist": _manage_watchlist,
+    "find_music": _find_music,
+    "play_music": _play_music,
+    "add_to_playlist": _add_to_playlist,
+    "create_playlist": _create_playlist,
 }
 
 
-async def dispatch(name: str, args: Dict, *, user_id: int):
+async def dispatch(name: str, args: Dict, *, user_id: int, offered: frozenset):
     """Run one tool call.
 
     Returns ``(result, action)``. Never raises: a tool that blows up returns an
     error object the model can read and recover from, because an exception here
     would abort a half-streamed reply and leave the drawer stuck. The model is
     explicitly told in the persona to report failures honestly rather than
-    invent a result.
+    invent a result. ``offered`` is what this viewer was shown, so a model
+    cannot reach a tool its viewer was never given by naming it.
     """
-    handler = _HANDLERS.get(name)
+    handler = _HANDLERS.get(name) if name in offered else None
     if handler is None:
         return {"error": f"No such tool: {name}"}, None
     try:

@@ -67,6 +67,8 @@ async def reply(
 
     collected: List[str] = []
     actions: List[Dict] = []
+    offered_schemas = tools.schemas_for(user)
+    offered = frozenset(t["name"] for t in offered_schemas)
     try:
         convo = await _conversation(user, conversation_id, message, settings["history_turns"])
         for _ in range(max(1, int(settings["max_tool_iterations"]))):
@@ -77,7 +79,7 @@ async def reply(
                 model=model,
                 system=persona.SYSTEM_PROMPT,
                 messages=convo,
-                tools=tools.TOOL_SCHEMAS,
+                tools=offered_schemas,
             ):
                 if event["type"] == "text":
                     collected.append(event["text"])
@@ -106,7 +108,9 @@ async def reply(
             # parts lost the thought signatures it minted.
             convo.append(providers.assistant_msg(turn.text, turn.tool_calls, turn.signature))
             for call in turn.tool_calls:
-                result, action = await tools.dispatch(call.name, call.args, user_id=user_id)
+                result, action = await tools.dispatch(
+                    call.name, call.args, user_id=user_id, offered=offered
+                )
                 convo.append(providers.tool_msg(call, result))
                 if action:
                     actions.append(action)

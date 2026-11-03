@@ -80,3 +80,56 @@ def test_songs_cannot_be_added_to_an_imported_playlist(client, monkeypatch):
     body = {"url": "https://youtu.be/x", "title": "Song"}
     assert client.post("/music/playlists/2/tracks", json=body).status_code == 400
     assert client.delete("/music/playlists/2/tracks/4").status_code == 400
+
+
+def test_only_your_own_playlist_can_be_cloned(client, monkeypatch):
+    async def not_yours(user_id, playlist_id, name):
+        return None
+
+    monkeypatch.setattr(routes.library, "clone", not_yours)
+    assert client.post("/music/playlists/2/clone", json={"name": "Mine"}).status_code == 404
+
+
+def test_a_clone_is_named_as_asked(client, monkeypatch):
+    cloned = []
+
+    async def fake_clone(user_id, playlist_id, name):
+        cloned.append((user_id, playlist_id, name))
+        return {"id": 7, "name": name, "source": "local", "cover_url": None}
+
+    monkeypatch.setattr(routes.library, "clone", fake_clone)
+    response = client.post("/music/playlists/2/clone", json={"name": "  Mine  "})
+    assert response.status_code == 200
+    assert response.json()["playlist"]["id"] == 7
+    assert cloned == [(1, 2, "Mine")]
+
+
+@pytest.fixture
+def own_playlist(monkeypatch):
+    monkeypatch.setattr(routes.store, "get_playlist",
+                        lambda user_id, playlist_id: {"id": playlist_id, "source": "spotify",
+                                                      "cover_url": None, "custom_cover_at": None})
+    saved = []
+    monkeypatch.setattr(routes.store, "set_cover",
+                        lambda playlist_id, kind, data: saved.append((playlist_id, kind, data)))
+    return saved
+
+
+def test_a_cover_upload_must_be_a_picture(client, own_playlist):
+    response = client.put("/music/playlists/2/cover", content=b"<svg/>")
+    assert response.status_code == 400
+    assert own_playlist == []
+
+
+def test_a_cover_upload_is_stored_under_its_sniffed_type(client, own_playlist):
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+    response = client.put("/music/playlists/2/cover", content=png,
+                          headers={"Content-Type": "image/jpeg"})
+    assert response.status_code == 200
+    assert own_playlist == [(2, "image/png", png)]
+
+
+def test_an_oversized_cover_is_refused(client, own_playlist):
+    huge = b"\xff\xd8\xff" + b"\x00" * (routes.covers.MAX_BYTES + 10)
+    assert client.put("/music/playlists/2/cover", content=huge).status_code == 400
+    assert own_playlist == []
