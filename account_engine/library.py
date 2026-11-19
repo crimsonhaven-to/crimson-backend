@@ -6,7 +6,9 @@ unambiguously next to an anime row. The anime and TV keys predate both and are
 unchanged, so existing rows need no migration.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+from metadata_engine import catalogue
 
 from .schemas import ProgressIn
 
@@ -24,6 +26,32 @@ def favorite_item_key(
     if media_type == "movie":
         return f"movie:{tmdb_id}"
     return f"tmdb:{tmdb_id}"
+
+
+def as_show_favorite(fav: Dict) -> Dict:
+    """Every season of a show is its own AniList entry, but a favorite means the
+    show: Overlord and Overlord IV in one list were two cards for one page. Store
+    it under the first season, with that season's title."""
+    anilist_id = fav.get("anilist_id")
+    if anilist_id is None or fav.get("media_type") == "manga":
+        return fav
+    first = catalogue.first_season_entry(anilist_id)
+    if not first or first["anilist_id"] == anilist_id:
+        return fav
+    return {
+        **fav,
+        "anilist_id": first["anilist_id"],
+        "item_key": favorite_item_key(fav.get("tmdb_id"), first["anilist_id"]),
+        "title": first["title"] or fav.get("title"),
+    }
+
+
+def show_favorite_key(
+    tmdb_id: Optional[int], anilist_id: Optional[int], media_type: Optional[str] = None
+) -> str:
+    """The key a favorite was stored under, for removing it by any season's id."""
+    fav = as_show_favorite({"tmdb_id": tmdb_id, "anilist_id": anilist_id, "media_type": media_type})
+    return favorite_item_key(fav["tmdb_id"], fav["anilist_id"], media_type)
 
 
 def progress_item_key(

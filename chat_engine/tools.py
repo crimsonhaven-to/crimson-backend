@@ -23,7 +23,7 @@ import logging
 from typing import Callable, Dict, List, Optional
 
 from account_engine.db import QuotaExceeded, store
-from account_engine.library import favorite_item_key
+from account_engine.library import as_show_favorite, favorite_item_key, show_favorite_key
 from core.http_client import http_client
 from metadata_engine.tmdb import (
     fetch_tmdb_movie_search_results,
@@ -476,6 +476,8 @@ async def _manage_watchlist(user_id: int, args: Dict):
         )
 
     if action == "remove":
+        if kind == "anime":
+            key = await asyncio.to_thread(show_favorite_key, tmdb_id, anilist_id, kind)
         removed = await asyncio.to_thread(store.remove_favorite, user_id, key, None)
         return {"removed": bool(removed)}, None
 
@@ -489,6 +491,7 @@ async def _manage_watchlist(user_id: int, args: Dict):
         "poster": args.get("poster"),
     }
     try:
+        fav = await asyncio.to_thread(as_show_favorite, fav)
         await asyncio.to_thread(store.upsert_favorite, user_id, fav, "favorites")
     except QuotaExceeded as exc:
         return {"error": f"Their watchlist is full: {exc}"}, None

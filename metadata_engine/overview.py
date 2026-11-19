@@ -201,6 +201,13 @@ async def anime_info(tmdb_id: int, season: int) -> Dict:
     }
 
 
+async def _show_anilist_id(anilist_id: int) -> int:
+    """The id the show is favorited under, so a later season's page can tell it is
+    already in a list."""
+    first = await asyncio.to_thread(catalogue.first_season_entry, anilist_id)
+    return first["anilist_id"] if first else anilist_id
+
+
 async def anime_seasons(anilist_id: int) -> Dict:
     """Every season of the show an anilist_id belongs to, in the legacy shape."""
     mapping = await asyncio.to_thread(catalogue.get_tmdb_season, anilist_id)
@@ -218,6 +225,7 @@ async def anime_seasons(anilist_id: int) -> Dict:
         "success": True,
         "anilist_id": anilist_id,
         "title": (anime or {}).get("title") or show.get("title") or "Unknown Anime",
+        "show_anilist_id": await _show_anilist_id(anilist_id),
         "total_seasons": len(seasons),
         "seasons": seasons,
         "extras": await asyncio.to_thread(catalogue.get_show_extras, tmdb_id),
@@ -265,6 +273,7 @@ async def anime_overview(anilist_id: int) -> Dict:
     start_year = (anime.get("start_date") or {}).get("year")
     return _title_page(
         anilist_id=anilist_id,
+        show_anilist_id=await _show_anilist_id(anilist_id),
         tmdb_id=tmdb_id,
         title=anime.get("title") or show.get("title") or "Unknown Anime",
         title_romaji=anime.get("title_romaji"),

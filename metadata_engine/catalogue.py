@@ -64,6 +64,25 @@ def get_tmdb_season(anilist_id: int) -> Optional[Tuple[int, Optional[int]]]:
     return (row["tmdb_id"], None) if row else None
 
 
+def first_season_entry(anilist_id: int) -> Optional[Dict]:
+    """The AniList id and title of the first season of the show ``anilist_id`` is a
+    season of. None for a film, an extra or an unmapped id. Specials (season 0)
+    only count when the show has no numbered season mapped."""
+    return _one(
+        """
+        SELECT c.anilist_id,
+               COALESCE(e.title_english, e.title_romaji, e.title_native) AS title
+        FROM tmdb_seasons s
+        JOIN tmdb_seasons c ON c.tmdb_id = s.tmdb_id
+        JOIN anime_entries e ON e.anilist_id = c.anilist_id
+        WHERE s.anilist_id = %s
+        ORDER BY s.tmdb_id, c.season_number = 0, c.season_number, c.anilist_id
+        LIMIT 1
+        """,
+        (anilist_id,),
+    )
+
+
 def get_extra_movie_id(anilist_id: int) -> Optional[int]:
     """The TMDB movie id of an extra that is a film in its own right, which plays
     through the movie pipeline rather than a season and episode it has no page for."""

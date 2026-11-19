@@ -21,7 +21,14 @@ from playback_engine.warmup import schedule_warmup
 from . import transfer
 from .db import QuotaExceeded, store
 from .deps import require_user
-from .library import dedup_by_show, favorite_item_key, progress_item_key, resolve_status
+from .library import (
+    as_show_favorite,
+    dedup_by_show,
+    favorite_item_key,
+    progress_item_key,
+    resolve_status,
+    show_favorite_key,
+)
 from .schemas import FavoriteIn, ProgressIn
 
 logger = logging.getLogger(__name__)
@@ -96,7 +103,10 @@ async def import_favorites(
 
     favs, skipped_no_id = transfer.favorites_from_rows(rows)
     result = await run_in_threadpool(
-        store.bulk_upsert_favorites, user["user_id"], favs, mode == "replace"
+        store.bulk_upsert_favorites,
+        user["user_id"],
+        [(list_name, as_show_favorite(fav)) for list_name, fav in favs],
+        mode == "replace",
     )
     return {
         "success": True,
@@ -112,10 +122,10 @@ async def import_favorites(
 @router.post("/account/favorites")
 @limiter.limit("60/minute")
 def add_favorite(request: Request, body: FavoriteIn, user: dict = Depends(require_user)):
-    fav = {
+    fav = as_show_favorite({
         "item_key": favorite_item_key(body.tmdb_id, body.anilist_id, body.media_type),
         **body.model_dump(exclude={"list_name"}),
-    }
+    })
     try:
         saved = store.upsert_favorite(user["user_id"], fav, list_name=body.list_name)
     except QuotaExceeded as e:
@@ -135,7 +145,7 @@ def remove_favorite(
     if not item_key:
         if tmdb_id is None and anilist_id is None:
             raise HTTPException(status_code=400, detail="Provide item_key, tmdb_id or anilist_id")
-        item_key = favorite_item_key(tmdb_id, anilist_id, media_type)
+        item_key = show_favorite_key(tmdb_id, anilist_id, media_type)
     if not store.remove_favorite(user["user_id"], item_key, list_name):
         raise HTTPException(status_code=404, detail="Favorite not found")
     return {"success": True, "removed": item_key}
