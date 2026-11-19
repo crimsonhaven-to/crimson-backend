@@ -22,6 +22,11 @@ async def search_anime(query: str, tmdb_enabled: bool) -> List[Dict]:
     if len(results) < LOCAL_SEARCH_FLOOR and tmdb_enabled:
         async with http_client() as client:
             remote = await fetch_tmdb_search_results(client, query)
-        seen = {r["anilist_id"] for r in results}
-        results += [r for r in remote if r["anilist_id"] not in seen]
+        # A show listed locally under one season's id comes back from TMDB under another.
+        seen_ids = {r["anilist_id"] for r in results}
+        seen_shows = {r["tmdb_id"] for r in results if r["tmdb_id"] is not None}
+        results += [
+            r for r in remote
+            if r["anilist_id"] not in seen_ids and r.get("tmdb_id") not in seen_shows
+        ]
     return results

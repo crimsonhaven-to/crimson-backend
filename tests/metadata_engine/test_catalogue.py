@@ -130,9 +130,9 @@ def test_vote_average_is_present_and_null(monkeypatch):
 
 def test_english_title_wins_then_romaji_then_native(monkeypatch):
     _with_rows(monkeypatch, [
-        _row(anilist_id=1, title_english="English", title_romaji="Romaji"),
-        _row(anilist_id=2, title_english=None, title_romaji="Romaji"),
-        _row(anilist_id=3, title_english=None, title_romaji=None, title_native="ネイティブ"),
+        _row(anilist_id=1, season_tmdb_id=1, title_english="English", title_romaji="Romaji"),
+        _row(anilist_id=2, season_tmdb_id=2, title_english=None, title_romaji="Romaji"),
+        _row(anilist_id=3, season_tmdb_id=3, title_english=None, title_romaji=None, title_native="ネイティブ"),
     ])
     assert [i["title"] for i in queries.search_anime_entries("x")] == [
         "English", "Romaji", "ネイティブ",
@@ -176,7 +176,10 @@ def test_a_missing_poster_is_null_not_a_broken_url(monkeypatch):
 
 def test_a_missing_year_is_null_and_a_present_one_is_a_string(monkeypatch):
     """TMDB slices its year out of a date string, so the shapes must agree."""
-    _with_rows(monkeypatch, [_row(anilist_id=1, start_year=None), _row(anilist_id=2, start_year=2013)])
+    _with_rows(monkeypatch, [
+        _row(anilist_id=1, season_tmdb_id=1, start_year=None),
+        _row(anilist_id=2, season_tmdb_id=2, start_year=2013),
+    ])
     a, b = queries.search_anime_entries("x")
     assert a["year"] is None
     assert b["year"] == "2013"
@@ -196,3 +199,53 @@ def test_a_database_error_degrades_to_no_results(monkeypatch):
         raise RuntimeError("connection refused")
     monkeypatch.setattr(queries, "get_connection", _boom)
     assert queries.search_anime_entries("one piece") == []
+
+
+def _overlord_season(anilist_id, season_number, title):
+    return _row(anilist_id=anilist_id, title_english=title, season_tmdb_id=64196,
+                season_number=season_number)
+
+
+def test_seasons_of_one_show_collapse_into_its_first_season(monkeypatch):
+    """Each Overlord season is its own AniList entry; listing all four showed four
+    rows that opened the same page."""
+    _with_rows(monkeypatch, [
+        _overlord_season(146984, 4, "Overlord IV"),
+        _row(anilist_id=7, title_english="Overlord: The Sacred Kingdom",
+             season_tmdb_id=None, season_number=None, extra_tmdb_id=64196),
+        _overlord_season(101474, 3, "Overlord III"),
+        _overlord_season(20832, 1, "Overlord"),
+        _overlord_season(98437, 2, "Overlord II"),
+    ])
+    items = queries.search_anime_entries("overlord")
+
+    assert [(i["anilist_id"], i["title"]) for i in items] == [
+        (20832, "Overlord"),
+        (7, "Overlord: The Sacred Kingdom"),
+    ]
+
+
+def test_specials_only_stand_in_for_a_show_when_no_season_matched(monkeypatch):
+    _with_rows(monkeypatch, [
+        _row(anilist_id=1, season_number=0, title_english="Specials"),
+        _row(anilist_id=2, season_number=2, title_english="Season Two"),
+    ])
+    assert [i["anilist_id"] for i in queries.search_anime_entries("x")] == [2]
+
+    _with_rows(monkeypatch, [_row(anilist_id=1, season_number=0, title_english="Specials")])
+    assert [i["anilist_id"] for i in queries.search_anime_entries("x")] == [1]
+
+
+def test_a_season_with_no_title_never_hides_the_titled_ones(monkeypatch):
+    _with_rows(monkeypatch, [
+        _row(anilist_id=1, season_number=1, title_english=None, title_romaji=None, title_native=None),
+        _row(anilist_id=2, season_number=2, title_english="Season Two"),
+    ])
+    assert [i["anilist_id"] for i in queries.search_anime_entries("x")] == [2]
+
+
+def test_collapsing_still_fills_the_limit(monkeypatch):
+    rows = [_row(anilist_id=n, season_tmdb_id=n, title_english=f"Show {n}") for n in range(1, 30)]
+    conn = _with_rows(monkeypatch, rows)
+    assert len(queries.search_anime_entries("x", limit=5)) == 5
+    assert conn.cursor_obj.params["cap"] == 5 * queries._ROWS_PER_SHOW

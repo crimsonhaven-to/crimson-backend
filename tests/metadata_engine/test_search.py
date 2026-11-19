@@ -86,3 +86,14 @@ async def test_the_response_envelope_is_unchanged(monkeypatch):
     assert body["success"] is True
     assert body["query"] == "abc"
     assert body["count"] == len(body["suggestions"])
+
+
+async def test_tmdb_never_repeats_a_show_listed_under_another_season(monkeypatch):
+    local = [{**_suggestion(20832, "Overlord"), "tmdb_id": 64196}]
+    remote = [{**_suggestion(98437, "Overlord II"), "tmdb_id": 64196},
+              {**_suggestion(5, "Other"), "tmdb_id": 1}]
+    _wire(monkeypatch, local, remote)
+
+    body = await discovery.search_anime_by_name(settings=get_settings(), query_name="overlord")
+
+    assert [s["anilist_id"] for s in body["suggestions"]] == [20832, 5]

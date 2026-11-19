@@ -270,6 +270,8 @@ def get_movies_catalogue_items() -> List[Dict]:
 # A query matching this many rows is too vague to autocomplete usefully, and the
 # cap keeps a one-letter query from sorting the whole catalogue.
 _SEARCH_SCAN_CAP = 400
+# Long franchises run past a handful of seasons, but rarely all match one query.
+_ROWS_PER_SHOW = 4
 # Backslash is LIKE's default escape in Postgres, and the pattern travels as a
 # bound parameter, so it reaches the server unmangled.
 _LIKE_ESCAPES = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
@@ -347,15 +349,15 @@ def search_anime_entries(query: str, limit: int = 10) -> List[Dict]:
             "contains": f"%{escaped}%",
             "prefix": f"{escaped}%",
             "exact": needle.lower(),
-            "cap": min(max(limit, 1), _SEARCH_SCAN_CAP),
+            # Seasons collapse below, so read past `limit` to still fill it.
+            "cap": min(max(limit, 1) * _ROWS_PER_SHOW, _SEARCH_SCAN_CAP),
         },
     )
 
+    titled = [r for r in rows if _entry_title(r)]
     items: List[Dict] = []
-    for r in rows:
-        title = r["title_english"] or r["title_romaji"] or r["title_native"]
-        if not title:
-            continue
+    for r in _one_row_per_show(titled)[:limit]:
+        title = _entry_title(r)
         tmdb_id = r["season_tmdb_id"] or r["extra_tmdb_id"]
         poster_path = r["show_poster"] if tmdb_id else r["movie_poster"]
         items.append(
@@ -371,3 +373,36 @@ def search_anime_entries(query: str, limit: int = 10) -> List[Dict]:
             }
         )
     return items
+
+
+def _entry_title(row: Dict) -> Optional[str]:
+    return row["title_english"] or row["title_romaji"] or row["title_native"]
+
+
+def _one_row_per_show(rows: List[Dict]) -> List[Dict]:
+    """Every season of a show is its own AniList entry, so "Overlord" matched four
+    rows that all open the same overview. Keep one per show, at the best-ranked
+    season's position, but as the show's first season so the title and the page it
+    opens are the show's own. Specials (season 0) only stand in when nothing else
+    matched."""
+    first: Dict[int, Dict] = {}
+    for r in rows:
+        show = r["season_tmdb_id"]
+        if show is None:
+            continue
+        kept = first.get(show)
+        if kept is None or _season_order(r) < _season_order(kept):
+            first[show] = r
+
+    out: List[Dict] = []
+    for r in rows:
+        show = r["season_tmdb_id"]
+        if show is None:
+            out.append(r)
+        elif show in first:
+            out.append(first.pop(show))
+    return out
+
+
+def _season_order(row: Dict) -> tuple:
+    return (row["season_number"] == 0, row["season_number"])
