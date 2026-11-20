@@ -6,6 +6,10 @@ One request and no tools: a random slice of the library rides in the prompt, so 
 set costs a single round trip and the model can only pick songs that exist. When
 the oracle fails or answers nonsense the music keeps going on a random set,
 because silence is the one thing a DJ must never produce.
+
+The intro is also spoken (see voice.py), after the set is chosen, since the words
+must exist before the voice can. It rides along with the set, so the prefetch two
+songs ahead hides that second round trip too.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from typing import Dict, List, Optional
 
 from music_engine.db import store as music_store
 
-from . import persona, providers
+from . import persona, providers, voice
 from .access import provider_key, record_usage
 from .models import resolve
 
@@ -122,11 +126,14 @@ async def _ask(user_id: int, settings: Dict, pool: List[Dict], themes: List[str]
 
 
 async def next_set(user: Dict, settings: Dict, played_ids: List[int], themes: List[str]) -> Dict:
-    """``theme``, ``intro`` and the ``tracks`` rows to play, in order."""
+    """``theme``, ``intro``, the ``tracks`` rows to play in order, and ``voice``:
+    the intro spoken as a base64 WAV, or None."""
     pool = await _pool(user["user_id"], played_ids)
     try:
         text = await _ask(user["user_id"], settings, pool, themes)
     except providers.ProviderError as exc:
         logger.warning("dj set for user %s fell back: %s", user["user_id"], exc)
         text = ""
-    return parse_set(text, pool) or random_set(pool)
+    chosen = parse_set(text, pool) or random_set(pool)
+    chosen["voice"] = await voice.speak(user["user_id"], chosen["intro"])
+    return chosen

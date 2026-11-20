@@ -115,5 +115,6 @@ async def dj_set(request: Request, body: DjRequest, user: dict = Depends(require
     return {
         "theme": chosen["theme"],
         "intro": chosen["intro"],
+        "voice": chosen["voice"],
         "tracks": [track_payload(t, base) for t in chosen["tracks"]],
     }
