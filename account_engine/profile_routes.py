@@ -2,6 +2,7 @@
 display name."""
 
 import json
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
@@ -10,7 +11,7 @@ from core.rate_limit import limiter
 
 from .db import store
 from .deps import require_user
-from .schemas import MAX_USERNAME_LENGTH, UsernameIn
+from .schemas import HANDLE_PATTERN, MAX_USERNAME_LENGTH, HandleIn, UsernameIn
 
 router = APIRouter(tags=["account"])
 
@@ -30,6 +31,7 @@ def account_me(user: dict = Depends(require_user)):
         "is_admin": bool(user.get("is_admin")),
         "music_enabled": bool(user.get("music_enabled")),
         "username": user.get("username"),
+        "handle": user.get("handle"),
         "label": user.get("label"),
         "created_at": user.get("created_at"),
         "last_login_at": user.get("last_login_at"),
@@ -72,3 +74,19 @@ def set_username(request: Request, body: UsernameIn, user: dict = Depends(requir
         )
     store.set_username(user["user_id"], name or None)
     return {"success": True, "username": name or None}
+
+
+@router.put("/account/handle")
+@limiter.limit("10/minute")
+def set_handle(request: Request, body: HandleIn, user: dict = Depends(require_user)):
+    """The unique @name other members message you by. It can change but never be
+    cleared, since existing chats show it."""
+    handle = body.handle.strip().lstrip("@").lower()
+    if not re.fullmatch(HANDLE_PATTERN, handle):
+        raise HTTPException(
+            status_code=400,
+            detail="A handle is 3 to 20 letters, digits or _, starting with a letter",
+        )
+    if handle != user.get("handle") and not store.set_handle(user["user_id"], handle):
+        raise HTTPException(status_code=409, detail="That handle is taken")
+    return {"success": True, "handle": handle}

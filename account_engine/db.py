@@ -14,6 +14,8 @@ import secrets
 from datetime import timedelta
 from typing import Dict, List, Optional, Tuple
 
+import psycopg
+
 from core.clock import utc_now, utc_now_iso
 from core.db_pool import get_connection, lock_schema_init
 
@@ -249,6 +251,17 @@ class AccountStore:
                 "UPDATE accounts SET username = %s WHERE user_id = %s",
                 (username, user_id),
             )
+
+    def set_handle(self, user_id: int, handle: str) -> bool:
+        """False when another account already has the handle."""
+        try:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE accounts SET handle = %s WHERE user_id = %s", (handle, user_id)
+                )
+        except psycopg.errors.UniqueViolation:
+            return False
+        return True
 
     def set_admin(self, user_id: int, is_admin: bool) -> None:
         with get_connection() as conn:

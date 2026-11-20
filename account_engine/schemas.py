@@ -8,6 +8,10 @@ from . import passwords
 
 MAX_USERNAME_LENGTH = 20
 
+# Lowercase so the database's plain unique constraint is case insensitive, and
+# no punctuation besides "_" so a handle reads the same typed or spoken.
+HANDLE_PATTERN = r"^[a-z][a-z0-9_]{2,19}$"
+
 
 # --- mnemonic sign-in -------------------------------------------------------
 class ChallengeRequest(BaseModel):
@@ -73,6 +77,10 @@ class ResetPasswordRequest(BaseModel):
 class UsernameIn(BaseModel):
     # Empty or null clears it, falling back to a generic greeting.
     username: Optional[str] = Field(default=None, max_length=MAX_USERNAME_LENGTH)
+
+
+class HandleIn(BaseModel):
+    handle: str = Field(..., max_length=40)
 
 
 class DeleteAccountRequest(BaseModel):
