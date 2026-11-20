@@ -43,9 +43,26 @@ def test_a_failing_oracle_still_plays_a_set(monkeypatch):
 
     monkeypatch.setattr(dj.providers, "stream_turn", broken)
     monkeypatch.setattr(dj, "provider_key", lambda provider: "key")
+    monkeypatch.setattr(dj.voice, "provider_key", lambda provider: None)
     chosen = asyncio.run(dj.next_set({"user_id": 1}, SETTINGS, [], []))
     assert chosen["theme"] == dj.FALLBACK_THEME
     assert len(chosen["tracks"]) == dj.SET_MAX
+    assert chosen["voice"] is None
+
+
+def test_the_intro_she_chose_is_the_one_she_speaks(monkeypatch):
+    monkeypatch.setattr(dj.music_store, "random_ready_tracks", lambda user_id, excluded, limit: POOL)
+
+    async def answer(user_id, settings, pool, themes):
+        return '{"theme": "x", "intro": "Listen, mortal.", "track_ids": [1, 2, 3]}'
+
+    async def speak(user_id, text):
+        return f"wav of {text}"
+
+    monkeypatch.setattr(dj, "_ask", answer)
+    monkeypatch.setattr(dj.voice, "speak", speak)
+    chosen = asyncio.run(dj.next_set({"user_id": 1}, SETTINGS, [], []))
+    assert chosen["voice"] == "wav of Listen, mortal."
 
 
 def test_a_fully_played_library_starts_over(monkeypatch):
