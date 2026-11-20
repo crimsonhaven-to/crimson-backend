@@ -100,6 +100,7 @@ COPY download_engine ./download_engine
 COPY iptv_engine ./iptv_engine
 COPY local_engine ./local_engine
 COPY manga_engine ./manga_engine
+COPY messaging_engine ./messaging_engine
 COPY metadata_engine ./metadata_engine
 COPY music_engine ./music_engine
 COPY notify_engine ./notify_engine

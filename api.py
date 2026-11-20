@@ -38,6 +38,11 @@ from local_engine import (
     routes as local_routes,
 )
 from manga_engine import routes as manga_routes
+from messaging_engine import (
+    block_routes as messaging_blocks,
+    message_routes as messaging_messages,
+    room_routes as messaging_rooms,
+)
 from music_engine import admin_routes as music_admin
 from music_engine import listening_routes as music_listening
 from music_engine import media_routes as music_media
@@ -118,6 +123,9 @@ for module in (
     music_media,
     app_routes,
     music_listening,
+    messaging_rooms,
+    messaging_messages,
+    messaging_blocks,
     metrics_routes,
     account_admin,
     apikey_admin,
