@@ -14,7 +14,7 @@ from account_engine.deps import require_user
 from core.config import get_settings
 
 from .db import store
-from .models import ANTHROPIC, GEMINI
+from .models import ANTHROPIC, GEMINI, ChatModel
 
 
 def provider_key(provider: str) -> Optional[str]:
@@ -58,3 +58,26 @@ def monthly_budget(user: Dict, settings: Dict) -> int:
     """The account's own ceiling if set, else the global one. 0 means unlimited."""
     own = user.get("chat_monthly_token_budget")
     return int(own) if own is not None else int(settings.get("monthly_token_budget") or 0)
+
+
+def ensure_budget(user: Dict, settings: Dict) -> None:
+    """429 past the budget. It bounds the next request rather than cutting the
+    current reply short."""
+    budget = monthly_budget(user, settings)
+    if budget > 0 and store.tokens_this_month(user["user_id"]) >= budget:
+        raise HTTPException(
+            status_code=429,
+            detail="You have exhausted this month's audience with me. Ask the operator.",
+        )
+
+
+def record_usage(user_id: int, provider: str, model: ChatModel, usage) -> None:
+    store.record_usage(
+        user_id,
+        provider,
+        model.model_id,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cached_tokens,
+        model.cost_micros(usage.input_tokens, usage.output_tokens, usage.cached_tokens),
+    )

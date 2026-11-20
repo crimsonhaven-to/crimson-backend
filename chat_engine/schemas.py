@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Annotated, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -19,3 +19,8 @@ class ChatSettingsUpdate(BaseModel):
     monthly_token_budget: Optional[int] = Field(None, ge=0)
     history_turns: Optional[int] = Field(None, ge=1, le=50)
     max_tool_iterations: Optional[int] = Field(None, ge=1, le=10)
+
+
+class DjRequest(BaseModel):
+    played_ids: List[int] = Field(default_factory=list, max_length=2000)
+    themes: List[Annotated[str, Field(max_length=100)]] = Field(default_factory=list, max_length=20)

@@ -320,6 +320,24 @@ class MusicStore:
                 (user_id, pattern, pattern, pattern, limit),
             ).fetchall()
 
+    def random_ready_tracks(self, user_id: int, exclude_ids: list[int], limit: int) -> list[dict]:
+        with get_connection() as conn:
+            return conn.execute(
+                f"""
+                SELECT {_TRACK_COLS_T} FROM music_tracks t
+                WHERE t.status = 'ready'
+                      AND NOT (t.id = ANY(%s))
+                      AND t.id IN (
+                          SELECT pt.track_id FROM music_playlist_tracks pt
+                          JOIN music_playlists p ON p.id = pt.playlist_id
+                          WHERE p.user_id = %s AND NOT pt.removed_upstream
+                      )
+                ORDER BY random()
+                LIMIT %s
+                """,
+                (exclude_ids, user_id, limit),
+            ).fetchall()
+
     # --- custom playlist covers -------------------------------------------------
     def set_cover(self, playlist_id: int, content_type: str, data: bytes) -> str:
         now = utc_now_iso()

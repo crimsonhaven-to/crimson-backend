@@ -188,15 +188,16 @@ async def _anthropic_stream(
             {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
         ],
         "messages": _anthropic_messages(messages),
-        "tools": [
+    }
+    if tools:
+        request["tools"] = [
             {
                 "name": t["name"],
                 "description": t["description"],
                 "input_schema": t["input_schema"],
             }
             for t in tools
-        ],
-    }
+        ]
 
     # The current models reject sampling parameters outright, so the persona does
     # the steering and depth rides on effort, which older Haiku will not accept.
@@ -323,10 +324,14 @@ async def _gemini_stream(
     messages: List[Dict],
     tools: List[Dict],
 ) -> AsyncIterator[Dict]:
-    body = {
+    body: Dict = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": _gemini_contents(messages),
-        "tools": [
+        "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS},
+    }
+    # Gemini rejects an empty declaration list, and the DJ offers no tools.
+    if tools:
+        body["tools"] = [
             {
                 "functionDeclarations": [
                     {
@@ -337,9 +342,7 @@ async def _gemini_stream(
                     for t in tools
                 ]
             }
-        ],
-        "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS},
-    }
+        ]
 
     url = f"{GEMINI_ENDPOINT}/{model.model_id}:streamGenerateContent?alt=sse"
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
