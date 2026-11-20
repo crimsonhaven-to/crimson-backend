@@ -2316,6 +2316,64 @@
         }
       }
     },
+    "/chat/dj": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Dj Set",
+        "description": "The next set when Lumi plays DJ. Needs both Lumi and music.",
+        "operationId": "dj_set_chat_dj_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DjRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/subtitles": {
       "get": {
         "tags": [
@@ -6367,6 +6425,119 @@
         }
       }
     },
+    "/music/tracks/{track_id}/share": {
+      "post": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Share Track",
+        "description": "The link points at the website even from the desktop app, whose own origin\na friend could not open.",
+        "operationId": "share_track_music_tracks__track_id__share_post",
+        "parameters": [
+          {
+            "name": "track_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Track Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/music/shared/{token}": {
+      "get": {
+        "tags": [
+          "music"
+        ],
+        "summary": "Shared Track",
+        "operationId": "shared_track_music_shared__token__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/music_stream/{track_id}": {
       "get": {
         "tags": [
@@ -10224,6 +10395,29 @@
         "type": "object",
         "title": "DeleteAccountRequest",
         "description": "Proof that the caller is the account holder and not a stolen token: the\npassword for an email account, a signed challenge for a mnemonic one."
+      },
+      "DjRequest": {
+        "properties": {
+          "played_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "maxItems": 2000,
+            "title": "Played Ids"
+          },
+          "themes": {
+            "items": {
+              "type": "string",
+              "maxLength": 100
+            },
+            "type": "array",
+            "maxItems": 20,
+            "title": "Themes"
+          }
+        },
+        "type": "object",
+        "title": "DjRequest"
       },
       "DownloadCreate": {
         "properties": {

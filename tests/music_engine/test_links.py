@@ -32,3 +32,14 @@ def test_an_expired_link_fails(monkeypatch):
 
 def test_links_are_stable_within_a_day():
     assert links.signed_path(links.STREAM, 5) == links.signed_path(links.STREAM, 5)
+
+
+def test_a_share_token_names_its_track():
+    assert links.shared_track_id(links.share_token(42)) == 42
+
+
+def test_a_tampered_share_token_is_refused():
+    _track, _, signature = links.share_token(42).partition(".")
+    assert links.shared_track_id(f"43.{signature}") is None
+    assert links.shared_track_id("42.") is None
+    assert links.shared_track_id("nonsense") is None

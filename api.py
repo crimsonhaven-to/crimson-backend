@@ -42,6 +42,7 @@ from music_engine import admin_routes as music_admin
 from music_engine import listening_routes as music_listening
 from music_engine import media_routes as music_media
 from music_engine import routes as music_routes
+from music_engine import share_routes as music_share
 from metadata_engine import (
     admin_routes as metadata_admin,
     discovery_routes,
@@ -113,6 +114,7 @@ for module in (
     local_routes,
     local_media,
     music_routes,
+    music_share,
     music_media,
     app_routes,
     music_listening,

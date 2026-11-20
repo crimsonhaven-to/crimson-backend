@@ -14,7 +14,7 @@ from typing import AsyncIterator, Dict, List, Optional
 from account_engine.db import store as account_store
 
 from . import persona, providers, tools
-from .access import provider_key
+from .access import provider_key, record_usage
 from .db import store
 from .models import resolve
 
@@ -91,17 +91,7 @@ async def reply(
                     "My oracle went silent mid-sentence. Try again shortly."
                 )
 
-            usage = turn.usage
-            await asyncio.to_thread(
-                store.record_usage,
-                user_id,
-                provider,
-                model.model_id,
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cached_tokens,
-                model.cost_micros(usage.input_tokens, usage.output_tokens, usage.cached_tokens),
-            )
+            await asyncio.to_thread(record_usage, user_id, provider, model, turn.usage)
             if not turn.tool_calls:
                 break
             # The signature must ride along: Gemini rejects a replayed turn whose

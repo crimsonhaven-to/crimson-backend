@@ -11,12 +11,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from account_engine.deps import require_user
+from core.public_url import public_base_url
 from core.rate_limit import limiter
+from music_engine.access import has_music
+from music_engine.payloads import track_payload
 
-from . import conversation, persona
-from .access import feature_state, monthly_budget, require_chat_user
+from . import conversation, dj, persona
+from .access import ensure_budget, feature_state, require_chat_user
 from .db import store
-from .schemas import ChatRequest
+from .schemas import ChatRequest, DjRequest
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -67,13 +70,14 @@ def _open_conversation(user: dict, requested_id):
     """Settings and conversation id for a new turn, or 429 past the budget. The
     budget bounds the next message rather than cutting the current reply short."""
     settings = store.get_settings()
-    budget = monthly_budget(user, settings)
-    if budget > 0 and store.tokens_this_month(user["user_id"]) >= budget:
-        raise HTTPException(
-            status_code=429,
-            detail="You have exhausted this month's audience with me. Ask the operator.",
-        )
+    ensure_budget(user, settings)
     return settings, store.get_or_create_conversation(user["user_id"], requested_id)
+
+
+def _dj_settings(user: dict) -> dict:
+    settings = store.get_settings()
+    ensure_budget(user, settings)
+    return settings
 
 
 @router.post("")
@@ -94,3 +98,22 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(require
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/dj")
+@limiter.limit("10/minute")
+async def dj_set(request: Request, body: DjRequest, user: dict = Depends(require_chat_user)):
+    """The next set when Lumi plays DJ. Needs both Lumi and music."""
+    if not has_music(user):
+        raise HTTPException(status_code=403, detail="Music has not been enabled for your account.")
+    settings = await asyncio.to_thread(_dj_settings, user)
+    try:
+        chosen = await dj.next_set(user, settings, body.played_ids, body.themes)
+    except dj.EmptyLibrary:
+        raise HTTPException(status_code=404, detail="Nothing in your library is ready to play yet.")
+    base = public_base_url(request).rstrip("/")
+    return {
+        "theme": chosen["theme"],
+        "intro": chosen["intro"],
+        "tracks": [track_payload(t, base) for t in chosen["tracks"]],
+    }

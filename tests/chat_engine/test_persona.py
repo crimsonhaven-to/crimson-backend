@@ -62,3 +62,9 @@ def test_context_block_summarises_what_it_has():
     )
     assert "Ramon" in block
     assert "Overlord" in block
+
+
+def test_dj_prompt_states_the_dash_ban_and_uses_none():
+    assert "em dashes" in persona.DJ_PROMPT
+    assert EM_DASH not in persona.DJ_PROMPT
+    assert EN_DASH not in persona.DJ_PROMPT
