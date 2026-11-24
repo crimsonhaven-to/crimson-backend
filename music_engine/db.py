@@ -412,6 +412,28 @@ class MusicStore:
                 (playlist_id,),
             ).fetchall()
 
+    def all_titles(self, user_id: int) -> list[dict]:
+        """Every active track across this user's playlists, deduplicated by track
+        id and ordered stably by title then primary artist, with the playlists
+        that hold it."""
+        with get_connection() as conn:
+            return conn.execute(
+                f"""
+                SELECT {_TRACK_COLS_T},
+                       JSONB_AGG(
+                           JSONB_BUILD_OBJECT('id', p.id, 'name', p.name)
+                           ORDER BY p.created_at, p.id
+                       ) AS playlists
+                FROM music_tracks t
+                JOIN music_playlist_tracks pt ON pt.track_id = t.id
+                JOIN music_playlists p ON p.id = pt.playlist_id
+                WHERE p.user_id = %s AND NOT pt.removed_upstream
+                GROUP BY t.id
+                ORDER BY LOWER(t.title), LOWER(COALESCE(t.artists->>0, '')), t.id
+                """,
+                (user_id,),
+            ).fetchall()
+
     def save_tracks(self, playlist_id: int, entries: list[tuple[str, ImportedTrack]]) -> dict:
         """Upsert every ``(track_key, track)``, point the playlist at them in
         order, and flag what the source no longer lists. One transaction, so a
@@ -570,12 +592,14 @@ class MusicStore:
         """Tracks in this user's playlists by status, and how many of them are in
         the CDN copy, for the library header."""
         out = {s: 0 for s in (STATUS_PENDING, STATUS_WORKING, STATUS_READY, STATUS_REVIEW,
-                              STATUS_UNMATCHED, STATUS_FAILED, "mirrored")}
+                              STATUS_UNMATCHED, STATUS_FAILED, "mirrored",
+                              "active", "active_ready")}
         with get_connection() as conn:
             for row in conn.execute(
                 """
                 SELECT t.status, COUNT(DISTINCT t.id) AS n,
-                       COUNT(DISTINCT t.id) FILTER (WHERE t.mirrored_at IS NOT NULL) AS mirrored
+                       COUNT(DISTINCT t.id) FILTER (WHERE t.mirrored_at IS NOT NULL) AS mirrored,
+                       COUNT(DISTINCT t.id) FILTER (WHERE NOT pt.removed_upstream) AS active
                 FROM music_tracks t
                 JOIN music_playlist_tracks pt ON pt.track_id = t.id
                 JOIN music_playlists p ON p.id = pt.playlist_id
@@ -586,6 +610,9 @@ class MusicStore:
             ).fetchall():
                 out[row["status"]] = row["n"]
                 out["mirrored"] += row["mirrored"]
+                out["active"] += row["active"]
+                if row["status"] == STATUS_READY:
+                    out["active_ready"] = row["active"]
         return out
 
     def fetch_pending(self, limit: int) -> list[dict]:
