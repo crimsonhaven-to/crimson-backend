@@ -31,6 +31,8 @@ class ImportedTrack:
     duration_ms: int = 0
     cover_url: Optional[str] = None
     added_at: Optional[str] = None
+    spotify_artist_ids: list[str] = field(default_factory=list)
+    genres: list[str] = field(default_factory=list)
 
 
 @dataclass

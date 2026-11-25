@@ -40,6 +40,9 @@ def tag_args(source: str, cover: Optional[str], dest: str, track: dict, album: s
     meta("track", track.get("track_number"))
     meta("disc", track.get("disc_number"))
     meta("date", (track.get("release_date") or "")[:4])
+    # Players show one genre field, and an artist's long tail of micro genres
+    # crowds it, so only the first few go into the file.
+    meta("genre", "; ".join((track.get("genres") or [])[:3]))
     return args + ["-movflags", "+faststart", "-f", "mp4", dest]
 
 

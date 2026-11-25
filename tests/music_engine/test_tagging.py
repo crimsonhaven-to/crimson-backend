@@ -39,3 +39,9 @@ def test_a_cover_becomes_a_square_jpeg():
     assert args[args.index("-vf") + 1] == "crop='min(iw,ih)':'min(iw,ih)'"
     assert args[args.index("-f") + 1] == "mjpeg"
     assert args[-1] == "cover.jpg"
+
+
+def test_the_first_three_genres_are_written():
+    args = tag_args("in.m4a", None, "out.m4a", {**TRACK, "genres": ["a", "b", "c", "d"]}, "")
+    assert "genre=a; b; c" in _metadata(args)
+    assert not any(m.startswith("genre=") for m in _metadata(tag_args("in.m4a", None, "o", TRACK, "")))

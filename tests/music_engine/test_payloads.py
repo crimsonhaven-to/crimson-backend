@@ -12,6 +12,8 @@ def test_a_ready_track_gets_signed_stream_and_art_urls():
     assert payload["stream_url"].startswith("https://api/music_stream/3?e=")
     assert payload["cover_url"].startswith("https://api/music_art/3?e=")
     assert payload["file_size"] == 4_000_000
+    assert payload["genres"] == []
+    assert payloads.track_payload({**row, "genres": ["j-pop"]}, "https://api")["genres"] == ["j-pop"]
     pending = payloads.track_payload({**row, "status": "pending", "cover_path": None}, "https://api")
     assert pending["stream_url"] is None
     assert pending["cover_url"] == "https://i.scdn.co/x"

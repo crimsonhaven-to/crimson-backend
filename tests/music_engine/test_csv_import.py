@@ -75,3 +75,15 @@ def test_spotify_track_ids_in_every_spelling(value):
 def test_no_track_id_in_junk():
     assert spotify_track_id("") is None
     assert spotify_track_id("not an id") is None
+
+
+def test_exportify_genres_are_read_and_normalized():
+    [track] = parse_csv(
+        'Track Name,Artist Name(s),Genres\nSong,Band,"J-Pop,City Pop, j-pop"\n'
+    )
+    assert track.genres == ["j-pop", "city pop"]
+
+
+def test_a_file_without_genres_leaves_them_empty():
+    [track] = parse_csv(EXPORTIFY_NEW)
+    assert track.genres == []

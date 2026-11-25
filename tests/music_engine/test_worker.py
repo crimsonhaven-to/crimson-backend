@@ -73,7 +73,25 @@ def env(tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(worker_module.tagging, "write_tagged", fake_tag)
+    monkeypatch.setattr(worker_module.genres_db, "track_genres", lambda track_id: [])
     return tmp_path, store
+
+
+async def test_the_file_is_tagged_with_the_tracks_genres(env, monkeypatch):
+    _root, _store = env
+    tagged = []
+
+    async def fake_tag(source, cover, dest, track, album):
+        tagged.append(track)
+        with open(dest, "wb") as handle:
+            handle.write(b"audio")
+        return None
+
+    monkeypatch.setattr(worker_module.tagging, "write_tagged", fake_tag)
+    monkeypatch.setattr(worker_module.genres_db, "track_genres", lambda track_id: ["j-pop"])
+    provider = FakeProvider(Match(kind="auto", url="https://yt/1"))
+    await worker_module.MusicWorker()._process(provider, dict(TRACK), "x")
+    assert tagged[0]["genres"] == ["j-pop"]
 
 
 async def test_an_auto_match_is_downloaded_and_published(env):
