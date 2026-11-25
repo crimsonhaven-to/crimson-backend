@@ -166,6 +166,17 @@ async def create_local_playlist(
     return {"success": True, **await library.create_local(user["user_id"], body.name.strip())}
 
 
+@router.get("/all-titles")
+async def all_titles(request: Request, user: dict = Depends(require_music_user)):
+    rows = await asyncio.to_thread(store.all_titles, user["user_id"])
+    base = _base(request)
+    tracks = [
+        {**track_payload(row, base), "playlists": row.get("playlists") or []}
+        for row in rows
+    ]
+    return {"success": True, "total": len(tracks), "tracks": tracks}
+
+
 @router.get("/playlists/{playlist_id}")
 async def get_playlist(
     request: Request, playlist_id: int, user: dict = Depends(require_music_user)
