@@ -27,6 +27,7 @@ def track_payload(row: dict, base: str) -> dict:
         "title": row["title"],
         "artists": row["artists"],
         "album": row["album"],
+        "genres": row.get("genres") or [],
         "duration_ms": row["duration_ms"],
         "file_size": row["file_size"] if ready else None,
         "status": row["status"],

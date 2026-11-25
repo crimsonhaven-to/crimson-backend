@@ -10,6 +10,7 @@ import io
 import re
 from typing import Optional
 
+from .genres import normalize
 from .provider import ImportedTrack
 
 MAX_ROWS = 10_000
@@ -27,6 +28,7 @@ _COLUMNS = {
     "duration": ("track duration (ms)", "duration (ms)", "duration_ms", "duration"),
     "isrc": ("isrc",),
     "added_at": ("added at",),
+    "genres": ("genres", "artist genres"),
 }
 
 _SPOTIFY_ID = re.compile(r"(?:spotify:track:|open\.spotify\.com/track/)?([A-Za-z0-9]{22})\b")
@@ -104,6 +106,7 @@ def parse_csv(text: str) -> list[ImportedTrack]:
                 duration_ms=_duration_ms(cell("duration")),
                 cover_url=cell("cover") or None,
                 added_at=cell("added_at") or None,
+                genres=normalize([cell("genres")]),
             )
         )
     if not tracks:

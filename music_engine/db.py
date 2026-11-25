@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from core.clock import utc_now_iso
 from core.db_pool import get_connection
 
+from .genres_db import TRACK_GENRES_T
 from .provider import Candidate, ImportedTrack
 
 STATUS_PENDING = "pending"
@@ -403,7 +404,8 @@ class MusicStore:
         with get_connection() as conn:
             return conn.execute(
                 f"""
-                SELECT {_TRACK_COLS_T}, pt.position, pt.added_at, pt.removed_upstream
+                SELECT {_TRACK_COLS_T}, pt.position, pt.added_at, pt.removed_upstream,
+                       {TRACK_GENRES_T}
                 FROM music_playlist_tracks pt
                 JOIN music_tracks t ON t.id = pt.track_id
                 WHERE pt.playlist_id = %s
@@ -423,7 +425,8 @@ class MusicStore:
                        JSONB_AGG(
                            JSONB_BUILD_OBJECT('id', p.id, 'name', p.name)
                            ORDER BY p.created_at, p.id
-                       ) AS playlists
+                       ) AS playlists,
+                       {TRACK_GENRES_T}
                 FROM music_tracks t
                 JOIN music_playlist_tracks pt ON pt.track_id = t.id
                 JOIN music_playlists p ON p.id = pt.playlist_id
@@ -441,7 +444,9 @@ class MusicStore:
 
         Metadata already on a track wins, except where it is empty: the first
         import decided the file's tags and path, and a later import must not
-        rename a file under a playlist that is playing it."""
+        rename a file under a playlist that is playing it. Artist ids and
+        genres are the exception: they name no file, and an import that has
+        them knows better than a lookup by name."""
         now = utc_now_iso()
         added = 0
         with get_connection() as conn:
@@ -460,8 +465,8 @@ class MusicStore:
                     INSERT INTO music_tracks
                         (track_key, spotify_id, isrc, title, artists, album, album_artist,
                          track_number, disc_number, release_date, duration_ms, cover_url,
-                         created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         spotify_artist_ids, genres, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (track_key) DO UPDATE SET
                         spotify_id = COALESCE(music_tracks.spotify_id, EXCLUDED.spotify_id),
                         isrc = COALESCE(music_tracks.isrc, EXCLUDED.isrc),
@@ -476,13 +481,20 @@ class MusicStore:
                         duration_ms = CASE WHEN music_tracks.duration_ms = 0
                                            THEN EXCLUDED.duration_ms
                                            ELSE music_tracks.duration_ms END,
-                        cover_url = COALESCE(music_tracks.cover_url, EXCLUDED.cover_url)
+                        cover_url = COALESCE(music_tracks.cover_url, EXCLUDED.cover_url),
+                        spotify_artist_ids = CASE
+                            WHEN EXCLUDED.spotify_artist_ids = '[]'::jsonb
+                            THEN music_tracks.spotify_artist_ids
+                            ELSE EXCLUDED.spotify_artist_ids END,
+                        genres = CASE WHEN EXCLUDED.genres = '[]'::jsonb THEN music_tracks.genres
+                                      ELSE EXCLUDED.genres END
                     RETURNING id
                     """,
                     (
                         key, track.spotify_id, track.isrc, track.title, Jsonb(track.artists),
                         track.album, track.album_artist, track.track_number, track.disc_number,
-                        track.release_date, track.duration_ms, track.cover_url, now, now,
+                        track.release_date, track.duration_ms, track.cover_url,
+                        Jsonb(track.spotify_artist_ids), Jsonb(track.genres), now, now,
                     ),
                 ).fetchone()["id"]
                 if track_id in seen:

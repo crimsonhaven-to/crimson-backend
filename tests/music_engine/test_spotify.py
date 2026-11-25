@@ -2,7 +2,14 @@
 
 from datetime import datetime, timedelta, timezone
 
-from music_engine.spotify import _token_still_valid, parse_playlist_entry, parse_track
+import pytest
+
+from music_engine.spotify import (
+    SpotifyClient,
+    _token_still_valid,
+    parse_playlist_entry,
+    parse_track,
+)
 
 TRACK = {
     "id": "2FZcjBYK4dTt48q94pJbJD",
@@ -12,7 +19,7 @@ TRACK = {
     "track_number": 3,
     "disc_number": 1,
     "external_ids": {"isrc": "USSM12600001"},
-    "artists": [{"name": "Miley Cyrus"}],
+    "artists": [{"id": "5YGY8feqx7naU7z4HrwZM6", "name": "Miley Cyrus"}, {"name": "Guest"}],
     "album": {
         "name": "Something Beautiful",
         "release_date": "2026-09-03",
@@ -54,3 +61,29 @@ def test_token_validity_leaves_a_margin():
     assert not _token_still_valid({"access_token": "t", "access_expires_at": soon})
     assert _token_still_valid({"access_token": "t", "access_expires_at": later})
     assert not _token_still_valid({"access_token": None, "access_expires_at": later})
+
+
+def test_a_track_carries_its_artists_spotify_ids():
+    track = parse_track(TRACK)
+    assert track.artists == ["Miley Cyrus", "Guest"]
+    assert track.spotify_artist_ids == ["5YGY8feqx7naU7z4HrwZM6"]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("miley cyrus", "m1"), ("Miley", None), ("", None)],
+)
+async def test_an_artist_is_found_by_exact_name_only(monkeypatch, name, expected):
+    asked = []
+
+    async def fake_get(self, path, params=None):
+        asked.append(params)
+        return {"artists": {"items": [
+            {"id": "m0", "name": "Miley Cyrus Tribute"},
+            {"id": "m1", "name": "Miley Cyrus"},
+        ]}}
+
+    monkeypatch.setattr(SpotifyClient, "get", fake_get)
+    found = await SpotifyClient(1).find_artist(name)
+    assert (found or {}).get("id") == expected
+    assert len(asked) == (1 if name else 0)

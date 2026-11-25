@@ -44,7 +44,7 @@ _MAX_RETRY_AFTER = 60.0
 
 _TRACK_FIELDS = (
     "id,name,duration_ms,type,is_local,track_number,disc_number,external_ids(isrc),"
-    "artists(name),album(name,release_date,images,artists(name))"
+    "artists(id,name),album(name,release_date,images,artists(name))"
 )
 _ITEM_FIELDS = f"items(added_at,is_local,item({_TRACK_FIELDS}),track({_TRACK_FIELDS})),next,total"
 
@@ -173,7 +173,8 @@ def parse_track(raw: Optional[dict], added_at: Optional[str] = None) -> Optional
     if not raw or raw.get("is_local") or raw.get("type", "track") != "track":
         return None
     title = raw.get("name") or ""
-    artists = [a["name"] for a in raw.get("artists") or [] if a.get("name")]
+    named = [a for a in raw.get("artists") or [] if a.get("name")]
+    artists = [a["name"] for a in named]
     if not title or not artists:
         return None
     album = raw.get("album") or {}
@@ -191,6 +192,7 @@ def parse_track(raw: Optional[dict], added_at: Optional[str] = None) -> Optional
         duration_ms=int(raw.get("duration_ms") or 0),
         cover_url=_largest_image(album.get("images")),
         added_at=added_at,
+        spotify_artist_ids=[a["id"] for a in named if a.get("id")],
     )
 
 
@@ -331,6 +333,27 @@ class SpotifyClient:
             return None
         meta = await self.get(f"/playlists/{playlist_id}", {"fields": "snapshot_id"})
         return meta.get("snapshot_id")
+
+    async def artist(self, artist_id: str) -> dict:
+        """One request per artist: the batch ``GET /artists`` went away for
+        development-mode apps in February 2026, ``genres`` on the artist did not."""
+        return await self.get(f"/artists/{artist_id}")
+
+    async def find_artist(self, name: str) -> Optional[dict]:
+        """The artist named exactly ``name``, ignoring case, or None. A near
+        miss is worse than nothing here: it would hang someone else's genres on
+        the song."""
+        wanted = name.strip().casefold()
+        query = name.replace('"', " ").strip()
+        if not wanted or not query:
+            return None
+        found = await self.get(
+            "/search", {"q": f'artist:"{query}"', "type": "artist", "limit": 10}
+        )
+        for item in (found.get("artists") or {}).get("items") or []:
+            if item and (item.get("name") or "").strip().casefold() == wanted:
+                return item
+        return None
 
     async def liked_songs(self) -> ImportedPlaylist:
         tracks = []

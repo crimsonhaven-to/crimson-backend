@@ -23,9 +23,10 @@ from typing import Optional
 from core.config import get_settings
 from core.http_client import http_client
 
-from . import cdn, fs, library, tagging
+from . import cdn, fs, genres, genres_db, library, tagging
 from .db import STATUS_UNMATCHED, store
 from .provider import MusicProvider, ProviderError, TrackQuery, get_provider
+from .spotify import SpotifyError
 
 logger = logging.getLogger("crimson.music.worker")
 
@@ -37,6 +38,9 @@ BACKOFF_SECONDS = 120.0
 # Tracks copied to the CDN per poll tick. The first run after switching the CDN
 # on copies the whole library, and a tick must not stall for that long.
 MIRROR_BATCH = 5
+# Spotify requests per poll tick for genre lookups. A whole library looks its
+# artists up within the hour without ever brushing the app's rate limit.
+GENRE_BATCH = 3
 
 
 class MusicWorker:
@@ -45,6 +49,7 @@ class MusicWorker:
         self._poller: Optional[asyncio.Task] = None
         self._paused_until = 0.0
         self._mirror_paused_until = 0.0
+        self._genres_paused_until = 0.0
         self._last_sync_check = 0.0
         # Playlists whose M3U is stale, rewritten once the queue goes quiet.
         self._dirty: set[int] = set()
@@ -100,6 +105,8 @@ class MusicWorker:
                     await self._write_dirty_playlists()
                 if cdn.enabled() and loop.time() >= self._mirror_paused_until:
                     await self._mirror_some()
+                if loop.time() >= self._genres_paused_until:
+                    await self._look_up_genres()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -181,7 +188,8 @@ class MusicWorker:
                          "artists": fetched.artists or track["artists"]}
         cover = await _download_cover(cover_url, work)
         album = track["album"] or fetched.album
-        track = {**track, "album": album}
+        genre_list = await asyncio.to_thread(genres_db.track_genres, track_id)
+        track = {**track, "album": album, "genres": genre_list}
 
         rel_path = await asyncio.to_thread(fs.unique_rel_path, fs.plan_rel_path(track))
         tagged = os.path.join(work, "tagged.m4a")
@@ -233,6 +241,14 @@ class MusicWorker:
                 return
             await asyncio.to_thread(store.mark_mirrored, track["id"], track["rel_path"])
             logger.info("[music] copied %s to the CDN", track["rel_path"])
+
+    async def _look_up_genres(self) -> None:
+        """A failure pauses the lookups only: downloads do not need Spotify."""
+        try:
+            await genres.enrich(GENRE_BATCH)
+        except SpotifyError as e:
+            logger.warning("[music] genre lookups paused: %s", e)
+            self._genres_paused_until = asyncio.get_running_loop().time() + BACKOFF_SECONDS
 
     async def _write_dirty_playlists(self) -> None:
         dirty, self._dirty = self._dirty, set()
